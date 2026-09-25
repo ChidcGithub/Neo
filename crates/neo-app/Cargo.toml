@@ -33,6 +33,10 @@ egui_commonmark = { version = "0.25.0", default-features = false, features = ["p
 eframe = { workspace = true, features = ["wgpu"] }
 egui = { workspace = true }
 
+# 全局输入轮询（GetCursorPos / GetAsyncKeyState）：迷你窗避让与打断确认用
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Input", "Win32_UI_WindowsAndMessaging"] }
+
 [dev-dependencies]
 # 打开组件库的 Id 探针，供端到端 Id 冲突测试使用
 neo-ui = { workspace = true, features = ["probe"] }

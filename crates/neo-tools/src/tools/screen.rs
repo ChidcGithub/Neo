@@ -30,6 +30,22 @@
 
 use crate::result::{ErrorKind, ToolError};
 
+/// 最近一次截屏开始的时间戳（毫秒，Unix epoch；0 = 还没截过）。
+///
+/// 上层（neo-app 的迷你窗）每帧读它：值一变就说明 AI 正在截屏，
+/// 立刻把自己从屏幕上藏起来，避免被截进画面。置位放在这里而不是 app 侧，
+/// 是因为 `capture()` 是 `screenshot` / `screen_elements` 的唯一入口，一处全覆盖。
+pub static SCREENSHOT_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 置位 [`SCREENSHOT_AT`]，返回当前毫秒时间戳。
+fn mark_screenshot() {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    SCREENSHOT_AT.store(millis, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 屏幕上的一个矩形（虚拟桌面物理像素）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -192,6 +208,11 @@ mod imp {
             return Err(ToolError::bad_args("截屏区域必须是正的宽高")
                 .with_hint("width / height 是整数像素"));
         }
+        // 先广播「要截屏了」再抓帧：迷你窗靠这个信号把自己藏起来，
+        // 等它真正从屏幕上消失，画面里才不会带上 Neo 自己的窗口。
+        // 隐藏态轮询周期 200ms，留足余量取 300ms。
+        mark_screenshot();
+        std::thread::sleep(Duration::from_millis(300));
         unsafe {
             let screen = GetDC(std::ptr::null_mut());
             if screen.is_null() {

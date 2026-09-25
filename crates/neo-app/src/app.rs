@@ -77,6 +77,8 @@ pub struct NeoApp {
     toast: Option<(neo_ui::ToastKind, String, std::time::Instant)>,
     /// 全屏跑马灯覆盖层（唤醒聆听时亮起）。离屏测试没有 GPU 窗口线程，为 `None`。
     overlay: Option<neo_overlay::OverlayHandle>,
+    /// 后台执行期间的角落迷你窗（对话速览 / 截屏回避 / 打断确认）。
+    miniwin: ui::miniwin::MiniWin,
     /// STT 线程的投喂端（音频帧 / 复位命令）。
     stt_tx: Option<std::sync::mpsc::Sender<SttCmd>>,
     /// STT 转写结果的回收端。
@@ -139,6 +141,7 @@ impl NeoApp {
             quitting: false,
             toast: None,
             overlay: None,
+            miniwin: Default::default(),
             stt_tx: None,
             stt_rx: None,
             dictating: false,
@@ -784,8 +787,8 @@ impl NeoApp {
             self.wake_rx = None;
             self.wake = None;
         }
-        // STT 转写结果：第一句完整的话到了就作为输入直接发送，
-        // 主界面在这时才唤回，展示这轮对话与回复。
+        // STT 转写结果：第一句完整的话到了就作为输入直接发送。
+        // 不再唤出主界面：全程后台静默处理，进度看右上角小窗。
         let stt_out = self.stt_rx.as_ref().map(|rx| rx.try_recv());
         match stt_out {
             Some(Ok(Ok(text))) => {
@@ -793,9 +796,6 @@ impl NeoApp {
                 if self.dictating && !text.is_empty() {
                     self.end_dictation();
                     self.state.draft = text;
-                    if self.hidden_to_tray {
-                        self.show_window(&ctx);
-                    }
                     Self::send_input(&mut self.state, self.store.as_ref());
                 }
             }
@@ -826,6 +826,9 @@ impl NeoApp {
             // 听写期间保持帧循环：沉默超时与电平回落都靠它。
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
+        // 迷你窗：主窗藏起 + AI 在忙时贴屏幕角落（对话速览 / 截屏回避 / 打断确认）。
+        self.miniwin
+            .tick(&ctx, &mut self.state, self.theme, self.hidden_to_tray);
         // 托盘没有 winit 唤醒源：隐藏期间保持低频轮询，托盘菜单点击才有响应。
         if self.hidden_to_tray {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));

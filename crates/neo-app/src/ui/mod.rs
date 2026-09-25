@@ -19,6 +19,7 @@ pub mod conversation;
 pub mod hero;
 pub mod markdown;
 pub mod math;
+pub mod miniwin;
 pub mod settings;
 pub mod sidebar;
 pub mod tools;
