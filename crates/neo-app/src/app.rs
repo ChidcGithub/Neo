@@ -85,6 +85,8 @@ pub struct NeoApp {
     confirmwin: ui::confirmwin::ConfirmWin,
     /// 已见到的「唤回主窗」信号（`open_app` 工具置位；变了 = AI 要开主界面）。
     show_window_seen: u64,
+    /// 记忆文件 mtime 轮询节拍（2s）。
+    memory_poll: std::time::Instant,
     /// STT 线程的投喂端（音频帧 / 复位命令）。
     stt_tx: Option<std::sync::mpsc::Sender<SttCmd>>,
     /// STT 转写结果的回收端。
@@ -151,6 +153,7 @@ impl NeoApp {
             shotflash: Default::default(),
             confirmwin: Default::default(),
             show_window_seen: 0,
+            memory_poll: std::time::Instant::now(),
             stt_tx: None,
             stt_rx: None,
             dictating: false,
@@ -190,6 +193,8 @@ impl NeoApp {
             // 恢复上次使用的会话。
             Self::restore_last_session(&mut app.state, store);
             app.saved_active = app.state.active_session;
+            // 长期记忆入库：启动加载，之后由 tick 里的 mtime 轮询热更新。
+            app.state.memories = neo_tools::tools::memory::load_memories();
         }
 
         // 首帧还不知道视口尺寸，先按 1080p 建一套；`sync_theme` 会在第一帧立刻纠正。
@@ -846,6 +851,39 @@ impl NeoApp {
         self.shotflash.tick(&ctx);
         // 工具确认窗：模型请求权限时独立弹出（不绑主窗，后台也能授权）。
         self.confirmwin.tick(&ctx, &mut self.state, self.theme);
+        // 记忆热重载：remember/forget 工具在工具线程写盘，这里 2s 一拍沿检。
+        if self.memory_poll.elapsed() > std::time::Duration::from_secs(2) {
+            self.memory_poll = std::time::Instant::now();
+            self.state.maybe_reload_memories();
+        }
+        // 记忆导入导出对话框的回执落地（toast + 立即重读）。
+        let io_msg = self
+            .state
+            .memory_io_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        if let Some(msg) = io_msg {
+            self.state.memory_io_rx = None;
+            // 导入刚写完盘：清 mtime 缓存强制重读（粒度可能骗过沿检）。
+            self.state.memories_file_ms = None;
+            self.state.maybe_reload_memories();
+            let (kind, text) = match msg {
+                crate::state::MemoryIoMsg::Imported(Ok((added, skipped))) => (
+                    neo_ui::ToastKind::Success,
+                    format!("已导入 {added} 条记忆（跳过 {skipped} 条重复）"),
+                ),
+                crate::state::MemoryIoMsg::Imported(Err(e)) => {
+                    (neo_ui::ToastKind::Error, format!("导入失败：{e}"))
+                }
+                crate::state::MemoryIoMsg::Exported(Ok(n)) => {
+                    (neo_ui::ToastKind::Success, format!("已导出 {n} 条记忆"))
+                }
+                crate::state::MemoryIoMsg::Exported(Err(e)) => {
+                    (neo_ui::ToastKind::Error, format!("导出失败：{e}"))
+                }
+            };
+            self.toast = Some((kind, text, std::time::Instant::now() + std::time::Duration::from_secs(3)));
+        }
         // 「打开主界面」工具：执行层只置信号位，这里真正唤窗。
         let show_at = neo_tools::tools::open_app::SHOW_WINDOW_AT
             .load(std::sync::atomic::Ordering::Relaxed);

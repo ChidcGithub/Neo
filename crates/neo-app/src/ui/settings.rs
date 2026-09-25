@@ -193,6 +193,7 @@ pub fn panel(
                     SettingsTab::Appearance => appearance_tab(ui, skin, w, state),
                     SettingsTab::Display => display_tab(ui, skin, w, state, viewport_h),
                     SettingsTab::Model => model_tab(ui, skin, w, state),
+                    SettingsTab::Memory => memory_tab(ui, skin, w, state),
                     SettingsTab::About => about_tab(ui, skin, w, state, loaded),
                 }
             });
@@ -215,6 +216,7 @@ fn page_desc(tab: SettingsTab) -> &'static str {
         SettingsTab::Appearance => "主题与回复展示",
         SettingsTab::Display => "观看距离与缩放链路",
         SettingsTab::Model => "接口、密钥与模型列表",
+        SettingsTab::Memory => "AI 记住的事：查看、修改、导入导出",
         SettingsTab::About => "版本、存储与字体装配",
     }
 }
@@ -225,6 +227,7 @@ fn nav_icon(tab: SettingsTab) -> Icon {
         SettingsTab::Appearance => Icon::Sun,
         SettingsTab::Display => Icon::Board,
         SettingsTab::Model => Icon::Sparkle,
+        SettingsTab::Memory => Icon::Checklist,
         SettingsTab::About => Icon::Info,
     }
 }
@@ -473,6 +476,203 @@ fn about_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &AppState, loaded:
         ui.add_space(m.s(6.0));
         hint_row(ui, skin, width, "未找到中文字体，界面中文会显示为方块");
     }
+}
+
+/// 记忆页：AI 跨对话记住的事 —— 查看、行内编辑、删除、手动添加、导入导出。
+fn memory_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
+    use neo_tools::tools::memory as mem;
+
+    let d = skin.d();
+    let p = skin.p();
+    let m = skin.m();
+
+    section_label_row(ui, skin, width, "AI 记住的事");
+
+    if state.memories.is_empty() {
+        hint_row(
+            ui,
+            skin,
+            width,
+            "还没有记忆。对话里告诉 Neo「记住……」，或在下面手动添加",
+        );
+    }
+
+    // 行内动作先记账、循环外落地 —— 避免边遍历边改 Vec / 编辑态。
+    enum Act {
+        Edit(u64, String),
+        Delete(u64),
+        Save,
+        Cancel,
+    }
+    let mut act: Option<Act> = None;
+
+    for item in &state.memories {
+        let editing = matches!(&state.memory_editing, Some((id, _)) if *id == item.id);
+        if editing {
+            // 编辑态：输入框 + 保存/取消，横向一行。
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(m.s(6.0), 0.0);
+                let input_w = (width - m.s(30.0) * 2.0 - m.s(12.0)).max(0.0);
+                if let Some((_, draft)) = state.memory_editing.as_mut() {
+                    TextField::new(draft)
+                        .id_salt(("neo-mem-edit", item.id))
+                        .show(ui, &d, input_w);
+                }
+                if IconButton::new(Icon::Check)
+                    .ghost()
+                    .id_salt(("neo-mem-save", item.id))
+                    .show(ui, &d)
+                    .clicked()
+                {
+                    act = Some(Act::Save);
+                }
+                if IconButton::new(Icon::Close)
+                    .ghost()
+                    .id_salt(("neo-mem-cancel", item.id))
+                    .show(ui, &d)
+                    .clicked()
+                {
+                    act = Some(Act::Cancel);
+                }
+            });
+            ui.add_space(m.s(6.0));
+            continue;
+        }
+
+        // 常规态：#id + 内容（超长截断），右侧恒显 编辑/删除（教室一体机没有 hover）。
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, m.s(36.0)), Sense::hover());
+        if resp.hovered() {
+            ui.painter().squircle_filled(rect, m.radius_chip(), p.hover);
+        }
+
+        let btn_d = m.s(26.0);
+        let trash_center = egui::pos2(rect.right() - btn_d * 0.5, rect.center().y);
+        let pen_center = egui::pos2(rect.right() - btn_d * 1.5 - m.s(4.0), rect.center().y);
+        if IconButton::new(Icon::Pen)
+            .ghost()
+            .id_salt(("neo-mem-pen", item.id))
+            .show_at(ui, &d, pen_center)
+            .clicked()
+        {
+            act = Some(Act::Edit(item.id, item.content.clone()));
+        }
+        if IconButton::new(Icon::Trash)
+            .danger()
+            .id_salt(("neo-mem-trash", item.id))
+            .show_at(ui, &d, trash_center)
+            .clicked()
+        {
+            act = Some(Act::Delete(item.id));
+        }
+
+        // 文字区给按钮让位；内容里的换行压成空格，保证单行不顶破行高。
+        let text_rect = Rect::from_min_max(
+            rect.min + egui::vec2(m.s(8.0), 0.0),
+            egui::pos2(pen_center.x - btn_d * 0.5 - m.s(8.0), rect.bottom()),
+        );
+        let id_font = skin.prop(skin.t().caption);
+        let id_text = format!("#{}", item.id);
+        let id_w = ui
+            .painter()
+            .layout_no_wrap(id_text.clone(), id_font.clone(), p.label_caption)
+            .size()
+            .x;
+        ui.painter().text(
+            text_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            id_text,
+            id_font,
+            p.label_caption,
+        );
+        let body_rect = Rect::from_min_max(
+            egui::pos2(text_rect.left() + id_w + m.s(8.0), text_rect.top()),
+            text_rect.max,
+        );
+        let font = d.font(d.t().label);
+        let flat = item.content.replace(['\r', '\n'], " ");
+        let shown = neo_ui::elide(ui.painter(), &flat, &font, body_rect.width());
+        ui.painter().text(
+            body_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            shown,
+            font,
+            p.label_primary,
+        );
+        ui.add_space(m.s(2.0));
+    }
+
+    match act {
+        Some(Act::Edit(id, content)) => state.memory_editing = Some((id, content)),
+        Some(Act::Delete(id)) => {
+            let _ = mem::forget_memory(&format!("#{id}"));
+            reload_memories(state);
+        }
+        Some(Act::Save) => {
+            // 清空文本 = 放弃保存（当成误触），删记忆走删除键。
+            if let Some((id, draft)) = state.memory_editing.take() {
+                let trimmed = draft.trim();
+                if !trimmed.is_empty() {
+                    let _ = mem::edit_memory(id, trimmed);
+                }
+            }
+            reload_memories(state);
+        }
+        Some(Act::Cancel) => state.memory_editing = None,
+        None => {}
+    }
+
+    // 添加与备份。
+    ui.add_space(m.s(10.0));
+    section_label_row(ui, skin, width, "添加与备份");
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(m.s(8.0), 0.0);
+        let input_w = (width - m.s(64.0) - m.s(8.0)).max(0.0);
+        input_row(ui, skin, input_w, &mut state.memory_draft, false, "neo-mem-new");
+        if neo_ui::Button::new("记下")
+            .elevated()
+            .show(ui, &d)
+            .clicked()
+        {
+            let content = state.memory_draft.trim().to_owned();
+            if !content.is_empty() {
+                let _ = mem::add_memory(&content);
+                state.memory_draft.clear();
+                reload_memories(state);
+            }
+        }
+    });
+    ui.add_space(m.s(8.0));
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(m.s(8.0), 0.0);
+        if neo_ui::Button::new("导入…")
+            .ghost()
+            .show(ui, &d)
+            .clicked()
+        {
+            state.import_memories_dialog(ui.ctx());
+        }
+        if neo_ui::Button::new("导出…")
+            .ghost()
+            .show(ui, &d)
+            .clicked()
+        {
+            state.export_memories_dialog(ui.ctx());
+        }
+    });
+    ui.add_space(m.s(6.0));
+    hint_row(
+        ui,
+        skin,
+        width,
+        &format!("记忆保存在 {}", mem::memories_path().display()),
+    );
+}
+
+/// 本地刚写完记忆文件：清掉 mtime 缓存强制重读
+/// （mtime 粒度在某些文件系统上可能骗过沿检）。
+fn reload_memories(state: &mut AppState) {
+    state.memories_file_ms = None;
+    state.maybe_reload_memories();
 }
 
 // ---------------------------------------------------------------------------

@@ -21,6 +21,8 @@
 | `edit_file` | 修改文件 | `write` | 把一段确定的原文替换成新文本 | 新建文件用 `write_file` |
 | `powershell` | 执行命令 | `exec` | 工作区内执行 PowerShell 命令 | 专用文件/文档/图像工具能表达的不要用它 |
 | `bash` | 执行命令 | `exec` | 工作区内的类 Unix 环境（随包 Git Bash）里执行命令 | 同上；写 PowerShell 语法用 `powershell` |
+| `remember` | 记住 | `open` | 把值得长期记住的事写进长期记忆（以后每轮对话都带着） | 一次性的任务指令不要记 |
+| `forget` | 忘掉 | `open` | 删除一条长期记忆（#id 或内容关键词） | 删多条逐条来，一次只删最近更新的一条 |
 | `screenshot` | 截取屏幕 | `read` | 截屏并把图交给模型看 | 它只是「看一眼」，不会操作界面 |
 | `screen_elements` | 屏幕元素 | `read` | 枚举可交互元素并按阅读顺序编号 | 游戏/画布等 UIA 不可见区域仍要靠截图坐标 |
 | `screen_element_search` | 搜索屏幕元素 | `read` | 按按钮名称、类型或屏幕位置搜索最近清单，返回 `element_id` 和精确位置 | 找不到按钮时先用它，不要凭截图猜坐标 |
@@ -414,6 +416,48 @@ npm run dev *> .neo-dev.log
 3. `background: true` 同样**不等待、不捕获输出**，要看输出请自己重定向到工作区内的文件；
 4. 超时同样只杀直接子进程（没有作业对象），孙进程可能残留 —— 已知局限。
 
+---
+
+### 7.5 `remember` / `forget` —— 长期记忆
+
+**用途**：`remember` 把值得长期记住的事（用户偏好、身份信息、常用设定）写进
+长期记忆，之后**每一轮对话的系统提示词里都带着**；`forget` 删掉一条
+（记忆过期、记错、或用户明确要求忘掉时）。
+
+**风险**：`open`（默认放行；`Policy::allow_open = false` 时拒绝）。
+改的是 Neo 自己的记忆文件，不动用户数据 —— 所以归 open 档。
+
+| `remember` 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `content` | string | ✅ | 一句完整、独立、长期有效的话；一次性的任务指令不要记 |
+
+| `forget` 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `query` | string | ✅ | `#id`（如 `#3`）精确删，或内容关键词 —— 命中多条时只删最近更新的一条 |
+
+**成功返回**
+
+```json
+{ "ok": true, "tool": "remember", "summary": "已记住（#2）：用户是高二学生",
+  "data": { "id": 2, "created": true } }
+```
+
+`created: false` = 内容完全相同，已去重（只刷新时间戳）。
+
+**存储**：`memories.json`（与 `neo.db` 同目录：`NEO_HOME` > `%APPDATA%\Neo` >
+当前目录），JSON 数组，原子写（tmp + rename）。**同一个文件，三个入口**：
+这两个工具、设置 → 记忆页（查看 / 行内编辑 / 删除 / 手动添加 / 导入导出），
+以及系统提示词注入（每轮带上，上限 50 条 / 3000 字符，超出丢最旧）。
+工具线程写盘后，app 侧 2s 一拍按 mtime 沿检热重载。
+
+**边界**：
+
+1. 内容完全相同的记忆不重复入库（`remember` 返回 `created: false`，只刷新时间戳）；
+2. 文件损坏时不丢数据 —— 原文件改名 `.bad` 留档，从空记忆重新开始；
+3. 修改记忆没有独立工具：先 `forget` 再 `remember`（设置页里可以直接编辑）。
+
+---
+
 ### 8. `screenshot` —— 截取屏幕
 
 **用途**：截取整个虚拟桌面或其中一块，**把图直接交给模型看**（认界面、读屏幕上的
@@ -606,7 +650,7 @@ npm run dev *> .neo-dev.log
 | 风险 | 工具 | 默认裁定 |
 |---|---|---|
 | `read` | `read_file` / `view_image` | 直接放行 |
-| `open` | `open_file` / `open_app` | 直接放行（策略可关） |
+| `open` | `open_file` / `open_app` / `remember` / `forget` | 直接放行（策略可关） |
 | `write` | `write_file` / `edit_file` | **需用户确认** |
 | `exec` | `powershell` / `bash` / `click` / `drag` | **需用户确认** |
 | `read` | `screenshot` | 直接放行（它只看不动） |

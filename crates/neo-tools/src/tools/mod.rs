@@ -11,6 +11,7 @@ pub mod bash;
 pub mod click;
 pub mod drag;
 pub mod edit_file;
+pub mod memory;
 pub mod open_app;
 pub mod open_file;
 pub mod powershell;
@@ -113,6 +114,25 @@ pub static REGISTRY: &[Tool] = &[
         params: bash::PARAMS,
         preview: bash::preview,
         run: bash::run,
+    },
+    // 长期记忆：改的是 AI 自己的记忆文件，不动用户数据 —— 归 open 档放行。
+    Tool {
+        name: "remember",
+        title: "记住",
+        purpose: "把值得长期记住的事（用户偏好、身份、常用设定）写进长期记忆，以后的对话都带在身上。一次性的任务指令不要记。",
+        risk: Risk::Open,
+        params: memory::REMEMBER_PARAMS,
+        preview: memory::remember_preview,
+        run: memory::remember_run,
+    },
+    Tool {
+        name: "forget",
+        title: "忘掉",
+        purpose: "删除一条长期记忆（#id 或内容关键词）。记忆过期、记错、或用户要求忘掉时用。",
+        risk: Risk::Open,
+        params: memory::FORGET_PARAMS,
+        preview: memory::forget_preview,
+        run: memory::forget_run,
     },
     // 屏幕交互：比"执行命令"更贴近直接操作这台机器，排在最后。
     Tool {

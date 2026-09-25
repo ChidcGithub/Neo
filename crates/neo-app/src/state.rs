@@ -319,6 +319,7 @@ pub enum SettingsTab {
     Appearance,
     Display,
     Model,
+    Memory,
     About,
 }
 
@@ -328,8 +329,17 @@ impl SettingsTab {
         (Self::Appearance, "外观"),
         (Self::Display, "显示"),
         (Self::Model, "模型"),
+        (Self::Memory, "记忆"),
         (Self::About, "关于"),
     ];
+}
+
+/// 记忆导入导出对话框的回执。
+pub enum MemoryIoMsg {
+    /// 导入完成：Ok(新增数, 跳过数)。
+    Imported(Result<(usize, usize), String>),
+    /// 导出完成：Ok(条数)。
+    Exported(Result<usize, String>),
 }
 
 /// 一次后台执行的句柄。
@@ -405,6 +415,16 @@ pub struct AppState {
     pub show_settings: bool,
     pub settings_tab: SettingsTab,
     pub show_reasoning: bool,
+    /// 长期记忆（启动时加载；文件被工具改动后热重载，见 `maybe_reload_memories`）。
+    pub memories: Vec<neo_tools::tools::memory::Memory>,
+    /// 已见的记忆文件修改时间（毫秒；热重载的沿检测用）。
+    pub memories_file_ms: Option<u128>,
+    /// 设置页「记忆」tab 的新建输入框草稿。
+    pub memory_draft: String,
+    /// 正在编辑的记忆：(id, 草稿)。
+    pub memory_editing: Option<(u64, String)>,
+    /// 记忆导入导出对话框的结果通道（rfd 是阻塞调用，挪到独立线程）。
+    pub memory_io_rx: Option<std::sync::mpsc::Receiver<MemoryIoMsg>>,
     /// 关闭窗口时最小化到系统托盘（后台运行），而不是直接退出。
     pub minimize_to_tray: bool,
     /// "Hi, Neo" 语音唤醒开关。
@@ -506,6 +526,11 @@ impl Default for AppState {
             show_settings: false,
             settings_tab: SettingsTab::General,
             show_reasoning: false,
+            memories: Vec::new(),
+            memories_file_ms: None,
+            memory_draft: String::new(),
+            memory_editing: None,
+            memory_io_rx: None,
             minimize_to_tray: true,
             wake_enabled: true,
             start_in_tray: true,
@@ -1019,6 +1044,9 @@ impl AppState {
              能一次工具调用做完的就不要拆成多步；不要先做多余的勘察、规划或验证 —— \
              按用户的字面意思直接动手，撞上具体问题再针对性解决。\
              用户要的是结果，不是过程展示。\n\n\
+             长期记忆（跨对话一直带着的用户档案）：\n{}\n\
+             用户告诉你值得长期记住的事（偏好、身份、常用设定）时，主动调 `remember` 存下；\
+             记错、内容过期、或用户要求忘掉时调 `forget`。一次性的任务指令不要记。\n\n\
              你可以调用以下工具完成需要读文件、改文件或执行命令的任务：\n{}\n\n\
              调用工具的原则：\n\
              1. 需要确认事实（文件里到底写了什么）时先读，不要凭记忆回答；\n\
@@ -1042,8 +1070,98 @@ impl AppState {
              8. 需要看屏幕时先 `screenshot`（它会直接把图给你，你**看得见**界面）；\
              要操作界面就用 `click` / `drag`，**动手之前先截一次图确认位置**，\
              动完再截一次确认结果。双击用 `click` 的 `double`，不要连调两次 `click`。",
+            self.memory_block(),
             neo_tools::spec::prompt_catalog()
         )
+    }
+
+    /// 提示词里的记忆段：按 id 升序列出（带 `#id`，`forget` 按它精确删）。
+    /// 上限 50 条 / 3000 字符，超出从最旧的开始丢 —— 新近记的总是留下。
+    fn memory_block(&self) -> String {
+        const MAX_ITEMS: usize = 50;
+        const MAX_CHARS: usize = 3000;
+        if self.memories.is_empty() {
+            return "（空）".to_owned();
+        }
+        let mut lines: Vec<String> = self
+            .memories
+            .iter()
+            .map(|m| format!("- [#{}] {}", m.id, m.content.replace('\n', " ")))
+            .collect();
+        let mut out = String::new();
+        while !lines.is_empty() {
+            out = lines.join("\n");
+            if lines.len() <= MAX_ITEMS && out.chars().count() <= MAX_CHARS {
+                break;
+            }
+            lines.remove(0);
+        }
+        out
+    }
+
+    /// 记忆文件被工具线程改动后热重载（mtime 沿检测；调用方控制轮询节奏）。
+    pub fn maybe_reload_memories(&mut self) {
+        let ms = std::fs::metadata(neo_tools::tools::memory::memories_path())
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis());
+        if ms != self.memories_file_ms {
+            self.memories_file_ms = ms;
+            self.memories = neo_tools::tools::memory::load_memories();
+        }
+    }
+
+    /// 弹出「导入记忆」文件框；结果经 channel 回到主循环（不卡 UI 线程）。
+    pub fn import_memories_dialog(&mut self, ctx: &egui::Context) {
+        if self.memory_io_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repaint = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("neo-memory-import".into())
+            .spawn(move || {
+                let picked = rfd::FileDialog::new()
+                    .set_title("导入记忆")
+                    .add_filter("记忆文件", &["json"])
+                    .pick_file();
+                // 用户取消：不发消息，channel 断开由主循环清理。
+                let Some(path) = picked else { return };
+                let result = neo_tools::tools::memory::import_memories(&path)
+                    .map_err(|e| e.message);
+                let _ = tx.send(MemoryIoMsg::Imported(result));
+                repaint.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.memory_io_rx = Some(rx);
+        }
+    }
+
+    /// 弹出「导出记忆」保存框；同上，独立线程。
+    pub fn export_memories_dialog(&mut self, ctx: &egui::Context) {
+        if self.memory_io_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repaint = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("neo-memory-export".into())
+            .spawn(move || {
+                let picked = rfd::FileDialog::new()
+                    .set_title("导出记忆")
+                    .set_file_name("neo-memories.json")
+                    .add_filter("记忆文件", &["json"])
+                    .save_file();
+                let Some(path) = picked else { return };
+                let result = neo_tools::tools::memory::export_memories(&path)
+                    .map_err(|e| e.message);
+                let _ = tx.send(MemoryIoMsg::Exported(result));
+                repaint.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.memory_io_rx = Some(rx);
+        }
     }
 
     // ---- 工具执行 ----
