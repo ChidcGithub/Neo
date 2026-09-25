@@ -23,7 +23,7 @@ use neo_theme::{SquirclePaint, Theme};
 use neo_ui::modal::Confirm;
 use neo_ui::Design;
 
-use crate::state::{AppState, Role};
+use crate::state::{AppState, Role, ToolState};
 
 /// 避让动画时长（秒）：右上 ↔ 左上。
 const AVOID_SECS: f32 = 0.35;
@@ -32,7 +32,10 @@ const REFADE_SECS: f32 = 0.25;
 /// 截屏信号置位后小窗保持隐藏的时长（`capture()` 内已先等 300ms 再抓帧）。
 const SHOT_HIDE: Duration = Duration::from_millis(500);
 /// 小窗开着时的轮询节拍（避让 / 截屏信号 / 打断点击都靠它）。
-const POLL: Duration = Duration::from_millis(33);
+/// 16ms ≈ 60fps：避让、淡入、呼吸点都是动画，再低肉眼能看出顿。
+const POLL: Duration = Duration::from_millis(16);
+/// 工具流水最多保留的步数（旧的滚出，最近的排最下）。
+const MAX_STEPS: usize = 4;
 
 fn viewport_id() -> ViewportId {
     ViewportId::from_hash_of("neo-miniwin")
@@ -97,19 +100,54 @@ fn tail(s: &str, max: usize) -> String {
     format!("…{kept}")
 }
 
+/// 留头部 max 个字符（动作名在开头），被裁就补个省略号。
+/// 工具摘要用它：「读文件 crates/…/main.rs」砍尾比砍头可读。
+fn head(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let kept: String = s.chars().take(max).collect();
+    format!("{kept}…")
+}
+
+/// 工具流水里一步的状态色（与主窗工具卡片的成败判定一致）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepTone {
+    /// 执行中 / 待确认：accent 呼吸点 + 亮文本。
+    Active,
+    /// 已成功：success 点。
+    Ok,
+    /// 失败 / 被拒：error 点。
+    Failed,
+    /// 被打断：中性灰（取消不是失败）。
+    Muted,
+}
+
+/// 工具流水里的一步：单行摘要 + 状态色。
+struct Step {
+    line: String,
+    tone: StepTone,
+}
+
 /// 一帧要画的内容。视口回调是 `'static` 的，数据必须整份搬走。
 struct Snapshot {
     theme: Theme,
     fade: f32,
     interrupt_open: bool,
     title: String,
-    tool_line: Option<String>,
+    steps: Vec<Step>,
     body: String,
     streaming: bool,
 }
 
 impl Snapshot {
-    fn build(state: &AppState, theme: Theme, fade: f32, interrupt_open: bool) -> Self {
+    fn build(
+        state: &AppState,
+        theme: Theme,
+        fade: f32,
+        interrupt_open: bool,
+        busy_secs: u64,
+    ) -> Self {
         let last_assistant = state
             .messages
             .iter()
@@ -125,19 +163,51 @@ impl Snapshot {
         let inner_w = m.s(340.0 - 28.0);
         let body_px = theme.typo.body.max(1.0);
         let per_line = (inner_w / body_px).floor().max(6.0) as usize;
-        // 还在路上的最近一个工具（执行中 / 待确认），没有就是纯生成。
-        let tool_line = state.messages.iter().rev().find_map(|msg| {
-            msg.tool
-                .as_ref()
-                .filter(|tool| !tool.state.is_settled())
-                .map(|tool| tool.line())
-        });
+        // 本轮工具流水（自最后一条用户消息起）：最近 MAX_STEPS 步，旧的在上。
+        // 倒序收集到量即停，再翻回正序 —— 老消息成堆时不全扫。
+        let step_px = theme.typo.caption.max(1.0);
+        let step_chars =
+            ((inner_w - m.s(12.0)) / step_px).floor().max(6.0) as usize;
+        let mut steps: Vec<Step> = Vec::new();
+        for msg in state.messages.iter().rev() {
+            if msg.role == Role::User {
+                break;
+            }
+            if let Some(tool) = &msg.tool {
+                let tone = match tool.state {
+                    ToolState::Running | ToolState::AwaitingConfirm => StepTone::Active,
+                    ToolState::Cancelled => StepTone::Muted,
+                    ToolState::Denied => StepTone::Failed,
+                    ToolState::Done => {
+                        if tool.ok() {
+                            StepTone::Ok
+                        } else {
+                            StepTone::Failed
+                        }
+                    }
+                };
+                steps.push(Step {
+                    line: head(&tool.line(), step_chars),
+                    tone,
+                });
+                if steps.len() >= MAX_STEPS {
+                    break;
+                }
+            }
+        }
+        steps.reverse();
+        // 标题带已用时长：后台跑久了，一眼知道这轮已经花了多久。
+        let elapsed = if busy_secs >= 60 {
+            format!("{}m{:02}s", busy_secs / 60, busy_secs % 60)
+        } else {
+            format!("{busy_secs}s")
+        };
         Self {
             theme,
             fade,
             interrupt_open,
-            title: "Neo 执行中".to_owned(),
-            tool_line,
+            title: format!("Neo 执行中 · {elapsed}"),
+            steps,
             body: tail(body_src, per_line * 3),
             streaming,
         }
@@ -151,7 +221,7 @@ impl Snapshot {
             fade: 0.0,
             interrupt_open: false,
             title: String::new(),
-            tool_line: None,
+            steps: Vec::new(),
             body: String::new(),
             streaming: false,
         }
@@ -193,17 +263,42 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>) {
         d.font_bold(d.t().caption),
         tint(p.label_tertiary),
     );
-    y += d.t().caption * 1.6 + m.s(2.0);
-    if let Some(tool) = &snap.tool_line {
+    y += d.t().caption * 1.6 + m.s(4.0);
+
+    // 工具流水：状态圆点 + 单行摘要，最近的在最下；执行中的点呼吸。
+    let step_lh = d.t().caption * 1.55;
+    let dot_r = m.s(3.0);
+    let text_x = inner.left() + m.s(12.0);
+    let now = ui.ctx().input(|i| i.time);
+    for step in &snap.steps {
+        let cy = y + step_lh * 0.5;
+        let dot = match step.tone {
+            StepTone::Active => {
+                let k = (now * 3.0).sin() as f32 * 0.35 + 0.65;
+                p.accent.gamma_multiply(k)
+            }
+            StepTone::Ok => p.success,
+            StepTone::Failed => p.error,
+            StepTone::Muted => p.label_caption,
+        };
+        painter.circle_filled(Pos2::new(inner.left() + dot_r, cy), dot_r, tint(dot));
+        let ink = match step.tone {
+            StepTone::Active => p.label_primary,
+            _ => p.label_secondary,
+        };
         painter.text(
-            Pos2::new(inner.left(), y),
+            Pos2::new(text_x, y),
             Align2::LEFT_TOP,
-            tool,
+            &step.line,
             d.font(d.t().caption),
-            tint(p.accent),
+            tint(ink),
         );
-        y += d.t().caption * 1.6 + m.s(4.0);
+        y += step_lh;
     }
+    if !snap.steps.is_empty() {
+        y += m.s(4.0);
+    }
+
     let mut body = snap.body.clone();
     if snap.streaming {
         body.push('▍');
@@ -238,6 +333,8 @@ pub struct MiniWin {
     interrupt_result: Arc<AtomicU8>,
     /// 上一帧全局左键状态（沿检测用）。
     lmb_was_down: bool,
+    /// 本轮后台执行的起点（标题里的已用时长靠它）；闲下来清零。
+    busy_since: Option<Instant>,
 }
 
 impl MiniWin {
@@ -266,7 +363,7 @@ impl MiniWin {
             return;
         }
         let m = theme.metrics;
-        let size = Vec2::new(m.s(340.0), m.s(200.0));
+        let size = Vec2::new(m.s(340.0), m.s(220.0));
         let margin = m.s(16.0);
         let monitor = ctx
             .input(|i| i.viewport().monitor_size)
@@ -310,8 +407,12 @@ impl MiniWin {
             // 执行结束（或刚被打断）：确认框一并收掉。
             self.interrupt_open = false;
             self.interrupt_result.store(0, Ordering::Relaxed);
+            self.busy_since = None;
         }
         let open = hidden_to_tray && busy && !shot_hiding;
+        if open && self.busy_since.is_none() {
+            self.busy_since = Some(Instant::now());
+        }
 
         // 3. 全局输入：逻辑坐标光标 + 左键按下沿。
         let ppp = ctx
@@ -336,7 +437,7 @@ impl MiniWin {
         let size = if self.interrupt_open {
             Vec2::new(m.s(380.0), m.s(280.0))
         } else {
-            Vec2::new(m.s(340.0), m.s(200.0))
+            Vec2::new(m.s(340.0), m.s(220.0))
         };
         let margin = m.s(16.0);
         let monitor = ctx
@@ -413,7 +514,11 @@ impl MiniWin {
                 self.shown = open;
             }
             if open {
-                let snapshot = Snapshot::build(state, theme, fade, self.interrupt_open);
+                let busy_secs = self
+                    .busy_since
+                    .map(|t0| t0.elapsed().as_secs())
+                    .unwrap_or(0);
+                let snapshot = Snapshot::build(state, theme, fade, self.interrupt_open, busy_secs);
                 let result = Arc::clone(&self.interrupt_result);
                 ctx.show_viewport_deferred(
                     viewport_id(),

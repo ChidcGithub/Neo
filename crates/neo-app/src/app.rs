@@ -845,6 +845,13 @@ impl NeoApp {
     pub fn render(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.tick(ctx.clone());
+        // 主窗藏在托盘时，小窗一旦可见会反向强制本视口跑完整渲染 pass；
+        // 若照常构建主窗 UI（对话列表 + markdown + 代码高亮），每 16ms 一次
+        // 全量重建，小窗动画直接被拖垮。反正主窗不可见，这一帧空跑 ——
+        // 恢复可见时下一帧自动全量重画（动效沿检重新播种，无害）。
+        if self.hidden_to_tray {
+            return;
+        }
         let tool_modal_open = self.state.awaiting_tool().is_some();
         let modal_open = self.state.show_settings
             || tool_modal_open
