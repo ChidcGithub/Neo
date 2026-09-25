@@ -1,0 +1,13 @@
+[package]
+name = "neo-stt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# sherpa-onnx 安全绑定：默认静态链接，构建脚本自动从 GitHub Releases
+# 下载预编译 -lib 归档（Windows 为 win-x64-static-MT-Release）。
+# 若直连 GitHub 受限，可手动下载归档后用 SHERPA_ONNX_ARCHIVE_DIR 指过去。
+sherpa-onnx = "1.13"

@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/neo-theme",
+    "crates/neo-ui",
+    "crates/neo-store",
+    "crates/neo-llm",
+    "crates/neo-tools",
+    "crates/neo-wake",
+    "crates/neo-stt",
+    "crates/neo-overlay",
+    "crates/neo-app",
+]
+
+[workspace.package]
+version = "0.1.0-rc269251305"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+authors = ["Chidc"]
+
+[workspace.dependencies]
+neo-theme = { path = "crates/neo-theme" }
+neo-ui = { path = "crates/neo-ui" }
+neo-store = { path = "crates/neo-store" }
+neo-llm = { path = "crates/neo-llm" }
+neo-tools = { path = "crates/neo-tools" }
+neo-wake = { path = "crates/neo-wake" }
+neo-stt = { path = "crates/neo-stt" }
+neo-overlay = { path = "crates/neo-overlay" }
+eframe = "0.36.2"
+egui = "0.36.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "default-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 屏幕截图要编码成 PNG（只开 png，别把整套编解码器拖进来）
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Markdown 解析（CommonMark）+ KaTeX 移植（LaTeX 排版）
+pulldown-cmark = { version = "0.13", default-features = false, features = ["simd"] }
+ratex-layout = "0.1"
+ratex-parser = "0.1"
+ratex-types = "0.1"
+
+# 大屏远距可读 + 触控优先：Release 下开启优化，保证 4K 下 60fps
+# Local compatibility fixes for constrained tables and safe media/link handling.
+[patch.crates-io]
+egui_commonmark = { path = "vendor/egui_commonmark" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

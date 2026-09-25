@@ -1,0 +1,10 @@
+[package]
+name = "neo-theme"
+description = "Neo 设计系统：颜色 / 度量 / 字体 / 圆角 / 动效 token，取自 DeepSeek Harness 的设计语言"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+egui = { workspace = true }

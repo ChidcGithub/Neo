@@ -1,0 +1,16 @@
+[package]
+name = "neo-llm"
+description = "Neo 的模型接入：OpenAI 兼容的流式对话客户端（默认 DeepSeek）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# 只用于「真实工具声明 → 请求体形状」的回归测试
+neo-tools = { workspace = true }

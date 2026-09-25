@@ -1,0 +1,41 @@
+[package]
+name = "neo-app"
+description = "Neo —— 面向教室大屏的全场景 AI 助手客户端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "neo"
+path = "src/main.rs"
+
+[dependencies]
+neo-theme = { workspace = true }
+neo-ui = { workspace = true }
+neo-store = { workspace = true }
+neo-llm = { workspace = true }
+neo-tools = { workspace = true }
+neo-wake = { workspace = true }
+neo-stt = { workspace = true }
+neo-overlay = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22.1"
+image = { workspace = true, features = ["jpeg", "webp", "gif", "bmp"] }
+rfd = "0.15"
+# 系统托盘：关窗转后台、菜单「显示/退出」
+tray-icon = "0.21"
+ratex-types = { workspace = true }
+ratex-layout = { workspace = true }
+ratex-parser = { workspace = true }
+egui_commonmark = { version = "0.25.0", default-features = false, features = ["pulldown_cmark", "better_syntax_highlighting"] }
+eframe = { workspace = true, features = ["wgpu"] }
+egui = { workspace = true }
+
+[dev-dependencies]
+# 打开组件库的 Id 探针，供端到端 Id 冲突测试使用
+neo-ui = { workspace = true, features = ["probe"] }
+# 离屏渲染：把主界面渲成 PNG，用于人工核对与回归比对
+egui_kittest = { version = "0.36.2", features = ["wgpu", "snapshot"] }
+image = { version = "0.25.6", default-features = false, features = ["png"] }

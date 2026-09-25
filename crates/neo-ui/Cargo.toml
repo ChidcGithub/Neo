@@ -1,0 +1,18 @@
+[package]
+name = "neo-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Neo 的组件库：以 DeepSeek Harness 的设计语言为规范，提供统一的自绘控件接口"
+
+[dependencies]
+neo-theme = { workspace = true }
+egui = { workspace = true }
+
+[features]
+# 只给测试用：记录分段控件实际用过的 Id，让"渲染真实界面并断言 Id 唯一"成为可能。
+# egui 自带的 `warn_on_id_clash` 只覆盖真正的 widget（`create_widget`），
+# 组件库是直接用 `ui.interact` 画的，撞车它看不见。
+probe = []

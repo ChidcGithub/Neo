@@ -1,0 +1,29 @@
+# Rust 构建产物
+/target
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# 本地临时文件
+/tmp/
+/.tmp/
+*.log
+
+# 随包运行时（由 tools/fetch_runtime.py 下载，约 91 MB）
+# 能从 npmmirror 重新获取，不进版本库 —— 复制仓库时不该带着一份二进制发行版
+/runtime/
+
+# STT 模型资产（约 240 MB，从 hf-mirror 重新下载，不进版本库）
+/crates/neo-stt/assets/
+
+# 唤醒词训练：数据 / 环境 / 产物（合计约 24 GB，可重新下载与训练，不进版本库）
+# 保留脚本与配置：dl_*.ps1、hi_neo.yaml、rir_tree.json、rir_files.txt
+/wake-training/data/
+/wake-training/.venv/
+/wake-training/output/
+__pycache__/
+*.pyc

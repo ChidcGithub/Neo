@@ -1,0 +1,36 @@
+[package]
+name = "neo-tools"
+description = "Neo 可调用的工具集：读/写/改文件、查看图片、打开文件、调用 Bash"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true, features = ["jpeg", "webp", "gif", "bmp"] }
+base64 = "0.22.1"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+quick-xml = "0.41.0"
+cfb = "0.7.3"
+encoding_rs = "0.8.35"
+
+# 屏幕捕获（GDI BitBlt）与鼠标输入（SendInput）只在 Windows 上需要。
+# 用 windows-sys 而不是 windows：这里全是原始 Win32 调用，不需要包装层。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# UI Automation 是 COM 接口 —— windows-sys 只有裸 Win32，没有 COM 封装，
+# 所以这里需要完整版 windows crate（screen_elements 的枚举走 UIA 树）。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Com",
+    "Win32_UI_Accessibility",
+] }

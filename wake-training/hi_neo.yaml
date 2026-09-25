@@ -1,0 +1,80 @@
+# "Hi, Neo" wake word training config (livekit-wakeword pipeline)
+# NOTE: keep this file ASCII-only; the loader opens with the OS locale (GBK).
+# Run from wake-training/:
+#   .venv/Scripts/livekit-wakeword.exe run hi_neo.yaml
+
+model_name: hi_neo
+
+# Target phrases: main phrase + common accent/near variants (Chinese-accent robustness)
+target_phrases:
+  - "hi neo"
+  - "hey neo"
+  - "hai neo"
+
+# Sample counts: positives and adversarial negatives each get
+# n_samples (train) / n_samples_val (test)
+n_samples: 10000
+n_samples_val: 1000
+n_background_samples: 200
+n_background_samples_val: 40
+tts_batch_size: 50
+tts_backend: piper_vits
+
+# Custom adversarial negatives (on top of automatic phoneme-based ones)
+# Goal: reject English-class greetings and everyday speech in a classroom
+custom_negative_phrases:
+  - "hi"                 # bare "hi" must never trigger
+  - "hey"
+  - "hello"
+  - "hi everyone"        # frequent English-class opener
+  - "hi guys"
+  - "hello everyone"
+  - "good morning"
+  - "neo"                # bare "neo" must not trigger
+  - "hi neil"            # near-sounding names
+  - "hey neil"
+  - "hi leo"
+  - "hi neon"
+  - "hi nia"
+  - "high neo"
+  - "he neo"
+  - "i know"             # /ai nou/ is very close to "hi neo"
+  - "hi no"
+  - "hello neo"          # non-target variants, strictly rejected
+  - "okay neo"
+  - "ok neo"
+
+# Piper VITS diversity (SLERP speaker blending + speaking-rate jitter)
+noise_scales: [0.667, 0.98]
+noise_scale_ws: [0.8, 0.98]
+length_scales: [0.75, 1.0, 1.25]
+slerp_weights: [0.2, 0.35, 0.5, 0.65, 0.8]
+
+# Paths (relative to the wake-training/ run directory)
+data_dir: "./data"
+output_dir: "./output"
+
+augmentation:
+  clip_duration: 2.0
+  batch_size: 16
+  rounds: 1
+  background_paths: ["./data/backgrounds"]
+  rir_paths: ["./data/rirs"]
+
+# Classifier head: Conv-Attention / small (32-dim, 1 block) -> ~162KB ONNX
+model:
+  model_type: conv_attention
+  model_size: small
+
+# Training: target 0.1 false positives/hour (stricter than default 0.2, classroom)
+steps: 50000
+learning_rate: 1e-4
+weight_decay: 1e-2
+label_smoothing: 0.05
+max_negative_weight: 1500.0
+target_fp_per_hour: 0.1
+batch_n_per_class:
+  positive: 50
+  adversarial_negative: 50
+  ACAV100M_sample: 1024
+  background_noise: 50
