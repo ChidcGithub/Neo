@@ -40,10 +40,17 @@ pub struct SttConfig {
 
 impl Default for SttConfig {
     fn default() -> Self {
-        // 模型目录优先级：NEO_STT_MODEL_DIR 环境变量 > crate 自带 assets/
-        // （assets 由 tools 脚本下载，体积约 240MB，不进版本库）
+        // 模型目录优先级：NEO_STT_MODEL_DIR 环境变量 > exe 同级 assets-stt/
+        // （release 打包布局）> crate 自带 assets/（开发布局，约 240MB，不进版本库）
         let root = std::env::var_os("NEO_STT_MODEL_DIR")
             .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|d| d.join("assets-stt")))
+                    .filter(|p| p.is_dir())
+            })
             .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"));
         Self {
             sense_voice_model: root.join("sense-voice").join("model.int8.onnx"),

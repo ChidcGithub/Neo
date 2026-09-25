@@ -1,0 +1,123 @@
+# 自动构建 Windows 发行包并发布 GitHub Release。
+# 触发：推送 v* 标签，或手动 workflow_dispatch（版本号取自根 Cargo.toml）。
+# 版本号含 "-"（如 -rc...）时发布为 pre-release。
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 需要完整历史生成 changelog
+
+      - name: Determine version
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $v = $env:GITHUB_REF_NAME -replace '^v', ''
+          } else {
+            $m = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"'
+            $v = $m.Matches.Groups[1].Value
+          }
+          if (-not $v) { throw "cannot determine version" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "tag=v$v" >> $env:GITHUB_OUTPUT
+          $pre = if ($v -match '-') { 'true' } else { 'false' }
+          "prerelease=$pre" >> $env:GITHUB_OUTPUT
+          echo "version=$v prerelease=$pre"
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p neo-app
+
+      - name: Download STT models
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models'
+          New-Item -ItemType Directory -Force assets-stt, assets-stt\sense-voice, assets-stt\vad | Out-Null
+          Invoke-WebRequest "$base/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2" -OutFile sv.tar.bz2
+          tar -xjf sv.tar.bz2
+          Copy-Item 'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\model.int8.onnx',
+                    'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\tokens.txt' assets-stt\sense-voice\
+          Invoke-WebRequest "$base/silero_vad.onnx" -OutFile assets-stt\vad\silero_vad.onnx
+
+      - name: Fetch MinGit runtime
+        run: python tools/fetch_runtime.py --mirror github
+
+      - name: Assemble package
+        shell: pwsh
+        run: |
+          $pkg = "dist\neo"
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item target\release\neo.exe $pkg\
+          Copy-Item -Recurse crates\neo-wake\assets "$pkg\assets"
+          Copy-Item -Recurse assets-stt "$pkg\assets-stt"
+          Copy-Item -Recurse runtime "$pkg\runtime"
+          Copy-Item README.md, LICENSE $pkg\ -ErrorAction SilentlyContinue
+
+      - name: Zip package
+        shell: pwsh
+        run: |
+          $zip = "dist\neo-${{ steps.ver.outputs.version }}-windows-x64.zip"
+          7z a -tzip -mx=5 $zip ".\dist\neo" | Select-Object -Last 2
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+        id: zip
+
+      - name: Generate changelog
+        id: log
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $prev = git tag --sort=-v:refname | Where-Object { $_ -ne $tag } | Select-Object -First 1
+          $range = if ($prev) { "$prev..HEAD" } else { 'HEAD' }
+          $commits = git log $range --pretty=format:'- %h %s (@%an)' --no-merges
+          $notes = @()
+          $notes += "## Neo ${{ steps.ver.outputs.version }}"
+          $notes += ''
+          $notes += '### Commits'
+          $notes += ''
+          if ($prev) { $notes += "Changes since ``$prev``:" ; $notes += '' }
+          $notes += $commits
+          $notes += ''
+          $notes += '### Package contents'
+          $notes += ''
+          $notes += '- ``neo.exe`` - main application'
+          $notes += '- ``assets/`` - wake-word models (melspectrogram / embedding / hi_neo + onnxruntime)'
+          $notes += '- ``assets-stt/`` - SenseVoice int8 ASR + Silero VAD'
+          $notes += '- ``runtime/gitbash/`` - bundled MinGit (bash tool runtime)'
+          $notes += ''
+          $notes += 'Unpack anywhere and run ``neo.exe``.'
+          $notes -join "`n" | Out-File -Encoding utf8 dist\notes.md
+          Get-Content dist\notes.md
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $args = @('release', 'create', $tag, "${{ steps.zip.outputs.zip }}",
+                    '--title', "Neo $tag", '--notes-file', 'dist\notes.md')
+          if ("${{ steps.ver.outputs.prerelease }}" -eq 'true') { $args += '--prerelease' }
+          gh @args

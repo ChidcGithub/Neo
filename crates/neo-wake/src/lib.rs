@@ -38,7 +38,10 @@ pub struct WakeConfig {
 impl Default for WakeConfig {
     fn default() -> Self {
         Self {
-            model_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
+            // 模型目录查找顺序：NEO_WAKE_MODEL_DIR 环境变量
+            // > exe 同级 assets/（release 打包布局）
+            // > 源码内 assets/（cargo run 开发布局）
+            model_dir: default_model_dir(),
             // 默认 0.2：合成训练集上能到 0.5，但真实麦克风 + 真人嗓音实测
             // 只有 0.31~0.58，而静音/噪声 ≤0.04——0.2 在两侧都留有 5 倍余量。
             // 调试期可用 NEO_WAKE_THRESHOLD=0.3 之类临时压阈值试灵敏度，
@@ -50,6 +53,25 @@ impl Default for WakeConfig {
             debounce: Duration::from_secs(2),
         }
     }
+}
+
+/// 模型目录回退链：环境变量 > exe 同级 assets/ > 源码 assets/
+fn default_model_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("NEO_WAKE_MODEL_DIR") {
+        let dir = PathBuf::from(dir);
+        if dir.is_dir() {
+            return dir;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let dir = dir.join("assets");
+            if dir.is_dir() {
+                return dir;
+            }
+        }
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("assets")
 }
 
 #[derive(Debug, Clone)]
