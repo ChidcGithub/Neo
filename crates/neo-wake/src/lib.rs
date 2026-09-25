@@ -4,7 +4,7 @@
 //!   麦克风 16kHz i16 → 1280 样本（80ms）一帧 → 25 帧（2s）滑窗
 //!   → melspectrogram.onnx（输出 x/10+2）→ 76/8 滑窗 → embedding_model.onnx
 //!   → 最后 16 个 96 维 embedding → hi_neo.onnx → score
-//!   → score >= threshold 且过 debounce → WakeEvent::Detected
+//!   → 连续 CONFIRM_FRAMES 帧 score >= threshold 且过 debounce → WakeEvent::Detected
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,12 @@ const EMB_STRIDE: usize = 8;
 const MIN_EMBEDDINGS: usize = 16;
 const MEL_BINS: usize = 32;
 const EMB_DIM: usize = 96;
+
+/// 连续确认帧数：滑窗每 80ms 预测一次，要求**连续 2 帧**过线才触发。
+/// 「随便说几个字」的误触发几乎都是单帧尖峰；「嗨，Neo」持续约 0.6s，
+/// 覆盖 5~7 个连续窗口，稳稳两连。阈值卡在真唤醒得分下缘（≈0.2）时，
+/// 这个比硬提阈值更能保住唤醒率。
+const CONFIRM_FRAMES: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct WakeConfig {
@@ -192,6 +198,8 @@ fn engine_main(
     let mut stat_pow = 0f64;
     let mut stat_n = 0usize;
     let mut mode_seen = MODE_DETECT;
+    // 连续过线帧数（见 CONFIRM_FRAMES）：单帧尖峰不算数。
+    let mut streak = 0usize;
 
     while !stop.load(Ordering::Relaxed) {
         // 模式切换：清缓冲 + 重置防抖。
@@ -202,6 +210,7 @@ fn engine_main(
             mode_seen = m;
             frames.clear();
             pending.clear();
+            streak = 0;
             last_fire = Instant::now();
             if debug {
                 eprintln!("[neo-wake] 模式切换 → {}", if m == MODE_DICTATE { "听写" } else { "检测" });
@@ -264,7 +273,13 @@ fn engine_main(
                     if debug {
                         stat_peak = stat_peak.max(score);
                     }
-                    if score >= config.threshold && last_fire.elapsed() >= config.debounce {
+                    if score >= config.threshold {
+                        streak += 1;
+                    } else {
+                        streak = 0;
+                    }
+                    if streak >= CONFIRM_FRAMES && last_fire.elapsed() >= config.debounce {
+                        streak = 0;
                         last_fire = Instant::now();
                         if debug {
                             eprintln!("[neo-wake] 触发！score={score:.3}");
