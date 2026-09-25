@@ -48,14 +48,15 @@ impl Default for WakeConfig {
             // > exe 同级 assets/（release 打包布局）
             // > 源码内 assets/（cargo run 开发布局）
             model_dir: default_model_dir(),
-            // 默认 0.2：合成训练集上能到 0.5，但真实麦克风 + 真人嗓音实测
-            // 只有 0.31~0.58，而静音/噪声 ≤0.04——0.2 在两侧都留有 5 倍余量。
+            // 默认 0.25：混入机主真人录音重训后，实测真唤醒 0.34~0.83，
+            // 日常说话/环境噪声峰值 ≤0.01 —— 两侧都是几十倍距离；
+            // 再叠加连续 2 帧确认（CONFIRM_FRAMES），误触发基本没有空间。
             // 调试期可用 NEO_WAKE_THRESHOLD=0.3 之类临时压阈值试灵敏度，
             // 不必改代码重新构建。
             threshold: std::env::var("NEO_WAKE_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0.2),
+                .unwrap_or(0.25),
             debounce: Duration::from_secs(2),
         }
     }
