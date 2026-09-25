@@ -22,8 +22,9 @@ import numpy as np
 
 from import_recordings import ASSETS, OUT_DIR, SPLITS, SAMPLE_RATE, align_to_end, extract, trim_silence
 
+ROOT = Path(__file__).resolve().parent
 RECORD_SECONDS = 2.0
-RECORDINGS_DIR = Path(__file__).resolve().parent / "data" / "recordings"
+RECORDINGS_DIR = ROOT / "data" / "recordings"
 
 # 正样本得分低于它建议重录；负样本得分高于它反而是最有价值的对抗样本。
 LOW_SCORE = 0.15
