@@ -265,18 +265,14 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>) {
     );
     y += d.t().caption * 1.6 + m.s(4.0);
 
-    // 工具流水：状态圆点 + 单行摘要，最近的在最下；执行中的点呼吸。
+    // 工具流水：状态圆点 + 单行摘要，最近的在最下。
     let step_lh = d.t().caption * 1.55;
     let dot_r = m.s(3.0);
     let text_x = inner.left() + m.s(12.0);
-    let now = ui.ctx().input(|i| i.time);
     for step in &snap.steps {
         let cy = y + step_lh * 0.5;
         let dot = match step.tone {
-            StepTone::Active => {
-                let k = (now * 3.0).sin() as f32 * 0.35 + 0.65;
-                p.accent.gamma_multiply(k)
-            }
+            StepTone::Active => p.accent,
             StepTone::Ok => p.success,
             StepTone::Failed => p.error,
             StepTone::Muted => p.label_caption,
@@ -310,6 +306,76 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>) {
         inner.width(),
     );
     painter.galley(Pos2::new(inner.left(), y), galley, tint(p.label_primary));
+
+    // 边缘流光：小窗只在后台执行中露面，这道光就是「还在跑」的持续信号。
+    // 截屏淡出时随卡片一起淡（tint 已乘 fade）。
+    let now = ui.ctx().input(|i| i.time);
+    paint_border_beam(&painter, rect, m.s(18.0), now, tint(p.accent), m.s(1.4));
+}
+
+/// 边缘流光：一段细线沿卡片边缘顺时针匀速循环，头部实、拖尾渐隐。
+///
+/// 沿弧长（而非点序号）参数化，圆角与直边上的速度才一致。
+fn paint_border_beam(
+    painter: &egui::Painter,
+    rect: Rect,
+    radius: f32,
+    now: f64,
+    base: Color32,
+    width: f32,
+) {
+    /// 一圈的秒数。
+    const PERIOD: f64 = 2.4;
+    /// 拖尾长度占周长的比例。
+    const TAIL: f32 = 0.30;
+    /// 拖尾分多少段渐隐。
+    const SLICES: usize = 28;
+
+    // shrink(0.5)：对齐静态描边（1px Inside）的中心线。
+    let pts = neo_theme::squircle::squircle_points(
+        rect.shrink(0.5),
+        radius,
+        neo_theme::HARNESS_SUPERELLIPSE,
+        neo_theme::squircle::DEFAULT_SEGMENTS,
+    );
+    if pts.len() < 2 {
+        return;
+    }
+    // 闭合路径的累计弧长（含末点绕回首点的一段）。
+    let mut cum = Vec::with_capacity(pts.len() + 1);
+    cum.push(0.0f32);
+    for i in 0..pts.len() {
+        cum.push(cum[i] + pts[i].distance(pts[(i + 1) % pts.len()]));
+    }
+    let total = *cum.last().unwrap();
+    if total <= 0.0 {
+        return;
+    }
+    // 弧长 s 处的点：先二分定位采样区间，再在区间内线性插值。
+    let at = |s: f32| -> Pos2 {
+        let s = s.rem_euclid(total);
+        let idx = match cum.binary_search_by(|c| c.partial_cmp(&s).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        }
+        .min(pts.len() - 1);
+        let seg = (cum[idx + 1] - cum[idx]).max(f32::EPSILON);
+        let t = ((s - cum[idx]) / seg).clamp(0.0, 1.0);
+        pts[idx] + (pts[(idx + 1) % pts.len()] - pts[idx]) * t
+    };
+    let head = ((now / PERIOD).fract() as f32) * total;
+    let tail_len = total * TAIL;
+    for i in 0..SLICES {
+        // i = 0 是最尾端（最透明），越靠头越亮；平方让尾部更快隐没。
+        let s1 = head - tail_len + tail_len * (i as f32 / SLICES as f32);
+        let s2 = head - tail_len + tail_len * ((i + 1) as f32 / SLICES as f32);
+        let k = (i + 1) as f32 / SLICES as f32;
+        painter.line_segment(
+            [at(s1), at(s2)],
+            Stroke::new(width, base.gamma_multiply(k * k)),
+        );
+    }
 }
 
 /// 迷你窗运行时状态，挂在 `NeoApp` 上，每帧由 [`MiniWin::tick`] 驱动。
