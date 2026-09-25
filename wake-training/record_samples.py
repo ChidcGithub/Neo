@@ -135,12 +135,14 @@ def main() -> int:
         print("稍后可手动：train → export → 替换 assets（见 import_recordings.py 头部注释）")
         return 0
 
-    exe = Path(".venv/Scripts/livekit-wakeword.exe")
-    for step in (["train", "hi_neo.yaml"], ["export", "hi_neo.yaml"]):
-        print(f"\n== livekit-wakeword {step[0]} ==")
-        r = subprocess.run([str(exe), *step])
+    exe = ROOT / ".venv" / "Scripts" / "livekit-wakeword.exe"
+    # hi_neo.yaml 里的 data_dir/output_dir 是相对配置文件目录的，钉死 cwd。
+    yaml = ROOT / "hi_neo.yaml"
+    for step in ("train", "export"):
+        print(f"\n== livekit-wakeword {step} ==")
+        r = subprocess.run([str(exe), step, str(yaml)], cwd=ROOT)
         if r.returncode != 0:
-            print(f"{step[0]} 失败（{r.returncode}）")
+            print(f"{step} 失败（{r.returncode}）")
             return r.returncode
     dst = ASSETS / "hi_neo.onnx"
     import shutil
