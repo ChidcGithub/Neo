@@ -28,6 +28,21 @@ const MODAL_FADE: f32 = 0.2;
 /// 唤醒听写的沉默超时：这么久没识别出完整句子就自动收场，回到唤醒检测。
 const DICTATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// 全局鼠标左键此刻是否按下（听写打断轮询用）。
+/// 主窗托盘 / 跑马灯穿透时 egui 拿不到输入，只能绕到系统 API。
+#[cfg(windows)]
+fn lmb_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+    // SAFETY: GetAsyncKeyState 是无状态读取，无内存安全问题。
+    (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000) != 0
+}
+
+/// 非 Windows 没有全局输入轮询（点击打断退化为不可用，沉默超时兜底）。
+#[cfg(not(windows))]
+fn lmb_down() -> bool {
+    false
+}
+
 /// 发给 STT 线程的命令。音频帧直接投喂；`Reset` 在每次唤醒听写前清掉
 /// VAD 缓冲，避免把上一轮的尾巴算进这一轮。
 enum SttCmd {
@@ -99,6 +114,8 @@ pub struct NeoApp {
     dictating: bool,
     /// 听写起点，用于沉默超时。
     dictation_since: Option<std::time::Instant>,
+    /// 听写期间的左键状态（沿检测）：按下沿 = 打断，丢弃本次识别。
+    dictation_lmb_down: bool,
     /// 「启动即后台」只在首帧执行一次。
     start_hidden_done: bool,
 }
@@ -164,6 +181,7 @@ impl NeoApp {
             stt_rx: None,
             dictating: false,
             dictation_since: None,
+            dictation_lmb_down: false,
             start_hidden_done: false,
             saved_prefs: (
                 false,
@@ -407,6 +425,8 @@ impl NeoApp {
             }
             self.dictating = true;
             self.dictation_since = Some(std::time::Instant::now());
+            // 打断沿的基线：进入瞬间正按着不算（那是触发前的点击尾巴）。
+            self.dictation_lmb_down = lmb_down();
         } else {
             if self.hidden_to_tray {
                 self.show_window(ctx);
@@ -448,6 +468,18 @@ impl NeoApp {
         }
         if let Some(wake) = &self.wake {
             wake.set_dictation(false);
+        }
+    }
+
+    /// 打断听写（点击屏幕）：丢弃本次识别 —— 结束 + 重置 STT 的 VAD 缓冲。
+    /// 在途文本由收取处的 `dictating` 守卫天然丢弃（弹出但不发送）。
+    fn cancel_dictation(&mut self) {
+        if !self.dictating {
+            return;
+        }
+        self.end_dictation();
+        if let Some(tx) = &self.stt_tx {
+            let _ = tx.send(SttCmd::Reset);
         }
     }
 
@@ -849,11 +881,23 @@ impl NeoApp {
         }
         // 沉默超时：唤醒后一直没说出完整句子，自动收场回唤醒检测。
         if self.dictating {
+            // 点击 = 打断：跑马灯是鼠标穿透窗（WS_EX_TRANSPARENT），收不到点击，
+            // 改为轮询全局左键的按下沿；丢弃本次识别，回到唤醒检测。
+            let down = lmb_down();
+            if down && !self.dictation_lmb_down {
+                self.cancel_dictation();
+                self.toast = Some((
+                    neo_ui::ToastKind::Info,
+                    "已取消本次听写".to_owned(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(2),
+                ));
+            }
+            self.dictation_lmb_down = down;
             if self.dictation_since.is_some_and(|t| t.elapsed() > DICTATION_TIMEOUT) {
                 self.end_dictation();
             }
-            // 听写期间保持帧循环：沉默超时与电平回落都靠它。
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            // 听写期间保持帧循环：沉默超时、点击打断与电平回落都靠它。
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         // 迷你窗：主窗藏起 + AI 在忙时贴屏幕角落（对话速览 / 截屏回避 / 打断确认）。
         self.miniwin
