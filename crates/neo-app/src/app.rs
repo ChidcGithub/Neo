@@ -79,6 +79,8 @@ pub struct NeoApp {
     overlay: Option<neo_overlay::OverlayHandle>,
     /// 后台执行期间的角落迷你窗（对话速览 / 截屏回避 / 打断确认）。
     miniwin: ui::miniwin::MiniWin,
+    /// 截屏完成后的区域闪光（整屏截图 = 全屏边框一闪）。
+    shotflash: ui::miniwin::ShotFlash,
     /// STT 线程的投喂端（音频帧 / 复位命令）。
     stt_tx: Option<std::sync::mpsc::Sender<SttCmd>>,
     /// STT 转写结果的回收端。
@@ -142,6 +144,7 @@ impl NeoApp {
             toast: None,
             overlay: None,
             miniwin: Default::default(),
+            shotflash: Default::default(),
             stt_tx: None,
             stt_rx: None,
             dictating: false,
@@ -189,10 +192,7 @@ impl NeoApp {
         // 动效基准：启动恢复不算「切换」，首帧不播入场。
         app.prev_stage = app.state.stage;
         app.prev_show_settings = app.state.show_settings;
-        // 小窗视口趁首帧（一定是真渲染 pass）先建出来、保持隐藏：否则启动即进
-        // 托盘、或主窗还没可见就被藏起时，logic-only 路径建不出 deferred 视口，
-        // 后台唤醒就看不到小窗了。
-        app.miniwin.ensure_created(ctx, app.theme);
+
         app
     }
 
@@ -833,6 +833,8 @@ impl NeoApp {
         // 迷你窗：主窗藏起 + AI 在忙时贴屏幕角落（对话速览 / 截屏回避 / 打断确认）。
         self.miniwin
             .tick(&ctx, &mut self.state, self.theme, self.hidden_to_tray);
+        // 截屏闪光：抓帧完成后在被抓区域边缘闪一道白框。
+        self.shotflash.tick(&ctx);
         // 托盘没有 winit 唤醒源：隐藏期间保持低频轮询，托盘菜单点击才有响应。
         if self.hidden_to_tray {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));

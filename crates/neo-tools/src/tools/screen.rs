@@ -37,8 +37,18 @@ use crate::result::{ErrorKind, ToolError};
 /// 是因为 `capture()` 是 `screenshot` / `screen_elements` 的唯一入口，一处全覆盖。
 pub static SCREENSHOT_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 置位 [`SCREENSHOT_AT`]，返回当前毫秒时间戳。
-fn mark_screenshot() {
+/// 最近一次截屏的区域（虚拟桌面物理像素）。
+///
+/// 与 [`SCREENSHOT_AT`] 的配对约定：**先写区域、再置位时间戳**；
+/// 上层读到新时间戳后回来取，拿到的一定是本次的区域。
+/// 区域截图的闪光动画靠它定位。
+pub static SCREENSHOT_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// 置位 [`SCREENSHOT_AT`]（带上本次抓取的区域），返回当前毫秒时间戳。
+fn mark_screenshot(rect: Rect) {
+    if let Ok(mut slot) = SCREENSHOT_RECT.lock() {
+        *slot = Some(rect);
+    }
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -211,7 +221,7 @@ mod imp {
         // 先广播「要截屏了」再抓帧：迷你窗靠这个信号把自己藏起来，
         // 等它真正从屏幕上消失，画面里才不会带上 Neo 自己的窗口。
         // 隐藏态轮询周期 200ms，留足余量取 300ms。
-        mark_screenshot();
+        mark_screenshot(rect);
         std::thread::sleep(Duration::from_millis(300));
         unsafe {
             let screen = GetDC(std::ptr::null_mut());

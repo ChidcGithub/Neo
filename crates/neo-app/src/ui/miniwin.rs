@@ -381,10 +381,6 @@ fn paint_border_beam(
 /// 迷你窗运行时状态，挂在 `NeoApp` 上，每帧由 [`MiniWin::tick`] 驱动。
 #[derive(Default)]
 pub struct MiniWin {
-    /// 小窗视口是否已趁主窗可见时建出来（进 viewports 表）。
-    /// deferred 视口的创建命令只在真渲染 pass 里派发，主窗藏到托盘后走
-    /// logic-only 路径、不再建窗，所以必须在还能跑 pass 时先建好。
-    created: bool,
     /// 上一帧是否已发 `Visible(true)`（显隐改由显式命令驱动，沿检测用）。
     shown: bool,
     /// 已见到的截屏时间戳（变了 = AI 又截了一次屏）。
@@ -416,35 +412,6 @@ impl MiniWin {
             .with_visible(visible)
             .with_inner_size(size)
             .with_position(pos)
-    }
-
-    /// 趁主窗可见（跑着真渲染 pass）把小窗视口先建出来（保持隐藏）。
-    ///
-    /// 为什么必须提前建：主窗藏到托盘后 eframe 走 logic-only 路径，
-    /// `show_viewport_deferred` 只写上下文状态、不产生创建命令，新视口永远
-    /// 建不出来；只有已存在于 viewports 表里的视口才收得到显式命令。首帧
-    /// （哪怕随后立即进托盘）一定是真 pass，趁这里建好，之后后台显隐才有着落。
-    pub fn ensure_created(&mut self, ctx: &Context, theme: Theme) {
-        if self.created {
-            return;
-        }
-        let m = theme.metrics;
-        let size = Vec2::new(m.s(340.0), m.s(220.0));
-        let margin = m.s(16.0);
-        let monitor = ctx
-            .input(|i| i.viewport().monitor_size)
-            .unwrap_or(Vec2::new(1920.0, 1080.0));
-        let home = Pos2::new((monitor.x - size.x - margin).max(margin), margin);
-        let snapshot = Snapshot::placeholder(theme);
-        let result = Arc::clone(&self.interrupt_result);
-        ctx.show_viewport_deferred(
-            viewport_id(),
-            Self::builder(size, home, false),
-            move |ui, _| {
-                paint(ui, &snapshot, &result);
-            },
-        );
-        self.created = true;
     }
 
     /// 每帧驱动一次。放在 `tick()` 里而不是 `render()` 里：
@@ -556,49 +523,195 @@ impl MiniWin {
 
         // 7. 显隐与内容。
         //
-        //    关键约束：deferred 视口的「创建」与 builder patch 只在真渲染 pass
-        //    里发生，主窗藏到托盘后的 logic-only 路径不产生这些命令。所以——
-        //    视口必须先趁主窗可见时建好（`ensure_created`，install 与此处兜底）；
-        //    显隐改用显式 `ViewportCommand::Visible`，它走另一条派发路径，
-        //    logic-only 下照送不误。小窗一旦可见，`is_viewport_or_descendant_visible`
-        //    又反向强制主窗跑真 pass，位置 / 避让 / 内容的增量更新随之恢复。
-        if !self.created {
-            if !hidden_to_tray {
-                // 主窗还可见：趁这帧真 pass 把视口建出来（保持隐藏）。
-                self.ensure_created(ctx, theme);
-            }
-        } else {
-            if open != self.shown {
-                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Visible(open));
-                if open {
-                    // 每次露面都重新提到顶层，盖过同屏后到的其它 topmost 窗口。
-                    ctx.send_viewport_cmd_to(
-                        viewport_id(),
-                        ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop),
-                    );
-                }
-                self.shown = open;
-            }
+        //    **每帧无条件注册视口**：egui 在真渲染 pass 结束时会回收本帧没被
+        //    `show_viewport_deferred` 触碰的子视口（"never used this pass"）。
+        //    曾经「open 才注册」的写法让小窗视口在主窗可见的第二帧就被销毁，
+        //    此后托盘里的显隐命令全部打空 —— 这就是「小窗只在主窗显示时出现过、
+        //    主窗一藏反而不来」的根因。每帧注册还带来自愈：即便极端时序下被
+        //    回收，下一个真 pass 也会按 builder 原样重建窗口。
+        //
+        //    显隐走两条路：builder 的 `with_visible` 由 patch 在真 pass 收增量；
+        //    显式 `ViewportCommand::Visible` 兜底 —— 主窗藏托盘后的 logic-only
+        //    路径不跑 pass、不产生 patch，只有显式命令照送不误。小窗一旦可见，
+        //    `is_viewport_or_descendant_visible` 又反向强制主窗跑真 pass，
+        //    位置 / 避让 / 内容的增量更新随之恢复。
+        if open != self.shown {
+            ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Visible(open));
             if open {
-                let busy_secs = self
-                    .busy_since
-                    .map(|t0| t0.elapsed().as_secs())
-                    .unwrap_or(0);
-                let snapshot = Snapshot::build(state, theme, fade, self.interrupt_open, busy_secs);
-                let result = Arc::clone(&self.interrupt_result);
-                ctx.show_viewport_deferred(
+                // 每次露面都重新提到顶层，盖过同屏后到的其它 topmost 窗口。
+                ctx.send_viewport_cmd_to(
                     viewport_id(),
-                    Self::builder(size, pos, true),
-                    move |ui, _class| {
-                        paint(ui, &snapshot, &result);
-                    },
+                    ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop),
                 );
             }
+            self.shown = open;
         }
+        let snapshot = if open {
+            let busy_secs = self
+                .busy_since
+                .map(|t0| t0.elapsed().as_secs())
+                .unwrap_or(0);
+            Snapshot::build(state, theme, fade, self.interrupt_open, busy_secs)
+        } else {
+            Snapshot::placeholder(theme)
+        };
+        let result = Arc::clone(&self.interrupt_result);
+        ctx.show_viewport_deferred(
+            viewport_id(),
+            Self::builder(size, pos, open),
+            move |ui, _class| {
+                paint(ui, &snapshot, &result);
+            },
+        );
 
         // 8. 小窗开着时把帧率拉上来（隐藏态默认 200ms 一拍，动画会卡）。
         if open || refading {
             ctx.request_repaint_after(POLL);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 截屏闪光
+// ---------------------------------------------------------------------------
+
+/// 闪光排程：截屏信号置位后这么久才亮 —— `capture()` 内置 300ms 等待 +
+/// 抓帧耗时，等闪光出现时画面早已抓完，AI 看到的截图里不会有这道白。
+const FLASH_DELAY: Duration = Duration::from_millis(450);
+/// 闪光总时长（前 13% 快速淡入，之后缓出）。
+const FLASH_SECS: f32 = 0.45;
+
+fn flash_viewport_id() -> ViewportId {
+    ViewportId::from_hash_of("neo-shotflash")
+}
+
+/// 截屏闪光：AI 抓屏后，在被抓区域的边缘闪一道白框（整屏截图 = 全屏边框）。
+///
+/// 视口是一整块盖满虚拟屏的透明窗，平时隐藏；机制与迷你窗相同：
+/// 每帧注册防回收，显隐走 builder patch + 显式 `Visible` 命令双通道。
+/// 与迷你窗的差别：主窗可见时也闪 —— 用户在主窗里发消息，AI 截了屏，
+/// 同样该有个看得见的反馈。
+#[derive(Default)]
+pub struct ShotFlash {
+    /// 已见到的截屏时间戳（变了 = AI 又截了一帧）。
+    shot_seen: u64,
+    /// 本次截图的区域（虚拟屏物理像素），信号变化那一刻锁定。
+    region: Option<neo_tools::tools::screen::Rect>,
+    /// 闪光排程到的时刻（None = 无排程）。
+    flash_at: Option<Instant>,
+    /// 闪光起点（Some = 正在闪）。
+    flashing_since: Option<Instant>,
+    /// 上一帧是否已发 `Visible(true)`（沿检测用）。
+    shown: bool,
+}
+
+impl ShotFlash {
+    /// 每帧驱动一次，挂在 `NeoApp::tick` 里（与迷你窗同路）。
+    pub fn tick(&mut self, ctx: &Context) {
+        use neo_tools::tools::screen;
+
+        // 1. 截屏信号：时间戳一变就锁定区域并排程闪光。
+        let shot_at = screen::SCREENSHOT_AT.load(Ordering::Relaxed);
+        if shot_at != self.shot_seen {
+            self.shot_seen = shot_at;
+            if shot_at != 0 {
+                self.region = screen::SCREENSHOT_RECT.lock().ok().and_then(|slot| *slot);
+                self.flash_at = Some(Instant::now() + FLASH_DELAY);
+            }
+        }
+        if self.flash_at.is_some_and(|at| Instant::now() >= at) {
+            self.flash_at = None;
+            self.flashing_since = Some(Instant::now());
+        }
+        if self
+            .flashing_since
+            .is_some_and(|t0| t0.elapsed().as_secs_f32() >= FLASH_SECS)
+        {
+            self.flashing_since = None;
+        }
+        let on = self.flashing_since.is_some();
+
+        // 2. 视口几何：盖满整个虚拟屏（多屏时原点可为负）。
+        let ppp = ctx
+            .input(|i| i.viewport().native_pixels_per_point)
+            .unwrap_or(1.0);
+        let vs = screen::virtual_screen();
+        let vs_size = Vec2::new(
+            (vs.width as f32 / ppp).max(1.0),
+            (vs.height as f32 / ppp).max(1.0),
+        );
+        let origin = Pos2::new(vs.x as f32 / ppp, vs.y as f32 / ppp);
+
+        // 3. 显隐沿：显式命令兜底（logic-only 下唯一通道），露面即提顶。
+        if on != self.shown {
+            ctx.send_viewport_cmd_to(flash_viewport_id(), ViewportCommand::Visible(on));
+            if on {
+                ctx.send_viewport_cmd_to(
+                    flash_viewport_id(),
+                    ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop),
+                );
+            }
+            self.shown = on;
+        }
+
+        // 4. 每帧注册（防回收 + 刷新动画帧）。区域换算成视口本地逻辑坐标。
+        let frame = if on {
+            let region = self.region.unwrap_or(vs);
+            Some((
+                Rect::from_min_size(
+                    Pos2::new(
+                        (region.x - vs.x) as f32 / ppp,
+                        (region.y - vs.y) as f32 / ppp,
+                    ),
+                    Vec2::new(
+                        region.width as f32 / ppp,
+                        region.height as f32 / ppp,
+                    ),
+                ),
+                self.flashing_since.unwrap_or_else(Instant::now),
+            ))
+        } else {
+            None
+        };
+        ctx.show_viewport_deferred(
+            flash_viewport_id(),
+            ViewportBuilder::default()
+                .with_title("Neo")
+                .with_decorations(false)
+                .with_resizable(false)
+                .with_taskbar(false)
+                .with_always_on_top()
+                .with_active(false)
+                .with_transparent(true)
+                .with_mouse_passthrough(true)
+                .with_visible(on)
+                .with_inner_size(vs_size)
+                .with_position(origin),
+            move |ui, _class| paint_flash(ui, frame),
+        );
+
+        // 5. 闪光与排程期间保持帧率（起燃时刻与动画都靠它）。
+        if on || self.flash_at.is_some() {
+            ctx.request_repaint_after(POLL);
+        }
+    }
+}
+
+/// 画一帧闪光：区域边缘一道白框 + 极淡的白色填充，快速淡入后缓出。
+fn paint_flash(ui: &mut egui::Ui, frame: Option<(Rect, Instant)>) {
+    let Some((rect, t0)) = frame else { return };
+    let k = (t0.elapsed().as_secs_f32() / FLASH_SECS).clamp(0.0, 1.0);
+    let alpha = if k < 0.13 {
+        k / 0.13
+    } else {
+        ease_out_cubic(1.0 - (k - 0.13) / 0.87)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, Color32::WHITE.gamma_multiply(alpha * 0.08));
+    painter.rect_stroke(
+        rect.shrink(1.0),
+        0.0,
+        Stroke::new(2.0, Color32::WHITE.gamma_multiply(alpha * 0.85)),
+        egui::StrokeKind::Inside,
+    );
 }
