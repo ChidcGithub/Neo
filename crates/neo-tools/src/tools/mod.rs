@@ -11,6 +11,7 @@ pub mod bash;
 pub mod click;
 pub mod drag;
 pub mod edit_file;
+pub mod open_app;
 pub mod open_file;
 pub mod powershell;
 pub mod read_document;
@@ -65,6 +66,15 @@ pub static REGISTRY: &[Tool] = &[
         params: open_file::PARAMS,
         preview: open_file::preview,
         run: open_file::run,
+    },
+    Tool {
+        name: "open_app",
+        title: "打开主界面",
+        purpose: "把 Neo 的主窗口唤回到屏幕上（后台静默处理时用户说「打开主界面 / 让我看看」就用它）。",
+        risk: Risk::Open,
+        params: &[],
+        preview: open_app::preview,
+        run: open_app::run,
     },
     Tool {
         name: "write_file",

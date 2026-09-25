@@ -81,6 +81,8 @@ pub struct NeoApp {
     miniwin: ui::miniwin::MiniWin,
     /// 截屏完成后的区域闪光（整屏截图 = 全屏边框一闪）。
     shotflash: ui::miniwin::ShotFlash,
+    /// 已见到的「唤回主窗」信号（`open_app` 工具置位；变了 = AI 要开主界面）。
+    show_window_seen: u64,
     /// STT 线程的投喂端（音频帧 / 复位命令）。
     stt_tx: Option<std::sync::mpsc::Sender<SttCmd>>,
     /// STT 转写结果的回收端。
@@ -145,6 +147,7 @@ impl NeoApp {
             overlay: None,
             miniwin: Default::default(),
             shotflash: Default::default(),
+            show_window_seen: 0,
             stt_tx: None,
             stt_rx: None,
             dictating: false,
@@ -799,6 +802,9 @@ impl NeoApp {
                 let text = text.trim().to_owned();
                 if self.dictating && !text.is_empty() {
                     self.end_dictation();
+                    // 每次语音唤醒都是一段全新对话：不续上次的上下文，
+                    // 免得隔了几个小时的提问被旧话题带偏。
+                    self.state.new_session();
                     self.state.draft = text;
                     Self::send_input(&mut self.state, self.store.as_ref());
                 }
@@ -835,6 +841,15 @@ impl NeoApp {
             .tick(&ctx, &mut self.state, self.theme, self.hidden_to_tray);
         // 截屏闪光：抓帧完成后在被抓区域边缘闪一道白框。
         self.shotflash.tick(&ctx);
+        // 「打开主界面」工具：执行层只置信号位，这里真正唤窗。
+        let show_at = neo_tools::tools::open_app::SHOW_WINDOW_AT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if show_at != self.show_window_seen {
+            self.show_window_seen = show_at;
+            if show_at != 0 && self.hidden_to_tray {
+                self.show_window(&ctx);
+            }
+        }
         // 托盘没有 winit 唤醒源：隐藏期间保持低频轮询，托盘菜单点击才有响应。
         if self.hidden_to_tray {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));

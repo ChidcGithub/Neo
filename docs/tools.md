@@ -16,6 +16,7 @@
 | `read_document` | 读取文档 | `read` | 提取 DOC/DOCX、PPT/PPTX 及文本正文并按字符分页 | 不做 OCR，不执行宏，不读取工作区外路径 |
 | `view_image` | 查看图片 | `read` | 报图片格式/尺寸，可选取回原始数据 | 它不解码像素、不做识别 |
 | `open_file` | 打开文件 | `open` | 在用户机器上打开文件/定位它 | 它不读内容，给模型读要用 `read_file` |
+| `open_app` | 打开主界面 | `open` | 把 Neo 主窗口从托盘唤回屏幕 | 主窗已在屏幕上时是空操作 |
 | `write_file` | 写入文件 | `write` | 写入或整体覆盖 | 只改一小段用 `edit_file` |
 | `edit_file` | 修改文件 | `write` | 把一段确定的原文替换成新文本 | 新建文件用 `write_file` |
 | `powershell` | 执行命令 | `exec` | 工作区内执行 PowerShell 命令 | 专用文件/文档/图像工具能表达的不要用它 |
@@ -162,6 +163,28 @@ macOS `open [-R]`；Linux `xdg-open`。
 
 **边界**：**只管交给系统** —— 不读内容、不解析、不等程序退出。
 模型自己要看内容用 `read_file`；这里只解决"给人看"。
+
+---
+
+### 3.5 `open_app` —— 打开主界面
+
+**用途**：把 Neo 自己的主窗口从托盘唤回到屏幕上。语音唤醒是全程后台静默的
+（进度看角落小窗），当用户说「打开主界面 / 让我看看」时调它。
+
+**风险**：`open`（默认放行；`Policy::allow_open = false` 时拒绝）
+
+**参数**：无。
+
+**成功返回**
+
+```json
+{ "ok": true, "tool": "open_app", "summary": "已唤回 Neo 主界面",
+  "data": { "at": 1764000000000 } }
+```
+
+**机制**：工具执行层碰不到 eframe 窗口句柄，只置位 `SHOW_WINDOW_AT`
+（毫秒时间戳）；app 主循环每帧轮询，见到新值才调 `show_window`。
+主窗已在屏幕上时是空操作（信号照样置位，轮询侧发现没在托盘就不动）。
 
 ---
 
@@ -583,7 +606,7 @@ npm run dev *> .neo-dev.log
 | 风险 | 工具 | 默认裁定 |
 |---|---|---|
 | `read` | `read_file` / `view_image` | 直接放行 |
-| `open` | `open_file` | 直接放行（策略可关） |
+| `open` | `open_file` / `open_app` | 直接放行（策略可关） |
 | `write` | `write_file` / `edit_file` | **需用户确认** |
 | `exec` | `powershell` / `bash` / `click` / `drag` | **需用户确认** |
 | `read` | `screenshot` | 直接放行（它只看不动） |

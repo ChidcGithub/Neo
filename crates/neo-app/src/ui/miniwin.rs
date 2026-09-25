@@ -30,7 +30,9 @@ const AVOID_SECS: f32 = 0.35;
 /// 截屏后重新露面的淡入时长（秒）。
 const REFADE_SECS: f32 = 0.25;
 /// 截屏信号置位后小窗保持隐藏的时长（`capture()` 内已先等 300ms 再抓帧）。
-const SHOT_HIDE: Duration = Duration::from_millis(500);
+/// 950ms = 截屏闪光（450ms 起亮 + 450ms 播放）结束后再回归 ——
+/// 闪光与小窗淡入叠在一起，看着就像「小窗一弹出屏幕就闪一下」。
+const SHOT_HIDE: Duration = Duration::from_millis(950);
 /// 小窗开着时的轮询节拍（避让 / 截屏信号 / 打断点击都靠它）。
 /// 16ms ≈ 60fps：避让、淡入、呼吸点都是动画，再低肉眼能看出顿。
 const POLL: Duration = Duration::from_millis(16);
@@ -136,6 +138,8 @@ struct Snapshot {
     interrupt_open: bool,
     title: String,
     steps: Vec<Step>,
+    /// 思考过程尾部一行（与主界面的「思考过程」块同一个数据源）。
+    thinking: Option<String>,
     body: String,
     streaming: bool,
 }
@@ -196,6 +200,11 @@ impl Snapshot {
             }
         }
         steps.reverse();
+        // 思考过程：与主界面「思考过程」块同源，小窗只留最新一行的尾巴。
+        let thinking = last_assistant
+            .map(|msg| msg.reasoning.trim())
+            .filter(|text| !text.is_empty())
+            .map(|text| tail(text, per_line));
         // 标题带已用时长：后台跑久了，一眼知道这轮已经花了多久。
         let elapsed = if busy_secs >= 60 {
             format!("{}m{:02}s", busy_secs / 60, busy_secs % 60)
@@ -208,6 +217,7 @@ impl Snapshot {
             interrupt_open,
             title: format!("Neo 执行中 · {elapsed}"),
             steps,
+            thinking,
             body: tail(body_src, per_line * 3),
             streaming,
         }
@@ -222,6 +232,7 @@ impl Snapshot {
             interrupt_open: false,
             title: String::new(),
             steps: Vec::new(),
+            thinking: None,
             body: String::new(),
             streaming: false,
         }
@@ -293,6 +304,18 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>) {
     }
     if !snap.steps.is_empty() {
         y += m.s(4.0);
+    }
+
+    // 思考过程：淡色小字一行，像主界面折叠块里最新的一句。
+    if let Some(thinking) = &snap.thinking {
+        painter.text(
+            Pos2::new(inner.left(), y),
+            Align2::LEFT_TOP,
+            format!("思考 · {thinking}"),
+            d.font(d.t().caption),
+            tint(p.label_caption),
+        );
+        y += d.t().caption * 1.55 + m.s(2.0);
     }
 
     let mut body = snap.body.clone();
@@ -409,6 +432,8 @@ impl MiniWin {
             .with_taskbar(false)
             .with_always_on_top()
             .with_active(false)
+            // 透明：squircle 卡片四个角外不该是一块直角底色。
+            .with_transparent(true)
             .with_visible(visible)
             .with_inner_size(size)
             .with_position(pos)
