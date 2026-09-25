@@ -257,9 +257,11 @@
 
 ---
 
-## 八、演进路线（不在本次范围）
+## 八、演进路线
 
-1. **v1（本规范）**：鲸青换色 + 动效成文 + 图标规则立规；
-2. **v2 候选**：鲸息气泡 pending 点、SonarDot 聆听点、EdgeBeamCard 收编 neo-ui；
+1. **v1（已实施，commit 见 git log）**：鲸青换色（`palette.rs` 双常量点）+
+   动效成文 + 图标规则立规 + 鲸息气泡 pending 点（`conversation.rs`）+
+   首枚原创图标 Sparkle（`icons.rs::sparkle`，程序化四角星）；
+2. **v2 候选**：SonarDot 聆听点、EdgeBeamCard 收编 neo-ui；
 3. **品牌任务**：Neo 鲸标志几何重绘（三稿评审后替换 `whale_path.rs`）；
-4. **存量图标渐进替换**：Sparkle → Board/Checklist → 其余随改随到。
+4. **存量图标渐进替换**：Board / Checklist → 其余随改随到（Sparkle 已换）。

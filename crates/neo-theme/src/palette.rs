@@ -34,6 +34,9 @@ pub const fn black_a(a: u8) -> Color32 {
 }
 
 /// DeepSeek 品牌蓝阶梯（`--dsw-static-deepseek-*`）。
+///
+/// 历史来源层：Neo 的 accent 已迁往「鲸青」（[`whale`]），本阶梯仅留作
+/// 对照上游与个别遗留引用，**新代码不要用**。
 pub mod deepseek {
     use super::{rgb, Color32};
 
@@ -46,6 +49,25 @@ pub mod deepseek {
     pub const D500: Color32 = rgb(65, 118, 230);
     pub const D600: Color32 = rgb(72, 104, 178);
     pub const D800: Color32 = rgb(52, 65, 91);
+}
+
+/// 鲸青（Whale Teal）阶梯 —— Neo 的品牌色（`docs/neo-brand.md`）。
+///
+/// 深海海水的青蓝（色相 ≈192°），与上游的紫向蓝（≈222°）差 30° 色相。
+/// 对比度承诺：T600 白底 ≈4.9:1、T400 暗底(#151517) ≈9.0:1，双过 AA。
+pub mod whale {
+    use super::{rgb, Color32};
+
+    pub const T50: Color32 = rgb(233, 248, 251);
+    pub const T100: Color32 = rgb(205, 239, 245);
+    pub const T200: Color32 = rgb(160, 224, 236);
+    pub const T300: Color32 = rgb(111, 204, 223);
+    pub const T400: Color32 = rgb(79, 195, 220);
+    pub const T500: Color32 = rgb(23, 168, 198);
+    pub const T600: Color32 = rgb(14, 122, 153);
+    pub const T700: Color32 = rgb(10, 94, 119);
+    pub const T800: Color32 = rgb(13, 61, 78);
+    pub const T900: Color32 = rgb(7, 42, 54);
 }
 
 /// 上游 `--dsw-static-neutral-bluish-*` 中性偏蓝阶梯（组件 token 的取值来源）。
@@ -189,8 +211,8 @@ impl Components {
         btn_contrast: neutral::N_700,
         btn_floating: neutral::N_00,
         btn_floating_hover: neutral::N_75,
-        btn_info: crate::palette::deepseek::D500,
-        btn_info_hover: crate::palette::deepseek::D400,
+        btn_info: crate::palette::whale::T600,
+        btn_info_hover: crate::palette::whale::T500,
         btn_ghost_active: neutral::N_100,
         btn_ghost_border: neutral::N_500,
         btn_ghost_active_hover: neutral::N_150,
@@ -214,8 +236,8 @@ impl Components {
         warn: neutral::AMBER_500,
         warn_label: neutral::AMBER_600,
         warn_soft: rgba(245, 158, 11, 26),
-        business: crate::palette::deepseek::D500,
-        business_soft: crate::palette::deepseek::D100,
+        business: crate::palette::whale::T600,
+        business_soft: crate::palette::whale::T100,
 
         hover: rgba(38, 49, 72, 15), // .06
         hover_solid: neutral::N_75,
@@ -243,8 +265,8 @@ impl Components {
         btn_contrast: neutral::N_50,
         btn_floating: neutral::N_850,
         btn_floating_hover: neutral::N_800,
-        btn_info: crate::palette::deepseek::D400,
-        btn_info_hover: crate::palette::deepseek::D500,
+        btn_info: crate::palette::whale::T400,
+        btn_info_hover: crate::palette::whale::T300,
         btn_ghost_active: neutral::N_750,
         btn_ghost_border: neutral::N_600,
         btn_ghost_active_hover: neutral::N_700,
@@ -268,8 +290,8 @@ impl Components {
         warn: neutral::AMBER_500,
         warn_label: neutral::AMBER_600,
         warn_soft: rgba(245, 158, 11, 38),
-        business: crate::palette::deepseek::D400,
-        business_soft: crate::palette::deepseek::D800,
+        business: crate::palette::whale::T400,
+        business_soft: crate::palette::whale::T800,
 
         hover: rgba(255, 255, 255, 20), // .08
         hover_solid: neutral::N_800,
@@ -400,10 +422,10 @@ impl Palette {
         label_on_accent: neutral::N_1000,
 
         brand_ink: neutral::N_50,
-        accent: deepseek::D400,
-        accent_hover: deepseek::D500,
-        accent_soft: deepseek::D800,
-        link: deepseek::D400,
+        accent: whale::T400,
+        accent_hover: whale::T300,
+        accent_soft: whale::T800,
+        link: whale::T400,
 
         success: neutral::GREEN_500,
         warn: neutral::AMBER_500,
@@ -435,7 +457,7 @@ impl Palette {
         sidebar_fill: rgb(249, 250, 251),
         input_surface: neutral::N_00,
         selector: neutral::N_60,
-        bubble: deepseek::D50,
+        bubble: whale::T50,
         tip: neutral::N_60,
 
         label_primary: neutral::N_1000,
@@ -445,10 +467,10 @@ impl Palette {
         label_on_accent: neutral::N_00,
 
         brand_ink: neutral::N_1000,
-        accent: deepseek::D500,
-        accent_hover: deepseek::D400,
-        accent_soft: deepseek::D100,
-        link: deepseek::D500,
+        accent: whale::T600,
+        accent_hover: whale::T500,
+        accent_soft: whale::T100,
+        link: whale::T600,
 
         success: neutral::GREEN_500,
         warn: neutral::AMBER_500,

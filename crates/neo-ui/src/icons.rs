@@ -110,7 +110,6 @@ impl Icon {
             Icon::Check => &g::CHECK,
             Icon::Info => &g::INFO,
             Icon::Warn => &g::WARN,
-            Icon::Sparkle => &g::SPARKLE,
             Icon::Copy => &g::COPY,
             Icon::Search => &g::SEARCH,
             Icon::ArrowLeft => &g::ARROW_LEFT,
@@ -118,6 +117,9 @@ impl Icon {
             Icon::Dots => &g::DOTS,
             // 上游图标集里没有麦克风 —— 这是 Neo 场景卡自己的图形。
             Icon::Mic => return None,
+            // 星芒是上游的品牌笔触；Neo 按自家规则重画（docs/neo-brand.md §五），
+            // 不再借用上游几何。
+            Icon::Sparkle => return None,
         })
     }
 
@@ -128,8 +130,10 @@ impl Icon {
             paint_glyph(painter, rect, color, glyph);
             return;
         }
-        if self == Icon::Mic {
-            mic(painter, rect, color, stroke_w);
+        match self {
+            Icon::Mic => mic(painter, rect, color, stroke_w),
+            Icon::Sparkle => sparkle(painter, rect, color),
+            _ => {}
         }
     }
 }
@@ -222,6 +226,79 @@ fn mic(painter: &Painter, rect: Rect, color: Color32, w: f32) {
     seg(painter, rect, (8.6, 18.4), (15.4, 18.4), color, w);
 }
 
+/// 星芒（✦）：大四角星 + 右上小四角星，实心填充（Neo 原创几何）。
+///
+/// 按自家图标规则画（docs/neo-brand.md §五）：24 栅格、尖角截角钝化
+/// （圆头近似）、凹点/尖半径比 0.30 —— 与 squircle(1.5) 的微鼓同族。
+fn sparkle(painter: &Painter, rect: Rect, color: Color32) {
+    // 大星偏左下、小星点缀右上（经典 sparkle 构图）。
+    fill_star(painter, rect, (10.3, 12.7), 8.1, 2.45, 1.15, color);
+    fill_star(painter, rect, (18.6, 5.4), 3.1, 1.0, 0.62, color);
+}
+
+/// 实心四角星：中心扇形三角化（四角星的核包含几何中心，扇形剖分无交叠；
+/// `PathShape::convex_polygon` 的三角扇只对凸多边形正确，不能用它）。
+fn fill_star(
+    painter: &Painter,
+    rect: Rect,
+    (cx, cy): (f32, f32),
+    r_out: f32,
+    r_in: f32,
+    tip: f32,
+    color: Color32,
+) {
+    let outline = star4_outline(cx, cy, r_out, r_in, tip);
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: p(rect, cx, cy),
+        uv: egui::epaint::WHITE_UV,
+        color,
+    });
+    for &(x, y) in &outline {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: p(rect, x, y),
+            uv: egui::epaint::WHITE_UV,
+            color,
+        });
+    }
+    let n = outline.len() as u32;
+    for i in 0..n {
+        mesh.indices.extend_from_slice(&[0, 1 + i, 1 + (i + 1) % n]);
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+/// 四角星轮廓：四尖（轴向）四凹（45° 对角）交替；尖角截角钝化 ——
+/// 两臂各退 `tip` 得肩点，肩点中点向尖外鼓 0.42× 补出圆头的弧度。
+fn star4_outline(cx: f32, cy: f32, r_out: f32, r_in: f32, tip: f32) -> Vec<(f32, f32)> {
+    /// 从 p 朝 q 方向退 d 的点。
+    fn along(p: (f32, f32), q: (f32, f32), d: f32) -> (f32, f32) {
+        let (dx, dy) = (q.0 - p.0, q.1 - p.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        (p.0 + dx / len * d, p.1 + dy / len * d)
+    }
+    let mut pts = Vec::with_capacity(16);
+    for k in 0..4 {
+        let tip_deg = -90.0f32 + 90.0 * k as f32; // 从顶尖起顺时针
+        let tip_a = tip_deg.to_radians();
+        let tip_p = (cx + r_out * tip_a.cos(), cy + r_out * tip_a.sin());
+        let d1 = (tip_deg - 45.0).to_radians();
+        let d2 = (tip_deg + 45.0).to_radians();
+        let q1 = (cx + r_in * d1.cos(), cy + r_in * d1.sin());
+        pts.push(q1);
+        let a = along(tip_p, q1, tip);
+        let b = along(tip_p, (cx + r_in * d2.cos(), cy + r_in * d2.sin()), tip);
+        let mid = (
+            (a.0 + b.0) * 0.5 + (tip_p.0 - (a.0 + b.0) * 0.5) * 0.42,
+            (a.1 + b.1) * 0.5 + (tip_p.1 - (a.1 + b.1) * 0.5) * 0.42,
+        );
+        pts.push(a);
+        pts.push(mid);
+        pts.push(b);
+    }
+    pts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,11 +346,11 @@ mod tests {
     }
 
     #[test]
-    fn every_icon_maps_to_a_glyph_except_the_hand_drawn_one() {
+    fn every_icon_maps_to_a_glyph_except_the_hand_drawn_ones() {
         for &icon in ALL {
             assert_eq!(
                 icon.glyph().is_some(),
-                icon != Icon::Mic,
+                !matches!(icon, Icon::Mic | Icon::Sparkle),
                 "{icon:?} 的字形映射与预期不符"
             );
         }

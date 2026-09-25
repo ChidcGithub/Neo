@@ -317,7 +317,8 @@ fn draw_reasoning(ui: &mut Ui, skin: &Skin<'_>, content_w: f32, text: &str) {
     );
 }
 
-/// 生成中的三个相位错开的脉动点（对应 Harness `.pending` 的呼吸）。
+/// 生成中的「鲸息气泡」：三个点错相上浮 + 淡出，像鲸鱼呼出的气泡
+/// （Neo 品牌动效，见 docs/neo-brand.md §四；接替上游 `.pending` 的原地呼吸）。
 fn pulsing_dots(ui: &mut Ui, skin: &Skin<'_>, content_w: f32) {
     let p = skin.p();
     let m = skin.m();
@@ -325,15 +326,20 @@ fn pulsing_dots(ui: &mut Ui, skin: &Skin<'_>, content_w: f32) {
     let cy = r.center().y;
     let d = m.s(5.0);
     let gap = m.s(14.0);
+    let rise = m.s(4.0);
     let t = ui.ctx().time();
     for i in 0..3usize {
-        // 1s 一轮，每个点错开 0.18s。
-        let phase = (t - i as f64 * 0.18) as f32;
-        let k = 0.3 + 0.7 * (0.5 + 0.5 * (phase * std::f32::consts::TAU).sin());
+        // 1s 一轮，每个点错开 0.18s（节奏沿用上游，运动改为上浮）。
+        let phase = ((t - i as f64 * 0.18) as f32).rem_euclid(1.0);
+        // 正弦包络：淡入 → 淡出；位移随相位匀速上升，半径收尾微缩。
+        let alpha = (phase * std::f32::consts::PI).sin();
+        let k = alpha * alpha; // 平方缓动：两端更柔
+        let y = cy + rise * (0.5 - phase) * 2.0;
+        let radius = d * 0.5 * (0.85 + 0.15 * k);
         ui.painter().circle_filled(
-            egui::pos2(r.left() + gap + i as f32 * gap, cy),
-            d * 0.5,
-            super::translucent(p.accent, k),
+            egui::pos2(r.left() + gap + i as f32 * gap, y),
+            radius,
+            super::translucent(p.accent, 0.15 + 0.85 * k),
         );
     }
     // 动画期间保持重绘。
