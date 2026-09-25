@@ -6,7 +6,7 @@
 
 Say *“Hi Neo”* — a flowing marquee lights up along the screen edges, refracting the live desktop beneath it. Speak, and Neo transcribes, reasons, streams answers, and operates the local machine through tools. When idle, it retreats to the system tray and waits for the next call.
 
-![version](https://img.shields.io/badge/version-0.1.0--rc269251305-blue)
+![version](https://img.shields.io/badge/version-0.1.0--rc260251648-blue)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%202004%2B-0078D6)
 ![rust](https://img.shields.io/badge/rust-1.95%2B-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
