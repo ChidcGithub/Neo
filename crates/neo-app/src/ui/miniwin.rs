@@ -153,8 +153,12 @@ struct Snapshot {
     interrupt_open: bool,
     title: String,
     steps: Vec<Step>,
+    /// 思考过程尾部一行（与主界面「思考过程」块同源；模型不出推理则不画）。
+    /// 独立于正文：正文一旦被 content 占据，思考也不该被顶掉 —— 两块并存，
+    /// 和主界面一样。
+    thinking: Option<String>,
     body: String,
-    /// 正文是思考过程（或占位）时的淡色标记：content 还空着时 reasoning 顶上来。
+    /// 正文是占位文案（「正在处理…」）时的淡色标记。
     body_dim: bool,
     streaming: bool,
 }
@@ -167,22 +171,10 @@ impl Snapshot {
             .rev()
             .find(|msg| msg.role == Role::Assistant);
         let streaming = last_assistant.is_some_and(|msg| msg.streaming);
-        // 正文优先 content；思考阶段 content 还空着时把 reasoning 顶上来 ——
-        // 小窗只有一块正文区，「正在想什么」就是此刻的正文，不再是干等的
-        // 「正在处理…」。
+        // 正文只放正式回复；思考过程有专行（见下）。content 还空着时给占位。
         let (body_src, body_dim) = match last_assistant {
-            Some(msg) => {
-                let content = msg.content.trim();
-                let reasoning = msg.reasoning.trim();
-                if !content.is_empty() {
-                    (content, false)
-                } else if !reasoning.is_empty() {
-                    (reasoning, true)
-                } else {
-                    ("正在处理…", true)
-                }
-            }
-            None => ("正在处理…", true),
+            Some(msg) if !msg.content.trim().is_empty() => (msg.content.trim(), false),
+            _ => ("正在处理…", true),
         };
         // 正文最多三行：按 CJK 最宽情形（一字符 ≈ 一个字号）估算每行字数，留尾巴。
         let m = theme.metrics;
@@ -213,7 +205,9 @@ impl Snapshot {
                     }
                 };
                 steps.push(Step {
-                    line: head(&tool.line(), step_chars),
+                    // 工具摘要多行命令（如 `$paths = @(\n…`）必须压成单行：
+                    // 行高按一行算，多行会溢出去盖住下一条。
+                    line: head(&tool.line().replace(['\r', '\n'], " "), step_chars),
                     tone,
                 });
                 if steps.len() >= MAX_STEPS {
@@ -222,6 +216,18 @@ impl Snapshot {
             }
         }
         steps.reverse();
+        // 思考过程：本轮（倒序到最后一条用户消息为止）最近一条有 reasoning 的
+        // 助手消息，留一行尾巴。模型不出推理（reasoning 恒空）则不画。
+        let thinking = state
+            .messages
+            .iter()
+            .rev()
+            .take_while(|msg| msg.role != Role::User)
+            .filter(|msg| msg.role == Role::Assistant)
+            .find_map(|msg| {
+                let r = msg.reasoning.trim();
+                (!r.is_empty()).then(|| tail(r, per_line))
+            });
         // 标题带已用时长：后台跑久了，一眼知道这轮已经花了多久。
         let elapsed = if busy_secs >= 60 {
             format!("{}m{:02}s", busy_secs / 60, busy_secs % 60)
@@ -234,7 +240,9 @@ impl Snapshot {
             interrupt_open,
             title: format!("Neo 执行中 · {elapsed}"),
             steps,
-            body: tail(body_src, per_line * 3),
+            thinking,
+            // 正文是 markdown 源串，反引号等记号在小窗裸奔很扎眼，极简清洗。
+            body: tail(&body_src.replace('`', ""), per_line * 3),
             body_dim,
             streaming,
         }
@@ -322,6 +330,18 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>, fade: f32) 
     }
     if !snap.steps.is_empty() {
         y += m.s(4.0);
+    }
+
+    // 思考过程：淡色小字一行，与正文并存（像主界面展开的思考块最新一句）。
+    if let Some(thinking) = &snap.thinking {
+        painter.text(
+            Pos2::new(inner.left(), y),
+            Align2::LEFT_TOP,
+            format!("思考 · {thinking}"),
+            d.font(d.t().caption),
+            tint(p.label_caption),
+        );
+        y += d.t().caption * 1.55 + m.s(2.0);
     }
 
     let mut body = snap.body.clone();
