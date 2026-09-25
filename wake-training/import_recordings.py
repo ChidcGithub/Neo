@@ -10,7 +10,7 @@
 # 然后只需重训分类头：
 #   .venv/Scripts/livekit-wakeword.exe train hi_neo.yaml
 #   .venv/Scripts/livekit-wakeword.exe export hi_neo.yaml
-#   copy /Y output\hi_neo\hi_neo.onnx ..\crates\neo-wake\assets\hi_neo.onnx
+#   Copy-Item -Force output\hi_neo\hi_neo.onnx ..\crates\neo-wake\assets\hi_neo.onnx
 #
 # 录音建议（正样本）：
 #   - 10~20 句「嗨，Neo / Hi, Neo」，不同语速、远近、响度；
@@ -164,7 +164,7 @@ def main() -> int:
     print("下一步（重训分类头，不用再跑 TTS 合成）：")
     print("  .venv/Scripts/livekit-wakeword.exe train hi_neo.yaml")
     print("  .venv/Scripts/livekit-wakeword.exe export hi_neo.yaml")
-    print("  copy /Y output\\hi_neo\\hi_neo.onnx ..\\crates\\neo-wake\\assets\\hi_neo.onnx")
+    print("  Copy-Item -Force output\\hi_neo\\hi_neo.onnx ..\\crates\\neo-wake\\assets\\hi_neo.onnx")
     return 0
 
 
