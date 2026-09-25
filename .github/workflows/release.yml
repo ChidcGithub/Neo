@@ -63,6 +63,8 @@ jobs:
           Invoke-WebRequest "$base/silero_vad.onnx" -OutFile assets-stt\vad\silero_vad.onnx
 
       - name: Fetch MinGit runtime
+        env:
+          PYTHONUTF8: "1" # runner 默认 cp1252，脚本输出中文会炸
         run: python tools/fetch_runtime.py --mirror github
 
       - name: Assemble package
