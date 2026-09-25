@@ -223,6 +223,22 @@ mod imp {
         // 隐藏态轮询周期 200ms，留足余量取 300ms。
         mark_screenshot(rect);
         std::thread::sleep(Duration::from_millis(300));
+        capture_impl(rect)
+    }
+
+    /// 抓一块屏幕区域，但**不广播截屏信号、不等迷你窗躲开**。
+    /// 课堂记录等静默后台截图用它：屏幕闪光与回避是给「AI 应用户要求截屏」
+    /// 的反馈，后台监听截屏不该惊扰正在上课的屏幕。
+    pub fn capture_silent(rect: Rect) -> Result<Shot, ToolError> {
+        if rect.width <= 0 || rect.height <= 0 {
+            return Err(ToolError::bad_args("截屏区域必须是正的宽高")
+                .with_hint("width / height 是整数像素"));
+        }
+        capture_impl(rect)
+    }
+
+    /// 实际的 GDI 抓帧（`capture` / `capture_silent` 共用）。
+    fn capture_impl(rect: Rect) -> Result<Shot, ToolError> {
         unsafe {
             let screen = GetDC(std::ptr::null_mut());
             if screen.is_null() {
@@ -463,6 +479,10 @@ mod imp {
     }
 
     pub fn capture(_rect: Rect) -> Result<Shot, ToolError> {
+        Err(unsupported())
+    }
+
+    pub fn capture_silent(_rect: Rect) -> Result<Shot, ToolError> {
         Err(unsupported())
     }
 

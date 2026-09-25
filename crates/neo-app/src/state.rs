@@ -431,6 +431,10 @@ pub struct AppState {
     pub wake_enabled: bool,
     /// 启动后直接进入系统托盘后台运行，等待语音唤醒，不显示主界面。
     pub start_in_tray: bool,
+    /// 课堂总结开关（默认关）：检测到应用最大化时后台记录，课后弹总结。
+    pub class_enabled: bool,
+    /// 课堂总结状态行（「记录中…」「等待收尾…」），由 app 每帧从 ClassMonitor 同步。
+    pub class_status: Option<String>,
 
     // ---- 会话管理（侧栏行内编辑）----
     /// 正在重命名的会话 id。
@@ -534,6 +538,8 @@ impl Default for AppState {
             minimize_to_tray: true,
             wake_enabled: true,
             start_in_tray: true,
+            class_enabled: false,
+            class_status: None,
             renaming: None,
             rename_draft: String::new(),
             rename_request_focus: false,

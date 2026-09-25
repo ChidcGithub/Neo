@@ -167,7 +167,9 @@ fn engine_main(
 
     let (sample_tx, sample_rx) = mpsc::channel::<Vec<i16>>();
     let err_tx = tx.clone();
-    let stream = match build_stream(sample_tx, err_tx) {
+    let stream = match build_stream(sample_tx, move |msg| {
+        let _ = err_tx.send(WakeEvent::Error(msg));
+    }) {
         Ok(s) => s,
         Err(e) => {
             let _ = tx.send(WakeEvent::Error(e));
@@ -408,9 +410,10 @@ struct AudioStream {
     device_name: String,
 }
 
+/// `on_err` 只在致命错误时调用；Xrun / 设备切换这类瞬态事件内部消化。
 fn build_stream(
     tx: mpsc::Sender<Vec<i16>>,
-    err_tx: mpsc::Sender<WakeEvent>,
+    on_err: impl Fn(String) + Send + Clone + 'static,
 ) -> Result<AudioStream, String> {
     let host = cpal::default_host();
     let device = host
@@ -430,9 +433,7 @@ fn build_stream(
             cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged => {
                 eprintln!("[neo-wake] mic stream 瞬态事件（流仍存活，忽略）: {e}");
             }
-            _ => {
-                let _ = err_tx.send(WakeEvent::Error(format!("mic stream: {e}")));
-            }
+            _ => on_err(format!("mic stream: {e}")),
         }
     };
 
@@ -623,6 +624,116 @@ impl Resampler {
             }
             self.frac -= 1.0;
             self.prev = x;
+        }
+    }
+}
+
+// ---------------- 独立音频采集（AudioTap） ----------------
+
+/// 一路独立的 16kHz 单声道音频采集，按 80ms（1280 样本）切成 f32 帧。
+///
+/// 唤醒引擎内部用的就是同一条采集链路；课堂记录等需要原始音频的功能
+/// 自己 `start` 一路 —— 与唤醒流并存是安全的（WASAPI 共享模式允许多个
+/// 客户端同开一支麦克风）。
+pub struct AudioTap {
+    rx: mpsc::Receiver<Vec<f32>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    device: String,
+}
+
+impl AudioTap {
+    /// 开流并启动采集线程。拿不到麦克风 / 启动失败时立即报错（同步握手）。
+    pub fn start() -> Result<Self, String> {
+        let (frame_tx, frame_rx) = mpsc::channel::<Vec<f32>>();
+        let (hello_tx, hello_rx) = mpsc::channel::<Result<String, String>>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("neo-audio-tap".into())
+            .spawn(move || tap_main(frame_tx, hello_tx, stop2))
+            .map_err(|e| format!("spawn audio tap: {e}"))?;
+        // 等采集线程握手：设备名或启动错误。流活着时线程不会主动退出。
+        let device = match hello_rx.recv() {
+            Ok(Ok(name)) => name,
+            Ok(Err(e)) => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = thread.join();
+                return Err(e);
+            }
+            Err(_) => return Err("audio tap 线程启动即退出".into()),
+        };
+        Ok(Self {
+            rx: frame_rx,
+            stop,
+            thread: Some(thread),
+            device,
+        })
+    }
+
+    /// 采集设备名（遥测用）。
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    /// 取下一帧（80ms / 1280 样本 f32）。超时返回 `None`；
+    /// 流死亡（线程退出）后持续返回 `None`。
+    pub fn next_frame(&self, timeout: Duration) -> Option<Vec<f32>> {
+        self.rx.recv_timeout(timeout).ok()
+    }
+}
+
+impl Drop for AudioTap {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn tap_main(
+    tx: mpsc::Sender<Vec<f32>>,
+    hello: mpsc::Sender<Result<String, String>>,
+    stop: Arc<AtomicBool>,
+) {
+    let (sample_tx, sample_rx) = mpsc::channel::<Vec<i16>>();
+    // 致命流错误：记日志后让帧通道断开（对端拿 Disconnected 当结束信号）。
+    let stream = match build_stream(sample_tx, move |msg| {
+        eprintln!("[neo-audio-tap] {msg}");
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = hello.send(Err(e));
+            return;
+        }
+    };
+    if let Err(e) = stream.stream.play() {
+        let _ = hello.send(Err(format!("start mic stream: {e}")));
+        return;
+    }
+    if hello.send(Ok(stream.device_name.clone())).is_err() {
+        return; // 启动方已放弃
+    }
+
+    // 收样本 → 重采样 → 组帧 → 转发，直到 stop 或流断开。
+    let mut resampler = Resampler::new(stream.sample_rate, SAMPLE_RATE);
+    let mut pending: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
+    while !stop.load(Ordering::Relaxed) {
+        let raw = match sample_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(v) => v,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        resampler.process(&raw, &mut pending);
+        while pending.len() >= FRAME_SAMPLES {
+            let frame: Vec<f32> = pending
+                .drain(..FRAME_SAMPLES)
+                .map(|s| s as f32 / 32768.0)
+                .collect();
+            if tx.send(frame).is_err() {
+                return; // 消费端走了
+            }
         }
     }
 }

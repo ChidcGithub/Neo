@@ -182,7 +182,7 @@ pub fn export_memories(path: &std::path::Path) -> Result<usize, ToolError> {
     Ok(list.len())
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

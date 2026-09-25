@@ -14,6 +14,7 @@
 //!
 //! 凡是"以后还会再用"的控件，写到 `neo-ui`，不要写进页面。
 
+pub mod classwin;
 pub mod composer;
 pub mod confirmwin;
 pub mod conversation;

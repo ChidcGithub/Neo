@@ -48,8 +48,8 @@ pub struct NeoApp {
     /// 上次落库的活跃会话 id，作用同上。
     saved_active: Option<i64>,
     /// 上次落库的面板内设置。直接修改 state 的控件统一在帧末检测变化。
-    /// 元素顺序：思考过程 / 思考挡位 / 主题 / 距离 / 最小化到托盘 / 语音唤醒 / 启动即后台。
-    saved_prefs: (bool, neo_llm::Thinking, ThemeMode, Distance, bool, bool, bool),
+    /// 元素顺序：思考过程 / 思考挡位 / 主题 / 距离 / 最小化到托盘 / 语音唤醒 / 启动即后台 / 课堂总结。
+    saved_prefs: (bool, neo_llm::Thinking, ThemeMode, Distance, bool, bool, bool, bool),
     /// 原生文件夹选择器在独立线程运行，主线程只接收结果。
     workspace_picker: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
     /// 舞台切换淡入的基准：上一帧画出去的舞台。
@@ -83,10 +83,14 @@ pub struct NeoApp {
     shotflash: ui::miniwin::ShotFlash,
     /// 工具权限确认窗（独立弹出，不绑定主窗）。
     confirmwin: ui::confirmwin::ConfirmWin,
+    /// 课堂总结的顶部弹窗（打磨完成后从屏幕上方滑入）。
+    classwin: ui::classwin::ClassWin,
     /// 已见到的「唤回主窗」信号（`open_app` 工具置位；变了 = AI 要开主界面）。
     show_window_seen: u64,
     /// 记忆文件 mtime 轮询节拍（2s）。
     memory_poll: std::time::Instant,
+    /// 课堂总结控制器（最大化监听 / 转写 / 打磨 / 弹窗状态机）。
+    class: crate::class::ClassMonitor,
     /// STT 线程的投喂端（音频帧 / 复位命令）。
     stt_tx: Option<std::sync::mpsc::Sender<SttCmd>>,
     /// STT 转写结果的回收端。
@@ -152,8 +156,10 @@ impl NeoApp {
             miniwin: Default::default(),
             shotflash: Default::default(),
             confirmwin: Default::default(),
+            classwin: Default::default(),
             show_window_seen: 0,
             memory_poll: std::time::Instant::now(),
+            class: Default::default(),
             stt_tx: None,
             stt_rx: None,
             dictating: false,
@@ -167,6 +173,7 @@ impl NeoApp {
                 true,
                 true,
                 true,
+                false,
             ),
         };
 
@@ -187,6 +194,7 @@ impl NeoApp {
             app.state.minimize_to_tray,
             app.state.wake_enabled,
             app.state.start_in_tray,
+            app.state.class_enabled,
         );
         if let Some(store) = app.store.as_ref() {
             Self::refresh_sessions(&mut app.state, store);
@@ -470,6 +478,9 @@ impl NeoApp {
         }
         if let Some(v) = get("start_in_tray") {
             self.state.start_in_tray = v == "1";
+        }
+        if let Some(v) = get("class_enabled") {
+            self.state.class_enabled = v == "1";
         }
         if let Some(v) = get("thinking") {
             self.state.thinking = neo_llm::Thinking::from_key(&v);
@@ -851,6 +862,13 @@ impl NeoApp {
         self.shotflash.tick(&ctx);
         // 工具确认窗：模型请求权限时独立弹出（不绑主窗，后台也能授权）。
         self.confirmwin.tick(&ctx, &mut self.state, self.theme);
+        // 课堂总结：最大化监听 / 转写 / 打磨状态机（默认关，设置里开）。
+        self.class
+            .tick(&ctx, &self.state, self.state.class_enabled);
+        // 课堂总结弹窗：打磨就绪后从屏幕上方滑入。
+        self.classwin.tick(&ctx, &mut self.class, self.theme);
+        // 状态行同步给设置页（开关下方的「记录中…」提示）。
+        self.state.class_status = self.class.status().map(|s| s.to_owned());
         // 记忆热重载：remember/forget 工具在工具线程写盘，这里 2s 一拍沿检。
         if self.memory_poll.elapsed() > std::time::Duration::from_secs(2) {
             self.memory_poll = std::time::Instant::now();
@@ -1297,6 +1315,15 @@ impl NeoApp {
             )
         {
             self.saved_prefs.6 = state.start_in_tray;
+        }
+        if state.class_enabled != self.saved_prefs.7
+            && Self::save_setting(
+                self.store.as_ref(),
+                "class_enabled",
+                if state.class_enabled { "1" } else { "0" },
+            )
+        {
+            self.saved_prefs.7 = state.class_enabled;
         }
         // 接口配置变化时落库（输入框每帧都在读，不能每帧写）。
         if (state.api_base.as_str(), state.api_key.as_str())

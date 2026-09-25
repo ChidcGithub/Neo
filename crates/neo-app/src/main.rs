@@ -29,6 +29,7 @@
 mod app;
 mod attachments;
 mod brand;
+mod class;
 mod state;
 mod ui;
 

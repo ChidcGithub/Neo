@@ -267,6 +267,20 @@ fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         &mut state.wake_enabled,
         "neo-set-wake",
     );
+    row_divider(ui, skin, width);
+    switch_row(
+        ui,
+        skin,
+        width,
+        "课堂总结",
+        "应用全屏/最大化（如课件放映）时后台截屏分析 + 录音转写；退出后两分钟无操作生成总结，从屏幕上方弹出。记录存进分记忆（记忆目录下的 class/）",
+        &mut state.class_enabled,
+        "neo-set-class",
+    );
+    if let Some(status) = &state.class_status {
+        ui.add_space(skin.m().s(4.0));
+        hint_row(ui, skin, width, status);
+    }
 }
 
 fn appearance_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
