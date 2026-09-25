@@ -28,10 +28,10 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PeekMessageW,
-    PostThreadMessageW, RegisterClassExW, SetWindowDisplayAffinity, ShowWindow, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, MSG, PM_REMOVE, SW_HIDE, SW_SHOWNA, WDA_EXCLUDEFROMCAPTURE, WM_APP,
-    WM_QUIT, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    WS_POPUP,
+    PostThreadMessageW, RegisterClassExW, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_QUIT,
+    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 /// 相位目标表（VCC TARGETS 照搬）：(强度, 速度, 环流)。
@@ -218,8 +218,19 @@ fn msg_loop(
                     visible.store(true, Ordering::Relaxed);
                     gfx.tgt = PH_LISTEN;
                     // SW_SHOWNA：显示但不激活，焦点不能被抢（用户可能正在打字）。
+                    // SetWindowPos 重新提顶：创建时虽带 WS_EX_TOPMOST，但后到的
+                    // topmost 窗口（如小窗）会把它压下去，每次露面都要抢回最前。
                     unsafe {
                         ShowWindow(hwnd, SW_SHOWNA);
+                        SetWindowPos(
+                            hwnd,
+                            HWND_TOPMOST,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
                     }
                 }
                 Cmd::Hide => {

@@ -15,7 +15,10 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Color32, Context, Id, Pos2, Rect, Stroke, Vec2, ViewportBuilder, ViewportId};
+use egui::{
+    Align2, Color32, Context, Id, Pos2, Rect, Stroke, Vec2, ViewportBuilder, ViewportCommand,
+    ViewportId, WindowLevel,
+};
 use neo_theme::{SquirclePaint, Theme};
 use neo_ui::modal::Confirm;
 use neo_ui::Design;
@@ -139,6 +142,20 @@ impl Snapshot {
             streaming,
         }
     }
+
+    /// 创建视口时的占位快照：`fade = 0` 全透明，即便意外露面也只是一张
+    /// 看不见的卡片；真正的内容要等打开后由 [`Snapshot::build`] 逐帧刷新。
+    fn placeholder(theme: Theme) -> Self {
+        Self {
+            theme,
+            fade: 0.0,
+            interrupt_open: false,
+            title: String::new(),
+            tool_line: None,
+            body: String::new(),
+            streaming: false,
+        }
+    }
 }
 
 /// 画一帧小窗内容（纯 painter 自绘：这里拿不到 `&WhaleMark`，也用不上）。
@@ -203,7 +220,11 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>) {
 /// 迷你窗运行时状态，挂在 `NeoApp` 上，每帧由 [`MiniWin::tick`] 驱动。
 #[derive(Default)]
 pub struct MiniWin {
-    /// 上一帧是否注册为可见（关上时要再注册最后一帧 `visible(false)`）。
+    /// 小窗视口是否已趁主窗可见时建出来（进 viewports 表）。
+    /// deferred 视口的创建命令只在真渲染 pass 里派发，主窗藏到托盘后走
+    /// logic-only 路径、不再建窗，所以必须在还能跑 pass 时先建好。
+    created: bool,
+    /// 上一帧是否已发 `Visible(true)`（显隐改由显式命令驱动，沿检测用）。
     shown: bool,
     /// 已见到的截屏时间戳（变了 = AI 又截了一次屏）。
     shot_seen: u64,
@@ -220,6 +241,49 @@ pub struct MiniWin {
 }
 
 impl MiniWin {
+    /// 视口 builder：显隐、尺寸、位置都给目标值，patch 自己收成增量命令。
+    fn builder(size: Vec2, pos: Pos2, visible: bool) -> ViewportBuilder {
+        ViewportBuilder::default()
+            .with_title("Neo")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_always_on_top()
+            .with_active(false)
+            .with_visible(visible)
+            .with_inner_size(size)
+            .with_position(pos)
+    }
+
+    /// 趁主窗可见（跑着真渲染 pass）把小窗视口先建出来（保持隐藏）。
+    ///
+    /// 为什么必须提前建：主窗藏到托盘后 eframe 走 logic-only 路径，
+    /// `show_viewport_deferred` 只写上下文状态、不产生创建命令，新视口永远
+    /// 建不出来；只有已存在于 viewports 表里的视口才收得到显式命令。首帧
+    /// （哪怕随后立即进托盘）一定是真 pass，趁这里建好，之后后台显隐才有着落。
+    pub fn ensure_created(&mut self, ctx: &Context, theme: Theme) {
+        if self.created {
+            return;
+        }
+        let m = theme.metrics;
+        let size = Vec2::new(m.s(340.0), m.s(200.0));
+        let margin = m.s(16.0);
+        let monitor = ctx
+            .input(|i| i.viewport().monitor_size)
+            .unwrap_or(Vec2::new(1920.0, 1080.0));
+        let home = Pos2::new((monitor.x - size.x - margin).max(margin), margin);
+        let snapshot = Snapshot::placeholder(theme);
+        let result = Arc::clone(&self.interrupt_result);
+        ctx.show_viewport_deferred(
+            viewport_id(),
+            Self::builder(size, home, false),
+            move |ui, _| {
+                paint(ui, &snapshot, &result);
+            },
+        );
+        self.created = true;
+    }
+
     /// 每帧驱动一次。放在 `tick()` 里而不是 `render()` 里：
     /// 主窗隐藏时渲染循环走 logic-only 路径，两者都经过 `tick()`。
     pub fn tick(&mut self, ctx: &Context, state: &mut AppState, theme: Theme, hidden_to_tray: bool) {
@@ -323,25 +387,42 @@ impl MiniWin {
             None => 1.0,
         };
 
-        // 7. 注册视口：每帧给出目标 builder，patch 自己收成增量命令；
-        //    刚关上时也要注册最后一帧（带 visible(false)），窗口才真正隐藏。
-        if open || self.shown {
-            let builder = ViewportBuilder::default()
-                .with_title("Neo")
-                .with_decorations(false)
-                .with_resizable(false)
-                .with_taskbar(false)
-                .with_always_on_top()
-                .with_active(false)
-                .with_visible(open)
-                .with_inner_size(size)
-                .with_position(pos);
-            let snapshot = Snapshot::build(state, theme, fade, self.interrupt_open);
-            let result = Arc::clone(&self.interrupt_result);
-            ctx.show_viewport_deferred(viewport_id(), builder, move |ui, _class| {
-                paint(ui, &snapshot, &result);
-            });
-            self.shown = open;
+        // 7. 显隐与内容。
+        //
+        //    关键约束：deferred 视口的「创建」与 builder patch 只在真渲染 pass
+        //    里发生，主窗藏到托盘后的 logic-only 路径不产生这些命令。所以——
+        //    视口必须先趁主窗可见时建好（`ensure_created`，install 与此处兜底）；
+        //    显隐改用显式 `ViewportCommand::Visible`，它走另一条派发路径，
+        //    logic-only 下照送不误。小窗一旦可见，`is_viewport_or_descendant_visible`
+        //    又反向强制主窗跑真 pass，位置 / 避让 / 内容的增量更新随之恢复。
+        if !self.created {
+            if !hidden_to_tray {
+                // 主窗还可见：趁这帧真 pass 把视口建出来（保持隐藏）。
+                self.ensure_created(ctx, theme);
+            }
+        } else {
+            if open != self.shown {
+                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Visible(open));
+                if open {
+                    // 每次露面都重新提到顶层，盖过同屏后到的其它 topmost 窗口。
+                    ctx.send_viewport_cmd_to(
+                        viewport_id(),
+                        ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop),
+                    );
+                }
+                self.shown = open;
+            }
+            if open {
+                let snapshot = Snapshot::build(state, theme, fade, self.interrupt_open);
+                let result = Arc::clone(&self.interrupt_result);
+                ctx.show_viewport_deferred(
+                    viewport_id(),
+                    Self::builder(size, pos, true),
+                    move |ui, _class| {
+                        paint(ui, &snapshot, &result);
+                    },
+                );
+            }
         }
 
         // 8. 小窗开着时把帧率拉上来（隐藏态默认 200ms 一拍，动画会卡）。

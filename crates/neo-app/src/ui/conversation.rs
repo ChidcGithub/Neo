@@ -251,8 +251,10 @@ fn draw_one(
                 ui.add_space(m.s(8.0));
             }
 
-            if msg.content.is_empty() && msg.error.is_none() {
-                // 还没有任何内容：脉动点。
+            // 只在生成中、还没等到任何内容时亮脉动点。
+            // 必须看 streaming：「已停止」的空回复同样满足 content 空、无错误，
+            // 不看的话停止后三个点还一直转，看着像仍在加载。
+            if msg.streaming && msg.content.is_empty() && msg.error.is_none() {
                 pulsing_dots(ui, skin, content_w);
             } else if !msg.content.is_empty() {
                 // 正文：Markdown。

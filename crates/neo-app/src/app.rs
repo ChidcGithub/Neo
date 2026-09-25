@@ -189,6 +189,10 @@ impl NeoApp {
         // 动效基准：启动恢复不算「切换」，首帧不播入场。
         app.prev_stage = app.state.stage;
         app.prev_show_settings = app.state.show_settings;
+        // 小窗视口趁首帧（一定是真渲染 pass）先建出来、保持隐藏：否则启动即进
+        // 托盘、或主窗还没可见就被藏起时，logic-only 路径建不出 deferred 视口，
+        // 后台唤醒就看不到小窗了。
+        app.miniwin.ensure_created(ctx, app.theme);
         app
     }
 
