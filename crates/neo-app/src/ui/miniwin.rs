@@ -7,12 +7,17 @@
 //! - 本轮 AI 用过鼠标/键盘工具时，用户点击屏幕任意处弹出「打断确认」，
 //!   确认即 [`AppState::cancel`]。
 //!
-//! 实现要点：egui deferred 视口每帧重注册，`with_visible` / `with_position`
-//! 的变化会被 `ViewportBuilder::patch` 收成增量命令，所以显隐与移动都只需要
-//! 「每帧给出目标值」，不用手动发 viewport 命令。
+//! 实现要点：
+//! - deferred 视口**每帧无条件重注册**：egui 会回收真渲染 pass 里没被触碰的
+//!   子视口，不注册就等着被销毁；
+//! - 显隐走双通道：builder 的 `with_visible` 由 patch 在真 pass 收增量，
+//!   显式 `ViewportCommand::Visible` 兜底主窗托盘后的 logic-only 路径；
+//! - 主窗托盘后主视口的 repaint 被 eframe 节流到 ~10fps，所以**动画全部在
+//!   小窗视口自己的回调里自驱**（避让 / 淡入 / 边缘流光），主视口只管
+//!   10fps 的内容快照；窗口位置也由回调发 `OuterPosition`，builder 不碰。
 
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{
@@ -132,9 +137,14 @@ struct Step {
 }
 
 /// 一帧要画的内容。视口回调是 `'static` 的，数据必须整份搬走。
+///
+/// 注意**没有** fade 与位置：主视口藏托盘后被 eframe 节流到 10fps，
+/// 这两个动画量改由回调自驱（fade 走共享的 `refade_since`，位置走
+/// 回调里现算现发的 `OuterPosition`）。
 struct Snapshot {
     theme: Theme,
-    fade: f32,
+    /// 卡片尺寸（回调里的避让判定要用）。
+    size: Vec2,
     interrupt_open: bool,
     title: String,
     steps: Vec<Step>,
@@ -145,13 +155,7 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn build(
-        state: &AppState,
-        theme: Theme,
-        fade: f32,
-        interrupt_open: bool,
-        busy_secs: u64,
-    ) -> Self {
+    fn build(state: &AppState, theme: Theme, size: Vec2, interrupt_open: bool, busy_secs: u64) -> Self {
         let last_assistant = state
             .messages
             .iter()
@@ -213,7 +217,7 @@ impl Snapshot {
         };
         Self {
             theme,
-            fade,
+            size,
             interrupt_open,
             title: format!("Neo 执行中 · {elapsed}"),
             steps,
@@ -222,34 +226,23 @@ impl Snapshot {
             streaming,
         }
     }
-
-    /// 创建视口时的占位快照：`fade = 0` 全透明，即便意外露面也只是一张
-    /// 看不见的卡片；真正的内容要等打开后由 [`Snapshot::build`] 逐帧刷新。
-    fn placeholder(theme: Theme) -> Self {
-        Self {
-            theme,
-            fade: 0.0,
-            interrupt_open: false,
-            title: String::new(),
-            steps: Vec::new(),
-            thinking: None,
-            body: String::new(),
-            streaming: false,
-        }
-    }
 }
 
 /// 画一帧小窗内容（纯 painter 自绘：这里拿不到 `&WhaleMark`，也用不上）。
-fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>) {
+fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>, fade: f32) {
     let d = Design::new(snap.theme);
     let p = d.p();
     let m = d.m();
     let rect = ui.ctx().content_rect();
     let painter = ui.painter().clone();
-    let fade = snap.fade;
     let tint = |c: Color32| c.gamma_multiply(fade);
 
-    // 卡片：视口本身是主题底色矩形，squircle 卡片盖在上面。
+    // 假阴影 + 卡片：透明视口上先垫一层偏移的暗 squircle，浮起来的层次感。
+    painter.squircle_filled(
+        rect.translate(Vec2::new(0.0, m.s(2.0))),
+        m.s(18.0),
+        tint(Color32::from_black_alpha(26)),
+    );
     painter.squircle_filled(rect, m.s(18.0), tint(p.bg_layer_1));
     painter.squircle_stroked(rect, m.s(18.0), Stroke::new(1.0, tint(p.border_l1)));
 
@@ -267,14 +260,26 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>) {
 
     let inner = rect.shrink(m.s(14.0));
     let mut y = inner.top();
+    // 标题行：accent 小圆点 + 标题，下面压一条细分隔线。
+    let title_r = m.s(3.5);
+    painter.circle_filled(
+        Pos2::new(inner.left() + title_r, y + d.t().caption * 0.8),
+        title_r,
+        tint(p.accent),
+    );
     painter.text(
-        inner.left_top(),
+        Pos2::new(inner.left() + m.s(11.0), y),
         Align2::LEFT_TOP,
         &snap.title,
         d.font_bold(d.t().caption),
         tint(p.label_tertiary),
     );
     y += d.t().caption * 1.6 + m.s(4.0);
+    painter.line_segment(
+        [Pos2::new(inner.left(), y), Pos2::new(inner.right(), y)],
+        Stroke::new(1.0, tint(p.border_l1)),
+    );
+    y += m.s(6.0);
 
     // 工具流水：状态圆点 + 单行摘要，最近的在最下。
     let step_lh = d.t().caption * 1.55;
@@ -410,8 +415,10 @@ pub struct MiniWin {
     shot_seen: u64,
     /// 截屏隐藏的截止时刻。
     shot_hide_until: Option<Instant>,
-    /// 截屏后重新露面的淡入起点。
-    refade_since: Option<Instant>,
+    /// 截屏后重新露面的淡入起点。**与视口回调共享**：主窗藏托盘后主视口的
+    /// repaint 被 eframe 节流到 10fps（`INVISIBLE_WINDOW_REPAINT_INTERVAL`），
+    /// 250ms 的淡入若靠快照下发只剩两三帧 —— 改由回调里现取现算。
+    refade_since: Arc<Mutex<Option<Instant>>>,
     /// 打断确认弹窗是否打开（画在小窗自己的视口里）。
     interrupt_open: bool,
     /// 打断确认结果（回调里写、tick 里读）：0 未决 / 1 打断 / 2 继续。
@@ -423,8 +430,12 @@ pub struct MiniWin {
 }
 
 impl MiniWin {
-    /// 视口 builder：显隐、尺寸、位置都给目标值，patch 自己收成增量命令。
-    fn builder(size: Vec2, pos: Pos2, visible: bool) -> ViewportBuilder {
+    /// 视口 builder：显隐与尺寸给目标值，patch 自己收成增量命令。
+    ///
+    /// **故意不带位置**：位置的动画在视口回调里以 `OuterPosition` 命令自驱
+    /// （主视口藏托盘后被节流到 10fps，位置若走 builder patch 会卡）。
+    /// builder 里不给 `position`，patch 就不会把回调挪好的位置拉回去。
+    fn builder(size: Vec2, visible: bool) -> ViewportBuilder {
         ViewportBuilder::default()
             .with_title("Neo")
             .with_decorations(false)
@@ -436,7 +447,6 @@ impl MiniWin {
             .with_transparent(true)
             .with_visible(visible)
             .with_inner_size(size)
-            .with_position(pos)
     }
 
     /// 每帧驱动一次。放在 `tick()` 里而不是 `render()` 里：
@@ -455,7 +465,7 @@ impl MiniWin {
             .is_some_and(|until| Instant::now() >= until)
         {
             self.shot_hide_until = None;
-            self.refade_since = Some(Instant::now());
+            *self.refade_since.lock().unwrap() = Some(Instant::now());
         }
         let shot_hiding = self.shot_hide_until.is_some();
 
@@ -488,14 +498,14 @@ impl MiniWin {
             }
         };
 
-        // 4. 位置：常态贴右上；光标进入小窗区域就非线性躲到左上。
-        //    只盯「静止位」判定 —— 窗口移动本身不会让光标反复进出，
-        //    否则窗口会在两个角之间来回振荡。
+        // 4. 几何：常态贴右上、避让时躲左上。窗口位置的动画挪到了视口回调里
+        //    自驱（主视口托盘态被节流，跑不动动画）；这里只留两个静止端点，
+        //    供打断判定「点在小窗自己身上不算」用 —— 两端都算上，覆盖移动途中。
         let m = theme.metrics;
         let size = if self.interrupt_open {
             Vec2::new(m.s(380.0), m.s(280.0))
         } else {
-            Vec2::new(m.s(340.0), m.s(220.0))
+            Vec2::new(m.s(340.0), m.s(236.0))
         };
         let margin = m.s(16.0);
         let monitor = ctx
@@ -503,19 +513,14 @@ impl MiniWin {
             .unwrap_or(Vec2::new(1920.0, 1080.0));
         let home = Pos2::new((monitor.x - size.x - margin).max(margin), margin);
         let away = Pos2::new(margin, margin);
-        let dodge = cursor.is_some_and(|c| Rect::from_min_size(home, size).contains(c));
-        let t = ctx.animate_value_with_time(
-            Id::new("neo-miniwin-avoid"),
-            if dodge { 1.0 } else { 0.0 },
-            AVOID_SECS,
-        );
-        let pos = home + (away - home) * ease_out_cubic(t);
 
         // 5. 打断确认：后台执行中 + 本轮动过鼠标/键盘 + 左键按下沿。
         //    点在小窗自己身上不算（那是在点弹窗按钮）。
         if lmb_edge && open && !self.interrupt_open && used_mouse_or_keyboard(state) {
-            let on_miniwin =
-                cursor.is_some_and(|c| Rect::from_min_size(pos, size).contains(c));
+            let on_miniwin = cursor.is_some_and(|c| {
+                Rect::from_min_size(home, size).contains(c)
+                    || Rect::from_min_size(away, size).contains(c)
+            });
             if !on_miniwin {
                 self.interrupt_open = true;
                 self.interrupt_result.store(0, Ordering::Relaxed);
@@ -530,23 +535,7 @@ impl MiniWin {
             _ => {}
         }
 
-        // 6. 截屏隐藏结束后的轻微淡入。
-        let mut refading = false;
-        let fade = match self.refade_since {
-            Some(t0) => {
-                let k = t0.elapsed().as_secs_f32() / REFADE_SECS;
-                if k >= 1.0 {
-                    self.refade_since = None;
-                    1.0
-                } else {
-                    refading = true;
-                    ease_out_cubic(k)
-                }
-            }
-            None => 1.0,
-        };
-
-        // 7. 显隐与内容。
+        // 6. 显隐与内容。
         //
         //    **每帧无条件注册视口**：egui 在真渲染 pass 结束时会回收本帧没被
         //    `show_viewport_deferred` 触碰的子视口（"never used this pass"）。
@@ -559,15 +548,19 @@ impl MiniWin {
         //    显式 `ViewportCommand::Visible` 兜底 —— 主窗藏托盘后的 logic-only
         //    路径不跑 pass、不产生 patch，只有显式命令照送不误。小窗一旦可见，
         //    `is_viewport_or_descendant_visible` 又反向强制主窗跑真 pass，
-        //    位置 / 避让 / 内容的增量更新随之恢复。
+        //    内容快照的增量更新随之恢复（但被托盘节流到 10fps，只够刷文字）。
         if open != self.shown {
-            ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Visible(open));
             if open {
+                // 先落位再露面，免得窗口在系统默认位置闪出一帧；
                 // 每次露面都重新提到顶层，盖过同屏后到的其它 topmost 窗口。
+                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(home));
+                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd_to(
                     viewport_id(),
                     ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop),
                 );
+            } else {
+                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Visible(false));
             }
             self.shown = open;
         }
@@ -576,21 +569,71 @@ impl MiniWin {
                 .busy_since
                 .map(|t0| t0.elapsed().as_secs())
                 .unwrap_or(0);
-            Snapshot::build(state, theme, fade, self.interrupt_open, busy_secs)
+            Some(Snapshot::build(state, theme, size, self.interrupt_open, busy_secs))
         } else {
-            Snapshot::placeholder(theme)
+            // 隐藏中不供内容：回调空转，Visible(false) 生效前的缝隙帧
+            // 不会画出一张空卡片。
+            None
         };
         let result = Arc::clone(&self.interrupt_result);
+        let refade = Arc::clone(&self.refade_since);
         ctx.show_viewport_deferred(
             viewport_id(),
-            Self::builder(size, pos, open),
+            Self::builder(size, open),
             move |ui, _class| {
-                paint(ui, &snapshot, &result);
+                let Some(snapshot) = &snapshot else { return };
+                let ctx = ui.ctx().clone();
+                // ---- 回调自驱的动画（主视口托盘态被 eframe 节流到 10fps，
+                // 这些量若靠快照下发全会卡；本视口可见、不被节流）----
+                // 淡入：起点由 tick 写进共享槽，插值在这里现算。
+                let fade = {
+                    let mut slot = refade.lock().unwrap();
+                    match *slot {
+                        Some(t0) => {
+                            let k = t0.elapsed().as_secs_f32() / REFADE_SECS;
+                            if k >= 1.0 {
+                                *slot = None;
+                                1.0
+                            } else {
+                                ease_out_cubic(k)
+                            }
+                        }
+                        None => 1.0,
+                    }
+                };
+                // 避让：只盯「静止位」判定（窗口移动本身不会让光标反复进出，
+                // 否则会在两个角之间振荡）；弹窗打开时不躲（用户正要去点按钮）。
+                let m = snapshot.theme.metrics;
+                let size = snapshot.size;
+                let margin = m.s(16.0);
+                let monitor = ctx
+                    .input(|i| i.viewport().monitor_size)
+                    .unwrap_or(Vec2::new(1920.0, 1080.0));
+                let home = Pos2::new((monitor.x - size.x - margin).max(margin), margin);
+                let away = Pos2::new(margin, margin);
+                let ppp = ctx
+                    .input(|i| i.viewport().native_pixels_per_point)
+                    .unwrap_or(1.0);
+                let cursor =
+                    global_cursor().map(|(p, _)| Pos2::new(p.x / ppp, p.y / ppp));
+                let dodge = !snapshot.interrupt_open
+                    && cursor.is_some_and(|c| Rect::from_min_size(home, size).contains(c));
+                let t = ctx.animate_value_with_time(
+                    Id::new("neo-miniwin-avoid"),
+                    if dodge { 1.0 } else { 0.0 },
+                    AVOID_SECS,
+                );
+                let pos = home + (away - home) * ease_out_cubic(t);
+                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(pos));
+                paint(ui, &snapshot, &result, fade);
+                // 本视口自驱 60fps：流光 / 避让 / 淡入全靠它。
+                ctx.request_repaint_after(POLL);
             },
         );
 
-        // 8. 小窗开着时把帧率拉上来（隐藏态默认 200ms 一拍，动画会卡）。
-        if open || refading {
+        // 7. 主视口侧的刷新请求只负责「内容快照」（流式文字 / 工具流水）。
+        //    托盘态下它被 eframe 节流到 ~10fps —— 刷文字够用；动画不指望它。
+        if open {
             ctx.request_repaint_after(POLL);
         }
     }
@@ -712,7 +755,12 @@ impl ShotFlash {
                 .with_visible(on)
                 .with_inner_size(vs_size)
                 .with_position(origin),
-            move |ui, _class| paint_flash(ui, frame),
+            move |ui, _class| {
+                paint_flash(ui, frame);
+                // 闪光动画由本视口自驱：主视口托盘态被 eframe 节流到 10fps，
+                // 指望它拉帧率闪光会卡成慢动作。
+                ui.ctx().request_repaint_after(POLL);
+            },
         );
 
         // 5. 闪光与排程期间保持帧率（起燃时刻与动画都靠它）。
