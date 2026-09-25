@@ -81,6 +81,8 @@ pub struct NeoApp {
     miniwin: ui::miniwin::MiniWin,
     /// 截屏完成后的区域闪光（整屏截图 = 全屏边框一闪）。
     shotflash: ui::miniwin::ShotFlash,
+    /// 工具权限确认窗（独立弹出，不绑定主窗）。
+    confirmwin: ui::confirmwin::ConfirmWin,
     /// 已见到的「唤回主窗」信号（`open_app` 工具置位；变了 = AI 要开主界面）。
     show_window_seen: u64,
     /// STT 线程的投喂端（音频帧 / 复位命令）。
@@ -147,6 +149,7 @@ impl NeoApp {
             overlay: None,
             miniwin: Default::default(),
             shotflash: Default::default(),
+            confirmwin: Default::default(),
             show_window_seen: 0,
             stt_tx: None,
             stt_rx: None,
@@ -841,6 +844,8 @@ impl NeoApp {
             .tick(&ctx, &mut self.state, self.theme, self.hidden_to_tray);
         // 截屏闪光：抓帧完成后在被抓区域边缘闪一道白框。
         self.shotflash.tick(&ctx);
+        // 工具确认窗：模型请求权限时独立弹出（不绑主窗，后台也能授权）。
+        self.confirmwin.tick(&ctx, &mut self.state, self.theme);
         // 「打开主界面」工具：执行层只置信号位，这里真正唤窗。
         let show_at = neo_tools::tools::open_app::SHOW_WINDOW_AT
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -869,9 +874,7 @@ impl NeoApp {
         if self.hidden_to_tray {
             return;
         }
-        let tool_modal_open = self.state.awaiting_tool().is_some();
         let modal_open = self.state.show_settings
-            || tool_modal_open
             || self.workspace_picker.is_some()
             || self.state.attachment_picker_open;
         // eframe 交给 `App::ui` 的根 `Ui` 比屏幕内缩一圈（默认 8pt）。
@@ -1004,8 +1007,7 @@ impl NeoApp {
                 .rect_filled(main, 0.0, ui::translucent(p.bg_base, 1.0 - stage_k));
         }
 
-        // 工具确认位于最上层时，设置面板保持状态但不参与交互。
-        if state.show_settings && !tool_modal_open {
+        if state.show_settings {
             ui.interact(
                 screen,
                 Id::new("neo-settings-blocker"),
@@ -1036,30 +1038,8 @@ impl NeoApp {
             }
         }
 
-        // ---- 3.4 工具确认弹窗（覆盖一切，与设置面板同层）----
-        if let Some(index) = state.awaiting_tool() {
-            let remaining = state.awaiting_tool_count();
-            let meta = state.messages[index].tool.clone();
-            if let Some(meta) = meta {
-                match ui::tools::confirm(ui, &skin, &meta, remaining) {
-                    Some(ui::tools::Answer::Once) => state.approve_tool(index),
-                    Some(ui::tools::Answer::Always) => {
-                        // "都允许"只在本次会话内有效，重启即失效。
-                        state.auto_approve_tools = true;
-                        state.approve_tool(index);
-                    }
-                    Some(ui::tools::Answer::Deny) => state.deny_tool(index),
-                    None => {}
-                }
-                // Esc 与"拒绝"同义：弹窗不能没有出口。
-                if escape_pressed {
-                    state.deny_tool(index);
-                }
-            }
-        }
-
-        // 没有任何弹窗时，Esc = 停止当前这一轮（生成或工具执行中）。
-        // 弹窗开着时 Esc 已各有含义（关设置 / 拒工具），不抢。
+        // Esc = 停止当前这一轮（生成或工具执行中）。待确认的工具会随
+        // cancel 置为「已取消」，独立确认窗随之关闭，不需要单独出口。
         if escape_pressed
             && !modal_open
             && (state.generating || state.tool_open || state.tool_round)
@@ -1592,9 +1572,12 @@ fn distance_key(d: Distance) -> &'static str {
 }
 
 impl App for NeoApp {
-    /// 窗口清屏色与主题一致，避免缩放或首帧出现白闪。
+    /// 清屏透明。主窗在 `render` 首行自己铺满主题底色，不依赖清屏色；
+    /// 透明化是为了小窗 / 截屏闪光 / 确认窗这些**透明子视口** —— 它们共用
+    /// 这个清屏色，不透明底色会让透明视口每帧先刷一层主题色，
+    /// 闪光就成了「屏幕先变黑再闪走」。
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        self.theme.palette.bg_base.to_normalized_gamma_f32()
+        [0.0, 0.0, 0.0, 0.0]
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

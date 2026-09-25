@@ -43,6 +43,11 @@ const SHOT_HIDE: Duration = Duration::from_millis(950);
 const POLL: Duration = Duration::from_millis(16);
 /// 工具流水最多保留的步数（旧的滚出，最近的排最下）。
 const MAX_STEPS: usize = 4;
+/// 休眠位：屏幕外远处。本文件的所有视口都**不切 `Visible`**——透明视口
+/// 从隐藏切回可见的首帧还没跑过回调、surface 无内容，DWM 会补一帧黑，
+/// 就是「小窗弹出 / 截屏闪光时屏幕闪一下黑」的来源。改为常态可见 +
+/// 休眠时缩 1x1 挪到这里：surface 自创建起一直有（透明）内容，露面即正片。
+pub(crate) const OFFSCREEN: Pos2 = Pos2::new(-16000.0, -16000.0);
 
 fn viewport_id() -> ViewportId {
     ViewportId::from_hash_of("neo-miniwin")
@@ -148,9 +153,9 @@ struct Snapshot {
     interrupt_open: bool,
     title: String,
     steps: Vec<Step>,
-    /// 思考过程尾部一行（与主界面的「思考过程」块同一个数据源）。
-    thinking: Option<String>,
     body: String,
+    /// 正文是思考过程（或占位）时的淡色标记：content 还空着时 reasoning 顶上来。
+    body_dim: bool,
     streaming: bool,
 }
 
@@ -162,10 +167,23 @@ impl Snapshot {
             .rev()
             .find(|msg| msg.role == Role::Assistant);
         let streaming = last_assistant.is_some_and(|msg| msg.streaming);
-        let body_src = last_assistant
-            .map(|msg| msg.content.trim())
-            .filter(|text| !text.is_empty())
-            .unwrap_or("正在处理…");
+        // 正文优先 content；思考阶段 content 还空着时把 reasoning 顶上来 ——
+        // 小窗只有一块正文区，「正在想什么」就是此刻的正文，不再是干等的
+        // 「正在处理…」。
+        let (body_src, body_dim) = match last_assistant {
+            Some(msg) => {
+                let content = msg.content.trim();
+                let reasoning = msg.reasoning.trim();
+                if !content.is_empty() {
+                    (content, false)
+                } else if !reasoning.is_empty() {
+                    (reasoning, true)
+                } else {
+                    ("正在处理…", true)
+                }
+            }
+            None => ("正在处理…", true),
+        };
         // 正文最多三行：按 CJK 最宽情形（一字符 ≈ 一个字号）估算每行字数，留尾巴。
         let m = theme.metrics;
         let inner_w = m.s(340.0 - 28.0);
@@ -204,11 +222,6 @@ impl Snapshot {
             }
         }
         steps.reverse();
-        // 思考过程：与主界面「思考过程」块同源，小窗只留最新一行的尾巴。
-        let thinking = last_assistant
-            .map(|msg| msg.reasoning.trim())
-            .filter(|text| !text.is_empty())
-            .map(|text| tail(text, per_line));
         // 标题带已用时长：后台跑久了，一眼知道这轮已经花了多久。
         let elapsed = if busy_secs >= 60 {
             format!("{}m{:02}s", busy_secs / 60, busy_secs % 60)
@@ -221,8 +234,8 @@ impl Snapshot {
             interrupt_open,
             title: format!("Neo 执行中 · {elapsed}"),
             steps,
-            thinking,
             body: tail(body_src, per_line * 3),
+            body_dim,
             streaming,
         }
     }
@@ -311,29 +324,18 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>, fade: f32) 
         y += m.s(4.0);
     }
 
-    // 思考过程：淡色小字一行，像主界面折叠块里最新的一句。
-    if let Some(thinking) = &snap.thinking {
-        painter.text(
-            Pos2::new(inner.left(), y),
-            Align2::LEFT_TOP,
-            format!("思考 · {thinking}"),
-            d.font(d.t().caption),
-            tint(p.label_caption),
-        );
-        y += d.t().caption * 1.55 + m.s(2.0);
-    }
-
     let mut body = snap.body.clone();
     if snap.streaming {
         body.push('▍');
     }
-    let galley = painter.layout(
-        body,
-        d.font(d.t().body),
-        tint(p.label_primary),
-        inner.width(),
-    );
-    painter.galley(Pos2::new(inner.left(), y), galley, tint(p.label_primary));
+    // 思考过程用淡色：与正式回答拉开层次，也暗示「还没落定」。
+    let ink = if snap.body_dim {
+        p.label_secondary
+    } else {
+        p.label_primary
+    };
+    let galley = painter.layout(body, d.font(d.t().body), tint(ink), inner.width());
+    painter.galley(Pos2::new(inner.left(), y), galley, tint(ink));
 
     // 边缘流光：小窗只在后台执行中露面，这道光就是「还在跑」的持续信号。
     // 截屏淡出时随卡片一起淡（tint 已乘 fade）。
@@ -430,12 +432,15 @@ pub struct MiniWin {
 }
 
 impl MiniWin {
-    /// 视口 builder：显隐与尺寸给目标值，patch 自己收成增量命令。
+    /// 视口 builder：尺寸按显隐给（休眠 1x1），patch 自己收成增量命令。
     ///
-    /// **故意不带位置**：位置的动画在视口回调里以 `OuterPosition` 命令自驱
-    /// （主视口藏托盘后被节流到 10fps，位置若走 builder patch 会卡）。
-    /// builder 里不给 `position`，patch 就不会把回调挪好的位置拉回去。
-    fn builder(size: Vec2, visible: bool) -> ViewportBuilder {
+    /// 两个反直觉处：
+    /// - **永不切 `Visible`**（恒 true）：透明视口从隐藏切回可见的首帧
+    ///   surface 无内容，DWM 补一帧黑 —— 休眠改走「1x1 + 屏幕外」；
+    /// - **不带位置**：位置的动画在回调里以 `OuterPosition` 命令自驱，
+    ///   builder 给了就会被 patch 拉回（`None` = 不碰）。创建时的初始
+    ///   位置是系统默认，但彼时 1x1 全透明，无感。
+    fn builder(size: Vec2, open: bool) -> ViewportBuilder {
         ViewportBuilder::default()
             .with_title("Neo")
             .with_decorations(false)
@@ -445,8 +450,8 @@ impl MiniWin {
             .with_active(false)
             // 透明：squircle 卡片四个角外不该是一块直角底色。
             .with_transparent(true)
-            .with_visible(visible)
-            .with_inner_size(size)
+            .with_visible(true)
+            .with_inner_size(if open { size } else { Vec2::new(1.0, 1.0) })
     }
 
     /// 每帧驱动一次。放在 `tick()` 里而不是 `render()` 里：
@@ -515,8 +520,14 @@ impl MiniWin {
         let away = Pos2::new(margin, margin);
 
         // 5. 打断确认：后台执行中 + 本轮动过鼠标/键盘 + 左键按下沿。
-        //    点在小窗自己身上不算（那是在点弹窗按钮）。
-        if lmb_edge && open && !self.interrupt_open && used_mouse_or_keyboard(state) {
+        //    点在小窗自己身上不算（那是在点弹窗按钮）；有待确认的工具也不算 ——
+        //    那一击多半是点在独立确认窗的按钮上，且等待权限时 AI 本就停着。
+        if lmb_edge
+            && open
+            && !self.interrupt_open
+            && state.awaiting_tool().is_none()
+            && used_mouse_or_keyboard(state)
+        {
             let on_miniwin = cursor.is_some_and(|c| {
                 Rect::from_min_size(home, size).contains(c)
                     || Rect::from_min_size(away, size).contains(c)
@@ -544,23 +555,25 @@ impl MiniWin {
         //    主窗一藏反而不来」的根因。每帧注册还带来自愈：即便极端时序下被
         //    回收，下一个真 pass 也会按 builder 原样重建窗口。
         //
-        //    显隐走两条路：builder 的 `with_visible` 由 patch 在真 pass 收增量；
-        //    显式 `ViewportCommand::Visible` 兜底 —— 主窗藏托盘后的 logic-only
-        //    路径不跑 pass、不产生 patch，只有显式命令照送不误。小窗一旦可见，
-        //    `is_viewport_or_descendant_visible` 又反向强制主窗跑真 pass，
+        //    显隐不切 `Visible`（恒 true）：露面 = 恢复尺寸 + 挪回屏幕内，
+        //    休眠 = 缩 1x1 + 挪去 OFFSCREEN；透明视口的「隐藏→可见」首帧会
+        //    闪黑（surface 空），尺寸/位置切换不经过那一帧。显式命令兜底
+        //    logic-only（patch 不跑），与 builder patch 双通道幂等。小窗一旦
+        //    露面，`is_viewport_or_descendant_visible` 反向强制主窗跑真 pass，
         //    内容快照的增量更新随之恢复（但被托盘节流到 10fps，只够刷文字）。
         if open != self.shown {
             if open {
-                // 先落位再露面，免得窗口在系统默认位置闪出一帧；
+                // 先落位再恢复尺寸，免得在屏幕内从 1x1 长大被瞥见；
                 // 每次露面都重新提到顶层，盖过同屏后到的其它 topmost 窗口。
                 ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(home));
-                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::InnerSize(size));
                 ctx.send_viewport_cmd_to(
                     viewport_id(),
                     ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop),
                 );
             } else {
-                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Visible(false));
+                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::InnerSize(Vec2::new(1.0, 1.0)));
+                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(OFFSCREEN));
             }
             self.shown = open;
         }
@@ -624,7 +637,14 @@ impl MiniWin {
                     AVOID_SECS,
                 );
                 let pos = home + (away - home) * ease_out_cubic(t);
-                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(pos));
+                // 位置没变就不发：每条命令都是一次 SetWindowPos + DWM 重合成，
+                // 静止时每帧白调是纯开销。
+                let pos_id = Id::new("neo-miniwin-pos");
+                let last = ctx.data_mut(|d| d.get_temp::<Pos2>(pos_id));
+                if last != Some(pos) {
+                    ctx.data_mut(|d| d.insert_temp(pos_id, pos));
+                    ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(pos));
+                }
                 paint(ui, &snapshot, &result, fade);
                 // 本视口自驱 60fps：流光 / 避让 / 淡入全靠它。
                 ctx.request_repaint_after(POLL);
@@ -669,7 +689,7 @@ pub struct ShotFlash {
     flash_at: Option<Instant>,
     /// 闪光起点（Some = 正在闪）。
     flashing_since: Option<Instant>,
-    /// 上一帧是否已发 `Visible(true)`（沿检测用）。
+    /// 上一帧是否在闪（沿检测用）。
     shown: bool,
 }
 
@@ -710,14 +730,23 @@ impl ShotFlash {
         );
         let origin = Pos2::new(vs.x as f32 / ppp, vs.y as f32 / ppp);
 
-        // 3. 显隐沿：显式命令兜底（logic-only 下唯一通道），露面即提顶。
+        // 3. 显隐沿：不切 `Visible`（恒 true）——全屏透明视口的「隐藏→可见」
+        //    首帧 surface 无内容，DWM 补一帧全屏黑，正是「截屏时屏幕闪黑」。
+        //    起闪 = 恢复全屏尺寸 + 挪到虚拟屏原点；熄闪 = 缩 1x1 回 OFFSCREEN。
         if on != self.shown {
-            ctx.send_viewport_cmd_to(flash_viewport_id(), ViewportCommand::Visible(on));
             if on {
+                ctx.send_viewport_cmd_to(flash_viewport_id(), ViewportCommand::OuterPosition(origin));
+                ctx.send_viewport_cmd_to(flash_viewport_id(), ViewportCommand::InnerSize(vs_size));
                 ctx.send_viewport_cmd_to(
                     flash_viewport_id(),
                     ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop),
                 );
+            } else {
+                ctx.send_viewport_cmd_to(
+                    flash_viewport_id(),
+                    ViewportCommand::InnerSize(Vec2::new(1.0, 1.0)),
+                );
+                ctx.send_viewport_cmd_to(flash_viewport_id(), ViewportCommand::OuterPosition(OFFSCREEN));
             }
             self.shown = on;
         }
@@ -752,10 +781,14 @@ impl ShotFlash {
                 .with_active(false)
                 .with_transparent(true)
                 .with_mouse_passthrough(true)
-                .with_visible(on)
-                .with_inner_size(vs_size)
-                .with_position(origin),
+                // 恒可见（见 OFFSCREEN 注释）：熄闪态是 1x1 屏幕外。
+                .with_visible(true)
+                .with_inner_size(if on { vs_size } else { Vec2::new(1.0, 1.0) })
+                .with_position(if on { origin } else { OFFSCREEN }),
             move |ui, _class| {
+                if frame.is_none() {
+                    return;
+                }
                 paint_flash(ui, frame);
                 // 闪光动画由本视口自驱：主视口托盘态被 eframe 节流到 10fps，
                 // 指望它拉帧率闪光会卡成慢动作。
