@@ -31,6 +31,7 @@ fn registry_is_well_formed() {
             "read_file",
             "read_document",
             "view_image",
+            "web_search",
             "open_file",
             "open_app",
             "write_file",

@@ -15,6 +15,7 @@
 | `read_file` | 查看文件 | `read` | 读文本文件内容给模型看 | 图片走 `view_image`；Word/PPT 走 `read_document` |
 | `read_document` | 读取文档 | `read` | 提取 DOC/DOCX、PPT/PPTX 及文本正文并按字符分页 | 不做 OCR，不执行宏，不读取工作区外路径 |
 | `view_image` | 查看图片 | `read` | 报图片格式/尺寸，可选取回原始数据 | 它不解码像素、不做识别 |
+| `web_search` | 联网搜索 | `read` | 抓 Bing 结果页，把标题/链接/摘要回给模型；可在用户浏览器打开搜索页 | 只发 GET、只给摘要；要读某网页正文它做不到 |
 | `open_file` | 打开文件 | `open` | 在用户机器上打开文件/定位它 | 它不读内容，给模型读要用 `read_file` |
 | `open_app` | 打开主界面 | `open` | 把 Neo 主窗口从托盘唤回屏幕 | 主窗已在屏幕上时是空操作 |
 | `write_file` | 写入文件 | `write` | 写入或整体覆盖 | 只改一小段用 `edit_file` |
@@ -136,6 +137,52 @@
 
 **边界**：**不做图像处理**。缩放、裁切、OCR、识别画面内容都不在这里 ——
 它只回答"这是什么图、多大、原始数据能不能给你"。要看画面内容，靠多模态模型。
+
+---
+
+### 2.5 `web_search` —— 联网搜索
+
+**用途**：用 Bing 搜索互联网，**不需要任何 API key/token** —— 直接 HTTPS GET
+抓结果页（浏览器 UA），解析出自然结果回给模型。时效或课外事实（新闻、近况、
+没把握的知识）用它核实，不要凭记忆硬答。
+
+**风险**：`read`（只出网、不进工作区，直接放行）。查询词会发给 Bing ——
+课堂场景里这与老师自己开浏览器搜一下等价。
+
+| 参数 | 类型 | 必填 | 默认 | 约束 | 说明 |
+|---|---|---|---|---|---|
+| `query` | string | ✅ | — | 非空 | 自然语言问题或关键词，越具体越准 |
+| `count` | integer | | `5` | `1…10` | 返回的结果条数 |
+| `open_browser` | boolean | | `false` | — | `true` = 同时在用户默认浏览器里打开搜索页（结果给用户亲眼看） |
+
+**成功返回**
+
+```json
+{ "ok": true, "tool": "web_search", "summary": "搜索「李白」（5 条结果）",
+  "data": { "query": "李白", "opened_in_browser": false,
+            "results": [ { "title": "…", "url": "…", "snippet": "…" } ] } }
+```
+
+`snippet` 截断到 300 字符；总回灌仍受 24 000 字符上限约束。
+`open_browser=true` 时浏览器侧先打开（失败则整个失败 —— 用户要的就是那扇窗）；
+此时抓取失败不算白跑：`results` 为空并带 `note`，模型如实转述即可。
+
+**失败**
+
+| 情形 | kind | hint 指向 |
+|---|---|---|
+| 缺 `query` / 为空 | `bad_arguments` | 必填参数 |
+| 连接超时（10 s） | `timeout` | 检查课堂网络后重试 |
+| 连不上 / 非 200 | `io` | 换搜索词，或 `open_browser=true` 让用户自己搜 |
+| 一条结果都解析不出 | `unsupported` | 页面结构变了或触发反爬；`open_browser=true` 兜底 |
+
+**边界**：只发 GET、不登录、不带 cookie、不执行页面脚本；结果 HTML 不原样回灌
+（解析器按 `<li class="b_algo">` 切块取 `<h2><a>` 与摘要 `<p>`，手写扫描，
+不引 HTML 解析器 —— 结构变了就报 `unsupported`，不会因依赖升级悄悄变行为）。
+它是 neo-tools「无网络」宣言的**唯一例外**；要读某个具体网页的正文它做不到
+（只有摘要），那种需求目前用摘要里的链接 + 用户浏览器解决。
+
+执行在独立线程（同所有工具），10 秒超时不会冻住大屏。
 
 ---
 
@@ -649,7 +696,7 @@ npm run dev *> .neo-dev.log
 
 | 风险 | 工具 | 默认裁定 |
 |---|---|---|
-| `read` | `read_file` / `view_image` | 直接放行 |
+| `read` | `read_file` / `view_image` / `web_search` | 直接放行 |
 | `open` | `open_file` / `open_app` / `remember` / `forget` | 直接放行（策略可关） |
 | `write` | `write_file` / `edit_file` | **需用户确认** |
 | `exec` | `powershell` / `bash` / `click` / `drag` | **需用户确认** |

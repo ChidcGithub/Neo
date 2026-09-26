@@ -9,6 +9,8 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# web_search 的唯一网络出口：blocking GET（工具本来就跑在独立线程）
+reqwest = { workspace = true }
 image = { workspace = true, features = ["jpeg", "webp", "gif", "bmp"] }
 base64 = "0.22.1"
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }

@@ -24,6 +24,7 @@ pub(crate) mod screen_uia;
 pub mod screenshot;
 pub mod shell;
 pub mod view_image;
+pub mod web_search;
 pub mod write_file;
 
 use crate::policy::Risk;
@@ -58,6 +59,18 @@ pub static REGISTRY: &[Tool] = &[
         params: view_image::PARAMS,
         preview: view_image::preview,
         run: view_image::run,
+    },
+    // 联网读取：只出网、不进工作区，所以排在本地「读」之后、「打开」之前。
+    Tool {
+        name: "web_search",
+        title: "联网搜索",
+        purpose: "用 Bing 搜索互联网：解析结果页，把标题 / 链接 / 摘要回给你（不需要任何 key）。\
+                 \n时效或课外事实（新闻、近况、没把握的知识）用它核实，不要凭记忆硬答；\
+                 用户想自己看网页时设 open_browser=true，在其浏览器里打开搜索页。",
+        risk: Risk::Read,
+        params: web_search::PARAMS,
+        preview: web_search::preview,
+        run: web_search::run,
     },
     Tool {
         name: "open_file",

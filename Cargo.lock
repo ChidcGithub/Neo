@@ -3299,6 +3299,7 @@ dependencies = [
  "encoding_rs",
  "image",
  "quick-xml 0.41.0",
+ "reqwest",
  "serde",
  "serde_json",
  "windows",
