@@ -9,15 +9,12 @@
 //! 横向偏移必须放进一次左到右布局（见 `draw_messages`），
 //! 且要用 `set_max_width(content_w)` 收窄，否则 Markdown 的代码块会撑到屏边。
 
-use egui::{Color32, Rect, ScrollArea, Sense, Ui, Vec2};
+use egui::{Rect, ScrollArea, Sense, Ui, Vec2};
 use neo_theme::SquirclePaint;
 use neo_ui::{Icon, IconButton};
 
-use super::{composer, elide, markdown, text_left, translucent, Skin};
+use super::{composer, elide, markdown, text_left, Skin};
 use crate::state::{AppState, Role};
-
-/// 消息入场淡入时长（对应 spec `--ds-transition-duration` 标准档 0.2s）。
-const ENTER_FADE: f32 = 0.2;
 
 /// 对话态上发生的用户动作。
 #[derive(Default, Clone, Copy)]
@@ -128,10 +125,6 @@ fn draw_messages(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState)
     // 上游 `--dsh-chat-content-width` 同样是居中的（输入卡再宽 32px）。
     // 注意 `add_space` 只在纵向生效：横向让位必须在左到右布局里放一个空白项。
     let x_off = ((rect.width() - content_w) * 0.5).max(0.0);
-    // 入场淡入所需的跨帧状态（本帧之前已播过的条数 + 会话代次）。
-    let entered = state.entered_count.min(state.messages.len());
-    let seq = state.session_seq;
-    let fade = skin.p().bg_base;
 
     super::at(ui, rect, |ui| {
         let scroll = ScrollArea::vertical()
@@ -146,28 +139,10 @@ fn draw_messages(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState)
                         // 收窄到内容列：Markdown / 代码块按列宽换行，不会撑到屏边。
                         ui.set_max_width(content_w);
                         ui.spacing_mut().item_spacing.y = gap;
-                        for (i, msg) in state.messages.iter().enumerate() {
-                            // egui 动画首调直接返回目标值 —— 新消息必须先播种 0
-                            // 再启动到 1 才有过渡；老消息每帧续播 1，收敛后是纯查表。
-                            let id = egui::Id::new(("neo-msg-enter", seq, i));
-                            let k = if i < entered {
-                                ui.ctx().animate_value_with_time(id, 1.0, ENTER_FADE)
-                            } else {
-                                ui.ctx().animate_value_with_time(id, 0.0, ENTER_FADE);
-                                ui.ctx().animate_value_with_time(id, 1.0, ENTER_FADE)
-                            };
-                            let top = ui.cursor().min;
+                        // 直接铺，不做逐条入场淡入 —— 每条消息一个动画 Id 的
+                        // 代价换来的只是"看着热闹"，简约界面里内容即到位。
+                        for msg in &state.messages {
                             draw_one(ui, skin, state, msg, content_w);
-                            if k < 1.0 {
-                                // 用背景色遮罩"盖住再掀开"，等价于整条淡入，
-                                // 不必逐形状穿透 markdown / 工具卡里的子 Ui。
-                                let cover = Rect::from_min_max(
-                                    top,
-                                    egui::pos2(top.x + content_w, ui.cursor().top()),
-                                );
-                                ui.painter()
-                                    .rect_filled(cover, 0.0, translucent(fade, 1.0 - k));
-                            }
                         }
                         ui.add_space(m.s(8.0));
                         // Expand the existing rect, not set_min_height: in egui 0.36
@@ -188,8 +163,6 @@ fn draw_messages(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState)
         });
         let _ = scroll;
     });
-    // 本帧起新出现的消息都已播种并启动淡入，后续帧走"续播 1"分支。
-    state.entered_count = state.messages.len();
 }
 
 /// 单条消息：用户气泡 / 助手（思考 + 正文 + 错误 + 元信息）。
@@ -317,8 +290,7 @@ fn draw_reasoning(ui: &mut Ui, skin: &Skin<'_>, content_w: f32, text: &str) {
     );
 }
 
-/// 生成中的「鲸息气泡」：三个点错相上浮 + 淡出，像鲸鱼呼出的气泡
-/// （Neo 品牌动效，见 docs/neo-brand.md §四；接替上游 `.pending` 的原地呼吸）。
+/// 生成中的三个相位错开的脉动点（对应 Harness `.pending` 的呼吸）。
 fn pulsing_dots(ui: &mut Ui, skin: &Skin<'_>, content_w: f32) {
     let p = skin.p();
     let m = skin.m();
@@ -326,20 +298,15 @@ fn pulsing_dots(ui: &mut Ui, skin: &Skin<'_>, content_w: f32) {
     let cy = r.center().y;
     let d = m.s(5.0);
     let gap = m.s(14.0);
-    let rise = m.s(4.0);
     let t = ui.ctx().time();
     for i in 0..3usize {
-        // 1s 一轮，每个点错开 0.18s（节奏沿用上游，运动改为上浮）。
-        let phase = ((t - i as f64 * 0.18) as f32).rem_euclid(1.0);
-        // 正弦包络：淡入 → 淡出；位移随相位匀速上升，半径收尾微缩。
-        let alpha = (phase * std::f32::consts::PI).sin();
-        let k = alpha * alpha; // 平方缓动：两端更柔
-        let y = cy + rise * (0.5 - phase) * 2.0;
-        let radius = d * 0.5 * (0.85 + 0.15 * k);
+        // 1s 一轮，每个点错开 0.18s。
+        let phase = (t - i as f64 * 0.18) as f32;
+        let k = 0.3 + 0.7 * (0.5 + 0.5 * (phase * std::f32::consts::TAU).sin());
         ui.painter().circle_filled(
-            egui::pos2(r.left() + gap + i as f32 * gap, y),
-            radius,
-            super::translucent(p.accent, 0.15 + 0.85 * k),
+            egui::pos2(r.left() + gap + i as f32 * gap, cy),
+            d * 0.5,
+            super::translucent(p.accent, k),
         );
     }
     // 动画期间保持重绘。
@@ -387,7 +354,6 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     let awaiting = tool.state == ToolState::AwaitingConfirm;
     let denied = tool.state == ToolState::Denied;
     let cancelled = tool.state == ToolState::Cancelled;
-    let running = tool.state == ToolState::Running;
     // 取消不是失败：中性灰，不上错误色。
     let failed = denied || (tool.outcome.is_some() && !tool.ok());
 
@@ -541,13 +507,6 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
         );
     }
 
-    // ---- 执行中：扫光 ----
-    if running {
-        sweep(ui, skin, row);
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(16));
-    }
-
     // ---- 失败：第二行说明 ----
     if let Some(g) = err_galley {
         painter.galley(
@@ -576,54 +535,4 @@ fn icon_for(variant: neo_tools::present::Variant) -> Icon {
         Variant::Screen => Icon::Board,
         Variant::Others => Icon::Dots,
     }
-}
-
-/// 执行中的扫光：一条柔和高光从左扫到右（上游 300px 宽、2.6s、ease-out 循环）。
-fn sweep(ui: &Ui, skin: &Skin<'_>, row: egui::Rect) {
-    let m = skin.m();
-    let band = m.s(300.0);
-    let period = 2.6f32;
-    let time = ui.input(|i| i.time) as f32;
-    let phase = (time / period) % 1.0;
-    // 上游关键帧：0% → left = -300px；90%…100% → left = 100%（越界后不可见）。
-    let p = (phase / 0.9).min(1.0);
-    let travel = row.width() + band;
-    let x = row.left() - band + p * travel;
-
-    let tex = sweep_texture(ui.ctx(), skin);
-    let target =
-        egui::Rect::from_min_size(egui::pos2(x, row.top()), egui::vec2(band, row.height()));
-    let p = ui.painter().with_clip_rect(row);
-    p.image(
-        tex.id(),
-        target,
-        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
-}
-
-/// 扫光贴图：一条两端透明、中间稍亮的横向渐变（缓存一份）。
-fn sweep_texture(ctx: &egui::Context, skin: &Skin<'_>) -> egui::TextureHandle {
-    let id = egui::Id::new("neo-tool-sweep");
-    if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
-        return t;
-    }
-    const W: usize = 128;
-    // 上游用的是「底色 60% 混合透明」；这里取正文色的低透明度高光，观感一致。
-    let base = skin.p().label_primary;
-    let pixels: Vec<Color32> = (0..W)
-        .map(|i| {
-            let t = i as f32 / (W - 1) as f32;
-            // 两端为 0，中间 0.55 处最亮
-            let a = if t < 0.55 { t / 0.55 } else { (1.0 - t) / 0.45 };
-            base.gamma_multiply(a.clamp(0.0, 1.0) * 0.10)
-        })
-        .collect();
-    let tex = ctx.load_texture(
-        "neo-tool-sweep",
-        egui::ColorImage::new([W, 1], pixels),
-        egui::TextureOptions::LINEAR,
-    );
-    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
-    tex
 }

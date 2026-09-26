@@ -97,13 +97,10 @@ fn notice_text(state: &AppState) -> &'static str {
 }
 
 /// 静息与悬停的卡片描边色。
-fn card_stroke(skin: &Skin<'_>, hovered: bool) -> egui::Stroke {
-    let p = skin.p();
-    if hovered {
-        egui::Stroke::new(1.0, p.border_l3)
-    } else {
-        egui::Stroke::new(1.0, p.border_l2)
-    }
+/// 卡片描边：恒定 1px —— hover 不再换色（聚焦环已经表达了「它在听你说话」，
+/// 描边再随悬停加深是第二重视觉噪音）。
+fn card_stroke(skin: &Skin<'_>) -> egui::Stroke {
+    egui::Stroke::new(1.0, skin.p().border_l2)
 }
 
 /// 文本区高度：随内容增长，`[min, max]` 之间收敛。
@@ -448,24 +445,11 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
     }
 
     // ---- 卡片本体 ----
-    // 悬停判定用整张卡的范围，让"鼠标进入卡片即高亮"这种大屏下的粗操作手感成立。
-    let card_hit = ui.interact(
-        rect,
-        ui.id()
-            .with(("composer", rect.left() as i32, rect.top() as i32)),
-        Sense::click(),
-    );
-    let hovered = card_hit.hovered();
     let painter = ui.painter().clone();
 
     let shadow = super::elevation_soft(skin);
     painter.add(shadow.as_shape(rect, m.radius_card()));
-    painter.squircle(
-        rect,
-        m.radius_card(),
-        p.input_surface,
-        card_stroke(skin, hovered),
-    );
+    painter.squircle(rect, m.radius_card(), p.input_surface, card_stroke(skin));
 
     // 聚焦环：键盘焦点落在编辑区时，卡片外沿浮出一圈 accent 描边（0.1s 缓动，
     // 对应 spec fast 档）。画在卡片本体之上、内容之下；失焦淡出到 0 即不画。
@@ -505,7 +489,7 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
         let font = skin.prop(skin.t().body);
         let ph_rect = inset(text_rect, 0.0, m.s(4.0), 0.0, 0.0);
         let hint = if hero {
-            "问点什么，或者从下面挑一个课堂场景"
+            "问点什么…"
         } else {
             "继续追问…"
         };
@@ -627,27 +611,6 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
         .clicked()
     {
         out.next_model = true;
-    }
-
-    // 提示文本：把"回车发送"这类约定讲清楚，大屏上用户很少看文档。
-    let hint_x = ro_rect.right() + m.toolbar_gap();
-    if hint_x < model_rect.left() - m.s(8.0) {
-        let hint = "Enter 发送 · Shift+Enter 换行";
-        let avail = model_rect.left() - m.s(8.0) - hint_x;
-        let font = skin.prop(skin.t().caption);
-        let shown = elide(&painter, hint, &font, avail);
-        if !shown.is_empty() {
-            text_left(
-                &painter,
-                Rect::from_min_max(
-                    egui::pos2(hint_x, mid - chip_h * 0.5),
-                    egui::pos2(model_rect.left(), mid + chip_h * 0.5),
-                ),
-                &shown,
-                font,
-                p.label_caption,
-            );
-        }
     }
 
     out

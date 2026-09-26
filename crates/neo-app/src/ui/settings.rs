@@ -36,7 +36,6 @@ pub struct ClusterOutcome {
 /// 一键搞定比"打开设置再选"少两步。想看缩放链路细节再进设置 → 显示。
 pub fn profile_cluster(ui: &Ui, skin: &Skin<'_>, rect: Rect, state: &AppState) -> ClusterOutcome {
     let d = skin.d();
-    let p = skin.p();
     let m = skin.m();
     let h = m.chip_h();
     let mut out = ClusterOutcome::default();
@@ -54,15 +53,9 @@ pub fn profile_cluster(ui: &Ui, skin: &Skin<'_>, rect: Rect, state: &AppState) -
         .show_at(ui, &d, btn_center)
         .clicked();
 
-    // 距离 chip
+    // 距离 chip：组件库 Chip（无描边，比手搓的描边胶囊更安静）。
     let label = format!("观看距离 · {}", state.distance.label());
-    let font = d.font_bold(d.t().caption);
-    let tw = ui
-        .painter()
-        .layout_no_wrap(label.clone(), font.clone(), p.label_secondary)
-        .size()
-        .x;
-    let chip_w = tw + m.s(22.0);
+    let chip_w = neo_ui::Chip::width(&ui.painter(), &d, &label, false);
     let chip = Rect::from_min_size(
         egui::pos2(
             btn_center.x - btn_d * 0.5 - m.s(8.0) - chip_w,
@@ -70,21 +63,10 @@ pub fn profile_cluster(ui: &Ui, skin: &Skin<'_>, rect: Rect, state: &AppState) -
         ),
         Vec2::new(chip_w, h),
     );
-    let dist_resp = super::tap(ui, chip, ui.id().with("neo-distance-chip"));
-    let st = super::State::of(&dist_resp);
-    let fill = if st.hovered {
-        p.hover_solid
-    } else {
-        p.bg_layer_2
-    };
-    ui.painter().squircle(
-        chip,
-        m.radius_chip(),
-        fill,
-        egui::Stroke::new(1.0, p.border_l1),
-    );
-    super::text_center(ui.painter(), chip, &label, font, p.label_secondary);
-    out.distance = dist_resp.clicked();
+    out.distance = neo_ui::Chip::new(&label)
+        .id_salt("neo-distance-chip")
+        .show_at(ui, &d, chip)
+        .clicked();
 
     out
 }
@@ -361,26 +343,12 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     hint_row(ui, skin, width, "仅保存在本机数据库，不会上传");
     ui.add_space(m.s(16.0));
 
-    section_label_row(ui, skin, width, "当前模型");
     let name = if state.has_models() {
         format!("{}（{}）", state.model_display(), state.model_id())
     } else {
         "未选择模型".to_owned()
     };
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, m.s(30.0)), Sense::hover());
-    ui.painter().squircle(
-        rect,
-        m.radius_chip(),
-        skin.p().bg_layer_2,
-        egui::Stroke::new(1.0, skin.p().border_l1),
-    );
-    text_left(
-        ui.painter(),
-        neo_ui::inset_all(rect, 8.0),
-        &name,
-        skin.prop(skin.t().label),
-        skin.p().label_secondary,
-    );
+    kv_row(ui, skin, width, "当前模型", &name);
     ui.add_space(m.s(6.0));
     let switch_hint = if state.model_def().is_some_and(|m| m.reasoning) {
         "在输入卡的模型选择器里切换（点一下循环）· 该模型默认开启思考"

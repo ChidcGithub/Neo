@@ -94,10 +94,7 @@ impl<'a> Skin<'a> {
 
 // ---- 组件库转发：让页面 `use crate::ui::…` 一处拿到常用接口 ----
 
-pub use neo_ui::{
-    at, bottom_fade, ease, elide, hover_area, inset, tap, text_center, text_left, translucent,
-    State,
-};
+pub use neo_ui::{at, bottom_fade, ease, elide, hover_area, inset, tap, text_left, translucent, State};
 
 /// 区块小标题（`Design` → `Skin` 包装）。
 pub fn section_label(painter: &egui::Painter, skin: &Skin<'_>, rect: egui::Rect, label: &str) {

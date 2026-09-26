@@ -7,57 +7,22 @@
 //! .headline { gap: 10px; font-size: 26px; line-height: 32px; font-weight: 500 }
 //! .stack    { flex-direction: column; gap: 12px; max-width: --dsh-composer-card-max-width }
 //! ```
-//!
-//! Neo 在下方追加一行场景卡：教室一体机前，老师需要一个"点一下就开始"的入口，
-//! 而不是先想清楚要问什么。
 
 use egui::{Rect, Ui, Vec2};
 use neo_theme::SquirclePaint;
-use neo_ui::{Card, Icon};
+use neo_ui::Icon;
 
-use super::{composer, elide, inset, text_left, Skin};
-use crate::state::{AppState, SceneIcon, SCENES};
+use super::{composer, elide, text_left, Skin};
+use crate::state::AppState;
 
 /// hero 上发生的用户动作。
 #[derive(Default, Clone, Copy)]
 pub struct Outcome {
     pub workspace_clicked: bool,
-    pub scene_clicked: Option<usize>,
     pub composer: composer::Outcome,
 }
 
-/// 只在每张场景卡都有足够宽度时排成单行；窄屏改为两列。
-fn scene_columns(width: f32, min_cell: f32, gap: f32, count: usize) -> usize {
-    let count = count.max(1);
-    if width >= count as f32 * min_cell + (count - 1) as f32 * gap {
-        count
-    } else {
-        count.min(2)
-    }
-}
-
-/// 同行卡片等高，并按提示语的实际换行高度为每一行留足空间。
-fn scene_h(ui: &Ui, skin: &Skin<'_>, rows: usize, cell_w: f32) -> f32 {
-    let m = skin.m();
-    let hint_h = SCENES
-        .iter()
-        .map(|scene| {
-            ui.painter()
-                .layout(
-                    scene.hint.into(),
-                    skin.prop(skin.t().caption),
-                    skin.p().label_caption,
-                    (cell_w - m.s(32.0)).max(1.0),
-                )
-                .size()
-                .y
-        })
-        .fold(0.0_f32, f32::max);
-    let cell_h = m.s(116.0).max(m.s(84.0) + hint_h);
-    rows as f32 * cell_h + rows.saturating_sub(1) as f32 * m.s(12.0)
-}
-
-/// 绘制空态。
+/// 绘制空态：鲸鱼 + 标题 / workspace chip / 输入卡，三段垂直居中。
 pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> Outcome {
     let p = skin.p();
     let m = skin.m();
@@ -70,14 +35,11 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
     let headline_h = t.headline_lh;
     let chip_h = m.s(28.0);
     let gap = m.stack_gap();
-    let scenes_gap = m.s(36.0);
-    let n = SCENES.len();
-    let cols = scene_columns(card_w, m.s(174.0), m.s(12.0), n);
-    let rows = n.div_ceil(cols);
-    let scene_cell_w = (card_w - m.s(12.0) * (cols - 1) as f32) / cols as f32;
-    let scenes_h = scene_h(ui, skin, rows, scene_cell_w);
+    // 标题与下方内容之间留开一点：它是这一列的「组标题」，
+    // 与 chip/输入卡的节奏区分开。
+    let head_gap = m.s(28.0);
 
-    let total = headline_h + gap + chip_h + gap + card_h + scenes_gap + scenes_h;
+    let total = headline_h + head_gap + chip_h + gap + card_h;
     // 顶部留一点余量，视觉重心比几何中心略高更稳。
     let top = area.center().y - total * 0.5 - area.height() * 0.02;
     let top = top.max(area.top() + m.s(24.0));
@@ -135,11 +97,21 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
         p.label_primary,
     );
 
-    // ---- workspace chip ----
-    let chip_top = gy + headline_h + gap;
+    // ---- workspace chip（宽度随内容收缩，不撑满也不留白）----
+    let chip_top = gy + headline_h + head_gap;
+    let chip_font = skin.bold(skin.t().label);
+    let label = state.workspace.as_deref().unwrap_or("选择工作区");
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), chip_font.clone(), p.label_primary)
+        .size()
+        .x
+        .min(m.s(280.0));
+    // icon(16) + 间距(4) + 文字 + 间距(4) + chevron(10) + 两侧内边距(14+12)
+    let chip_w = m.s(14.0 + 16.0 + 4.0) + text_w + m.s(4.0 + 10.0 + 12.0);
     let chip = Rect::from_min_size(
         egui::pos2(col.left() + m.workspace_row_pad(), chip_top),
-        Vec2::new(m.s(360.0), chip_h),
+        Vec2::new(chip_w, chip_h),
     );
     if workspace_chip(ui, skin, chip, state.workspace.as_deref()) {
         out.workspace_clicked = true;
@@ -151,28 +123,6 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
         Vec2::new(card_w, card_h),
     );
     out.composer = composer::draw(ui, skin, card, state, true);
-
-    // ---- 场景卡 ----
-    let scenes_top = card.bottom() + scenes_gap;
-    let cgap = m.s(12.0);
-    let cell_w = (card_w - cgap * (cols as f32 - 1.0)) / cols as f32;
-    let cell_h = (scenes_h - cgap * (rows as f32 - 1.0)) / rows as f32;
-
-    for (i, scene) in SCENES.iter().enumerate() {
-        let r = i / cols;
-        let c = i % cols;
-        let rect = Rect::from_min_size(
-            egui::pos2(
-                col.left() + c as f32 * (cell_w + cgap),
-                scenes_top + r as f32 * (cell_h + cgap),
-            ),
-            Vec2::new(cell_w, cell_h),
-        );
-        let selected = state.active_scene == Some(i);
-        if scene_card(ui, skin, rect, scene, selected) {
-            out.scene_clicked = Some(i);
-        }
-    }
 
     out
 }
@@ -227,89 +177,4 @@ fn workspace_chip(ui: &Ui, skin: &Skin<'_>, rect: Rect, label: Option<&str>) -> 
     );
 
     resp.clicked()
-}
-
-/// 一张场景卡。
-///
-/// 表面 + 悬停抬升 + 选中描边全部来自组件库 [`Card`]；本函数只画内容
-/// （图标、标题、提示语）。
-fn scene_card(
-    ui: &Ui,
-    skin: &Skin<'_>,
-    rect: Rect,
-    scene: &crate::state::Scene,
-    selected: bool,
-) -> bool {
-    let d = skin.d();
-    let p = skin.p();
-    let m = skin.m();
-
-    // 悬停态取自卡片的交互结果（Card 内部注册了点击 + 抬升动画）。
-    let (rect, resp) = Card::bubble()
-        .interactive()
-        .selected(selected)
-        .id_salt(("neo-scene", scene.title))
-        .paint(ui, &d, rect);
-    let st = super::State::of(
-        resp.as_ref()
-            .expect("interactive card always returns a response"),
-    );
-    let painter = ui.painter();
-
-    let inner = inset(rect, m.s(16.0), m.s(14.0), m.s(16.0), m.s(14.0));
-    let icon_box = Rect::from_min_size(inner.min, Vec2::splat(m.s(22.0)));
-    let icon_color = if selected || st.hovered {
-        p.accent
-    } else {
-        p.label_secondary
-    };
-    let icon = match scene.icon {
-        SceneIcon::Board => Icon::Board,
-        SceneIcon::Checklist => Icon::Checklist,
-        SceneIcon::Pen => Icon::Pen,
-        SceneIcon::Mic => Icon::Mic,
-    };
-    icon.paint(painter, icon_box, icon_color, 1.6);
-
-    let title_font = d.font_bold(d.t().label + m.s(1.0));
-    painter.text(
-        egui::pos2(inner.left(), icon_box.bottom() + m.s(12.0)),
-        egui::Align2::LEFT_TOP,
-        scene.title,
-        title_font,
-        p.label_primary,
-    );
-
-    let hint_font = d.font(d.t().caption);
-    let hint_top = icon_box.bottom() + m.s(12.0) + m.s(22.0);
-    let hint_rect = Rect::from_min_max(
-        egui::pos2(inner.left(), hint_top),
-        egui::pos2(inner.right(), inner.bottom()),
-    );
-    let galley = painter.layout(
-        scene.hint.to_owned(),
-        hint_font,
-        p.label_caption,
-        hint_rect.width(),
-    );
-    debug_assert!(
-        galley.size().y <= hint_rect.height() + 0.5,
-        "场景卡提示语溢出"
-    );
-    painter.galley(hint_rect.min, galley, p.label_caption);
-
-    resp.expect("interactive card always returns a response")
-        .clicked()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::scene_columns;
-
-    #[test]
-    fn scene_columns_keep_cards_readable() {
-        assert_eq!(scene_columns(714.0, 174.0, 12.0, 4), 2);
-        assert_eq!(scene_columns(732.0, 174.0, 12.0, 4), 4);
-        assert_eq!(scene_columns(400.0, 174.0, 12.0, 1), 1);
-    }
 }

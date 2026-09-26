@@ -16,7 +16,7 @@ use neo_store::Store;
 use neo_theme::{fonts::LoadedFonts, Distance, Theme, ThemeMode};
 
 use crate::brand::WhaleMark;
-use crate::state::{AppState, Role, Stage, StreamSource, SCENES};
+use crate::state::{AppState, Role, Stage, StreamSource};
 use crate::ui::{self, Skin};
 
 /// 主题重建的输入指纹。
@@ -567,8 +567,6 @@ impl NeoApp {
             .collect();
         state.active_session = Some(id);
         state.stage = Stage::Conversation;
-        // 整批恢复的历史消息不播入场动画（`new_session` 已把代次 +1）。
-        state.entered_count = state.messages.len();
         state.generating = false;
         state.stream = None;
         state.pending_persist = state.messages.len();
@@ -1050,7 +1048,6 @@ impl NeoApp {
                     ui.disable();
                 }
                 let sb = ui::sidebar::draw(ui, &skin, sidebar_rect, state, escape_pressed);
-                let mut scene_clicked = None;
                 let mut new_session = false;
                 let mut workspace_clicked = false;
 
@@ -1072,7 +1069,6 @@ impl NeoApp {
                         );
                         let out = ui::hero::draw(ui, &skin, area, state);
                         workspace_clicked = out.workspace_clicked;
-                        scene_clicked = out.scene_clicked;
                         (cluster, out.composer)
                     }
                     Stage::Conversation => {
@@ -1087,17 +1083,10 @@ impl NeoApp {
                     }
                 };
 
-                (
-                    sb,
-                    cluster,
-                    composer_out,
-                    scene_clicked,
-                    new_session,
-                    workspace_clicked,
-                )
+                (sb, cluster, composer_out, new_session, workspace_clicked)
             })
             .inner;
-        let (sb, cluster, composer_out, scene_clicked, new_session, workspace_clicked) = background;
+        let (sb, cluster, composer_out, new_session, workspace_clicked) = background;
 
         // 舞台切换入场：新舞台已画好，用背景色「盖一层再掀开」，等价于整区
         // 淡入，不必逐形状穿透各子 Ui；收敛后 k=1 不画。侧栏不参与 ——
@@ -1247,12 +1236,6 @@ impl NeoApp {
         }
         if cluster.distance {
             state.distance = state.distance.next();
-        }
-        if let Some(i) = scene_clicked {
-            if let Some(scene) = SCENES.get(i) {
-                state.active_scene = Some(i);
-                state.draft = scene.prompt.to_owned();
-            }
         }
 
         if composer_out.cancel_import {
@@ -1727,7 +1710,7 @@ mod snapshot {
 
     use super::NeoApp;
     use crate::state::{
-        AppState, ChatMessage, Role, Stage, StreamSource, ToolMeta, ToolState, SCENES,
+        AppState, ChatMessage, Role, Stage, StreamSource, ToolMeta, ToolState,
     };
     use neo_theme::{Distance, ThemeMode};
 
@@ -3099,8 +3082,7 @@ mod snapshot {
     }
 
     #[test]
-    fn scene_cards_visible_in_hero() {
-        assert_eq!(SCENES.len(), 4);
+    fn hero_is_the_default_stage() {
         // 模型列表默认为空：只由模型商提供，见 `model_list_tests`
         assert!(AppState::default().models.is_empty());
         let app_state = AppState::default();

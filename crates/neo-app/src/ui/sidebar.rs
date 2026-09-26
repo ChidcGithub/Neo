@@ -14,7 +14,7 @@ use neo_theme::SquirclePaint;
 use neo_ui::list::{ConfirmBar, ConfirmOutcome, ListRow, NavItem, RowAction};
 use neo_ui::Icon;
 
-use super::{at, inset, section_label, text_center, text_left, Skin};
+use super::{at, inset, section_label, text_left, Skin};
 use crate::state::AppState;
 
 /// 侧栏上发生的用户动作。
@@ -85,20 +85,17 @@ pub fn draw(
         p.label_primary,
     );
 
-    // 版本徽标（对应 Harness 的 previewBadge：等宽字 + 胶囊）
-    let font = d.font_mono(m.s(10.5));
-    let vw = ui
-        .painter()
-        .layout_no_wrap("v0.2.0".to_owned(), font.clone(), p.label_tertiary)
-        .size()
-        .x;
-    let badge = Rect::from_min_size(
-        egui::pos2(brand.right() - vw - m.s(14.0), brand.center().y - m.s(9.0)),
-        Vec2::new(vw + m.s(14.0), m.s(18.0)),
+    // 版本徽标：组件库 Badge（等宽字 + 浅底胶囊）；全版本号在 设置→关于。
+    let ver = env!("CARGO_PKG_VERSION");
+    let short = ver.split('-').next().unwrap_or(ver);
+    let ver_text = format!("v{short}");
+    let badge = neo_ui::Badge::new(&ver_text);
+    let bw = badge.width(ui, &d);
+    let rect = Rect::from_min_size(
+        egui::pos2(brand.right() - bw, brand.center().y - m.s(9.0)),
+        Vec2::new(bw, m.s(18.0)),
     );
-    ui.painter()
-        .squircle(badge, m.s(9.0), p.tip, egui::Stroke::new(0.5, p.border_l1));
-    text_center(ui.painter(), badge, "v0.2.0", font, p.label_tertiary);
+    badge.show_at(ui, &d, rect);
     y = brand.bottom() + m.s(14.0);
 
     // ---- 新对话（组件库 NavItem）----

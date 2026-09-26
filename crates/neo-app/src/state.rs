@@ -265,53 +265,6 @@ pub enum StreamSource {
     Demo { text: String, cursor: usize },
 }
 
-/// 场景卡图标。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SceneIcon {
-    Board,
-    Checklist,
-    Pen,
-    Mic,
-}
-
-/// 一个「全场景」入口。
-#[derive(Clone, Copy, Debug)]
-pub struct Scene {
-    pub icon: SceneIcon,
-    pub title: &'static str,
-    pub hint: &'static str,
-    /// 点下之后填入输入框的提示词。
-    pub prompt: &'static str,
-}
-
-/// 教室里的四个高频场景。
-pub const SCENES: &[Scene] = &[
-    Scene {
-        icon: SceneIcon::Board,
-        title: "课堂讲解",
-        hint: "把一个知识点讲成板书",
-        prompt: "帮我用板书的结构讲解「楞次定律」，分成定义、判断步骤、两个例子",
-    },
-    Scene {
-        icon: SceneIcon::Checklist,
-        title: "随堂测验",
-        hint: "出题 + 答案 + 讲评",
-        prompt: "为「电磁感应」出 5 道随堂选择题，附答案与一句话讲评，难度按高一水平",
-    },
-    Scene {
-        icon: SceneIcon::Pen,
-        title: "作业批改",
-        hint: "拍照上传后逐题批",
-        prompt: "拍照上传学生作业，逐题批改并指出共性错误",
-    },
-    Scene {
-        icon: SceneIcon::Mic,
-        title: "课堂记录",
-        hint: "录一段，出纪要",
-        prompt: "把这段课堂录音整理成纪要：知识点、学生提问、待跟进事项",
-    },
-];
-
 /// 设置面板的页签。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsTab {
@@ -393,10 +346,6 @@ pub struct AppState {
     pub attachment_picker_open: bool,
     attachment_job: Option<std::sync::mpsc::Receiver<AttachmentEvent>>,
     pub messages: Vec<ChatMessage>,
-    /// 已播过入场动画的消息条数；`messages` 里超出此数的下一条起播淡入。
-    pub entered_count: usize,
-    /// 会话代次：每次 `new_session` 递增，给入场动画派生不跨会话复用的 `Id`。
-    pub session_seq: u64,
     pub sessions: Vec<SessionRow>,
     /// 当前会话 id；`None` 表示还没产生第一条消息（空态）。
     pub active_session: Option<i64>,
@@ -411,7 +360,6 @@ pub struct AppState {
     pub read_only: bool,
 
     // ---- 交互 ----
-    pub active_scene: Option<usize>,
     pub show_settings: bool,
     pub settings_tab: SettingsTab,
     pub show_reasoning: bool,
@@ -517,8 +465,6 @@ impl Default for AppState {
             attachment_picker_open: false,
             attachment_job: None,
             messages: Vec::new(),
-            entered_count: 0,
-            session_seq: 0,
             sessions: Vec::new(),
             active_session: None,
             workspace_dir: None,
@@ -526,7 +472,6 @@ impl Default for AppState {
             model: 0,
             plan_mode: false,
             read_only: false,
-            active_scene: None,
             show_settings: false,
             settings_tab: SettingsTab::General,
             show_reasoning: false,
@@ -879,11 +824,8 @@ impl AppState {
         self.clear_draft_attachments();
         self.auto_approve_tools = false;
         self.messages.clear();
-        self.entered_count = 0;
-        self.session_seq += 1;
         self.draft.clear();
         self.stage = Stage::Hero;
-        self.active_scene = None;
         self.active_session = None;
         self.generating = false;
         self.stream = None;
@@ -1476,7 +1418,6 @@ impl AppState {
         self.draft.clear();
         self.clear_draft_attachments();
         self.stage = Stage::Conversation;
-        self.active_scene = None;
         true
     }
 

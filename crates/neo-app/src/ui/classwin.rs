@@ -143,10 +143,10 @@ fn paint(
     let m = skin.m();
     let rect = Rect::from_min_size(Pos2::ZERO, ui.available_size());
 
-    // 假阴影 + 卡片底（与迷你窗同款的两层画法）。
-    let shadow = rect.translate(egui::vec2(0.0, m.s(3.0))).shrink(m.s(2.0));
+    // 假阴影 + 卡片底（参数与迷你窗一致：偏移 2pt、26α 黑、圆角 18）。
+    let shadow = rect.translate(egui::vec2(0.0, m.s(2.0)));
     ui.painter()
-        .squircle_filled(shadow, m.s(18.0), Color32::from_black_alpha(30));
+        .squircle_filled(shadow, m.s(18.0), Color32::from_black_alpha(26));
     ui.painter().squircle_filled(rect, m.s(18.0), p.bg_layer_1);
     ui.painter().squircle_stroked(
         rect,
