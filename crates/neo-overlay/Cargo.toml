@@ -19,3 +19,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+# 与 wgpu 30 内部的 naga 同主版本：shader 单测的解析方言与运行时一致
+naga = { version = "30", default-features = false, features = ["wgsl-in"] }
+# 透镜预览图导出（--ignored 手动测试用）
+image = { workspace = true }

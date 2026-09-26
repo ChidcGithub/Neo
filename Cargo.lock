@@ -3252,6 +3252,8 @@ name = "neo-overlay"
 version = "0.1.0-rc260251648"
 dependencies = [
  "bytemuck",
+ "image",
+ "naga",
  "neo-tools",
  "pollster 0.4.0",
  "raw-window-handle",
