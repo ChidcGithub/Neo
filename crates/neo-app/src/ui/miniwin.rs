@@ -70,7 +70,9 @@ fn global_cursor() -> Option<(Pos2, bool)> {
         if GetCursorPos(&mut point) == 0 {
             return None;
         }
-        let lmb = (GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000) != 0;
+        // 0x8000 = 此刻按着；0x0001 = 自上次调用以来按过 —— 托盘态 ~10fps 的
+        // 采样会漏掉比间隔还快的点击（打断确认不弹），两个位都要。
+        let lmb = (GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8001) != 0;
         Some((Pos2::new(point.x as f32, point.y as f32), lmb))
     }
 }
@@ -79,6 +81,24 @@ fn global_cursor() -> Option<(Pos2, bool)> {
 #[cfg(not(windows))]
 fn global_cursor() -> Option<(Pos2, bool)> {
     None
+}
+
+/// 最近一次 AI 合成输入（click/drag 工具的 SendInput 注入）是不是就发生在刚刚。
+///
+/// 合成点击与物理点击在系统里不可区分，只能靠工具层留的时间戳排除：
+/// 注入与采样跨线程，留 1s 窗口盖住「注入完成 → 下一帧采样」的间隔。
+/// 不排除的话，AI 操作鼠标时一次按下沿就会弹出「打断执行？」——
+/// 弹窗又恰好钉在最大化窗口的关闭按钮区，AI 可能自己把自己打断。
+fn synthetic_click_recent() -> bool {
+    let last = neo_tools::tools::screen::SYNTHETIC_INPUT_AT.load(Ordering::Relaxed);
+    if last == 0 {
+        return false;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now.saturating_sub(last) < 1000
 }
 
 /// 本轮对话（自最后一条用户消息起）AI 是否动过鼠标/键盘。
@@ -272,7 +292,7 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>, fade: f32) 
         let answer = Confirm::new("打断执行？", "AI 本轮正在操作鼠标 / 键盘，确认打断吗？")
             .danger(true)
             .labels("打断", "继续")
-            .show(ui, &d, rect.width() - m.s(32.0));
+            .show(ui, &d);
         if let Some(yes) = answer {
             result.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
         }
@@ -476,7 +496,17 @@ impl MiniWin {
 
     /// 每帧驱动一次。放在 `tick()` 里而不是 `render()` 里：
     /// 主窗隐藏时渲染循环走 logic-only 路径，两者都经过 `tick()`。
-    pub fn tick(&mut self, ctx: &Context, state: &mut AppState, theme: Theme, hidden_to_tray: bool) {
+    ///
+    /// `classwin_rect`：课堂总结弹窗开着时的目标矩形 —— 点它的「关闭」
+    /// 不该被当成「用户想打断 AI」。
+    pub fn tick(
+        &mut self,
+        ctx: &Context,
+        state: &mut AppState,
+        theme: Theme,
+        hidden_to_tray: bool,
+        classwin_rect: Option<Rect>,
+    ) {
         // 1. 截屏信号：时间戳一变就进入短暂隐藏；隐藏结束后播淡入。
         let shot_at = neo_tools::tools::screen::SCREENSHOT_AT.load(Ordering::Relaxed);
         if shot_at != self.shot_seen {
@@ -541,18 +571,29 @@ impl MiniWin {
 
         // 5. 打断确认：后台执行中 + 本轮动过鼠标/键盘 + 左键按下沿。
         //    点在小窗自己身上不算（那是在点弹窗按钮）；有待确认的工具也不算 ——
-        //    那一击多半是点在独立确认窗的按钮上，且等待权限时 AI 本就停着。
+        //    那一击多半是点在独立确认窗的按钮上，且等待权限时 AI 本就停着；
+        //    点在课堂总结弹窗上不算；AI 自己注入的点击（click/drag）更不算。
         if lmb_edge
             && open
             && !self.interrupt_open
             && state.awaiting_tool().is_none()
             && used_mouse_or_keyboard(state)
+            && !synthetic_click_recent()
         {
             let on_miniwin = cursor.is_some_and(|c| {
-                Rect::from_min_size(home, size).contains(c)
+                // 实时位置优先（避让动画途中窗体不在任何一个静止端点上）；
+                // 子视口回调还没写过时退回 home/away 两端点。
+                let live = ctx
+                    .data(|d| d.get_temp::<Pos2>(Id::new("neo-miniwin-pos")))
+                    .map(|pos| Rect::from_min_size(pos, size));
+                live.is_some_and(|r| r.contains(c))
+                    || Rect::from_min_size(home, size).contains(c)
                     || Rect::from_min_size(away, size).contains(c)
             });
-            if !on_miniwin {
+            let on_classwin = cursor
+                .zip(classwin_rect)
+                .is_some_and(|(c, r)| r.contains(c));
+            if !on_miniwin && !on_classwin {
                 self.interrupt_open = true;
                 self.interrupt_result.store(0, Ordering::Relaxed);
             }

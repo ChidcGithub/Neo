@@ -397,6 +397,8 @@ pub struct AppState {
     // ---- 生成态 ----
     pub generating: bool,
     pub stream: Option<StreamSource>,
+    /// 本轮生成的开始时刻（元信息「模型 · 耗时」的耗时来源）。
+    pub stream_started: Option<std::time::Instant>,
     /// 已持久化的消息条数（与 `messages.len()` 的差值即待写消息）。
     pub pending_persist: usize,
     /// submit 后请求一条离线演示回复（未配置密钥时的降级路径）。
@@ -491,6 +493,7 @@ impl Default for AppState {
             confirming_delete: None,
             generating: false,
             stream: None,
+            stream_started: None,
             pending_persist: 0,
             wants_demo_reply: false,
             tool_frags: Vec::new(),
@@ -1437,6 +1440,7 @@ impl AppState {
         placeholder.streaming = true;
         self.messages.push(placeholder);
         self.generating = true;
+        self.stream_started = Some(std::time::Instant::now());
         self.stream = Some(source);
     }
 
@@ -1515,10 +1519,20 @@ impl AppState {
     fn end_stream(&mut self, error: Option<String>) {
         self.stream = None;
         self.generating = false;
+        // 元信息在借 messages 之前算好（model_display 也要借 self）。
+        let elapsed = self.stream_started.take().map(|t| t.elapsed().as_secs_f64());
+        let model = self.model_display().to_owned();
         if let Some(last) = self.messages.last_mut() {
             if last.streaming {
                 last.streaming = false;
                 last.error = error;
+                // 成功跑完的补「模型 · 耗时」；失败的有错误框，不占这一行。
+                if last.error.is_none() {
+                    last.meta = match elapsed {
+                        Some(s) => format!("{model} · {s:.1}s"),
+                        None => model,
+                    };
+                }
             }
         }
     }
@@ -1539,6 +1553,7 @@ impl AppState {
         if let Some(StreamSource::Real(s)) = self.stream.take() {
             s.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.stream_started = None;
         self.generating = false;
         self.tool_frags.clear();
         self.tool_round = false;

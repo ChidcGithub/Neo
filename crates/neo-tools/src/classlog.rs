@@ -190,9 +190,10 @@ mod tests {
     }
 
     /// 两个场景共享 NEO_HOME 环境变量，必须合在一个测试里串行跑
-    /// （memory.rs 已经踩过并行串台的坑）。
+    /// （memory.rs 已经踩过并行串台的坑）。跨模块再靠 `NEO_HOME_TEST_LOCK`。
     #[test]
     fn append_roundtrip_and_corruption_handling() {
+        let _lock = crate::NEO_HOME_TEST_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("neo-classlog-{}", std::process::id()));
         let _g = EnvGuard::set(&dir);
 

@@ -17,8 +17,8 @@
 //! - **字号**：整卡跟随 `Metrics::scale` 放大，远距仍可读。
 
 use egui::{Frame, Margin, Rect, Sense, TextEdit, Ui, Vec2};
-use egui_flex::{item, Flex, FlexAlign};
 use neo_theme::SquirclePaint;
+use neo_ui::flex::{item, Flex, FlexAlign};
 use neo_ui::{Chip, Icon, IconButton, Size};
 
 use super::{ease, elide, inset, text_left, translucent, Skin};
@@ -505,16 +505,19 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
     }
 
     // 真正的编辑区：egui 只保留输入法与选区这两件事。
+    // desired_rows(1)：multiline 默认最小 4 行高，不可见的交互矩形会向下溢出
+    // 盖住工具栏按钮上半（按下拖动会被判成划选文本）。margin 必须并进 frame ——
+    // 自定义了 frame 之后单独的 .margin() 会被静默吞掉。
     super::at(ui, text_rect, |ui| {
         let font = skin.prop(skin.t().body);
         ui.add_sized(
             text_rect.size(),
             TextEdit::multiline(&mut state.draft)
                 .id(egui::Id::new(super::COMPOSER_ID))
-                .frame(Frame::NONE)
-                .margin(Margin::symmetric(0, 4))
+                .frame(Frame::NONE.inner_margin(Margin::symmetric(0, 4)))
                 .font(font)
                 .text_color(p.label_primary)
+                .desired_rows(1)
                 .desired_width(text_rect.width()),
         );
     });
@@ -541,7 +544,10 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
     let can_send = state.can_submit();
 
     super::at(ui, row, |ui| {
+        // 溢出即裁：内容比行宽时（极端窄窗 / 超长模型名）也别画出卡片右缘。
+        ui.shrink_clip_rect(row);
         Flex::horizontal()
+            .id_salt("neo-composer-toolbar")
             .align_items(FlexAlign::Center)
             .gap(Vec2::splat(m.toolbar_gap()))
             .w_full()

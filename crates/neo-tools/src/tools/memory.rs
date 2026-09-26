@@ -283,8 +283,10 @@ mod tests {
     }
 
     /// 环境变量是进程级的：两个测试并行会互相串台，合成一个跑。
+    /// 跨模块（classlog 也改 NEO_HOME）靠 `NEO_HOME_TEST_LOCK` 串行。
     #[test]
     fn add_dedup_forget_and_import_roundtrip() {
+        let _lock = crate::NEO_HOME_TEST_LOCK.lock().unwrap();
         let (_g, dir) = temp_home("roundtrip");
         let (m1, fresh) = add_memory(" 用户教高二物理 ").unwrap();
         assert!(fresh);

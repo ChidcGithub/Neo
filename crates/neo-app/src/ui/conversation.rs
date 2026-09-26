@@ -16,6 +16,21 @@ use neo_ui::{Icon, IconButton};
 use super::{composer, elide, markdown, text_left, Skin};
 use crate::state::{AppState, Role};
 
+/// 多行排版：无空格长串（URL / 长 token / 路径）允许在任意字符间断行。
+/// 直接 `Painter::layout` 的 `break_anywhere` 默认关 —— 找不到断词点时
+/// epaint 会原地冲出 wrap 宽（文字画出气泡右缘）。
+fn wrap_text(
+    painter: &egui::Painter,
+    text: String,
+    font: egui::FontId,
+    color: egui::Color32,
+    wrap: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple(text, font, color, wrap);
+    job.wrap.break_anywhere = true;
+    painter.layout_job(job)
+}
+
 /// 对话态上发生的用户动作。
 #[derive(Default, Clone, Copy)]
 pub struct Outcome {
@@ -52,18 +67,22 @@ pub fn draw(
         title_font,
         skin.p().label_primary,
     );
+    // 副标题（模型 · 消息数）同样要 elide：模型商的长 id 不该伸进按钮区。
+    let sub_font = skin.prop(skin.t().caption);
+    let sub = format!(
+        "{} · {} 条消息",
+        state.model_display(),
+        state.messages.len()
+    );
+    let sub = elide(ui.painter(), &sub, &sub_font, header.width() - skin.m().s(44.0));
     text_left(
         ui.painter(),
         Rect::from_min_size(
             egui::pos2(header.left(), header.top() + skin.m().s(20.0)),
             Vec2::new(header.width(), skin.m().s(16.0)),
         ),
-        &format!(
-            "{} · {} 条消息",
-            state.model_display(),
-            state.messages.len()
-        ),
-        skin.prop(skin.t().caption),
+        &sub,
+        sub_font,
         skin.p().label_caption,
     );
 
@@ -127,8 +146,10 @@ fn draw_messages(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState)
     let x_off = ((rect.width() - content_w) * 0.5).max(0.0);
 
     super::at(ui, rect, |ui| {
+        // 滚动状态按会话分开：切会话后从最新消息看起，不继承上一个会话
+        // 残留的偏移（id 不变时 egui 会把旧的 scroll offset 接着用）。
         let scroll = ScrollArea::vertical()
-            .id_salt("neo-thread")
+            .id_salt(("neo-thread", state.active_session))
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
@@ -198,7 +219,8 @@ fn draw_one(
                     // 用户气泡：右侧对齐，最大宽度取内容列的 76%。
                     // 内边距 横 16 / 纵 12：文字与气泡边缘留出一口气的距离。
                     let font = skin.prop(skin.t().body);
-                    let galley = ui.painter().layout(
+                    let galley = wrap_text(
+                        ui.painter(),
                         msg.content.clone(),
                         font,
                         p.label_primary,
@@ -234,13 +256,23 @@ fn draw_one(
                 // 正文：Markdown。
                 markdown::render(ui, skin, &msg.content, msg.streaming);
                 ui.add_space(m.s(8.0));
+            } else if msg.error.is_none() {
+                // 流正常结束但一个字都没有（模型空响应）：不留一段隐形空白。
+                let font = skin.prop(skin.t().caption);
+                let (r, _) =
+                    ui.allocate_exact_size(Vec2::new(content_w, m.s(20.0)), Sense::hover());
+                text_left(ui.painter(), r, "（空回复）", font, p.label_tertiary);
             }
 
             if let Some(err) = &msg.error {
                 let font = skin.prop(skin.t().caption);
-                let galley =
-                    ui.painter()
-                        .layout(format!("⚠ {err}"), font, p.error, content_w - m.s(16.0));
+                let galley = wrap_text(
+                    ui.painter(),
+                    format!("⚠ {err}"),
+                    font,
+                    p.error,
+                    content_w - m.s(16.0),
+                );
                 let h = galley.size().y + m.s(12.0);
                 let (r, _) = ui.allocate_exact_size(Vec2::new(content_w, h), Sense::hover());
                 ui.painter()
@@ -274,9 +306,7 @@ fn draw_reasoning(ui: &mut Ui, skin: &Skin<'_>, content_w: f32, text: &str) {
     let pad_l = m.s(12.0);
     let pad_r = m.s(12.0);
     let text_w = (content_w - pad_l - pad_r).max(m.s(40.0));
-    let galley = ui
-        .painter()
-        .layout(text.to_owned(), font, p.label_tertiary, text_w);
+    let galley = wrap_text(ui.painter(), text.to_owned(), font, p.label_tertiary, text_w);
     let h = galley.size().y + m.s(16.0);
     let (r, _) = ui.allocate_exact_size(Vec2::new(content_w, h), Sense::hover());
     // 圆头细条（3pt 宽、两端半圆）：比直角 vline 更精致，也呼应整套 squircle 语言。
@@ -428,12 +458,10 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
         .map(|g| g.size().y + m.s(4.0))
         .unwrap_or(0.0);
     let h = lh + m.s(6.0) * 2.0 + err_h;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(content_w, h), Sense::hover());
+    let (rect, _resp) = ui.allocate_exact_size(Vec2::new(content_w, h), Sense::hover());
 
-    // 行本身透明（上游 `_row` 无底色）；悬停给一层极淡的底，表明可点。
-    if resp.hovered() {
-        ui.painter().squircle_filled(rect, m.s(8.0), p.hover);
-    }
+    // 行本身透明（上游 `_row` 无底色）。不可点，所以悬停也不给底色 ——
+    // 给一个没有点击行为的控件画 hover 态是在撒谎。
 
     let row = Rect::from_min_size(
         egui::pos2(rect.left(), rect.top() + m.s(6.0)),
@@ -463,18 +491,31 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     let summary_font = skin.prop(t.label);
     let mut x = lead_rect.right() + m.s(6.0);
 
-    let title_galley = painter.layout_no_wrap(title.clone(), title_font, p.label_primary);
-    // 右侧要留出退出码胶囊的位置
+    // 退出码胶囊按文本量宽：Windows 崩溃码（如 -1073741819）比个位数长得多。
     let pill_w = exit_code
         .filter(|c| *c != 0)
-        .map(|_| m.s(30.0))
+        .map(|c| {
+            painter
+                .layout_no_wrap(c.to_string(), skin.mono(t.caption), p.error)
+                .size()
+                .x
+                + m.s(12.0)
+        })
+        .map(|w| w.max(m.s(30.0)))
         .unwrap_or(0.0);
     let avail_end = row.right() - pad_x - pill_w;
-    let title_w = title_galley.size().x.min((avail_end - x).max(0.0));
+    // 标题也要 elide：模型给的异常长工具名不该画出内容列右缘。
+    let shown_title = super::elide(painter, &title, &title_font, (avail_end - x).max(0.0));
+    let title_w = painter
+        .layout_no_wrap(shown_title.clone(), title_font.clone(), p.label_primary)
+        .size()
+        .x;
 
-    painter.galley(
-        egui::pos2(x, cy - title_galley.size().y * 0.5),
-        title_galley.clone(),
+    painter.text(
+        egui::pos2(x, cy),
+        egui::Align2::LEFT_CENTER,
+        shown_title,
+        title_font,
         p.label_primary,
     );
     x += title_w;
@@ -500,7 +541,7 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     if let Some(code) = exit_code.filter(|c| *c != 0) {
         let pill = Rect::from_min_size(
             egui::pos2(avail_end, cy - m.s(9.0)),
-            Vec2::new(m.s(30.0), m.s(18.0)),
+            Vec2::new(pill_w, m.s(18.0)),
         );
         painter.squircle_filled(pill, m.s(6.0), p.error.gamma_multiply(0.18));
         painter.text(

@@ -39,6 +39,7 @@ pub mod button;
 pub mod container;
 pub mod feedback;
 pub mod field;
+pub mod flex;
 pub mod icons;
 pub mod list;
 pub mod modal;

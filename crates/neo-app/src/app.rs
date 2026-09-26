@@ -34,7 +34,9 @@ const DICTATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 fn lmb_down() -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
     // SAFETY: GetAsyncKeyState 是无状态读取，无内存安全问题。
-    (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000) != 0
+    // 0x8000 = 此刻按着；0x0001 = 自上次调用以来按过 —— 托盘态低频采样下，
+    // 比间隔还快的一次点按（听写打断）只有后一个位能留下。
+    (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8001) != 0
 }
 
 /// 非 Windows 没有全局输入轮询（点击打断退化为不可用，沉默超时兜底）。
@@ -88,9 +90,13 @@ pub struct NeoApp {
     hidden_to_tray: bool,
     /// 托盘菜单点了「退出」：下一次 close 请求直接放行，不再拦截。
     quitting: bool,
-    /// 待投递的轻提示（类别 + 内容 + 持续秒数）。渲染段统一喂给
-    /// egui-toast 队列 —— 锚定 / 堆叠 / 到期回收都不用自己管。
-    pending_toasts: Vec<(neo_ui::ToastKind, String, f64)>,
+    /// 待投递的轻提示（类别 + 内容 + 截止时间）。渲染段统一喂给 toast 队列。
+    /// 存截止时间而不是时长：主窗藏在托盘时提示只积不播，重开那一帧把
+    /// 早就过期的丢掉、没过期的按**剩余**时间播 —— 不当陈年弹幕补播。
+    pending_toasts: Vec<(neo_ui::ToastKind, String, std::time::Instant)>,
+    /// 本帧 `persist_ready` 的结果：切会话/新会话的门控（落库失败不切）。
+    /// 持久化已挪进 `tick`（托盘隐藏时也照跑），渲染段只读这个结果。
+    persistence_ok: bool,
     /// 全屏跑马灯覆盖层（唤醒聆听时亮起）。离屏测试没有 GPU 窗口线程，为 `None`。
     overlay: Option<neo_overlay::OverlayHandle>,
     /// 后台执行期间的角落迷你窗（对话速览 / 截屏回避 / 打断确认）。
@@ -170,6 +176,7 @@ impl NeoApp {
             hidden_to_tray: false,
             quitting: false,
             pending_toasts: Vec::new(),
+            persistence_ok: true,
             overlay: None,
             miniwin: Default::default(),
             shotflash: Default::default(),
@@ -437,7 +444,7 @@ impl NeoApp {
             self.pending_toasts.push((
                 neo_ui::ToastKind::Success,
                 format!("已唤醒（置信度 {score:.2}），请直接输入"),
-                3.0,
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
             ));
         }
     }
@@ -830,7 +837,7 @@ impl NeoApp {
                     self.pending_toasts.push((
                         neo_ui::ToastKind::Warning,
                         format!("语音唤醒未启用：{msg}（重新打开开关可重试）"),
-                        4.0,
+                        std::time::Instant::now() + std::time::Duration::from_secs(4),
                     ));
                     self.wake_rx = None;
                     self.wake = None;
@@ -869,7 +876,7 @@ impl NeoApp {
                 self.pending_toasts.push((
                     neo_ui::ToastKind::Warning,
                     format!("语音转写未启用：{msg}"),
-                    4.0,
+                    std::time::Instant::now() + std::time::Duration::from_secs(4),
                 ));
             }
             Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
@@ -888,7 +895,7 @@ impl NeoApp {
                 self.pending_toasts.push((
                     neo_ui::ToastKind::Info,
                     "已取消本次听写".to_owned(),
-                    2.0,
+                    std::time::Instant::now() + std::time::Duration::from_secs(2),
                 ));
             }
             self.dictation_lmb_down = down;
@@ -899,8 +906,22 @@ impl NeoApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         // 迷你窗：主窗藏起 + AI 在忙时贴屏幕角落（对话速览 / 截屏回避 / 打断确认）。
-        self.miniwin
-            .tick(&ctx, &mut self.state, self.theme, self.hidden_to_tray);
+        // 打断判定要排除课堂总结弹窗的矩形：点它的「关闭」不是「打断 AI」。
+        let classwin_rect = if self.class.presenting().is_some() {
+            let monitor = ctx
+                .input(|i| i.viewport().monitor_size)
+                .unwrap_or(egui::Vec2::new(1920.0, 1080.0));
+            Some(ui::classwin::ClassWin::target_rect(self.theme, monitor))
+        } else {
+            None
+        };
+        self.miniwin.tick(
+            &ctx,
+            &mut self.state,
+            self.theme,
+            self.hidden_to_tray,
+            classwin_rect,
+        );
         // 截屏闪光：抓帧完成后在被抓区域边缘闪一道白框。
         self.shotflash.tick(&ctx);
         // 工具确认窗：模型请求权限时独立弹出（不绑主窗，后台也能授权）。
@@ -943,7 +964,11 @@ impl NeoApp {
                     (neo_ui::ToastKind::Error, format!("导出失败：{e}"))
                 }
             };
-            self.pending_toasts.push((kind, text, 3.0));
+            self.pending_toasts.push((
+                kind,
+                text,
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+            ));
         }
         // 「打开主界面」工具：执行层只置信号位，这里真正唤窗。
         let show_at = neo_tools::tools::open_app::SHOW_WINDOW_AT
@@ -952,6 +977,80 @@ impl NeoApp {
             self.show_window_seen = show_at;
             if show_at != 0 && self.hidden_to_tray {
                 self.show_window(&ctx);
+            }
+        }
+        // ---- 状态机推进（与绘制无关，托盘隐藏时也照跑）----
+        // 这段曾经住在 render() 里：主窗一藏进托盘，生成泵 / 工具轮 / 回灌
+        // 全部停摆 —— 语音唤醒的后台链路（生成中弹确认窗、批了继续跑）整个冻住。
+        // 它们只依赖 state 与 ctx，本就该走 logic-only 路径。
+        //
+        // 每帧从流式来源泵增量；真实 / 演示两种来源在 UI 侧等价。
+        if self.state.generating && self.state.pump() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+        // 模型列表拉取：后台线程在跑，这里只收结果；收到就刷新可选模型。
+        if self.state.poll_model_fetch() {
+            // 拉到的列表落库：下次启动先读回来，没网也有模型可选。
+            // 列表为空时**不写** —— 别拿空值覆盖上一次拉到的好数据。
+            if self.state.has_models() {
+                Self::save_setting(self.store.as_ref(), "models", &self.state.model_ids_joined());
+                Self::save_setting(self.store.as_ref(), "model", self.state.model_id());
+            }
+            ctx.request_repaint();
+        }
+        // 工具轮登记：流结束在 `finish_reason = tool_calls` 时把分片聚合成消息块。
+        if self.state.tool_round {
+            self.state.begin_tool_round();
+        }
+        // 用户消息在生成开始前立即保存，流式占位只在稳定后提交。
+        // 结果给渲染段做「切会话」门控（落库失败不切，免得丢消息）。
+        self.persistence_ok = Self::persist_ready(&mut self.state, self.store.as_ref());
+        // 演示流：未配置密钥时，submit 之后自动接一条离线演示回复。
+        if self.state.wants_demo_reply {
+            self.state.wants_demo_reply = false;
+            let prompt = self
+                .state
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User)
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            let demo = crate::state::demo_reply(&prompt, self.state.model_display());
+            self.state.start_generation(StreamSource::Demo {
+                text: demo,
+                cursor: 0,
+            });
+        }
+        // 工具执行与回灌：工具在独立线程里跑（可能是几分钟的编译），
+        // 这里只逐帧收结果，绝不阻塞。
+        if self.state.tool_open {
+            self.state.poll_tool_jobs();
+            if self.state.awaiting_tool().is_none() {
+                if !self.state.tools_running() && !self.state.tools_settled() {
+                    let scope = neo_tools::Scope::new(self.state.workspace_root());
+                    self.state.spawn_ready_tools(&scope);
+                }
+                if self.state.tools_running() {
+                    // 后台在跑：定期回来收结果（也顺带刷新"执行中…"的动画）。
+                    ctx.request_repaint_after(std::time::Duration::from_millis(60));
+                } else if self.state.tools_settled() {
+                    self.state.tool_open = false;
+                    if self.state.can_call_real() {
+                        Self::start_real_stream(&mut self.state);
+                    }
+                }
+            }
+        }
+        // 活跃会话变化时落库：下次启动从这里恢复。空串表示空态。
+        if self.state.active_session != self.saved_active {
+            let v = self
+                .state
+                .active_session
+                .map(|id| id.to_string())
+                .unwrap_or_default();
+            if Self::save_setting(self.store.as_ref(), "active_session", &v) {
+                self.saved_active = self.state.active_session;
             }
         }
         // 托盘没有 winit 唤醒源：隐藏期间保持低频轮询，托盘菜单点击才有响应。
@@ -966,10 +1065,11 @@ impl NeoApp {
     pub fn render(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.tick(ctx.clone());
-        // 主窗藏在托盘时，小窗一旦可见会反向强制本视口跑完整渲染 pass；
-        // 若照常构建主窗 UI（对话列表 + markdown + 代码高亮），每 16ms 一次
-        // 全量重建，小窗动画直接被拖垮。反正主窗不可见，这一帧空跑 ——
-        // 恢复可见时下一帧自动全量重画（动效沿检重新播种，无害）。
+        // 状态机推进（生成泵 / 工具轮 / 回灌）在 tick() 里已完成 —— 托盘隐藏时
+        // 照常走。这里剩下的只有绘制：主窗不可见时若照常构建主窗 UI
+        // （对话列表 + markdown + 代码高亮），每 16ms 一次全量重建会把小窗动画
+        // 拖垮。反正主窗不可见，这一帧空跑 —— 恢复可见时下一帧自动全量重画
+        // （动效沿检重新播种，无害）。
         if self.hidden_to_tray {
             return;
         }
@@ -1130,60 +1230,18 @@ impl NeoApp {
 
         // Esc = 停止当前这一轮（生成或工具执行中）。待确认的工具会随
         // cancel 置为「已取消」，独立确认窗随之关闭，不需要单独出口。
+        // 侧栏先消费过的 Esc（取消重命名/删除确认）不再落到这里 —— 一键不一二鸟。
         if escape_pressed
             && !modal_open
+            && !sb.escape_consumed
             && (state.generating || state.tool_open || state.tool_round)
         {
             state.cancel();
         }
 
-        // ---- 3. 生成态推进 ----
-        // 每帧从流式来源泵增量；真实 / 演示两种来源在 UI 侧等价。
-        if state.generating && state.pump() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
-        }
-
-        // ---- 3.4 模型列表拉取 ----
-        // 后台线程在跑，这里只收结果；收到就刷新可选模型（当前选中按 id 保留）。
-        if state.poll_model_fetch() {
-            // 拉到的列表落库：下次启动先读回来，没网也有模型可选。
-            // 列表为空时**不写** —— 别拿空值覆盖上一次拉到的好数据。
-            if state.has_models() {
-                Self::save_setting(self.store.as_ref(), "models", &state.model_ids_joined());
-                Self::save_setting(self.store.as_ref(), "model", state.model_id());
-            }
-            ctx.request_repaint();
-        }
-
-        // ---- 3.5 工具轮 ----
-        // 流结束在 `finish_reason = tool_calls` 时，把分片聚合成消息块。
-        // 这一步只登记；执行放到确认弹窗之后（见本函数末尾），
-        // 否则用户这一帧既看不到卡片也看不到弹窗。
-        if state.tool_round {
-            state.begin_tool_round();
-        }
-
-        // 用户消息在生成开始前立即保存，流式占位只在稳定后提交。
-        let persistence_ok = Self::persist_ready(state, self.store.as_ref());
-
-        // 演示流：未配置密钥时，submit 之后自动接一条离线演示回复。
-        if state.wants_demo_reply {
-            state.wants_demo_reply = false;
-            let prompt = state
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.role == Role::User)
-                .map(|m| m.content.clone())
-                .unwrap_or_default();
-            let demo = crate::state::demo_reply(&prompt, state.model_display());
-            state.start_generation(StreamSource::Demo {
-                text: demo,
-                cursor: 0,
-            });
-        }
-
-        // ---- 4. 落状态 ----
+        // ---- 3. 落状态 ----
+        // 生成泵 / 工具轮 / 落库已在 tick() 里推进（托盘隐藏时也照跑）；
+        // 这里只处理绘制产生的 UI 结果。
         if workspace_clicked && self.workspace_picker.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
             let repaint = ctx.clone();
@@ -1205,10 +1263,10 @@ impl NeoApp {
                 Err(error) => eprintln!("[neo] 无法打开工作区选择器：{error}"),
             }
         }
-        if (sb.new_session || new_session) && persistence_ok {
+        if (sb.new_session || new_session) && self.persistence_ok {
             state.new_session();
         }
-        if let Some(id) = sb.open_session.filter(|_| persistence_ok) {
+        if let Some(id) = sb.open_session.filter(|_| self.persistence_ok) {
             if let Some(store) = self.store.as_ref() {
                 Self::open_session(state, store, id);
             }
@@ -1364,50 +1422,22 @@ impl NeoApp {
             }
         }
 
-        // ---- 4. 工具执行与回灌 ----
-        // 工具在**独立线程**里跑（可能是几分钟的编译），这里只逐帧收结果，
-        // 绝不阻塞渲染。放在最后：确认弹窗（上一步）可能刚把状态推到 Running。
-        if state.tool_open {
-            state.poll_tool_jobs();
-            if state.awaiting_tool().is_none() {
-                if !state.tools_running() && !state.tools_settled() {
-                    let scope = neo_tools::Scope::new(state.workspace_root());
-                    state.spawn_ready_tools(&scope);
-                }
-                if state.tools_running() {
-                    // 后台在跑：定期回来收结果（也顺带刷新"执行中…"的动画）。
-                    ctx.request_repaint_after(std::time::Duration::from_millis(60));
-                } else if state.tools_settled() {
-                    state.tool_open = false;
-                    if state.can_call_real() {
-                        Self::start_real_stream(state);
-                    }
-                }
-            }
-        }
-
-        // 活跃会话变化时落库：下次启动从这里恢复。空串表示空态。
-        if state.active_session != self.saved_active {
-            let v = state
-                .active_session
-                .map(|id| id.to_string())
-                .unwrap_or_default();
-            if Self::save_setting(self.store.as_ref(), "active_session", &v) {
-                self.saved_active = state.active_session;
-            }
-        }
-
         // ---- 5. 轻提示（最上层，一闪而过）----
-        // 队列 / 锚定 / 到期回收全交给 egui-toast；外观是组件库的 squircle 自绘
-        // （neo_ui::toasts 工厂里注册的 custom_contents）。每帧重建实例即可，
-        // 队列本体存在 egui memory 里。
+        // 队列 / 锚定 / 到期回收全交给 toast 队列；外观是组件库的 squircle 自绘
+        // （neo_ui::toasts 工厂里注册的自绘闭包）。每帧重建实例即可，
+        // 队列本体存在 egui memory 里。隐藏期间积压的按剩余寿命过滤。
         let mut toasts = neo_ui::toasts(&skin.design);
-        for (kind, text, secs) in self.pending_toasts.drain(..) {
+        let now = std::time::Instant::now();
+        for (kind, text, deadline) in self.pending_toasts.drain(..) {
+            let remain = deadline.saturating_duration_since(now);
+            if remain.is_zero() {
+                continue;
+            }
             toasts.add(
                 neo_ui::Toast::new()
                     .kind(kind)
                     .text(text)
-                    .options(neo_ui::ToastOptions::default().duration_in_seconds(secs)),
+                    .options(neo_ui::ToastOptions::default().duration(remain)),
             );
         }
         toasts.show(ui);

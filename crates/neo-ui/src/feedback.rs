@@ -41,7 +41,9 @@ impl Spinner {
     pub fn show_painter(&self, painter: &Painter, d: &Design, rect: Rect, color: Color32) {
         let t = painter.ctx().time();
         let phase = (t as f32 * self.speed) % std::f32::consts::TAU;
-        let r = rect.width().min(rect.height()) * 0.5 - self.stroke_w;
+        // 线宽是图形主体笔触（不是 1px 毛发描边），要跟着 scale 走。
+        let stroke_w = d.m().s(self.stroke_w);
+        let r = rect.width().min(rect.height()) * 0.5 - stroke_w;
         // 一段 270° 的弧，随时间旋转。
         let mut pts = Vec::with_capacity(24);
         for i in 0..=24 {
@@ -51,11 +53,7 @@ impl Spinner {
                 rect.center().y + a.sin() * r,
             ));
         }
-        painter.add(egui::Shape::line(
-            pts,
-            egui::Stroke::new(self.stroke_w, color),
-        ));
-        let _ = d;
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(stroke_w, color)));
     }
 
     /// 走布局流。
@@ -102,6 +100,8 @@ fn toast_icon(kind: ToastKind) -> Icon {
 }
 
 /// 一条 toast 的自绘尺寸：图标 + 间距 + 文字 + 左右内边距。
+/// 文本宽度封顶屏宽 60% —— 底层错误消息这类无界文案不该把 toast
+/// 画出屏幕左右缘（超出部分由绘制侧 `elide` 收成省略号）。
 fn toast_size(ui: &Ui, d: &Design, text: &str) -> Vec2 {
     let m = d.m();
     let font = d.font(d.t().label);
@@ -110,6 +110,9 @@ fn toast_size(ui: &Ui, d: &Design, text: &str) -> Vec2 {
         .layout_no_wrap(text.to_owned(), font, Color32::WHITE)
         .size()
         .x;
+    let screen_w = ui.ctx().content_rect().width();
+    let max_text_w = screen_w * 0.6 - m.s(16.0) - m.s(8.0) - m.s(28.0);
+    let text_w = text_w.min(max_text_w.max(m.s(80.0)));
     Vec2::new(text_w + m.s(16.0) + m.s(8.0) + m.s(28.0), m.s(40.0))
 }
 
@@ -132,13 +135,10 @@ fn paint_toast(ui: &Ui, d: &Design, kind: ToastKind, text: &str, rect: Rect) {
         Vec2::splat(icon_d),
     );
     toast_icon(kind).paint(ui.painter(), icon_rect, toast_accent(d, kind));
-    text_left(
-        ui.painter(),
-        inset(rect, m.s(38.0), 0.0, m.s(14.0), 0.0),
-        text,
-        d.font(d.t().label),
-        d.p().label_primary,
-    );
+    let font = d.font(d.t().label);
+    let inner = inset(rect, m.s(38.0), 0.0, m.s(14.0), 0.0);
+    let shown = crate::base::elide(ui.painter(), text, &font, inner.width());
+    text_left(ui.painter(), inner, &shown, font, d.p().label_primary);
 }
 
 /// 单条 toast（布局流）。toast 是纯提示：只感知悬停，不拦截点击。
@@ -166,4 +166,5 @@ pub fn toasts(d: &Design) -> Toasts {
     })
     .anchor(egui::Align2::CENTER_BOTTOM, egui::pos2(0.0, offset_y))
     .direction(egui::Direction::BottomUp)
+    .gap(d.m().s(10.0))
 }

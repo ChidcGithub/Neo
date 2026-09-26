@@ -75,6 +75,11 @@ pub mod scope;
 pub mod spec;
 pub mod tools;
 
+/// 测试里改 NEO_HOME 是进程级动作：classlog 与 memory 两个测试模块并行跑会
+/// 互相换走对方看到的目录（偶发 `!fresh2` 断言失败）。同一把锁串行化。
+#[cfg(test)]
+pub(crate) static NEO_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub use policy::{Decision, Policy, Risk};
 pub use result::{Args, ErrorKind, Outcome, ToolError};
 pub use scope::Scope;

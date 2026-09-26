@@ -209,7 +209,17 @@ impl<'a> Button<'a> {
         let (fill_idle, label_idle) = if self.enabled && !self.loading {
             (fill_idle, label_idle)
         } else {
-            (c.btn_primary_dimmed, translucent(c.on_primary, 0.6))
+            // 禁用态：颜色退场。Ghost 本来就无填充，别给它刷一块实心灰底；
+            // 文字色同理走自己的 secondary 而不是实心底的 on_primary。
+            let fill = match self.variant {
+                Variant::Ghost => egui::Color32::TRANSPARENT,
+                _ => c.btn_primary_dimmed,
+            };
+            let label = match self.variant {
+                Variant::Ghost => translucent(p.label_secondary, 0.5),
+                _ => translucent(c.on_primary, 0.6),
+            };
+            (fill, label)
         };
 
         // 悬停叠一层：抬起填充 + 提亮文字。
@@ -279,7 +289,11 @@ impl<'a> Button<'a> {
             egui::pos2(cx + text_w * 0.5, draw_rect.center().y),
             Vec2::new(text_w, draw_rect.height()),
         );
-        let shown = elide(painter, self.label, &font, text_rect.width() + m.s(4.0));
+        // 省略预算按按钮实际分到的宽度倒推（文本实测宽恒不大于它本身，
+        // 拿实测宽当预算是永远不会省略的死逻辑）。
+        let text_budget =
+            (draw_rect.width() - m.s(16.0) * 2.0 - icon_w - spinner_w).max(m.s(20.0));
+        let shown = elide(painter, self.label, &font, text_budget);
         text_center(painter, text_rect, &shown, font, label_color);
 
         resp
@@ -522,9 +536,10 @@ impl<'a> Chip<'a> {
     pub fn show_at(self, ui: &Ui, d: &Design, rect: Rect) -> Response {
         let p = d.p();
         let m = d.m();
-        let id = self
-            .id_salt
-            .unwrap_or_else(|| ui.id().with(("chip", self.label, rect.left() as i32)));
+        let id = self.id_salt.unwrap_or_else(|| {
+            ui.id()
+                .with(("chip", self.label, rect.left() as i32, rect.top() as i32))
+        });
         let resp = tap(ui, rect, id);
         let st = State::of(&resp);
         let painter = ui.painter();
@@ -620,8 +635,7 @@ pub mod probe {
 pub struct Segmented<'a> {
     options: &'a [&'a str],
     selected: usize,
-    full_width: bool,
-    /// 显式区分同一容器里的多个分段控件（两组**完全一样**的选项时必需）。
+    /// 显式区分同一容器里的多个分段控件（两组**完全一样的选项**时必需）。
     id_salt: Option<&'a str>,
 }
 
@@ -630,7 +644,6 @@ impl<'a> Segmented<'a> {
         Self {
             options,
             selected,
-            full_width: true,
             id_salt: None,
         }
     }
@@ -643,20 +656,14 @@ impl<'a> Segmented<'a> {
         self.id_salt = Some(salt);
         self
     }
-    pub fn fixed_width(mut self, _w: f32) -> Self {
-        self.full_width = false;
-        self
-    }
 
+    /// `width` 即本条的总宽（调用方给多少就占多少 —— 滚动条让位之类的
+    /// 余量由调用方在 width 里扣掉，控件不二次自作主张）。
     pub fn show(self, ui: &mut Ui, d: &Design, width: f32) -> Option<usize> {
         let p = d.p();
         let m = d.m();
         let h = m.s(32.0);
-        let w = if self.full_width {
-            width.max(ui.available_width())
-        } else {
-            width
-        };
+        let w = width;
         let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), egui::Sense::hover());
         let painter = ui.painter().clone();
 

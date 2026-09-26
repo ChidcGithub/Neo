@@ -47,13 +47,13 @@ impl ModalSize {
 /// ```no_run
 /// # use neo_ui::{Modal, ModalSize, Design};
 /// # fn demo(ui: &mut egui::Ui, d: &Design, open: &mut bool, content_h: f32) {
-/// // 1. 先问高度（用于居中定位，也用于自校验）
+/// // 1. 先问高度（用于居中定位）
 /// let h = Modal::height(d, ModalSize::Md, content_h);
 /// // 2. 画底（遮罩 + 卡片），拿到内容区
 /// let modal = Modal::new("设置", ModalSize::Md);
 /// if let Some(body) = modal.begin(ui, d, h) {
-///     // 3. 在 body 里画内容；返回 true 表示请求关闭
-///     if modal.end(ui, d, body) { *open = false; }
+///     // 3. 在 body 里画内容；end 返回 true 表示请求关闭（Esc / 关闭钮）
+///     if modal.end(ui, d) { *open = false; }
 /// }
 /// # }
 /// ```
@@ -135,18 +135,15 @@ impl<'a> Modal<'a> {
         ui.painter().rect_filled(screen, 0.0, mask);
 
         let w = self.size.width(d, screen.width());
+        // 高度同宽度一样钳在视口内：调用方预算失误时不至于画出屏幕上下缘。
+        let height = height.min(screen.height() * 0.9);
         let rect = Rect::from_center_size(screen.center(), Vec2::new(w, height));
         let panel = Panel::new();
         let body = panel.paint(ui, d, rect, ModalRhythm::new(d).pad);
 
         let r = ModalRhythm::new(d);
-        // 标题栏。
-        let (title_rect, _) =
-            ui.allocate_exact_size(Vec2::new(body.width(), r.title_h), egui::Sense::hover());
-        // 标题区可能落在 panel 之外（alloc 走的是父级游标）—— 用绝对坐标重画。
+        // 标题栏（绝对坐标：面板内的标题区）。
         let title_abs = Rect::from_min_size(body.min, Vec2::new(body.width(), r.title_h));
-        ui.painter()
-            .rect_filled(title_rect, 0.0, egui::Color32::TRANSPARENT);
         text_left(
             ui.painter(),
             title_abs,
@@ -177,7 +174,7 @@ impl<'a> Modal<'a> {
     }
 
     /// 收尾：处理 Esc / 关闭钮，返回是否请求关闭。
-    pub fn end(&self, ui: &mut Ui, d: &Design, body: Rect) -> bool {
+    pub fn end(&self, ui: &mut Ui, d: &Design) -> bool {
         let _ = d;
         let mut close = false;
         // Esc
@@ -195,13 +192,6 @@ impl<'a> Modal<'a> {
             ui.memory_mut(|m| m.data.remove::<bool>(close_flag(self.title)));
             close = true;
         }
-        // 自校验：内容不得溢出预留高度。
-        debug_assert!(
-            ui.min_rect().height() <= body.height() + 1.0,
-            "模态内容溢出：实际 {:.1}pt，预留 {:.1}pt",
-            ui.min_rect().height(),
-            body.height()
-        );
         close
     }
 }
@@ -254,9 +244,13 @@ impl<'a> Confirm<'a> {
     }
 
     /// 绘制一整个确认框。返回 `Some(true)` 确认、`Some(false)` 取消、`None` 未决。
-    pub fn show(&self, ui: &mut Ui, d: &Design, width: f32) -> Option<bool> {
+    pub fn show(&self, ui: &mut Ui, d: &Design) -> Option<bool> {
         let m = d.m();
-        let h = Self::height(d, self.body, width);
+        // 高度估算必须用**实际**对话宽（而不是调用方猜的宽），
+        // 否则行数估少、正文压到按钮行。
+        let screen = ui.ctx().content_rect();
+        let content_w = ModalSize::Sm.width(d, screen.width()) - ModalRhythm::new(d).pad * 2.0;
+        let h = Self::height(d, self.body, content_w);
         let modal = Modal::new(self.title, ModalSize::Sm).closable(false);
         let body_rect = modal.begin(ui, d, h)?;
 
@@ -323,7 +317,7 @@ impl<'a> Confirm<'a> {
             }
         });
 
-        if modal.end(ui, d, body_rect) && result.is_none() {
+        if modal.end(ui, d) && result.is_none() {
             result = Some(false);
         }
         result

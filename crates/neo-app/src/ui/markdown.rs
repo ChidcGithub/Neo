@@ -46,7 +46,10 @@ pub fn render(ui: &mut Ui, skin: &Skin<'_>, text: &str, streaming: bool) {
         };
         CommonMarkViewer::new()
             .explicit_image_uri_scheme(true)
-            .enable_scroll_to_heading(true)
+            // 消息间共享一个 cache：开着锚点滚动时，每条消息的 deferred 目标会
+            // 互相覆盖，非末尾消息里的 #anchor 点了永不跳转。聊天内容几乎不做
+            // 页内跳转，关掉比按消息分 cache 简单得多。
+            .enable_scroll_to_heading(false)
             .render_math_fn(Some(&math_fn))
             .show(ui, &mut cache, text);
         if streaming {

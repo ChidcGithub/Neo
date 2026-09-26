@@ -104,6 +104,7 @@ pub struct Toasts {
     offset: Pos2,
     direction: Direction,
     order: Order,
+    gap: f32,
     contents: std::sync::Arc<dyn Fn(&mut Ui, &Toast) + Send + Sync>,
     added: Vec<Toast>,
 }
@@ -117,6 +118,7 @@ impl Toasts {
             offset: Pos2::ZERO,
             direction: Direction::BottomUp,
             order: Order::Tooltip,
+            gap: 10.0,
             contents: std::sync::Arc::new(contents),
             added: Vec::new(),
         }
@@ -132,6 +134,12 @@ impl Toasts {
     /// 多条时的堆叠方向。
     pub fn direction(mut self, direction: impl Into<Direction>) -> Self {
         self.direction = direction.into();
+        self
+    }
+
+    /// 堆叠间距（默认 10pt；大屏按 `Metrics::s` 缩放后传入）。
+    pub fn gap(mut self, gap: f32) -> Self {
+        self.gap = gap;
         self
     }
 
@@ -160,6 +168,16 @@ impl Toasts {
                 .show(ui, |ui| (self.contents)(ui, toast))
                 .response;
 
+            // egui 的 Area 锚定用**上一帧**记住的尺寸换算位置：本条 toast 与
+            // 该槽位上一条尺寸不同（或中间一条过期、索引前移）时会按旧尺寸
+            // 摆偏。检测到尺寸变化就补一帧重绘，下一帧自动归位。
+            let size_id = self.id.with("slot-size").with(i);
+            let prev: Option<egui::Vec2> = ui.data(|d| d.get_temp(size_id));
+            ui.data_mut(|d| d.insert_temp(size_id, response.rect.size()));
+            if prev.is_some_and(|p| (p - response.rect.size()).abs().max_elem() > 0.5) {
+                ui.request_repaint();
+            }
+
             toast.options.ttl_sec -= dt;
             if toast.options.ttl_sec.is_finite() {
                 // 到期那一帧醒来一次，把尸体收走。
@@ -167,10 +185,10 @@ impl Toasts {
             }
 
             match self.direction {
-                Direction::LeftToRight => offset.x += response.rect.width() + 10.0,
-                Direction::RightToLeft => offset.x -= response.rect.width() + 10.0,
-                Direction::TopDown => offset.y += response.rect.height() + 10.0,
-                Direction::BottomUp => offset.y -= response.rect.height() + 10.0,
+                Direction::LeftToRight => offset.x += response.rect.width() + self.gap,
+                Direction::RightToLeft => offset.x -= response.rect.width() + self.gap,
+                Direction::TopDown => offset.y += response.rect.height() + self.gap,
+                Direction::BottomUp => offset.y -= response.rect.height() + self.gap,
             }
         }
 

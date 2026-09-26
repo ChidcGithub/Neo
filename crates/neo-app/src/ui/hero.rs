@@ -39,7 +39,11 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
     // 与 chip/输入卡的节奏区分开。
     let head_gap = m.s(28.0);
 
-    let total = headline_h + head_gap + chip_h + gap + card_h;
+    let fixed = headline_h + head_gap + chip_h + gap;
+    // 卡片高 clamp 进剩余空间：长草稿 + 矮窗口（如四分屏）时文本区变矮
+    // （内部滚动），而不是整列冲出屏幕把发送钮裁掉。
+    let card_h = card_h.min((area.height() - fixed - m.s(48.0)).max(m.s(120.0)));
+    let total = fixed + card_h;
     // 顶部留一点余量，视觉重心比几何中心略高更稳。
     let top = area.center().y - total * 0.5 - area.height() * 0.02;
     let top = top.max(area.top() + m.s(24.0));

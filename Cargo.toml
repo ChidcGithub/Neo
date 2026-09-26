@@ -30,10 +30,11 @@ neo-stt = { path = "crates/neo-stt" }
 neo-overlay = { path = "crates/neo-overlay" }
 eframe = "0.36.2"
 egui = "0.36.2"
-# 生态零件：flexbox 布局（锁 egui ^0.36，版本必须与 egui 同升同降）。
-# egui-toast 不直接依赖：其 toast 层写死可交互、会挡住被盖住的控件，
-# 队列核心已裁剪 vendor 进 neo-ui（crates/neo-ui/src/toasts.rs）。
-egui_flex = "0.8.0"
+# 生态零件：egui-toast / egui_flex 均不直接依赖 ——
+# egui-toast 的 toast 层写死可交互、会挡住被盖住的控件；
+# egui_flex 跨帧尺寸比较是精确相等，分数倍缩放下亚像素抖动会让它无限
+# request_discard。两者的核心都已裁剪 vendor 进 neo-ui
+# （crates/neo-ui/src/toasts.rs、crates/neo-ui/src/flex/）。
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "default-tls"] }
 serde = { version = "1", features = ["derive"] }

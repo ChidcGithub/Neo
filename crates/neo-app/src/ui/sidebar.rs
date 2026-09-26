@@ -28,6 +28,8 @@ pub struct Outcome {
     pub renamed: Option<(i64, String)>,
     /// 确认删除的会话 id。
     pub delete_confirmed: Option<i64>,
+    /// 本帧的 Esc 已被侧栏消费（取消重命名/删除确认）——app 不要再拿它去停生成。
+    pub escape_consumed: bool,
 }
 
 /// 绘制侧栏。
@@ -235,6 +237,7 @@ fn draw_session_list(
                         );
                         if escape {
                             state.confirming_delete = None;
+                            out.escape_consumed = true;
                             continue;
                         }
                         match neo_ui::list::confirm_row(
@@ -264,6 +267,7 @@ fn draw_session_list(
                         );
                         if escape {
                             state.renaming = None;
+                            out.escape_consumed = true;
                             continue;
                         }
                         ui.painter()
@@ -285,11 +289,7 @@ fn draw_session_list(
                         }
                         // Enter 或点击别处提交；清空视为取消。
                         if editor.lost_focus() {
-                            let title = state.rename_draft.trim().to_owned();
-                            state.renaming = None;
-                            if !title.is_empty() && title != row.title {
-                                out.renamed = Some((row.id, title));
-                            }
+                            settle_rename(state, &rows, &mut out);
                         }
                         continue;
                     }
@@ -302,12 +302,16 @@ fn draw_session_list(
                     {
                         Some(RowAction::Open) => out.open_session = Some(row.id),
                         Some(RowAction::Rename) => {
+                            // 先结算可能在别处进行中的重命名：被点行排在它上方时，
+                            // 那一行本帧就走不到重命名分支，草稿会被静默丢掉。
+                            settle_rename(state, &rows, &mut out);
                             state.renaming = Some(row.id);
                             state.rename_draft = row.title.clone();
                             state.rename_request_focus = true;
                             state.confirming_delete = None;
                         }
                         Some(RowAction::Delete) => {
+                            settle_rename(state, &rows, &mut out);
                             state.confirming_delete = Some(row.id);
                             state.renaming = None;
                         }
@@ -320,9 +324,28 @@ fn draw_session_list(
     out
 }
 
+/// 结算进行中的行内重命名：草稿非空且与旧标题不同才提交。
+/// 与「点击别处 lost_focus 提交」「点了另一行的动作钮」共用同一条路径，
+/// 与行序无关 —— 草稿什么时候被覆盖，都先把旧的那笔落账。
+fn settle_rename(
+    state: &mut AppState,
+    rows: &[neo_store::SessionRow],
+    out: &mut Outcome,
+) {
+    let Some(id) = state.renaming else { return };
+    let title = state.rename_draft.trim().to_owned();
+    state.renaming = None;
+    if title.is_empty() {
+        return;
+    }
+    let old = rows.iter().find(|r| r.id == id).map(|r| r.title.as_str());
+    if old != Some(title.as_str()) {
+        out.renamed = Some((id, title));
+    }
+}
+
 /// 会话列表的副标题：最近更新的时刻。
 ///
-/// # ponytail
 /// 时区硬编码 UTC+8 —— 部署环境就是国内教室，不值得为它引入 chrono。
 /// 需要正确跨时区显示时换成 `chrono::Local` 或 `jiff`。
 fn time_label(ms: i64) -> String {

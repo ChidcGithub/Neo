@@ -184,9 +184,10 @@ impl Switch {
         let m = d.m();
         let c = d.c();
         let p = d.p();
-        let id = self
-            .id_salt
-            .unwrap_or_else(|| ui.id().with(("switch", rect.left() as i32)));
+        let id = self.id_salt.unwrap_or_else(|| {
+            ui.id()
+                .with(("switch", rect.left() as i32, rect.top() as i32))
+        });
         let hit = Rect::from_center_size(rect.center(), Vec2::splat(m.hit_target(rect.height())));
         let resp = if self.enabled {
             crate::base::tap(ui, hit, id)
@@ -195,14 +196,13 @@ impl Switch {
         };
         let st = crate::base::State::of(&resp);
 
-        let track = if st.hovered && self.enabled {
+        // 关态悬停时轨道浮起一层（开态的 business 色本身已醒目，不再叠）。
+        let off_track = if st.hovered && self.enabled {
             c.hover_solid
         } else {
-            p.bg_layer_3
+            crate::base::translucent(p.border_l2, 0.6)
         };
-        let off_track = crate::base::translucent(p.border_l2, 0.6);
         let track_color = if self.on { c.business } else { off_track };
-        let _ = track;
 
         let r = rect.height() * 0.5;
         // 轨道与滑块都用正圆/胶囊：半径≈半边的形状退出超椭圆。

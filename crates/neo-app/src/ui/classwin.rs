@@ -43,6 +43,17 @@ pub struct ClassWin {
 }
 
 impl ClassWin {
+    /// 打开时的目标矩形（屏幕上方居中）。打断判定（miniwin）也用它排除
+    /// 「点在课堂总结窗上」的点击。
+    pub fn target_rect(theme: Theme, monitor_size: Vec2) -> Rect {
+        let m = theme.metrics;
+        let size = Vec2::new(m.s(640.0), m.s(460.0));
+        Rect::from_min_size(
+            Pos2::new(((monitor_size.x - size.x) * 0.5).max(m.s(16.0)), m.s(20.0)),
+            size,
+        )
+    }
+
     /// 每帧驱动一次，挂在 `NeoApp::tick`（与确认窗同路，logic-only 也经过）。
     pub fn tick(&mut self, ctx: &Context, monitor: &mut ClassMonitor, theme: Theme) {
         // 1. 关闭回传先行：dismiss 后 presenting 转 None，本轮即走关闭沿。
@@ -52,12 +63,13 @@ impl ClassWin {
         let open = monitor.presenting().is_some();
 
         // 2. 位置：屏幕上方居中。
-        let m = theme.metrics;
-        let size = Vec2::new(m.s(640.0), m.s(460.0));
-        let monitor_size = ctx
-            .input(|i| i.viewport().monitor_size)
-            .unwrap_or(Vec2::new(1920.0, 1080.0));
-        let target = Pos2::new(((monitor_size.x - size.x) * 0.5).max(m.s(16.0)), m.s(20.0));
+        let rect = Self::target_rect(
+            theme,
+            ctx.input(|i| i.viewport().monitor_size)
+                .unwrap_or(Vec2::new(1920.0, 1080.0)),
+        );
+        let size = rect.size();
+        let target = rect.min;
 
         // 3. 显隐沿：露面时提顶 + 记滑入起点；休眠缩 1x1 回 OFFSCREEN。
         if open != self.open {

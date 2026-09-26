@@ -37,6 +37,24 @@ use crate::result::{ErrorKind, ToolError};
 /// 是因为 `capture()` 是 `screenshot` / `screen_elements` 的唯一入口，一处全覆盖。
 pub static SCREENSHOT_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// 最近一次**合成输入**（`SendInput` 注入的鼠标事件）完成的墙钟毫秒
+/// （Unix epoch；0 = 还没注入过）。
+///
+/// `GetAsyncKeyState` 分不清真人点击与 AI 用 click/drag 注入的点击；
+/// 上层的「用户点了屏幕 = 打断 AI」判定（neo-app 的 miniwin）读这个戳，
+/// 把按下沿落在注入窗口期内的当作 AI 自己的动作忽略 ——
+/// 否则 AI 操作鼠标时会自己把自己打断。
+pub static SYNTHETIC_INPUT_AT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// 当前墙钟毫秒（Unix epoch）。
+pub(crate) fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 最近一次截屏的区域（虚拟桌面物理像素）。
 ///
 /// 与 [`SCREENSHOT_AT`] 的配对约定：**先写区域、再置位时间戳**；
@@ -367,6 +385,8 @@ mod imp {
         if events.is_empty() {
             return Ok(());
         }
+        // 注入前先置位：事件进系统队列的瞬间，全局左键就可能被采样到「按下」。
+        SYNTHETIC_INPUT_AT.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
         let sent = unsafe {
             SendInput(
                 events.len() as u32,
@@ -374,6 +394,9 @@ mod imp {
                 std::mem::size_of::<INPUT>() as i32,
             )
         };
+        // 完成后再写一次：drag 的分步移动会持续刷新这个戳，松手后
+        // 短暂的窗口期（上层采样间隔）内的按下沿也都算合成的。
+        SYNTHETIC_INPUT_AT.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
         if sent as usize != events.len() {
             // 最典型的成因：目标窗口以**管理员**身份运行而 Neo 不是 ——
             // UIPI 会静默丢掉这些事件。所以这里必须报出来，不能当成功。
