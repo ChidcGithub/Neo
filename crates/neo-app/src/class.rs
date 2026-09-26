@@ -533,7 +533,15 @@ fn stt_main(tx: mpsc::Sender<ClassEvent>, stop: Arc<AtomicBool>) {
     // 收帧 → VAD 断句 → 成句即转写回传；stop 后 flush 尾音再退。
     while !stop.load(Ordering::Relaxed) {
         let Some(frame) = tap.next_frame(Duration::from_millis(50)) else {
-            continue; // 超时空转；流死了 tap 线程退出，这里持续 None 无害
+            // 超时空转是常态；但 tap 线程死了（设备拔出/流错误）会持续
+            // None —— 不上报的话课堂录音会静默录进一片空白。
+            if !tap.is_alive() {
+                let _ = tx.send(ClassEvent::SttDied(
+                    "麦克风连接中断（设备被拔出或被安全软件拦截），请重新开启课堂记录".into(),
+                ));
+                return;
+            }
+            continue;
         };
         engine.accept_waveform(&frame);
         while let Some(seg) = engine.take_segment() {

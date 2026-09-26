@@ -34,11 +34,11 @@
 //! eframe 不是异步运行时，把 tokio 拖进来只为了一个 HTTP 请求得不偿失。
 //! `reqwest::blocking` + 后台线程在这里是更小、更可控的方案。
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -392,6 +392,10 @@ pub struct Stream {
 
 impl Stream {
     /// 非阻塞地取走目前所有事件。
+    ///
+    /// 返回空 `Vec` 只代表「此刻没有新事件」，**不代表流已结束** ——
+    /// 请求刚发出、首个增量未到达时同样是空。以收到 [`Event::Done`] /
+    /// [`Event::Failed`] 为结束标志；通道断开（发送端被 drop）是兜底。
     pub fn poll(&self) -> Vec<Event> {
         let mut out = Vec::new();
         while let Ok(ev) = self.rx.try_recv() {
@@ -421,7 +425,9 @@ pub fn list_models(config: &Config) -> Result<Vec<String>, String> {
         .send()
         .map_err(|e| format!("请求失败：{e}"))?;
     let status = resp.status();
-    let body = resp.text().unwrap_or_default();
+    let body = resp
+        .text()
+        .map_err(|e| format!("读取响应体失败：{e}"))?;
     if !status.is_success() {
         let hint = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
@@ -471,8 +477,9 @@ pub fn start(config: Config, messages: Vec<Msg>) -> Stream {
 
 /// 发起一次流式对话，可携带工具声明。
 ///
-/// 立即返回；HTTP 在后台线程进行。线程结束后发送端被 drop，
-/// 此时 [`Stream::poll`] 会得到空 `Vec` —— 用这一点判断流已结束。
+/// 立即返回；HTTP 在后台线程进行。结束标志是收到 [`Event::Done`] /
+/// [`Event::Failed`]（线程退出后发送端被 drop、通道断开是兜底），
+/// **不要**用「poll 出空 Vec」判断结束 —— 那可能只是暂无新事件。
 pub fn start_with_tools(
     config: Config,
     messages: Vec<Msg>,
@@ -666,7 +673,7 @@ fn run(
     messages: Vec<Msg>,
     tools: Vec<serde_json::Value>,
     tx: &Sender<Event>,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
 ) {
     if cancel.load(Ordering::Relaxed) {
         return;
@@ -710,7 +717,15 @@ fn run(
     if !resp.status().is_success() {
         let status = resp.status();
         // 服务端的错误说明通常就在响应体里，取出来比只报状态码有用得多。
-        let body = resp.text().unwrap_or_default();
+        let body = match resp.text() {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = tx.send(Event::Failed(format!(
+                    "接口返回 {status}，错误响应本身也读取失败：{e}"
+                )));
+                return;
+            }
+        };
         let hint = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
             .and_then(|v| {
@@ -727,24 +742,87 @@ fn run(
     }
 
     // `blocking::Response` 实现了 `Read`，逐行读 SSE。
-    let mut reader = BufReader::new(resp);
-    let mut line = String::new();
+    //
+    // 阻塞的 `read_line` 不响应取消：服务端半开挂着时线程会永远卡在读里，
+    // 取消键失效、UI 永远停在「生成中」。所以把读取关进专属线程，主循环用
+    // `recv_timeout` 轮询 —— 取消在 100ms 内生效、连接 stalled 有看门狗；
+    // 读线程在连接死亡前最多泄漏一个，换回的是 UI 一定解得开。
+    let (line_tx, line_rx) = mpsc::channel::<LineEvent>();
+    let reader_cancel = Arc::clone(cancel);
+    let reader = std::thread::Builder::new()
+        .name("neo-llm-reader".to_owned())
+        .spawn(move || {
+            let mut reader = BufReader::new(resp);
+            let mut line = String::new();
+            loop {
+                if reader_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                line.clear();
+                // 单行上限 1 MiB：畸形/恶意服务端发一个永不含换行的行时，
+                // read_line 会无限往 String 里灌。
+                let mut capped = (&mut reader).take(MAX_LINE_BYTES + 1);
+                match capped.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = line_tx.send(LineEvent::Eof);
+                        return;
+                    }
+                    Ok(_) => {
+                        if !line.ends_with('\n') && line.len() as u64 > MAX_LINE_BYTES {
+                            let _ = line_tx.send(LineEvent::Failed(
+                                "响应行过长（疑似畸形流），已中断".to_owned(),
+                            ));
+                            return;
+                        }
+                        if line_tx.send(LineEvent::Line(std::mem::take(&mut line))).is_err() {
+                            return; // 主循环已走（取消），连接随 resp 的 drop 关闭
+                        }
+                    }
+                    Err(e) => {
+                        let _ = line_tx.send(LineEvent::Failed(format!("读取流失败：{e}")));
+                        return;
+                    }
+                }
+            }
+        });
+    if let Err(e) = reader {
+        let _ = tx.send(Event::Failed(format!("无法启动读取线程：{e}")));
+        return;
+    }
+
     // 收尾块才有 finish_reason，用它判断"是否还要跑工具"。
     let mut saw_tool_call = false;
+    let mut last_data = Instant::now();
 
     loop {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // 连接结束
-            Ok(_) => {}
-            Err(e) => {
-                let _ = tx.send(Event::Failed(format!("读取流失败：{e}")));
+        let msg = match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(m) => m,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // 思考型模型可以静默很久，但「五分钟一个字节都没有」基本等于
+                // 连接死透了（正常服务端至少会发 keepalive 注释行）。
+                if last_data.elapsed() > STALL_TIMEOUT {
+                    let _ = tx.send(Event::Failed(
+                        "连接超时：五分钟没有收到任何数据，请重试".to_owned(),
+                    ));
+                    return;
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break, // 读线程异常退出
+        };
+        last_data = Instant::now();
+
+        let line = match msg {
+            LineEvent::Line(l) => l,
+            LineEvent::Eof => break,
+            LineEvent::Failed(e) => {
+                let _ = tx.send(Event::Failed(e));
                 return;
             }
-        }
+        };
 
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
@@ -796,6 +874,23 @@ fn run(
     });
 }
 
+/// 读线程发往主循环的一行（或终止信号）。
+enum LineEvent {
+    Line(String),
+    Eof,
+    Failed(String),
+}
+
+/// 单个 SSE 行的字节上限。正常的增量块最多几百 KB（大段工具参数）。
+const MAX_LINE_BYTES: u64 = 1 << 20;
+
+/// 流式读取的静默看门狗：超过它一个字节都没收到就判定连接已死。
+const STALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 一次响应里允许的最大工具调用数。服务端故障/恶意响应给出天文序号时，
+/// `assemble` 会按序号无上限扩容槽位 —— 在解析入口就拒掉（远程 DoS）。
+const MAX_TOOL_CALLS: usize = 128;
+
 /// 从一个 SSE data 块里解析出文本增量、工具调用分片与结束原因。
 #[derive(Debug, Default, PartialEq)]
 struct Chunk {
@@ -828,7 +923,14 @@ fn parse_chunk(payload: &str) -> Result<Chunk, String> {
     if let Some(calls) = delta["tool_calls"].as_array() {
         for (pos, call) in calls.iter().enumerate() {
             // 有的服务端不给 index，用数组下标兜底。
-            let index = call["index"].as_u64().map(|i| i as usize).unwrap_or(pos);
+            let index = match call["index"].as_u64() {
+                Some(i) if i < MAX_TOOL_CALLS as u64 => i as usize,
+                // 天文序号会让 assemble 无上限扩容槽位（远程 DoS）——判负。
+                Some(i) => {
+                    return Err(format!("工具调用序号 {i} 越界（上限 {MAX_TOOL_CALLS}）"));
+                }
+                None => pos,
+            };
             let id = call["id"]
                 .as_str()
                 .filter(|s| !s.is_empty())
@@ -959,6 +1061,23 @@ mod tests {
             arguments: "{not json".into(),
         };
         assert!(call.parse_arguments().is_err());
+    }
+
+    #[test]
+    fn astronomical_tool_call_index_is_rejected() {
+        // assemble 按 index 扩容槽位：天文序号 = 远程 DoS，解析入口必须拒掉。
+        let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":1000000000,"function":{"name":"bash","arguments":"{}"}}]}}]}"#;
+        let err = parse_chunk(payload).unwrap_err();
+        assert!(err.contains("越界"), "{err}");
+
+        // 边界内（含缺省兜底）仍然正常。
+        let ok = parse_chunk(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":3,"function":{"name":"bash","arguments":"{"}},{"function":{"arguments":"}"}}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(ok.tool_calls.len(), 2);
+        assert_eq!(ok.tool_calls[0].index, 3);
+        assert_eq!(ok.tool_calls[1].index, 1, "缺 index 时用数组下标兜底");
     }
 
     #[test]

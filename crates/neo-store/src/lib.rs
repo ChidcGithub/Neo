@@ -68,6 +68,10 @@ impl Store {
         // WAL 让"边聊边写"不阻塞读；synchronous=NORMAL 在 WAL 下是安全的折中。
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // SQLite 默认不强制外键（且不持久化、必须逐连接开启）——不开的话
+        // schema 里的 REFERENCES ... ON DELETE CASCADE 是死代码，还能写进
+        // 不属于任何会话的孤儿消息。
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         let has_attachments = {
             let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
@@ -77,19 +81,31 @@ impl Store {
             columns.iter().any(|name| name == "attachments")
         };
         if !has_attachments {
-            conn.execute(
+            // 双开同库时两个进程可能同时走到这里：一个是「列已存在」的错误，
+            // 不是真失败 —— 另一个进程已经替我们迁移好了。
+            if let Err(e) = conn.execute(
                 "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
                 [],
-            )?;
+            ) {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+            }
         }
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
+    /// 取连接。锁中毒（某次持锁期间 panic 过）不该让存储层永久瘫痪：
+    /// 连接本身没有并发损坏的风险，取出继续用。
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// 会话列表，最近更新的在前。
     pub fn sessions(&self) -> Result<Vec<SessionRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare_cached(
             "SELECT id, title, updated_ms FROM sessions ORDER BY updated_ms DESC, id DESC",
         )?;
@@ -108,7 +124,7 @@ impl Store {
     /// 新建会话，返回 id。
     pub fn create_session(&self, title: &str) -> Result<i64> {
         let now = now();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO sessions (title, created_ms, updated_ms) VALUES (?1, ?2, ?2)",
             params![title, now],
@@ -118,7 +134,7 @@ impl Store {
 
     /// 更新会话标题与 `updated_ms`。
     pub fn rename_session(&self, id: i64, title: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE sessions SET title = ?1, updated_ms = ?2 WHERE id = ?3",
             params![title, now(), id],
@@ -128,7 +144,7 @@ impl Store {
 
     /// 仅刷新 `updated_ms`（用于把会话顶到列表最前）。
     pub fn touch_session(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE sessions SET updated_ms = ?1 WHERE id = ?2",
             params![now(), id],
@@ -136,17 +152,20 @@ impl Store {
         Ok(())
     }
 
-    /// 删除会话及其全部消息。
+    /// 删除会话及其全部消息。两条 DELETE 必须同事务：中途失败
+    /// （磁盘满 / 进程崩溃）会留下"会话还在、消息全丢"的损坏态。
     pub fn delete_session(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
-        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
     /// 某个会话的全部消息，按写入顺序。
     pub fn messages(&self, session_id: i64) -> Result<Vec<MessageRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare_cached(
             "SELECT role, content, reasoning, meta, attachments FROM messages \
              WHERE session_id = ?1 ORDER BY id ASC",
@@ -187,7 +206,7 @@ impl Store {
         meta: &str,
         attachments: &str,
     ) -> Result<i64> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let timestamp = now();
         tx.execute(
@@ -206,7 +225,7 @@ impl Store {
 
     /// 读取设置；不存在返回 `None`。
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let v = conn
             .query_row(
                 "SELECT value FROM settings WHERE key = ?1",
@@ -219,7 +238,7 @@ impl Store {
 
     /// 写入设置（upsert）。
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -256,6 +275,7 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_ms DESC);
 
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -484,6 +504,20 @@ mod tests {
         store.delete_session(id).unwrap();
         assert!(store.sessions().unwrap().is_empty());
         assert!(store.messages(id).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn foreign_keys_are_enforced() {
+        let (store, dir) = temp_store("fk");
+        // 外键真的开着：给不存在的会话写消息必须报错，而不是产生孤儿消息。
+        assert!(store.append_message(999, "user", "孤儿", "", "").is_err());
+        let on: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(on, 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

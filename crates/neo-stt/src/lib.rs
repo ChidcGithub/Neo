@@ -127,9 +127,15 @@ impl SttEngine {
     pub fn accept_waveform(&self, samples: &[f32]) {
         let mut feed = self.feed.lock().unwrap();
         feed.extend_from_slice(samples);
-        while feed.len() >= VAD_WINDOW {
-            self.vad.accept_waveform(&feed[..VAD_WINDOW]);
-            feed.drain(..VAD_WINDOW);
+        // 按窗口消费时用游标而不是逐窗 drain：整段一次性喂入（如离线转写
+        // 测试）下逐窗 drain 是 O(n²) —— 10 分钟音频要搬移数十 GB。
+        let mut consumed = 0;
+        while feed.len() - consumed >= VAD_WINDOW {
+            self.vad.accept_waveform(&feed[consumed..consumed + VAD_WINDOW]);
+            consumed += VAD_WINDOW;
+        }
+        if consumed > 0 {
+            feed.drain(..consumed);
         }
     }
 

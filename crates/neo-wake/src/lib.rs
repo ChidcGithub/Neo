@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -32,6 +32,24 @@ const EMB_DIM: usize = 96;
 /// 覆盖 5~7 个连续窗口，稳稳两连。阈值卡在真唤醒得分下缘（≈0.2）时，
 /// 这个比硬提阈值更能保住唤醒率。
 const CONFIRM_FRAMES: usize = 2;
+
+/// 采集回调 → 引擎线程的缓冲块数。回调线程绝不能阻塞（实时音频线程），
+/// 满了就丢**新**块：积压说明推理跟不上实时，丢新块让引擎追当前
+/// （唤醒只看最近 2s 滑窗，丢一块等于一个几十毫秒的洞，比越落越远强）。
+const SAMPLE_CHUNKS: usize = 8;
+
+/// 麦克风静默看门狗：流活着时数据回调按设备周期持续到达（静音也是零
+/// 数据帧，不是没回调）。超过它一个样本都没到 = 流实质已死（拔出且无
+/// 后继设备等），必须上报而不是永远空转装没事。
+const MIC_SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Unix 毫秒（0 表示「还没有」）。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone)]
 pub struct WakeConfig {
@@ -165,7 +183,7 @@ fn engine_main(
         }
     };
 
-    let (sample_tx, sample_rx) = mpsc::channel::<Vec<i16>>();
+    let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<i16>>(SAMPLE_CHUNKS);
     let err_tx = tx.clone();
     let stream = match build_stream(sample_tx, move |msg| {
         let _ = err_tx.send(WakeEvent::Error(msg));
@@ -236,7 +254,20 @@ fn engine_main(
         }
         let raw = match sample_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(v) => v,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // 流活着就有持续的采样回调（静音也是零帧，不是没帧）。
+                // 一个样本都没有超过看门狗时间 = 流实质已死（设备拔出且
+                // 无后继等）—— DeviceChanged 错误回调分不出真假死，
+                // 只能靠数据兜底。上报后退出，别永远空转装没事。
+                let silent = now_ms().saturating_sub(stream.last_sample.load(Ordering::Relaxed));
+                if silent > MIC_SILENCE_TIMEOUT.as_millis() as u64 {
+                    let _ = tx.send(WakeEvent::Error(
+                        "麦克风已断开（5 秒没有采到任何声音）".to_owned(),
+                    ));
+                    return;
+                }
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if debug {
@@ -307,20 +338,22 @@ fn engine_main(
 
 // ---------------- 模型加载与推理 ----------------
 
-static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+static ORT_INIT: OnceLock<()> = OnceLock::new();
 
 fn init_ort(dir: &Path) -> Result<(), String> {
-    ORT_INIT
-        .get_or_init(|| {
-            let dll = dir.join("onnxruntime.dll");
-            // commit() 返回 bool：false 表示 environment 已配置过（幂等，可忽略）
-            ort::init_from(&dll)
-                .map_err(|e| format!("load {}: {e}", dll.display()))?
-                .with_name("neo-wake")
-                .commit();
-            Ok(())
-        })
-        .clone()
+    // 只缓存成功：失败（比如当时 dll 缺失）不该被记到进程寿命 ——
+    // 用户补好文件、经设置开关重启引擎后必须能重试。
+    if ORT_INIT.get().is_some() {
+        return Ok(());
+    }
+    let dll = dir.join("onnxruntime.dll");
+    // commit() 返回 bool：false 表示 environment 已配置过（幂等，可忽略）
+    ort::init_from(&dll)
+        .map_err(|e| format!("load {}: {e}", dll.display()))?
+        .with_name("neo-wake")
+        .commit();
+    let _ = ORT_INIT.set(()); // 并发首装下另一个线程可能抢先，幂等
+    Ok(())
 }
 
 fn load_models(dir: &Path) -> Result<Models, String> {
@@ -357,7 +390,20 @@ fn predict(models: &mut Models, audio: &[f32]) -> Result<f32, String> {
         .map_err(|e| e.to_string())?;
     let mel_out = models.mel.run(ort::inputs![mel_in]).map_err(|e| e.to_string())?;
     let (mel_shape, mel_data) = mel_out[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+    // 形状校验：模型版本不符时宁可报错也别静默错切（把 32 当成 T 之类的
+    // 事故没有任何报错、唤醒纯静默失效）或索引越界 panic。
+    if mel_shape.len() != 4 || mel_shape[3] as usize != MEL_BINS {
+        return Err(format!(
+            "mel 输出形状异常 {mel_shape:?}（应为 (1,1,T,{MEL_BINS})），模型版本不符？"
+        ));
+    }
     let t = mel_shape[2] as usize;
+    if mel_data.len() != t * MEL_BINS {
+        return Err(format!(
+            "mel 数据长度 {} 与形状 {mel_shape:?} 不符",
+            mel_data.len()
+        ));
+    }
     let mut feats = vec![0f32; t * MEL_BINS];
     for (dst, &src) in feats.iter_mut().zip(mel_data.iter()) {
         *dst = src / 10.0 + 2.0;
@@ -384,6 +430,13 @@ fn predict(models: &mut Models, audio: &[f32]) -> Result<f32, String> {
     .map_err(|e| e.to_string())?;
     let emb_out = models.embed.run(ort::inputs![emb_in]).map_err(|e| e.to_string())?;
     let (_, emb_data) = emb_out[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+    if emb_data.len() != n_emb * EMB_DIM {
+        return Err(format!(
+            "embedding 数据长度 {} 与期望 {} 不符，模型版本不符？",
+            emb_data.len(),
+            n_emb * EMB_DIM
+        ));
+    }
 
     // 3) 分类器：取最后 16 个 embedding，(1, 16, 96) -> (1, 1)
     let tail = &emb_data[(n_emb - MIN_EMBEDDINGS) * EMB_DIM..];
@@ -397,7 +450,10 @@ fn predict(models: &mut Models, audio: &[f32]) -> Result<f32, String> {
         .run(ort::inputs![cls_in])
         .map_err(|e| e.to_string())?;
     let (_, score) = cls_out[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-    Ok(score[0])
+    score
+        .first()
+        .copied()
+        .ok_or_else(|| "分类器输出为空，模型版本不符？".to_owned())
 }
 
 // ---------------- 音频采集 ----------------
@@ -408,11 +464,19 @@ struct AudioStream {
     sample_rate: u32,
     /// 设备名（启动遥测用）
     device_name: String,
+    /// 最近一次数据回调的 Unix 毫秒（看门狗用；回调每到一个块就刷新）
+    last_sample: Arc<AtomicU64>,
+}
+
+/// 有界队列 + 满了丢新块（理由见 [`SAMPLE_CHUNKS`]），顺手刷新看门狗。
+fn push_samples(tx: &mpsc::SyncSender<Vec<i16>>, last: &AtomicU64, buf: Vec<i16>) {
+    last.store(now_ms(), Ordering::Relaxed);
+    let _ = tx.try_send(buf); // Full / Disconnected 都丢：回调线程不能阻塞
 }
 
 /// `on_err` 只在致命错误时调用；Xrun / 设备切换这类瞬态事件内部消化。
 fn build_stream(
-    tx: mpsc::Sender<Vec<i16>>,
+    tx: mpsc::SyncSender<Vec<i16>>,
     on_err: impl Fn(String) + Send + Clone + 'static,
 ) -> Result<AudioStream, String> {
     let host = cpal::default_host();
@@ -425,11 +489,15 @@ fn build_stream(
         .map(|d| d.name().to_string())
         .unwrap_or_else(|_| "?".into());
 
+    // 看门狗起始值给「现在」：流刚建好、首个回调还没到之前不算死亡。
+    let last_sample = Arc::new(AtomicU64::new(now_ms()));
+
     let err_cb = move |e: cpal::Error| {
         match e.kind() {
             // Xrun（缓冲区欠载/过载）与 DeviceChanged（默认设备切换、流自动跟随）
             // 都是瞬态事件，流仍在继续采集——启动期 CPU 尖峰很容易触发一次 Xrun，
             // 误当致命错误会让唤醒整局失效，这里只记录不上报。
+            // （设备拔出且无后继的「假 DeviceChanged、真死流」由数据看门狗兜住。）
             cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged => {
                 eprintln!("[neo-wake] mic stream 瞬态事件（流仍存活，忽略）: {e}");
             }
@@ -454,10 +522,11 @@ fn build_stream(
         });
     if supports_16k {
         let tx16 = tx.clone();
+        let last = last_sample.clone();
         if let Ok(stream) = device.build_input_stream(
             want_16k,
             move |d: &[i16], _| {
-                let _ = tx16.send(d.to_vec());
+                push_samples(&tx16, &last, d.to_vec());
             },
             err_cb.clone(),
             None,
@@ -466,73 +535,88 @@ fn build_stream(
                 stream,
                 sample_rate: SAMPLE_RATE,
                 device_name,
+                last_sample,
             });
         }
     }
 
-    // 退回设备默认格式，自己混单声道 + 转 i16，重采样交给引擎线程
+    // 退回设备默认格式，混单声道（各声道平均 —— 只取左声道会对左右
+    // 不对称的 USB 阵列采到近静音）+ 转 i16，重采样交给引擎线程
     let def = device.default_input_config().map_err(|e| e.to_string())?;
     let ch = def.channels() as usize;
     let sample_rate = def.sample_rate();
     let config: cpal::StreamConfig = def.clone().into();
 
-    fn mix_mono<F: Fn(&f32) -> i16>(
-        data: &[f32],
-        ch: usize,
-        conv: &F,
-    ) -> Vec<i16> {
-        data.chunks_exact(ch).map(|f| conv(&f[0])).collect()
-    }
-
     let stream = match def.sample_format() {
-        cpal::SampleFormat::I16 => device
-            .build_input_stream(
-                config.clone(),
-                move |d: &[i16], _| {
-                    let mono = if ch == 1 {
-                        d.to_vec()
-                    } else {
-                        d.chunks_exact(ch)
-                            .map(|f| (f.iter().map(|&s| s as i32).sum::<i32>() / ch as i32) as i16)
-                            .collect()
-                    };
-                    let _ = tx.send(mono);
-                },
-                err_cb.clone(),
-                None,
-            )
-            .map_err(|e| e.to_string())?,
-        cpal::SampleFormat::F32 => device
-            .build_input_stream(
-                config.clone(),
-                move |d: &[f32], _| {
-                    let mono = mix_mono(d, ch, &|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16);
-                    let _ = tx.send(mono);
-                },
-                err_cb.clone(),
-                None,
-            )
-            .map_err(|e| e.to_string())?,
-        cpal::SampleFormat::U16 => device
-            .build_input_stream(
-                config,
-                move |d: &[u16], _| {
-                    let mono: Vec<i16> = d
-                        .chunks_exact(ch)
-                        .map(|f| (f[0] as i32 - 32768) as i16)
-                        .collect();
-                    let _ = tx.send(mono);
-                },
-                err_cb.clone(),
-                None,
-            )
-            .map_err(|e| e.to_string())?,
+        cpal::SampleFormat::I16 => {
+            let last = last_sample.clone();
+            device
+                .build_input_stream(
+                    config.clone(),
+                    move |d: &[i16], _| {
+                        let mono = if ch == 1 {
+                            d.to_vec()
+                        } else {
+                            d.chunks_exact(ch)
+                                .map(|f| {
+                                    (f.iter().map(|&s| s as i32).sum::<i32>() / ch as i32) as i16
+                                })
+                                .collect()
+                        };
+                        push_samples(&tx, &last, mono);
+                    },
+                    err_cb.clone(),
+                    None,
+                )
+                .map_err(|e| e.to_string())?
+        }
+        cpal::SampleFormat::F32 => {
+            let last = last_sample.clone();
+            device
+                .build_input_stream(
+                    config.clone(),
+                    move |d: &[f32], _| {
+                        let mono = d
+                            .chunks_exact(ch)
+                            .map(|f| {
+                                let avg = f.iter().sum::<f32>() / ch as f32;
+                                (avg.clamp(-1.0, 1.0) * 32767.0) as i16
+                            })
+                            .collect();
+                        push_samples(&tx, &last, mono);
+                    },
+                    err_cb.clone(),
+                    None,
+                )
+                .map_err(|e| e.to_string())?
+        }
+        cpal::SampleFormat::U16 => {
+            let last = last_sample.clone();
+            device
+                .build_input_stream(
+                    config,
+                    move |d: &[u16], _| {
+                        let mono: Vec<i16> = d
+                            .chunks_exact(ch)
+                            .map(|f| {
+                                (f.iter().map(|&s| s as i32 - 32768).sum::<i32>() / ch as i32)
+                                    as i16
+                            })
+                            .collect();
+                        push_samples(&tx, &last, mono);
+                    },
+                    err_cb.clone(),
+                    None,
+                )
+                .map_err(|e| e.to_string())?
+        }
         f => return Err(format!("unsupported sample format: {f:?}")),
     };
     Ok(AudioStream {
         stream,
         sample_rate,
         device_name,
+        last_sample,
     })
 }
 
@@ -592,6 +676,9 @@ struct Resampler {
 
 impl Resampler {
     fn new(fs_in: u32, fs_out: u32) -> Self {
+        // 驱动上报 0Hz 的病态情形：step=0 会让内层 while 死循环且输出无限
+        // 增长（挂死 + OOM）。当成不重采样（step=1）处理，至少链路还活着。
+        let fs_in = if fs_in == 0 { fs_out } else { fs_in };
         let lp = if fs_in > fs_out {
             Some(Biquad::lowpass(fs_in as f32, fs_out as f32 / 2.0 * 0.9))
         } else {
@@ -654,14 +741,24 @@ impl AudioTap {
             .spawn(move || tap_main(frame_tx, hello_tx, stop2))
             .map_err(|e| format!("spawn audio tap: {e}"))?;
         // 等采集线程握手：设备名或启动错误。流活着时线程不会主动退出。
-        let device = match hello_rx.recv() {
+        // 必须有超时：坏驱动/杀软钩住音频栈时建流可能永久卡住 —— 无超时
+        // 会把调用方线程一起 wedge 掉。超时后不能 join（同样会卡死），
+        // 置 stop 并分离线程：它若将来醒来会自己看到 stop 退出。
+        let device = match hello_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(name)) => name,
             Ok(Err(e)) => {
                 stop.store(true, Ordering::Relaxed);
                 let _ = thread.join();
                 return Err(e);
             }
-            Err(_) => return Err("audio tap 线程启动即退出".into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                stop.store(true, Ordering::Relaxed);
+                drop(thread); // 分离，不 join
+                return Err("打开麦克风超时（10s）——设备繁忙或被安全软件拦截".into());
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("audio tap 线程启动即退出".into());
+            }
         };
         Ok(Self {
             rx: frame_rx,
@@ -677,9 +774,16 @@ impl AudioTap {
     }
 
     /// 取下一帧（80ms / 1280 样本 f32）。超时返回 `None`；
-    /// 流死亡（线程退出）后持续返回 `None`。
+    /// 流死亡（线程退出）后持续返回 `None` —— 用 [`AudioTap::is_alive`]
+    /// 区分「安静的教室」与「死流」。
     pub fn next_frame(&self, timeout: Duration) -> Option<Vec<f32>> {
         self.rx.recv_timeout(timeout).ok()
+    }
+
+    /// 采集线程是否还活着。`next_frame` 持续返回 `None` 时用它区分
+    /// 「没声音」与「流死了」。
+    pub fn is_alive(&self) -> bool {
+        self.thread.as_ref().is_some_and(|t| !t.is_finished())
     }
 }
 
@@ -697,10 +801,15 @@ fn tap_main(
     hello: mpsc::Sender<Result<String, String>>,
     stop: Arc<AtomicBool>,
 ) {
-    let (sample_tx, sample_rx) = mpsc::channel::<Vec<i16>>();
-    // 致命流错误：记日志后让帧通道断开（对端拿 Disconnected 当结束信号）。
+    let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<i16>>(SAMPLE_CHUNKS);
+    // 致命流错误：置死标志，主循环见到即退出 —— 线程退出后帧通道断开，
+    // 对端经 is_alive() 得知流死（只 eprintln 的话对端永远分不清
+    // 「安静的教室」与「死流」）。
+    let dead = Arc::new(AtomicBool::new(false));
+    let dead2 = dead.clone();
     let stream = match build_stream(sample_tx, move |msg| {
         eprintln!("[neo-audio-tap] {msg}");
+        dead2.store(true, Ordering::Relaxed);
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -716,13 +825,24 @@ fn tap_main(
         return; // 启动方已放弃
     }
 
-    // 收样本 → 重采样 → 组帧 → 转发，直到 stop 或流断开。
+    // 收样本 → 重采样 → 组帧 → 转发，直到 stop、流报错或看门狗判定死流。
     let mut resampler = Resampler::new(stream.sample_rate, SAMPLE_RATE);
     let mut pending: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
     while !stop.load(Ordering::Relaxed) {
         let raw = match sample_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(v) => v,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if dead.load(Ordering::Relaxed) {
+                    return; // 流报过致命错误，帧通道随退出断开
+                }
+                // 同唤醒引擎的数据看门狗：持续无样本 = 流实质已死。
+                let silent = now_ms().saturating_sub(stream.last_sample.load(Ordering::Relaxed));
+                if silent > MIC_SILENCE_TIMEOUT.as_millis() as u64 {
+                    eprintln!("[neo-audio-tap] 麦克风 {MIC_SILENCE_TIMEOUT:?} 无数据，判定死流退出");
+                    return;
+                }
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         resampler.process(&raw, &mut pending);
@@ -735,5 +855,65 @@ fn tap_main(
                 return; // 消费端走了
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(resampler: &mut Resampler, input: &[i16]) -> Vec<i16> {
+        let mut out = Vec::new();
+        resampler.process(input, &mut out);
+        out
+    }
+
+    #[test]
+    fn same_rate_is_one_to_one() {
+        let mut r = Resampler::new(16_000, 16_000);
+        let input = vec![1000i16; 160];
+        let out = run(&mut r, &input);
+        // 首样本用于起相位，少一个是正常的；其余逐一对应。
+        assert_eq!(out.len(), input.len() - 1);
+        assert!(out.iter().all(|&s| (s - 1000).abs() <= 1));
+    }
+
+    #[test]
+    fn integer_decimation_ratio_and_dc_passthrough() {
+        let mut r = Resampler::new(48_000, 16_000);
+        // 直流信号过低通还是直流：3:1 抽取，幅度不变。
+        let input = vec![2000i16; 480];
+        let out = run(&mut r, &input);
+        assert!(
+            (out.len() as i32 - 160).abs() <= 2,
+            "480 样本 3:1 抽取应得 ~160，实得 {}",
+            out.len()
+        );
+        assert!(
+            out.iter().skip(10).all(|&s| (s - 2000).abs() < 100),
+            "直流过抽取后幅度跑偏"
+        );
+    }
+
+    #[test]
+    fn upsample_interpolates_on_the_ramp() {
+        let mut r = Resampler::new(16_000, 48_000);
+        // 斜坡信号 1:3 上采样：点数约 3 倍，且输出仍落在斜坡上（单调）。
+        let input: Vec<i16> = (0..160).map(|i| i * 10).collect();
+        let out = run(&mut r, &input);
+        assert!(
+            (out.len() as i32 - 477).abs() <= 6,
+            "160 样本 1:3 上采样应得 ~477，实得 {}",
+            out.len()
+        );
+        assert!(out.windows(2).all(|w| w[1] >= w[0]), "斜坡插值必须单调");
+    }
+
+    #[test]
+    fn zero_input_rate_does_not_hang_or_explode() {
+        // 病态驱动上报 0Hz：按不重采样兜底，绝不能死循环 / OOM。
+        let mut r = Resampler::new(0, 16_000);
+        let out = run(&mut r, &vec![7i16; 100]);
+        assert_eq!(out.len(), 99);
     }
 }
