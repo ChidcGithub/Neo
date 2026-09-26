@@ -83,11 +83,10 @@ impl Param {
         }
     }
 
-    /// 可选整数，`[lo, hi]` 闭区间，省略时用 `by_default`。
     /// 必填整数（带闭区间）。
     ///
     /// 坐标这类"没有合理默认值"的参数用它 —— 给个默认值反而危险：
-    /// 模型漏填时会被悄悄点到 (0,0)。
+    /// 模型漏填时会被悄悄点到 (0,0)。可选整数用 `opt_int`（省略时用默认值）。
     pub const fn int(name: &'static str, desc: &'static str, min: i64, max: i64) -> Self {
         Self {
             name,

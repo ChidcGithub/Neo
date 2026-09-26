@@ -16,7 +16,7 @@
 //!   小窗视口自己的回调里自驱**（避让 / 淡入 / 边缘流光），主视口只管
 //!   10fps 的内容快照；窗口位置也由回调发 `OuterPosition`，builder 不碰。
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -83,6 +83,46 @@ fn global_cursor() -> Option<(Pos2, bool)> {
     None
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 全局输入单点采样（只写于视口回调，读于 tick）。
+///
+/// `GetAsyncKeyState` 的「自上次调用以来按过」位（0x0001）**按线程锁存、读后
+/// 即清**：回调（60fps）与 tick（托盘态 ~10fps）同线程抢读时，按下沿会先被
+/// 回调清掉，tick 侧只剩「此刻仍按着」——一次 30ms 的快速点按约一半概率漏检。
+/// 所以只有回调采样，结果经这三个槽位转发：光标每次采样刷新，按下沿记时刻。
+static CURSOR: Mutex<Option<(Pos2, bool)>> = Mutex::new(None);
+/// 最近一次左键按下沿的时刻（ms）；0 = 从未按过。
+static LMB_EDGE_MS: AtomicU64 = AtomicU64::new(0);
+/// 回调侧的上一帧按下态（沿检测用）。
+static PREV_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// 视口回调里每帧调用一次：采样全局输入，刷新 [`CURSOR`] / [`LMB_EDGE_MS`]。
+fn poll_global_input() {
+    match global_cursor() {
+        Some((pos, down)) => {
+            let prev = PREV_DOWN.swap(down, Ordering::Relaxed);
+            if down && !prev {
+                LMB_EDGE_MS.store(now_ms(), Ordering::Relaxed);
+            }
+            if let Ok(mut g) = CURSOR.lock() {
+                *g = Some((pos, down));
+            }
+        }
+        None => {
+            PREV_DOWN.store(false, Ordering::Relaxed);
+            if let Ok(mut g) = CURSOR.lock() {
+                *g = None;
+            }
+        }
+    }
+}
+
 /// 最近一次 AI 合成输入（click/drag 工具的 SendInput 注入）是不是就发生在刚刚。
 ///
 /// 合成点击与物理点击在系统里不可区分，只能靠工具层留的时间戳排除：
@@ -94,11 +134,7 @@ fn synthetic_click_recent() -> bool {
     if last == 0 {
         return false;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    now.saturating_sub(last) < 1000
+    now_ms().saturating_sub(last) < 1000
 }
 
 /// 本轮对话（自最后一条用户消息起）AI 是否动过鼠标/键盘。
@@ -374,7 +410,11 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>, fade: f32) 
     } else {
         p.label_primary
     };
-    let galley = painter.layout(body, d.font(d.t().body), tint(ink), inner.width());
+    // break_anywhere：URL/长 token 这类无空格串冲出卡片右缘被硬切不如断行
+    // （会话页的气泡/错误框同款处理）。
+    let mut job = egui::text::LayoutJob::simple(body, d.font(d.t().body), tint(ink), inner.width());
+    job.wrap.break_anywhere = true;
+    let galley = painter.layout_job(job);
     painter.galley(Pos2::new(inner.left(), y), galley, tint(ink));
 
     // 边缘流光：小窗只在后台执行中露面，这道光就是「还在跑」的持续信号。
@@ -465,8 +505,8 @@ pub struct MiniWin {
     interrupt_open: bool,
     /// 打断确认结果（回调里写、tick 里读）：0 未决 / 1 打断 / 2 继续。
     interrupt_result: Arc<AtomicU8>,
-    /// 上一帧全局左键状态（沿检测用）。
-    lmb_was_down: bool,
+    /// 已消费的左键按下沿时刻（同一沿在 250ms 窗口内不重复触发）。
+    lmb_edge_consumed: u64,
     /// 本轮后台执行的起点（标题里的已用时长靠它）；闲下来清零。
     busy_since: Option<Instant>,
 }
@@ -537,21 +577,24 @@ impl MiniWin {
             self.busy_since = Some(Instant::now());
         }
 
-        // 3. 全局输入：逻辑坐标光标 + 左键按下沿。
+        // 3. 全局输入（由视口回调单点采样转发，见 LMB_EDGE_MS 注释）：
+        //    逻辑坐标光标 + 左键按下沿。沿带 250ms 窗口并记消费，托盘态
+        //    ~10fps 的 tick 不会漏掉两次 tick 之间的快速点按。
         let ppp = ctx
             .input(|i| i.viewport().native_pixels_per_point)
             .unwrap_or(1.0);
-        let (cursor, lmb_edge) = match global_cursor() {
-            Some((physical, down)) => {
-                let edge = down && !self.lmb_was_down;
-                self.lmb_was_down = down;
-                (Some(Pos2::new(physical.x / ppp, physical.y / ppp)), edge)
-            }
-            None => {
-                self.lmb_was_down = false;
-                (None, false)
-            }
-        };
+        let cursor = CURSOR
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(|(physical, _)| Pos2::new(physical.x / ppp, physical.y / ppp));
+        let edge_ms = LMB_EDGE_MS.load(Ordering::Relaxed);
+        let lmb_edge = edge_ms != 0
+            && edge_ms != self.lmb_edge_consumed
+            && now_ms().saturating_sub(edge_ms) < 250;
+        if lmb_edge {
+            self.lmb_edge_consumed = edge_ms;
+        }
 
         // 4. 几何：常态贴右上、避让时躲左上。窗口位置的动画挪到了视口回调里
         //    自驱（主视口托盘态被节流，跑不动动画）；这里只留两个静止端点，
@@ -688,8 +731,15 @@ impl MiniWin {
                 let ppp = ctx
                     .input(|i| i.viewport().native_pixels_per_point)
                     .unwrap_or(1.0);
-                let cursor =
-                    global_cursor().map(|(p, _)| Pos2::new(p.x / ppp, p.y / ppp));
+                let cursor = {
+                    // 采样顺带刷新槽位（60fps 单点，tick 的沿检测靠它喂）。
+                    poll_global_input();
+                    CURSOR
+                        .lock()
+                        .ok()
+                        .and_then(|g| *g)
+                        .map(|(p, _)| Pos2::new(p.x / ppp, p.y / ppp))
+                };
                 let dodge = !snapshot.interrupt_open
                     && cursor.is_some_and(|c| Rect::from_min_size(home, size).contains(c));
                 let t = ctx.animate_value_with_time(

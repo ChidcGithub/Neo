@@ -831,7 +831,12 @@ impl AppState {
         self.stage = Stage::Hero;
         self.active_session = None;
         self.generating = false;
-        self.stream = None;
+        // 与 cancel() 对齐：丢 rx 前先插取消标志 —— 旧流线程在下一个数据块
+        // 边界就能退出，而不是阻塞在 read_line 里多活（服务端挂起时实质泄漏）。
+        if let Some(StreamSource::Real(s)) = self.stream.take() {
+            s.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.stream_started = None;
         self.pending_persist = 0;
         self.wants_demo_reply = false;
         self.tool_frags.clear();
@@ -1380,6 +1385,20 @@ impl AppState {
         }
     }
 
+    /// 「本会话都允许」：打开自动批准（后续轮次直接放行），并把本轮**已挂起**
+    /// 的其余待确认项一并推到 `Running` —— 只批当前一条的话，确认窗会对剩下
+    /// 的逐条再弹，与按钮文案的「都允许」不符。
+    pub fn approve_all_awaiting(&mut self) {
+        self.auto_approve_tools = true;
+        for msg in &mut self.messages {
+            if let Some(meta) = msg.tool.as_mut() {
+                if meta.state == ToolState::AwaitingConfirm {
+                    meta.state = ToolState::Running;
+                }
+            }
+        }
+    }
+
     /// 还有几条在等用户点头。
     pub fn awaiting_tool_count(&self) -> usize {
         self.messages
@@ -1469,6 +1488,12 @@ impl AppState {
                             return false;
                         }
                         Event::Failed(msg) => {
+                            // 失败也要清工具分片：否则残留分片会混进下一轮
+                            // begin_tool_round —— 与本轮分片按 index 拼接出
+                            // "write_fileread_file" 这类怪名/非法 JSON，甚至让
+                            // 上一轮未执行的工具幽灵复活（已「本会话都允许」时
+                            // 会不经询问直接跑旧命令）。cancel() 同样清。
+                            self.tool_frags.clear();
                             self.end_stream(Some(msg));
                             return false;
                         }

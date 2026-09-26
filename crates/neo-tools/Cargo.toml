@@ -27,6 +27,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 # UI Automation 是 COM 接口 —— windows-sys 只有裸 Win32，没有 COM 封装，

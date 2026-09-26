@@ -150,6 +150,17 @@ fn run(
     visible: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
+    // 无论正常退出还是 panic 展开（wgpu 的校验错误默认就是 panic），都要放
+    // stop —— 否则抓屏线程跑到进程退出：迷你窗被永久压制、冻结的跑马灯残留
+    // 在屏上、show()/hide() 全部落空且无人上报。
+    struct StopGuard(Arc<AtomicBool>);
+    impl Drop for StopGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let _stop_guard = StopGuard(stop.clone());
+
     // 抓屏线程：可见时 ~30fps 抓虚拟桌面，供 shader 折射采样。
     let slot: FrameSlot = Arc::new(Mutex::new(None));
     {
@@ -169,7 +180,12 @@ fn run(
                         continue;
                     }
                     let rect = screen::virtual_screen();
-                    if let Ok(shot) = screen::capture(rect) {
+                    // 静默抓帧：`capture()` 带「广播截屏信号 + 等迷你窗躲开 300ms」
+                    // 的副作用，那是给「AI 应用户要求截屏」的；折射抓帧是 ~30fps 的
+                    // 后台循环，走它会压死迷你窗、把折射帧率拖到 ~3fps、还会在听写
+                    // 结束后凭空闪一次全屏白框（信号被反复续期后的假反馈）。
+                    // 本窗自带 WDA_EXCLUDEFROMCAPTURE，画面里本来就没有自己。
+                    if let Ok(shot) = screen::capture_silent(rect) {
                         if let Ok(mut g) = slot.lock() {
                             *g = Some(shot);
                         }
@@ -267,6 +283,15 @@ fn msg_loop(
                 hiding = false;
                 active = false;
                 visible.store(false, Ordering::Relaxed);
+                // 桌面纹理一并重置：下次 show 的折射只对重新抓到的画面开，
+                // 不拿隐藏前的陈旧桌面冒充「实时」。
+                gfx.desktop = Gfx::placeholder_desktop(
+                    &gfx.device,
+                    &gfx.queue,
+                    &gfx.bind_layout,
+                    &gfx.uniform_buf,
+                    &gfx.sampler,
+                );
                 unsafe {
                     ShowWindow(hwnd, SW_HIDE);
                 }
@@ -495,6 +520,15 @@ impl Gfx {
         if hwnd.is_null() {
             return Err("CreateWindowExW 失败".into());
         }
+        // 之后的初始化（surface/adapter/device…）任一步失败都要拆掉窗口，
+        // 否则一个隐藏的全屏 topmost 句柄泄漏到进程退出。
+        struct HwndGuard(HWND);
+        impl Drop for HwndGuard {
+            fn drop(&mut self) {
+                unsafe { DestroyWindow(self.0) };
+            }
+        }
+        let hwnd_guard = HwndGuard(hwnd);
         // 让窗口对截屏不可见（抓屏线程才能拍到干净的桌面做折射）。
         // WDA_EXCLUDEFROMCAPTURE 需 Win10 2004+；低版本或远程会话等场景下
         // 返回 FALSE。失败后抓屏会拍到跑马灯自己，折射形成反馈循环 ——
@@ -651,49 +685,8 @@ impl Gfx {
         });
 
         // 初始 1x1 黑色桌面纹理占位（第一帧抓屏到达后重建）
-        let desktop = {
-            let tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("overlay-desktop"),
-                size: wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &[0, 0, 0, 255],
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4),
-                    rows_per_image: Some(1),
-                },
-                wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-            );
-            let view = tex.create_view(&Default::default());
-            let bind = Self::make_bind_group(&device, &bind_layout, &uniform_buf, &view, &sampler);
-            DesktopTex {
-                tex,
-                bind,
-                w: 1,
-                h: 1,
-            }
-        };
+        let desktop =
+            Self::placeholder_desktop(&device, &queue, &bind_layout, &uniform_buf, &sampler);
 
         let offscreen = Self::make_offscreen(
             &device,
@@ -703,6 +696,8 @@ impl Gfx {
             ((config.height as f32) * RENDER_SCALE).max(1.0) as u32,
         );
 
+        // 初始化全部完成：句柄的所有权移给返回的 Gfx，守卫解除。
+        std::mem::forget(hwnd_guard);
         Ok(Self {
             hwnd,
             surface,
@@ -798,6 +793,59 @@ impl Gfx {
                 },
             ],
         })
+    }
+
+    /// 1x1 黑色桌面纹理占位（首帧抓屏到达前 / 隐藏后重置：
+    /// 折射只对**新鲜**画面开 —— 重新 show 时若还拿着隐藏前的陈旧桌面，
+    /// 折射采样到的就是几分钟前的屏幕内容）。
+    fn placeholder_desktop(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bind_layout: &wgpu::BindGroupLayout,
+        uniform_buf: &wgpu::Buffer,
+        sampler: &wgpu::Sampler,
+    ) -> DesktopTex {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("overlay-desktop"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0, 0, 0, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = tex.create_view(&Default::default());
+        let bind = Self::make_bind_group(device, bind_layout, uniform_buf, &view, sampler);
+        DesktopTex {
+            tex,
+            bind,
+            w: 1,
+            h: 1,
+        }
     }
 
     /// 上传最新抓屏帧；尺寸变化时重建纹理与 bind group。
@@ -913,7 +961,12 @@ impl Gfx {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
                 f
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                // 锁屏 / UAC 安全桌面期间拿不到 surface：直接 return 会让消息
+                // 循环在活跃分支里 100% 空转一个核。睡 50ms 降频等系统回来。
+                std::thread::sleep(Duration::from_millis(50));
+                return;
+            }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
                 return;

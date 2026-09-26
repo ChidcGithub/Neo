@@ -483,13 +483,18 @@ pub fn start_with_tools(
 
     {
         let cancel = Arc::clone(&cancel);
-        std::thread::Builder::new()
+        let tx_fallback = tx.clone();
+        let spawned = std::thread::Builder::new()
             .name("neo-llm-stream".to_owned())
             .spawn(move || {
                 run(config, messages, tools, &tx, &cancel);
                 // tx 在这里 drop，接收端据此得知流已结束。
-            })
-            .expect("无法启动 LLM 线程");
+            });
+        if let Err(e) = spawned {
+            // 线程起不来（句柄耗尽等）不能整应用 panic —— 别的线程创建点
+            // 全部走降级。发一条失败事件走正常流错误路径（错误框提示）。
+            let _ = tx_fallback.send(Event::Failed(format!("无法启动 LLM 线程：{e}")));
+        }
     }
 
     Stream { rx, cancel }
@@ -1053,11 +1058,18 @@ mod tests {
         for t in &parsed {
             assert_eq!(t.kind, "function");
             assert!(!t.function.name.is_empty());
-            // properties 必须非空（不是每个工具都有 path —— bash 就没有）
+            // properties 必须是对象；空不空跟参数声明走 —— 无参数工具
+            // （open_app）的空 properties 是合法 schema，不是拼错。
             let props = t.function.parameters["properties"]
                 .as_object()
                 .unwrap_or_else(|| panic!("{} 缺 properties", t.function.name));
-            assert!(!props.is_empty(), "{} 的参数表是空的", t.function.name);
+            let declared = neo_tools::find(&t.function.name).unwrap();
+            assert_eq!(
+                props.is_empty(),
+                declared.params.is_empty(),
+                "{} 的 properties 与参数声明不符",
+                t.function.name
+            );
         }
     }
 

@@ -23,7 +23,7 @@ pub enum ErrorKind {
     Conflict,
     /// 编码不是 UTF-8 等不支持的情况。
     Unsupported,
-    /// 超时（仅 `bash`）。
+    /// 超时（`bash` 的命令超时、`web_search` 的 HTTP 超时）。
     Timeout,
     /// 其它 I/O 错误。
     Io,
@@ -266,7 +266,15 @@ impl<'a> Args<'a> {
                 }
                 _ => 0,
             },
-            Some(v) => v.as_i64().ok_or_else(|| self.bad(name, "应为整数"))?,
+            Some(v) => match v.as_i64() {
+                Some(i) => i,
+                // 模型把整数参数写成 5.0 型浮点很常见：值在 ±2^53 内精确
+                // 可转才接纳，否则照常报错。
+                None => match v.as_f64() {
+                    Some(f) if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0 => f as i64,
+                    _ => return Err(self.bad(name, "应为整数")),
+                },
+            },
         };
         if let Some((lo, hi)) = self.declared(name).and_then(|p| p.range) {
             if raw < lo || raw > hi {
@@ -381,6 +389,15 @@ mod tests {
         assert!(err.hint.unwrap().contains("2000"));
 
         let v = json!({ "path": "a.txt", "limit": "x" });
+        assert_eq!(
+            Args::new(tool, &v).opt_int("limit").unwrap_err().kind,
+            ErrorKind::BadArguments
+        );
+
+        // 5.0 型浮点整数接纳（模型常这么写）；5.5 仍报错
+        let v = json!({ "path": "a.txt", "limit": 5.0 });
+        assert_eq!(Args::new(tool, &v).opt_int("limit").unwrap(), 5);
+        let v = json!({ "path": "a.txt", "limit": 5.5 });
         assert_eq!(
             Args::new(tool, &v).opt_int("limit").unwrap_err().kind,
             ErrorKind::BadArguments

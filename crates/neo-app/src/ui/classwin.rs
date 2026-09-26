@@ -47,7 +47,10 @@ impl ClassWin {
     /// 「点在课堂总结窗上」的点击。
     pub fn target_rect(theme: Theme, monitor_size: Vec2) -> Rect {
         let m = theme.metrics;
-        let size = Vec2::new(m.s(640.0), m.s(460.0));
+        // 尺寸随显示器收窄（钳左上不钳右下，窗口比屏大时关闭钮会画出屏外）。
+        let size = Vec2::new(m.s(640.0), m.s(460.0))
+            .min(monitor_size - egui::vec2(m.s(32.0), m.s(32.0)))
+            .max(egui::vec2(m.s(280.0), m.s(160.0)));
         Rect::from_min_size(
             Pos2::new(((monitor_size.x - size.x) * 0.5).max(m.s(16.0)), m.s(20.0)),
             size,
@@ -184,11 +187,15 @@ fn paint(
     } else {
         format!("课堂总结 · {subject} · {date}")
     };
+    // 科目名来自视觉模型输出，不守规矩时会画穿关闭钮 —— 超宽 elide。
+    let title_max_w = close_center.x - close_d - title_rect.left();
+    let title_font = d.font_bold(d.t().label + m.s(4.0));
+    let title = super::elide(ui.painter(), &title, &title_font, title_max_w);
     text_left(
         ui.painter(),
         Rect::from_min_max(title_rect.min, Pos2::new(close_center.x - close_d, title_rect.bottom())),
         &title,
-        d.font_bold(d.t().label + m.s(4.0)),
+        title_font,
         p.label_primary,
     );
     let mut y = title_rect.bottom() + m.s(4.0);

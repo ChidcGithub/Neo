@@ -149,12 +149,40 @@ fn fetch_and_parse(url: &str, count: usize) -> Result<Vec<Hit>, ToolError> {
 }
 
 /// 在用户默认浏览器里打开一个 URL（只拉起、不等待）。
+///
+/// Windows 走 `ShellExecuteW` 而不是 `cmd /C start`：URL 里的 `&` 会被 cmd
+/// 当命令分隔符（搜索页地址被截断、余下参数被当命令执行），而且 GUI 进程
+/// spawn 控制台子进程会闪一个黑窗。ShellExecute 是「用默认程序打开」的
+/// 系统原生入口，没有命令行解析这一层。
+#[cfg(target_os = "windows")]
 fn open_in_browser(url: &str) -> Result<(), ToolError> {
-    #[cfg(target_os = "windows")]
-    let (program, argv): (&str, Vec<&str>) = ("cmd", vec!["/C", "start", "", url]);
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let url_w: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    // lpOperation 传 null = 默认动词（等价 "open"）。
+    // 返回值 ≤ 32 是失败（错误码），> 32 才是有效的实例句柄。
+    let r = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            url_w.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (r as usize) <= 32 {
+        return Err(ToolError::io(format!("无法调起默认浏览器（错误码 {}）", r as usize))
+            .with_hint("也可以只抓取（open_browser=false），把结果读给用户听"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_in_browser(url: &str) -> Result<(), ToolError> {
     #[cfg(target_os = "macos")]
     let (program, argv): (&str, Vec<&str>) = ("open", vec![url]);
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     let (program, argv): (&str, Vec<&str>) = ("xdg-open", vec![url]);
     std::process::Command::new(program)
         .args(&argv)
@@ -223,7 +251,9 @@ fn parse_block(block: &str) -> Option<Hit> {
     }
     Some(Hit {
         title,
-        url: url.to_owned(),
+        // href 里的 &amp; 等实体也要解码 —— 不然 Bing 跳转链接原样进数据，
+        // 照抄就是坏链。
+        url: decode_entities(url),
         snippet: snippet.trim().to_owned(),
     })
 }
@@ -237,13 +267,27 @@ fn tag_text(s: &str, open: &str, close: &str) -> Option<String> {
 }
 
 /// 丢标签、留文本（`<em>` 这类高亮标签的内容保留）。
+///
+/// 容错：正文里未转义的裸 `<`/`>` 是合法的（数学摘要「a > b」）——
+/// `<` 后接的字符不像标签起始（字母 / `/` / `!` / `?`）就当文本留下；
+/// 不在标签里的 `>` 同理。不然正文字符会被静默吃掉。
 fn strip_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
-    for ch in s.chars() {
+    let mut it = s.chars().peekable();
+    while let Some(ch) = it.next() {
         match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
+            '<' if !in_tag => {
+                let starts_tag = it
+                    .peek()
+                    .is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?'));
+                if starts_tag {
+                    in_tag = true;
+                } else {
+                    out.push('<');
+                }
+            }
+            '>' if in_tag => in_tag = false,
             _ if !in_tag => out.push(ch),
             _ => {}
         }

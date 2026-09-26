@@ -187,7 +187,7 @@ pub fn paint(painter: &Painter, dl: &DisplayList, rect: Rect, size: f32, text_co
                 color,
             } => {
                 paint_path(
-                    painter.ctx(),
+                    painter,
                     *x,
                     *y,
                     commands,
@@ -212,9 +212,13 @@ fn baseline_offset(painter: &Painter, font: &FontId, color: Color32) -> f32 {
 }
 
 /// `Path` 指令：填充走带洞光栅化（缓存成纹理），描边走折线。
+///
+/// 画在调用方的 `painter` 上（继承滚动区/单元格的裁剪与图层）——
+/// 曾经用 `debug_painter()`：那是 Debug 层、裁剪是整个视口，公式滚出
+/// 视野后括号残影还漂在顶栏与输入卡之上。纹理缓存才需要 `Context`。
 #[allow(clippy::too_many_arguments)]
 fn paint_path(
-    ctx: &egui::Context,
+    painter: &egui::Painter,
     ox: f64,
     oy: f64,
     commands: &[PathCommand],
@@ -224,6 +228,7 @@ fn paint_path(
     size: f32,
     text_color: Color32,
 ) {
+    let ctx = painter.ctx();
     let contours = flatten(commands, ox, oy);
     if contours.is_empty() {
         return;
@@ -238,7 +243,7 @@ fn paint_path(
                 .map(|p| Pos2::new(rect.left() + p[0] * size, rect.top() + p[1] * size))
                 .collect();
             if pts.len() > 1 {
-                ctx.debug_painter().add(egui::Shape::line(pts, stroke));
+                painter.add(egui::Shape::line(pts, stroke));
             }
         }
         return;
@@ -300,7 +305,7 @@ fn paint_path(
         ),
         Vec2::new(vw * size, vh * size),
     );
-    ctx.debug_painter().image(
+    painter.image(
         tex.id(),
         target,
         Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),

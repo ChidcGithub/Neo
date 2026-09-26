@@ -65,9 +65,16 @@ fn write(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     }
 
     let path = scope.resolve(&raw)?;
+    // symlink_metadata 不跟随链接：词法路径本身是链接时，无论目标在不在，
+    // 都要走真实路径化解（dangling 链接 exists() 为 false，但写入会顺链接
+    // 落到链接目标 —— 目标是工作区外的文件就逃逸了）。
+    let is_link = std::fs::symlink_metadata(&path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
     let existed = path.exists();
-    if existed {
-        // 已存在的目标：先复查真实路径，避免顺着链接写到工作区外。
+    let path = if existed || is_link {
+        // 先复查真实路径，避免顺着链接写到工作区外；写也用化解后的路径，
+        // 校验与写入之间不留「链接被换掉」的窗口。
         let real = scope.verify_existing(&path)?;
         if real.is_dir() {
             return Err(
@@ -75,7 +82,7 @@ fn write(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
                     .with_hint("给一个文件名，例如 `src/main.rs`"),
             );
         }
-        if !overwrite {
+        if existed && !overwrite {
             let bytes = std::fs::metadata(&real).map(|m| m.len()).unwrap_or(0);
             return Err(ToolError::new(
                 ErrorKind::Conflict,
@@ -83,10 +90,16 @@ fn write(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
             )
             .with_hint("先 `read_file` 看原内容；确认要整体替换再把 `overwrite` 设为 true，或改用 `edit_file` 只改一段"));
         }
-    } else if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ToolError::io(format!("无法创建目录 {}：{e}", scope.display(parent))))?;
-    }
+        real
+    } else {
+        // 新建：目标不存在，但祖先目录可能是指向工作区外的链接。
+        scope.verify_new(&path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ToolError::io(format!("无法创建目录 {}：{e}", scope.display(parent))))?;
+        }
+        path
+    };
 
     let bytes = content.len() as u64;
     let lines = content.lines().count();

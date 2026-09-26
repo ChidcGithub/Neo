@@ -547,9 +547,9 @@ impl NeoApp {
         state.sessions = store.sessions().unwrap_or_default();
     }
 
-    /// 打开一个会话：从库里读消息。
-    fn open_session(state: &mut AppState, store: &Store, id: i64) {
-        let Ok(rows) = store.messages(id) else { return };
+    /// 打开一个会话：从库里读消息。读取失败返回 false（调用方给提示）。
+    fn open_session(state: &mut AppState, store: &Store, id: i64) -> bool {
+        let Ok(rows) = store.messages(id) else { return false };
         state.new_session();
         state.messages = rows
             .into_iter()
@@ -575,10 +575,10 @@ impl NeoApp {
             .collect();
         state.active_session = Some(id);
         state.stage = Stage::Conversation;
-        state.generating = false;
-        state.stream = None;
+        // 生成/流状态在 new_session() 里已复位（含流线程取消标志）。
         state.pending_persist = state.messages.len();
         state.auto_approve_tools = false;
+        true
     }
 
     /// 恢复上次使用的会话：库里存的 id 必须仍然存在才生效。
@@ -632,6 +632,11 @@ impl NeoApp {
                 if let Some(message) = state.messages.pop() {
                     state.draft = message.content;
                     state.draft_attachments = message.attachments;
+                }
+                // 回滚后消息空了就把舞台也退回空态 —— 否则界面停在
+                // 「对话态 + 零消息 + 草稿已回输入框」的错觉里。
+                if state.messages.is_empty() {
+                    state.stage = crate::state::Stage::Hero;
                 }
                 return;
             }
@@ -689,10 +694,12 @@ impl NeoApp {
             state.pending_persist = state.messages.len();
             return true;
         };
+        let had_session = state.active_session.is_some();
         let Some(session) = Self::ensure_session(state, store) else {
             state.attachment_error = Some("无法保存会话，请检查数据库位置及磁盘空间".into());
             return false;
         };
+        let mut wrote = false;
         while let Some(msg) = state.messages.get(state.pending_persist) {
             if msg.streaming || msg.tool.as_ref().is_some_and(|t| !t.state.is_settled()) {
                 break;
@@ -716,8 +723,13 @@ impl NeoApp {
                 return false;
             }
             state.pending_persist += 1;
+            wrote = true;
         }
-        Self::refresh_sessions(state, store);
+        // 只有真写过（或刚建了新会话）才刷新侧栏 —— 生成中每 33ms 都经过
+        // 这里，空转时的全表 SELECT 是纯浪费。
+        if wrote || !had_session {
+            Self::refresh_sessions(state, store);
+        }
         true
     }
 
@@ -775,7 +787,15 @@ impl NeoApp {
         if self.state.wake_enabled && !self.wake_broken {
             self.start_wake(&ctx);
         } else if !self.state.wake_enabled {
-            self.wake = None;
+            // Drop 会 join 引擎线程，而引擎加载模型/开麦克风流不可中断
+            //（首次 0.5~3s）——在 UI 线程 join 就是冻结界面。转交后台线程等。
+            if let Some(engine) = self.wake.take() {
+                let _ = std::thread::Builder::new()
+                    .name("neo-wake-drop".into())
+                    .spawn(move || drop(engine));
+                // spawn 失败（极端）时 engine 随闭包回收原地 Drop ——
+                // 顶多卡这一次，比没有降级强。
+            }
             self.wake_rx = None;
             // 开关拨回「关」即解锁故障锁存：重新打开视为一次手动重试。
             // 风暴防护仍在——引擎再次报错会重新置位 wake_broken。
@@ -859,11 +879,23 @@ impl NeoApp {
                 let text = text.trim().to_owned();
                 if self.dictating && !text.is_empty() {
                     self.end_dictation();
-                    // 每次语音唤醒都是一段全新对话：不续上次的上下文，
-                    // 免得隔了几个小时的提问被旧话题带偏。
-                    self.state.new_session();
-                    self.state.draft = text;
-                    Self::send_input(&mut self.state, self.store.as_ref());
+                    if !self.persistence_ok {
+                        // 落库失败期间禁止开新会话（与侧栏门控一致）——否则
+                        // new_session 直接 messages.clear()，未保存的消息永久丢。
+                        // 转写文本退回草稿，等持久化恢复后用户可手动发。
+                        self.state.draft = text;
+                        self.pending_toasts.push((
+                            neo_ui::ToastKind::Warning,
+                            "消息尚未保存，本次语音已转为草稿".into(),
+                            std::time::Instant::now() + std::time::Duration::from_secs(4),
+                        ));
+                    } else {
+                        // 每次语音唤醒都是一段全新对话：不续上次的上下文，
+                        // 免得隔了几个小时的提问被旧话题带偏。
+                        self.state.new_session();
+                        self.state.draft = text;
+                        Self::send_input(&mut self.state, self.store.as_ref());
+                    }
                 }
             }
             Some(Ok(Err(msg))) => {
@@ -939,36 +971,45 @@ impl NeoApp {
             self.state.maybe_reload_memories();
         }
         // 记忆导入导出对话框的回执落地（toast + 立即重读）。
-        let io_msg = self
+        let io_recv = self
             .state
             .memory_io_rx
             .as_ref()
-            .and_then(|rx| rx.try_recv().ok());
-        if let Some(msg) = io_msg {
-            self.state.memory_io_rx = None;
-            // 导入刚写完盘：清 mtime 缓存强制重读（粒度可能骗过沿检）。
-            self.state.memories_file_ms = None;
-            self.state.maybe_reload_memories();
-            let (kind, text) = match msg {
-                crate::state::MemoryIoMsg::Imported(Ok((added, skipped))) => (
-                    neo_ui::ToastKind::Success,
-                    format!("已导入 {added} 条记忆（跳过 {skipped} 条重复）"),
-                ),
-                crate::state::MemoryIoMsg::Imported(Err(e)) => {
-                    (neo_ui::ToastKind::Error, format!("导入失败：{e}"))
-                }
-                crate::state::MemoryIoMsg::Exported(Ok(n)) => {
-                    (neo_ui::ToastKind::Success, format!("已导出 {n} 条记忆"))
-                }
-                crate::state::MemoryIoMsg::Exported(Err(e)) => {
-                    (neo_ui::ToastKind::Error, format!("导出失败：{e}"))
-                }
-            };
-            self.pending_toasts.push((
-                kind,
-                text,
-                std::time::Instant::now() + std::time::Duration::from_secs(3),
-            ));
+            .map(|rx| rx.try_recv());
+        match io_recv {
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                // 用户在文件对话框按了「取消」：工作线程直接 return、tx 随 Drop
+                // 断开。不在这里回收的话 memory_io_rx 恒为 Some，「导入/导出」
+                // 按钮被 is_some() 门吞掉，对话框再也弹不出来（直到重启）。
+                self.state.memory_io_rx = None;
+            }
+            Some(Ok(msg)) => {
+                self.state.memory_io_rx = None;
+                // 导入刚写完盘：清 mtime 缓存强制重读（粒度可能骗过沿检）。
+                self.state.memories_file_ms = None;
+                self.state.maybe_reload_memories();
+                let (kind, text) = match msg {
+                    crate::state::MemoryIoMsg::Imported(Ok((added, skipped))) => (
+                        neo_ui::ToastKind::Success,
+                        format!("已导入 {added} 条记忆（跳过 {skipped} 条重复）"),
+                    ),
+                    crate::state::MemoryIoMsg::Imported(Err(e)) => {
+                        (neo_ui::ToastKind::Error, format!("导入失败：{e}"))
+                    }
+                    crate::state::MemoryIoMsg::Exported(Ok(n)) => {
+                        (neo_ui::ToastKind::Success, format!("已导出 {n} 条记忆"))
+                    }
+                    crate::state::MemoryIoMsg::Exported(Err(e)) => {
+                        (neo_ui::ToastKind::Error, format!("导出失败：{e}"))
+                    }
+                };
+                self.pending_toasts.push((
+                    kind,
+                    text,
+                    std::time::Instant::now() + std::time::Duration::from_secs(3),
+                ));
+            }
         }
         // 「打开主界面」工具：执行层只置信号位，这里真正唤窗。
         let show_at = neo_tools::tools::open_app::SHOW_WINDOW_AT
@@ -1223,8 +1264,14 @@ impl NeoApp {
             if ui::settings::panel(ui, &skin, panel_rect, state, screen.max.y, fonts) {
                 state.show_settings = false;
             }
-            if escape_pressed {
+            if escape_pressed && !sb.escape_consumed {
+                // 侧栏已用这记 Esc 取消重命名/删除确认的话，不再顺手关设置 ——
+                // 与下面「Esc 停止生成」的门同源：一键不一二鸟。
                 state.show_settings = false;
+            }
+            if !state.show_settings {
+                // 面板关掉时记忆编辑态一并收摊：重开不带上次的陈旧草稿。
+                state.memory_editing = None;
             }
         }
 
@@ -1268,7 +1315,14 @@ impl NeoApp {
         }
         if let Some(id) = sb.open_session.filter(|_| self.persistence_ok) {
             if let Some(store) = self.store.as_ref() {
-                Self::open_session(state, store, id);
+                if !Self::open_session(state, store, id) {
+                    // 库读失败不能无声：用户看到的是「点了没反应」。
+                    self.pending_toasts.push((
+                        neo_ui::ToastKind::Error,
+                        "无法读取该会话，数据库文件可能已损坏".into(),
+                        std::time::Instant::now() + std::time::Duration::from_secs(4),
+                    ));
+                }
             }
         }
         if let Some((id, title)) = sb.renamed {

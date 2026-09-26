@@ -164,7 +164,9 @@ pub fn panel(
         ui.add_space(m.s(14.0));
 
         // 内容区滚动：行多也不顶破面板（小窗里调用方会把面板收窄）。
+        // 滚动状态按页签分开：长页签滚到底切页签不该继承偏移。
         egui::ScrollArea::vertical()
+            .id_salt(("neo-settings-tab", page_name(state.settings_tab)))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -522,10 +524,9 @@ fn memory_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         }
 
         // 常规态：#id + 内容（超长截断），右侧恒显 编辑/删除（教室一体机没有 hover）。
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, m.s(36.0)), Sense::hover());
-        if resp.hovered() {
-            ui.painter().squircle_filled(rect, m.radius_chip(), p.hover);
-        }
+        // 行体不可点 —— 整行刷 hover 底色是在承诺点击行为，别画（项目规矩：
+        // 「给没有点击行为的控件画 hover 态是在撒谎」）。
+        let (rect, _resp) = ui.allocate_exact_size(Vec2::new(width, m.s(36.0)), Sense::hover());
 
         let btn_d = m.s(26.0);
         let trash_center = egui::pos2(rect.right() - btn_d * 0.5, rect.center().y);
@@ -708,10 +709,13 @@ fn switch_row(
         rect.min + egui::vec2(0.0, m.s(29.0)),
         Vec2::new(tw, m.s(16.0)),
     );
+    // 描述单行直绘不换行：长文案（如「课堂总结」那条 ~56 字）会碾过
+    // 开关再被硬切成半个字 —— 超宽就 elide。
+    let desc = super::elide(ui.painter(), desc, &skin.prop(skin.t().caption), tw);
     text_left(
         ui.painter(),
         desc_rect,
-        desc,
+        &desc,
         skin.prop(skin.t().caption),
         p.label_tertiary,
     );

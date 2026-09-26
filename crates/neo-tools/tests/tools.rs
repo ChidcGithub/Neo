@@ -138,10 +138,41 @@ fn write_then_read_roundtrip() {
     assert_eq!(out.data["lines_total"], 1);
 }
 
+/// 工作区里的目录链接指向外部时，write_file 新建也必须被拦（词法在围栏内
+/// 不代表真实落点在围栏内）。Windows 建符号链接要开发者模式/管理员 ——
+/// 建不了就跳过（CI 与课堂机器不保证有权限）。
+#[test]
+fn write_file_new_path_cannot_escape_via_dir_link() {
+    let (dir, scope) = workspace("link-escape");
+    let outside = dir.parent().unwrap().join(format!("neo-tools-outside-{}", std::process::id()));
+    std::fs::create_dir_all(&outside).unwrap();
+
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_dir(&outside, &dir.join("link"));
+    #[cfg(not(windows))]
+    let linked = std::os::unix::fs::symlink(&outside, dir.join("link"));
+    let Ok(()) = linked else {
+        eprintln!("无建链权限，跳过逃逸测试");
+        return;
+    };
+
+    let out = dispatch(
+        &scope,
+        "write_file",
+        &json!({ "path": "link/evil.txt", "content": "逃逸" }),
+    );
+    assert_eq!(kind_of(&out), ErrorKind::NotAllowed, "{out:?}");
+    assert!(
+        !outside.join("evil.txt").exists(),
+        "写入顺链接逃逸到工作区外了"
+    );
+
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
 #[test]
 fn read_errors_are_specific() {
     let (_dir, scope) = workspace("read-err");
-
     let out = dispatch(&scope, "read_file", &json!({ "path": "nope.txt" }));
     assert_eq!(kind_of(&out), ErrorKind::NotFound);
 

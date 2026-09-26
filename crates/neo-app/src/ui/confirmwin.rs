@@ -44,9 +44,9 @@ impl ConfirmWin {
             match self.answer.swap(0, Ordering::Relaxed) {
                 1 => state.approve_tool(index),
                 2 => {
-                    // 「都允许」只在本次会话内有效，重启即失效。
-                    state.auto_approve_tools = true;
-                    state.approve_tool(index);
+                    // 「都允许」只在本次会话内有效，重启即失效；
+                    // 且要追溯本轮已挂起的其它待确认项，不能光批当前这条。
+                    state.approve_all_awaiting();
                 }
                 3 => state.deny_tool(index),
                 _ => {}
@@ -57,11 +57,14 @@ impl ConfirmWin {
         }
 
         // 2. 位置：屏幕中央偏上（长面板的视觉重心比几何中心略高）。
+        //    尺寸随显示器收窄：窗比屏大时右/下缘会画出屏外。
         let m = theme.metrics;
-        let size = Vec2::new(m.s(560.0), m.s(420.0));
         let monitor = ctx
             .input(|i| i.viewport().monitor_size)
             .unwrap_or(Vec2::new(1920.0, 1080.0));
+        let size = Vec2::new(m.s(560.0), m.s(420.0))
+            .min(monitor - egui::vec2(m.s(32.0), m.s(32.0)))
+            .max(egui::vec2(m.s(280.0), m.s(180.0)));
         let center = Pos2::new(
             ((monitor.x - size.x) * 0.5).max(m.s(16.0)),
             ((monitor.y - size.y) * 0.42).max(m.s(16.0)),

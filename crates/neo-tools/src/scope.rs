@@ -81,6 +81,30 @@ impl Scope {
         Ok(real)
     }
 
+    /// 目标尚不存在时的边界复查：顺**最近一个已存在的祖先**化解符号链接，
+    /// 真实落点在工作区外则拒绝。词法路径在围栏内不代表真实落点在围栏内
+    /// （`ws\linkdir\new.txt`：linkdir 若是指向外的 Junction，写入就逃逸了）。
+    pub fn verify_new(&self, path: &Path) -> Result<(), ToolError> {
+        let mut ancestor = path.parent();
+        while let Some(p) = ancestor {
+            if p.exists() {
+                let real = p
+                    .canonicalize()
+                    .map_err(|e| ToolError::io(format!("无法访问 {}：{e}", self.display(p))))?;
+                let real = normalize(&real);
+                if !real.starts_with(&self.root) {
+                    return Err(ToolError::not_allowed(format!(
+                        "{} 经过指向工作区之外的目录链接",
+                        self.display(path)
+                    )));
+                }
+                return Ok(());
+            }
+            ancestor = p.parent();
+        }
+        Ok(())
+    }
+
     /// 输出用的相对路径（永远用 `/` 分隔，跨平台一致）。
     pub fn display(&self, path: &Path) -> String {
         let rel = path.strip_prefix(&self.root).unwrap_or(path);

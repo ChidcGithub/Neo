@@ -162,8 +162,13 @@ fn draw_messages(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState)
                         ui.spacing_mut().item_spacing.y = gap;
                         // 直接铺，不做逐条入场淡入 —— 每条消息一个动画 Id 的
                         // 代价换来的只是"看着热闹"，简约界面里内容即到位。
-                        for msg in &state.messages {
-                            draw_one(ui, skin, state, msg, content_w);
+                        // push_id 给每条消息独立的 Id 命名空间：表格的横向滚动
+                        // 与单元格高度缓存都以 ui.id() 派生，多条消息的表格
+                        // 不推 id 会跨消息撞车（高度缓存乒乓 → 每帧双跑布局）。
+                        for (i, msg) in state.messages.iter().enumerate() {
+                            ui.push_id(("neo-msg", i), |ui| {
+                                draw_one(ui, skin, state, msg, content_w);
+                            });
                         }
                         ui.add_space(m.s(8.0));
                         // Expand the existing rect, not set_min_height: in egui 0.36

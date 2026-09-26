@@ -238,7 +238,8 @@ mod imp {
         }
         // 先广播「要截屏了」再抓帧：迷你窗靠这个信号把自己藏起来，
         // 等它真正从屏幕上消失，画面里才不会带上 Neo 自己的窗口。
-        // 隐藏态轮询周期 200ms，留足余量取 300ms。
+        // 迷你窗的视口回调以 ~16ms 自驱轮询这个信号，300ms 的余量够它
+        // 走完「检测 → 隐藏 → DWM 重合成」一整圈。
         mark_screenshot(rect);
         std::thread::sleep(Duration::from_millis(300));
         capture_impl(rect)
@@ -455,7 +456,9 @@ mod imp {
         let (fx, fy) = to_absolute(from.0, from.1, vs);
         send(&[mouse(MOVE_ABS, fx, fy), mouse(down, 0, 0)])?;
 
-        let steps = (duration_ms / 15).clamp(1, 60) as i32;
+        // 每步固定 15ms：步数上限对齐参数声明的 duration_ms 上限（10s），
+        // 否则慢拖（框选/滑块常要几秒）被静默压成 ~0.9s。
+        let steps = (duration_ms / 15).clamp(1, 667) as i32;
         for i in 1..=steps {
             let t = f64::from(i) / f64::from(steps);
             let x = from.0 + ((to.0 - from.0) as f64 * t).round() as i32;

@@ -60,6 +60,15 @@ pub struct Policy {
     pub allow_open: bool,
 }
 
+/// 参数级风险升级：(工具, bool 参数, 升级后的档位)。
+/// 工具声明的 `risk` 是默认形态；个别参数会引入额外副作用 ——
+/// 升级表让裁定仍然可预测：同一（工具, 参数形态）永远同一种待遇。
+const PARAM_ESCALATION: &[(&str, &str, Risk)] = &[
+    // web_search 默认只读抓取；open_browser=true 要拉起浏览器 → Open 档
+    // （否则 allow_open=false 的策略挡不住它弹窗）。
+    ("web_search", "open_browser", Risk::Open),
+];
+
 impl Default for Policy {
     fn default() -> Self {
         Self {
@@ -94,7 +103,15 @@ impl Policy {
                 "当前处于「只读」模式：写文件与执行命令已被禁用，请让用户关闭只读后重试".to_owned(),
             );
         }
-        match tool.risk {
+        // 参数级升级（见 PARAM_ESCALATION）：比如 web_search 带 open_browser。
+        let risk = PARAM_ESCALATION
+            .iter()
+            .find(|(name, param, _)| {
+                *name == tool.name
+                    && args.get(*param).and_then(Value::as_bool).unwrap_or(false)
+            })
+            .map_or(tool.risk, |(_, _, r)| *r);
+        match risk {
             Risk::Read => Decision::Allow,
             Risk::Open => {
                 if self.allow_open {
@@ -160,5 +177,24 @@ mod tests {
             &json!({ "path": "a.txt", "content": "x", "rm_rf": true }),
         );
         assert!(matches!(d, Decision::Deny(_)));
+    }
+
+    #[test]
+    fn web_search_open_browser_escalates_to_open_risk() {
+        let tool = crate::find("web_search").unwrap();
+        let grab_only = json!({ "query": "楞次定律" });
+        let with_open = json!({ "query": "楞次定律", "open_browser": true });
+
+        // 纯抓取永远只读放行
+        assert_eq!(Policy::default().decide(tool, &grab_only), Decision::Allow);
+        // 拉起浏览器 → Open 档：allow_open=false 时必须拒
+        let no_open = Policy {
+            allow_open: false,
+            ..Policy::default()
+        };
+        assert!(matches!(no_open.decide(tool, &with_open), Decision::Deny(_)));
+        // 同一开关下不带 open_browser 的抓取不受影响
+        assert_eq!(no_open.decide(tool, &grab_only), Decision::Allow);
+        assert_eq!(Policy::default().decide(tool, &with_open), Decision::Allow);
     }
 }

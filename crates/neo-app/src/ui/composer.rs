@@ -480,6 +480,13 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
         ),
     );
     let text_h = text_height(ui, skin, &state.draft, text_rect.width(), hero);
+    // 窗口太矮（hero 的 clamp 把整块压进剩余空间）时文本区让位：收缩到
+    // 剩余高度（TextEdit 内部可滚动），工具栏行才不会被算成负高、被
+    // clip 整行裁掉 —— 发送钮「不可见也不可点」的事故就是这么来的。
+    let min_text_h = text_height(ui, skin, "", text_rect.width(), hero);
+    let avail_h = (rect.bottom() - m.card_gap() - toolbar_height(skin) - text_rect.top())
+        .max(min_text_h);
+    let text_h = text_h.min(avail_h);
     let text_rect = Rect::from_min_size(text_rect.min, Vec2::new(text_rect.width(), text_h));
 
     // 占位符：上游用 caption 色 + 与文本区同内缩的绝对定位元素。
