@@ -42,6 +42,7 @@ pub mod field;
 pub mod icons;
 pub mod list;
 pub mod modal;
+pub mod toasts;
 
 mod base;
 mod design;
@@ -56,7 +57,8 @@ pub use design::{Design, Size};
 pub use badge::{Badge, BadgeTone};
 pub use button::{Button, Chip, IconButton, IconButtonStyle, Segmented, Variant};
 pub use container::Panel;
-pub use feedback::{Spinner, Toast, ToastKind};
+pub use feedback::{toast, toast_at, toasts, Spinner};
+pub use toasts::{Toast, ToastKind, ToastOptions, Toasts};
 pub use field::{FieldRow, Switch, TextField};
 pub use icons::Icon;
 pub use list::{ListRow, NavItem};

@@ -88,8 +88,9 @@ pub struct NeoApp {
     hidden_to_tray: bool,
     /// 托盘菜单点了「退出」：下一次 close 请求直接放行，不再拦截。
     quitting: bool,
-    /// 一闪而过的轻提示：类别 + 内容 + 截止时间。
-    toast: Option<(neo_ui::ToastKind, String, std::time::Instant)>,
+    /// 待投递的轻提示（类别 + 内容 + 持续秒数）。渲染段统一喂给
+    /// egui-toast 队列 —— 锚定 / 堆叠 / 到期回收都不用自己管。
+    pending_toasts: Vec<(neo_ui::ToastKind, String, f64)>,
     /// 全屏跑马灯覆盖层（唤醒聆听时亮起）。离屏测试没有 GPU 窗口线程，为 `None`。
     overlay: Option<neo_overlay::OverlayHandle>,
     /// 后台执行期间的角落迷你窗（对话速览 / 截屏回避 / 打断确认）。
@@ -168,7 +169,7 @@ impl NeoApp {
             tray_quit_id: tray_icon::menu::MenuId::new("neo-tray-quit"),
             hidden_to_tray: false,
             quitting: false,
-            toast: None,
+            pending_toasts: Vec::new(),
             overlay: None,
             miniwin: Default::default(),
             shotflash: Default::default(),
@@ -433,10 +434,10 @@ impl NeoApp {
             }
             // "Hi, Neo"：焦点交给输入框，老师接着输入即可。
             ctx.memory_mut(|m| m.request_focus(Id::new(ui::COMPOSER_ID)));
-            self.toast = Some((
+            self.pending_toasts.push((
                 neo_ui::ToastKind::Success,
                 format!("已唤醒（置信度 {score:.2}），请直接输入"),
-                std::time::Instant::now() + std::time::Duration::from_secs(3),
+                3.0,
             ));
         }
     }
@@ -797,7 +798,7 @@ impl NeoApp {
             }
         }
         // 语音唤醒：事件由转发线程唤起本帧，这里只摘结果。
-        // 先收成局部值再处理 —— 处理时要改 `self.toast` / 清通道，
+        // 先收成局部值再处理 —— 处理时要推 `self.pending_toasts` / 清通道，
         // 不能一直借着自己的 `wake_rx`。听写期间音频帧 80ms 一批，
         // 必须一次排空，否则队列越积越深。
         let mut wake_events: Vec<neo_wake::WakeEvent> = Vec::new();
@@ -826,10 +827,10 @@ impl NeoApp {
                         self.end_dictation();
                     }
                     self.wake_broken = true;
-                    self.toast = Some((
-                        neo_ui::ToastKind::Warn,
+                    self.pending_toasts.push((
+                        neo_ui::ToastKind::Warning,
                         format!("语音唤醒未启用：{msg}（重新打开开关可重试）"),
-                        std::time::Instant::now() + std::time::Duration::from_secs(4),
+                        4.0,
                     ));
                     self.wake_rx = None;
                     self.wake = None;
@@ -865,10 +866,10 @@ impl NeoApp {
                     self.end_dictation();
                 }
                 self.stt_tx = None;
-                self.toast = Some((
-                    neo_ui::ToastKind::Warn,
+                self.pending_toasts.push((
+                    neo_ui::ToastKind::Warning,
                     format!("语音转写未启用：{msg}"),
-                    std::time::Instant::now() + std::time::Duration::from_secs(4),
+                    4.0,
                 ));
             }
             Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
@@ -884,10 +885,10 @@ impl NeoApp {
             let down = lmb_down();
             if down && !self.dictation_lmb_down {
                 self.cancel_dictation();
-                self.toast = Some((
+                self.pending_toasts.push((
                     neo_ui::ToastKind::Info,
                     "已取消本次听写".to_owned(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(2),
+                    2.0,
                 ));
             }
             self.dictation_lmb_down = down;
@@ -942,7 +943,7 @@ impl NeoApp {
                     (neo_ui::ToastKind::Error, format!("导出失败：{e}"))
                 }
             };
-            self.toast = Some((kind, text, std::time::Instant::now() + std::time::Duration::from_secs(3)));
+            self.pending_toasts.push((kind, text, 3.0));
         }
         // 「打开主界面」工具：执行层只置信号位，这里真正唤窗。
         let show_at = neo_tools::tools::open_app::SHOW_WINDOW_AT
@@ -1397,22 +1398,19 @@ impl NeoApp {
         }
 
         // ---- 5. 轻提示（最上层，一闪而过）----
-        // 唤醒成功 / 唤醒不可用都走它。过期即弃。
-        let expired = self
-            .toast
-            .as_ref()
-            .is_some_and(|(.., until)| std::time::Instant::now() >= *until);
-        if expired {
-            self.toast = None;
-        }
-        if let Some((kind, text, _)) = &self.toast {
-            neo_ui::Toast::new(*kind, text).show_at(
-                ui,
-                &skin.design,
-                egui::pos2(screen.center().x, screen.max.y - m.s(150.0)),
+        // 队列 / 锚定 / 到期回收全交给 egui-toast；外观是组件库的 squircle 自绘
+        // （neo_ui::toasts 工厂里注册的 custom_contents）。每帧重建实例即可，
+        // 队列本体存在 egui memory 里。
+        let mut toasts = neo_ui::toasts(&skin.design);
+        for (kind, text, secs) in self.pending_toasts.drain(..) {
+            toasts.add(
+                neo_ui::Toast::new()
+                    .kind(kind)
+                    .text(text)
+                    .options(neo_ui::ToastOptions::default().duration_in_seconds(secs)),
             );
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        toasts.show(ui);
 
         // 有生成中的动画（光标闪烁、悬停过渡）时保持重绘节奏。
         if composing {
@@ -3367,14 +3365,18 @@ mod snapshot {
 
         // ---- 右列 4：Toast ----
         ry = section(&painter, &d, rx, ry, w, "浮动提示 · Toast");
-        nui::Toast::new(nui::ToastKind::Success, "已保存到本机数据库").show_at(
+        nui::toast_at(
             ui,
             &d,
+            nui::ToastKind::Success,
+            "已保存到本机数据库",
             egui::pos2(rx + 200.0, ry + 24.0),
         );
-        nui::Toast::new(nui::ToastKind::Error, "连接已中断").show_at(
+        nui::toast_at(
             ui,
             &d,
+            nui::ToastKind::Error,
+            "连接已中断",
             egui::pos2(rx + 200.0, ry + 76.0),
         );
 

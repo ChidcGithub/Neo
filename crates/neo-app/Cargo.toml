@@ -32,6 +32,8 @@ ratex-parser = { workspace = true }
 egui_commonmark = { version = "0.25.0", default-features = false, features = ["pulldown_cmark", "better_syntax_highlighting"] }
 eframe = { workspace = true, features = ["wgpu"] }
 egui = { workspace = true }
+# flexbox 布局（输入卡工具栏）；toast 走 neo-ui 的 re-export，不直接依赖
+egui_flex = { workspace = true }
 
 # 全局输入轮询（GetCursorPos / GetAsyncKeyState）：迷你窗避让与打断确认用
 [target.'cfg(windows)'.dependencies]

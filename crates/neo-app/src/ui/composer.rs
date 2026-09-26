@@ -17,8 +17,9 @@
 //! - **字号**：整卡跟随 `Metrics::scale` 放大，远距仍可读。
 
 use egui::{Frame, Margin, Rect, Sense, TextEdit, Ui, Vec2};
+use egui_flex::{item, Flex, FlexAlign};
 use neo_theme::SquirclePaint;
-use neo_ui::{Chip, Icon, IconButton};
+use neo_ui::{Chip, Icon, IconButton, Size};
 
 use super::{ease, elide, inset, text_left, translucent, Skin};
 use crate::attachments::{Attachment, MAX_FILES};
@@ -519,99 +520,98 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
     });
 
     // ---- 工具栏 ----
+    // 布局交给 egui_flex：左组（+ / Plan / 只读）— 弹性间隔 — 右组（模型 / 发送），
+    // 不再手推 x 游标。发送钮按上游规格是 34px 主按钮（Lg），其余控件 28px。
     let d = skin.d();
     let row = Rect::from_min_max(
         egui::pos2(rect.left() + m.s(8.0), text_rect.bottom() + m.card_gap()),
         egui::pos2(rect.right() - m.s(8.0), rect.bottom()),
     );
     let row = inset(row, 0.0, m.s(2.0), 0.0, m.s(6.0));
-    let mid = row.center().y;
 
-    // 左侧：+ / Plan / 只读 —— 全部来自组件库。
-    let add_center = egui::pos2(row.left() + m.btn_add() * 0.5, mid);
     let can_attach = !state.generating
         && !state.tool_open
         && !state.tool_round
         && !state.attachment_busy()
         && !state.attachment_picker_open
         && state.draft_attachments.len() < MAX_FILES;
-    if IconButton::new(Icon::Plus)
-        .subtle()
-        .enabled(can_attach)
-        .id_salt("neo-composer-add")
-        .show_at(ui, &d, add_center)
-        .on_hover_text("添加图片、Word、PowerPoint 或文本文件")
-        .clicked()
-    {
-        out.attach = true;
-    }
-
-    let chip_h = m.chip_h();
-    let mut x = add_center.x + m.btn_add() * 0.5 + m.toolbar_gap();
-    let plan_w = Chip::width(&painter, &d, "Plan", false);
-    let plan_rect =
-        Rect::from_min_size(egui::pos2(x, mid - chip_h * 0.5), Vec2::new(plan_w, chip_h));
-    if Chip::new("Plan")
-        .active(state.plan_mode)
-        .id_salt("neo-composer-plan")
-        .show_at(ui, &d, plan_rect)
-        .clicked()
-    {
-        out.toggle_plan = true;
-    }
-    x = plan_rect.right() + m.toolbar_gap();
-
-    let ro_w = Chip::width(&painter, &d, "只读", false);
-    let ro_rect = Rect::from_min_size(egui::pos2(x, mid - chip_h * 0.5), Vec2::new(ro_w, chip_h));
-    if Chip::new("只读")
-        .active(state.read_only)
-        .id_salt("neo-composer-readonly")
-        .show_at(ui, &d, ro_rect)
-        .clicked()
-    {
-        out.toggle_read_only = true;
-    }
-
-    // 右侧：模型选择器 + 发送/停止
-    let send_d = m.btn_send();
-    let send_center = egui::pos2(row.right() - send_d * 0.5, mid - m.s(2.0));
-    let generating = state.generating;
-    let can_send = state.can_submit();
     // 工具轮（等确认 / 后台执行中）也算"进行中"：否则那段时间按钮变回
     // 发送且不可点，用户只能看着工具跑完并自动开始下一轮 —— 没有停止入口。
-    let busy = generating || state.tool_open || state.tool_round;
-    // 生成中按钮变成"停止"（仍可点）；无可发内容时淡出强调色（不可点）。
-    let send_icon = if busy { Icon::Stop } else { Icon::ArrowUp };
-    if IconButton::new(send_icon)
-        .accent()
-        .enabled(busy || can_send)
-        .id_salt("neo-composer-send")
-        .show_at(ui, &d, send_center)
-        .clicked()
-    {
-        if busy {
-            out.stop = true;
-        } else if can_send {
-            out.send = true;
-        }
-    }
+    let busy = state.generating || state.tool_open || state.tool_round;
+    let can_send = state.can_submit();
 
-    let model_w = Chip::width(&painter, &d, state.model_display(), true);
-    let model_rect = Rect::from_min_size(
-        egui::pos2(
-            send_center.x - send_d * 0.5 - m.toolbar_gap() - model_w,
-            mid - chip_h * 0.5,
-        ),
-        Vec2::new(model_w, chip_h),
-    );
-    if Chip::new(state.model_display())
-        .chevron(true)
-        .id_salt("neo-composer-model")
-        .show_at(ui, &d, model_rect)
-        .clicked()
-    {
-        out.next_model = true;
-    }
+    super::at(ui, row, |ui| {
+        Flex::horizontal()
+            .align_items(FlexAlign::Center)
+            .gap(Vec2::splat(m.toolbar_gap()))
+            .w_full()
+            .h_full()
+            .show(ui, |flex| {
+                // 左侧：+ / Plan / 只读。
+                let add = flex.add_ui(item(), |ui| {
+                    IconButton::new(Icon::Plus)
+                        .subtle()
+                        .enabled(can_attach)
+                        .id_salt("neo-composer-add")
+                        .show(ui, &d)
+                        .on_hover_text("添加图片、Word、PowerPoint 或文本文件")
+                });
+                if add.inner.clicked() {
+                    out.attach = true;
+                }
+                let plan = flex.add_ui(item(), |ui| {
+                    Chip::new("Plan")
+                        .active(state.plan_mode)
+                        .id_salt("neo-composer-plan")
+                        .show(ui, &d)
+                });
+                if plan.inner.clicked() {
+                    out.toggle_plan = true;
+                }
+                let ro = flex.add_ui(item(), |ui| {
+                    Chip::new("只读")
+                        .active(state.read_only)
+                        .id_salt("neo-composer-readonly")
+                        .show(ui, &d)
+                });
+                if ro.inner.clicked() {
+                    out.toggle_read_only = true;
+                }
+
+                // 弹性间隔把右组顶到行尾。
+                flex.grow();
+
+                // 右侧：模型选择器 + 发送/停止。
+                // 模型名会变：content_id 变了强制 flex 重测宽度。
+                let model = state.model_display();
+                let model_chip = flex.add_ui(item().content_id(egui::Id::new(model)), |ui| {
+                    Chip::new(model)
+                        .chevron(true)
+                        .id_salt("neo-composer-model")
+                        .show(ui, &d)
+                });
+                if model_chip.inner.clicked() {
+                    out.next_model = true;
+                }
+                // 生成中按钮变成"停止"（仍可点）；无可发内容时淡出强调色（不可点）。
+                let send_icon = if busy { Icon::Stop } else { Icon::ArrowUp };
+                let send = flex.add_ui(item(), |ui| {
+                    IconButton::new(send_icon)
+                        .accent()
+                        .size(Size::Lg)
+                        .enabled(busy || can_send)
+                        .id_salt("neo-composer-send")
+                        .show(ui, &d)
+                });
+                if send.inner.clicked() {
+                    if busy {
+                        out.stop = true;
+                    } else if can_send {
+                        out.send = true;
+                    }
+                }
+            });
+    });
 
     out
 }

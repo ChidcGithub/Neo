@@ -2,12 +2,17 @@
 //!
 //! 状态语言的统一出处："生成中"是转圈，"出错了"是错误色的 toast ——
 //! 不再每次手搓一组脉冲点或一段红字。
+//!
+//! toast 的**队列与生命周期**由 [`crate::toasts`] 承担（以 egui-toast 为底的
+//! vendor 版，锚定 / 堆叠 / 到期回收都是它的），组件库只管两件事：Neo 外观的
+//! 自绘内容（[`toast`]），和一只配好锚点与外观的队列工厂（[`toasts`]）。
 
 use egui::{Color32, Painter, Rect, Ui, Vec2};
 use neo_theme::SquirclePaint;
 
-use crate::base::{inset, text_left};
+use crate::base::{inset, text_left, translucent};
 use crate::icons::Icon;
+use crate::toasts::{Toast, ToastKind, Toasts};
 use crate::Design;
 
 /// 加载转圈。
@@ -70,78 +75,95 @@ impl Default for Spinner {
 
 /// 浮动提示（屏幕下方中央，短暂出现）。
 ///
-/// "已复制""已保存"这类一闪而过的确认。由一个外部状态
-/// （`state.toast = Some((kind, msg, 截止时间))`）驱动。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToastKind {
-    Info,
-    Success,
-    Warn,
-    Error,
+/// "已复制""已保存"这类一闪而过的确认。队列、堆叠、到期回收由
+/// egui-toast 承担；这里的三个函数是组件库侧的接口：
+///
+/// - [`toast`]：布局流里画一条（队列的 custom_contents 走这里）；
+/// - [`toast_at`]：指定中心点画一条（陈列室摆位用）；
+/// - [`toasts`]：拿一只配好 Neo 外观与锚点的队列，每帧重建即可
+///   （队列本体存在 egui memory，不丢）。
+fn toast_accent(d: &Design, kind: ToastKind) -> Color32 {
+    let c = d.c();
+    match kind {
+        ToastKind::Success => c.success,
+        ToastKind::Warning => c.warn,
+        ToastKind::Error => c.error,
+        ToastKind::Info | ToastKind::Custom(_) => d.p().label_secondary,
+    }
 }
 
-/// 单条 toast。
-pub struct Toast<'a> {
-    kind: ToastKind,
-    text: &'a str,
+fn toast_icon(kind: ToastKind) -> Icon {
+    match kind {
+        ToastKind::Success => Icon::Check,
+        ToastKind::Warning => Icon::Warn,
+        ToastKind::Error => Icon::Close,
+        ToastKind::Info | ToastKind::Custom(_) => Icon::Info,
+    }
 }
 
-impl<'a> Toast<'a> {
-    pub fn new(kind: ToastKind, text: &'a str) -> Self {
-        Self { kind, text }
-    }
+/// 一条 toast 的自绘尺寸：图标 + 间距 + 文字 + 左右内边距。
+fn toast_size(ui: &Ui, d: &Design, text: &str) -> Vec2 {
+    let m = d.m();
+    let font = d.font(d.t().label);
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, Color32::WHITE)
+        .size()
+        .x;
+    Vec2::new(text_w + m.s(16.0) + m.s(8.0) + m.s(28.0), m.s(40.0))
+}
 
-    fn accent(&self, d: &Design) -> Color32 {
-        let c = d.c();
-        match self.kind {
-            ToastKind::Info => d.p().label_secondary,
-            ToastKind::Success => c.success,
-            ToastKind::Warn => c.warn,
-            ToastKind::Error => c.error,
-        }
-    }
+/// 在 rect 内画一条 toast（elevation + squircle 底 + 图标 + 文字）。
+fn paint_toast(ui: &Ui, d: &Design, kind: ToastKind, text: &str, rect: Rect) {
+    let m = d.m();
+    let c = d.c();
+    ui.painter()
+        .add(crate::base::elevation_soft(d).as_shape(rect, m.s(20.0)));
+    ui.painter().squircle(
+        rect,
+        m.s(20.0),
+        c.toast,
+        egui::Stroke::new(1.0, translucent(d.p().border_l2, 0.4)),
+    );
 
-    /// 在 `anchor`（屏幕中央偏下）绘制。
-    pub fn show_at(&self, ui: &mut Ui, d: &Design, anchor: egui::Pos2) {
-        let m = d.m();
-        let font = d.font(d.t().label);
-        let text_w = ui
-            .painter()
-            .layout_no_wrap(self.text.to_owned(), font.clone(), Color32::WHITE)
-            .size()
-            .x;
-        let icon_d = m.s(16.0);
-        let w = text_w + icon_d + m.s(8.0) + m.s(28.0);
-        let h = m.s(40.0);
-        let rect = Rect::from_center_size(anchor, Vec2::new(w, h));
+    let icon_d = m.s(16.0);
+    let icon_rect = Rect::from_center_size(
+        egui::pos2(rect.left() + m.s(14.0) + icon_d * 0.5, rect.center().y),
+        Vec2::splat(icon_d),
+    );
+    toast_icon(kind).paint(ui.painter(), icon_rect, toast_accent(d, kind));
+    text_left(
+        ui.painter(),
+        inset(rect, m.s(38.0), 0.0, m.s(14.0), 0.0),
+        text,
+        d.font(d.t().label),
+        d.p().label_primary,
+    );
+}
 
-        let c = d.c();
-        ui.painter()
-            .add(crate::base::elevation_soft(d).as_shape(rect, m.s(20.0)));
-        ui.painter().squircle(
-            rect,
-            m.s(20.0),
-            c.toast,
-            egui::Stroke::new(1.0, crate::base::translucent(d.p().border_l2, 0.4)),
-        );
+/// 单条 toast（布局流）。toast 是纯提示：只感知悬停，不拦截点击。
+pub fn toast(ui: &mut Ui, d: &Design, kind: ToastKind, text: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(toast_size(ui, d, text), egui::Sense::hover());
+    paint_toast(ui, d, kind, text, rect);
+    resp
+}
 
-        let icon_rect = Rect::from_center_size(
-            egui::pos2(rect.left() + m.s(14.0) + icon_d * 0.5, rect.center().y),
-            Vec2::splat(icon_d),
-        );
-        let icon = match self.kind {
-            ToastKind::Info => Icon::Info,
-            ToastKind::Success => Icon::Check,
-            ToastKind::Warn => Icon::Warn,
-            ToastKind::Error => Icon::Close,
-        };
-        icon.paint(ui.painter(), icon_rect, self.accent(d));
-        text_left(
-            ui.painter(),
-            inset(rect, m.s(38.0), 0.0, m.s(14.0), 0.0),
-            self.text,
-            font,
-            d.p().label_primary,
-        );
-    }
+/// 单条 toast（指定中心点，陈列室摆位用）。
+pub fn toast_at(ui: &Ui, d: &Design, kind: ToastKind, text: &str, center: egui::Pos2) {
+    let rect = Rect::from_center_size(center, toast_size(ui, d, text));
+    paint_toast(ui, d, kind, text, rect);
+}
+
+/// 一只配好 Neo 外观的 toast 队列：屏幕下方中央、向上堆叠、最顶层。
+/// 每帧重建实例即可 —— 队列本体在 egui memory 里。
+///
+/// 提示层不拦截点击（见 [`crate::toasts`] 的模块说明）。
+pub fn toasts(d: &Design) -> Toasts {
+    let offset_y = -d.m().s(150.0);
+    let d = *d;
+    Toasts::new(move |ui: &mut Ui, t: &Toast| {
+        toast(ui, &d, t.kind, &t.text);
+    })
+    .anchor(egui::Align2::CENTER_BOTTOM, egui::pos2(0.0, offset_y))
+    .direction(egui::Direction::BottomUp)
 }

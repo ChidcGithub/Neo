@@ -475,7 +475,8 @@ impl IconButton {
 /// 文本胶囊（Plan / 只读开关 / 模型选择器）。
 ///
 /// 输入卡工具栏里的"点一下切换状态"的小块：静息无底，激活时浮起
-/// `nav-active` 底。宽度由 [`Chip::width`] 预先量出，调用方负责摆位。
+/// `nav-active` 底。布局流用 [`Chip::show`]；要精确摆位时用
+/// [`Chip::width`] 量宽 + [`Chip::show_at`]。
 pub struct Chip<'a> {
     label: &'a str,
     chevron: bool,
@@ -559,6 +560,14 @@ impl<'a> Chip<'a> {
             );
         }
         resp
+    }
+
+    /// 走布局流（量内容宽，分配 chip 高）——flex / horizontal 里直接用。
+    pub fn show(self, ui: &mut Ui, d: &Design) -> Response {
+        let w = Self::width(ui.painter(), d, self.label, self.chevron);
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(w, d.m().chip_h()), egui::Sense::hover());
+        self.show_at(ui, d, rect)
     }
 }
 
