@@ -1,38 +1,19 @@
 //! 图标集。
 //!
-//! ## 几何直接取自上游
+//! 全部字形来自 [Phosphor](https://phosphoricons.com/) 图标字体（MIT 许可）：
+//! 字体文件内嵌在 `neo-theme`（[`neo_theme::fonts::ICON_FONT`]），字体装配时
+//! 注入 egui 族链；本模块只负责「枚举 → 私有使用区字符」的映射，渲染就是
+//! 在矩形中央画一个字符。
 //!
-//! 22 个图标的路径数据来自 `dsh-client-ui-primitives`（见 [`paths`]，
-//! 自动生成、与上游逐字节一致），与 `brand/whale_path.rs` 同一套做法。
-//!
-//! 这一点很关键：上游图标是 **16/14 栅格上的填充路径**（`viewBox="0 0 16 16"`，
-//! `fill: currentColor`），**不是一笔描边**：看起来是线稿，其实由两条反向
-//! 绕行的轮廓（外轮廓 + 内轮廓）填出来。所以在这里手绘"差不多的线条"永远
-//! 对不上——粗细、端点、圆角都会差一截。
-//!
-//! ## 渲染方式
-//!
-//! 路径 → 白色 + alpha 的纹理（懒生成、每图标一份、按需上传），绘制时用
-//! `tint` 上色。好处：形状由 `neo_theme::svg` 用扫描线精确填充（支持挖空），
-//! 抗锯齿在纹理里一次性算好，每帧只是一个贴图四边形 —— 比每帧三角化便宜得多。
-//!
-//! 只有 [`Icon::Mic`] 仍是手绘描边：上游图标集里没有麦克风，它是 Neo 场景卡
-//! 自己的图形。
-//!
-//! 所有图标统一映射到目标矩形内接居中（保持 viewBox 比例），
-//! 因此同一个图标在 16pt 的行内动作和 28pt 的场景卡上比例完全一致。
+//! 这套做法退役了旧的 SVG 路径光栅化管线（`paths.rs` + `tools/gen_icons.py`
+//! + 每图标一张缓存纹理）：加图标从「跑生成器」变成「查 phosphor.com 加一行」。
 
-use egui::{Color32, Id, Painter, Pos2, Rect, Shape, Stroke, TextureHandle, TextureOptions, Vec2};
-
-pub mod paths;
-
-/// 设计栅格边长（仅手绘图标使用；上游图标按各自 viewBox 映射）。
-const GRID: f32 = 24.0;
+use egui::{Align2, Color32, FontId, Painter, Rect};
 
 /// 组件库认得的图标。
 ///
-/// 枚举而不是散函数：调用方在按钮/输入框上只写 `Icon::Board`，
-/// 不需要记住具体的自由函数签名，也方便日后加"选中态/填充态"变体。
+/// 枚举而不是散常量：调用方在按钮/输入框上只写 `Icon::Board`，
+/// 不需要记住具体的字符，也方便日后加「选中态/填充态」变体。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Icon {
     Plus,
@@ -90,389 +71,72 @@ pub const ALL: &[Icon] = &[
 ];
 
 impl Icon {
-    /// 上游字形。`None` = 上游没有这个图形，由 Neo 手绘。
-    pub fn glyph(self) -> Option<&'static paths::Glyph> {
-        use paths as g;
-        Some(match self {
-            Icon::Plus => &g::PLUS,
-            Icon::ArrowUp => &g::ARROW_UP,
-            Icon::Stop => &g::STOP,
-            Icon::Folder => &g::FOLDER,
-            Icon::ChevronDown => &g::CHEVRON_DOWN,
-            Icon::Sun => &g::SUN,
-            Icon::Moon => &g::MOON,
-            Icon::Close => &g::CLOSE,
-            Icon::Cog => &g::COG,
-            Icon::Trash => &g::TRASH,
-            Icon::Board => &g::BOARD,
-            Icon::Checklist => &g::CHECKLIST,
-            Icon::Pen => &g::PEN,
-            Icon::Check => &g::CHECK,
-            Icon::Info => &g::INFO,
-            Icon::Warn => &g::WARN,
-            Icon::Copy => &g::COPY,
-            Icon::Search => &g::SEARCH,
-            Icon::ArrowLeft => &g::ARROW_LEFT,
-            Icon::ArrowRight => &g::ARROW_RIGHT,
-            Icon::Dots => &g::DOTS,
-            // 上游图标集里没有麦克风 —— 这是 Neo 场景卡自己的图形。
-            Icon::Mic => return None,
-            // 星芒是上游的品牌笔触；Neo 按自家规则重画（docs/neo-brand.md §五），
-            // 不再借用上游几何。
-            Icon::Sparkle => return None,
-        })
+    /// Phosphor regular 字体里的私有区字符（右侧注释是 upstream 名字，
+    /// 加图标时到 phosphor.com 查名取码）。
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Icon::Plus => "\u{E3D4}",       // plus
+            Icon::ArrowUp => "\u{E08E}",    // arrow-up
+            Icon::Stop => "\u{E46C}",       // stop
+            Icon::Folder => "\u{E24A}",     // folder
+            Icon::ChevronDown => "\u{E136}", // caret-down
+            Icon::Sun => "\u{E472}",        // sun
+            Icon::Moon => "\u{E330}",       // moon
+            Icon::Close => "\u{E4F6}",      // x
+            Icon::Cog => "\u{E270}",        // gear
+            Icon::Trash => "\u{E4A6}",      // trash
+            Icon::Board => "\u{E600}",      // chalkboard-teacher
+            Icon::Checklist => "\u{EADC}",  // list-checks
+            Icon::Pen => "\u{E3B4}",        // pencil-simple
+            Icon::Mic => "\u{E326}",        // microphone
+            Icon::Check => "\u{E182}",      // check
+            Icon::Info => "\u{E2CE}",       // info
+            Icon::Warn => "\u{E4E0}",       // warning
+            Icon::Sparkle => "\u{E6A2}",    // sparkle
+            Icon::Copy => "\u{E1CA}",       // copy
+            Icon::Search => "\u{E30C}",     // magnifying-glass
+            Icon::ArrowLeft => "\u{E058}",  // arrow-left
+            Icon::ArrowRight => "\u{E06C}", // arrow-right
+            Icon::Dots => "\u{E1FE}",       // dots-three
+        }
     }
 
-    /// 在 `rect` 内绘制。`stroke_w` 以设计单位计，**只对手绘图标有效**
-    /// （目前只有 `Mic`）—— 上游图标的粗细写在路径里，不随参数变化。
-    pub fn paint(self, painter: &Painter, rect: Rect, color: Color32, stroke_w: f32) {
-        if let Some(glyph) = self.glyph() {
-            paint_glyph(painter, rect, color, glyph);
+    /// 在 `rect` 内居中绘制。
+    ///
+    /// 字号取短边 × 1.25：Phosphor 字面在 em 框内留了约两成边距，
+    /// 放大一格后与旧管线「viewBox 内接居中」的视觉尺寸相当。
+    pub fn paint(self, painter: &Painter, rect: Rect, color: Color32) {
+        if rect.width() <= 0.0 || rect.height() <= 0.0 || color.a() == 0 {
             return;
         }
-        match self {
-            Icon::Mic => mic(painter, rect, color, stroke_w),
-            Icon::Sparkle => sparkle(painter, rect, color),
-            _ => {}
-        }
-    }
-}
-
-/// 用预光栅化的纹理绘制一个上游字形。
-fn paint_glyph(painter: &Painter, rect: Rect, color: Color32, glyph: &'static paths::Glyph) {
-    if rect.width() <= 0.0 || rect.height() <= 0.0 || color.a() == 0 {
-        return;
-    }
-    // 上游把 viewBox 铺满一个 `size × size` 的方框；这里同样**内接居中**，
-    // 非正方形 viewBox（如 8×10）也不会被拉伸。
-    let scale = (rect.width() / glyph.vw).min(rect.height() / glyph.vh);
-    let target =
-        Rect::from_center_size(rect.center(), Vec2::new(glyph.vw * scale, glyph.vh * scale));
-    let texture = glyph_texture(painter, glyph);
-    painter.image(
-        texture.id(),
-        target,
-        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-        color,
-    );
-}
-
-/// 取（必要时生成）图标的白色 alpha 纹理。
-///
-/// 存在 egui 的临时数据里：每个 `Context` 一份，测试与真机互不影响，
-/// 也不需要全局静态（纹理的生命周期本就跟着 Context 走）。
-/// 键用字形自身的地址 —— 它在静态表里，全进程唯一且稳定。
-fn glyph_texture(painter: &Painter, glyph: &'static paths::Glyph) -> TextureHandle {
-    let ctx = painter.ctx();
-    let id = Id::new(("neo-icon-glyph", glyph as *const paths::Glyph as usize));
-    if let Some(tex) = ctx.data(|d| d.get_temp::<TextureHandle>(id)) {
-        return tex;
-    }
-    let w = paths::TEXTURE_PX;
-    let h = ((w as f32 / glyph.aspect()).round() as usize).max(1);
-    let image = egui::ColorImage::new([w, h], glyph.pixels().to_vec());
-    let tex = ctx.load_texture(format!("neo-icon-{w}x{h}"), image, TextureOptions::LINEAR);
-    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
-    tex
-}
-
-// ---------------------------------------------------------------------------
-// 手绘图标（上游没有对应图形）
-// ---------------------------------------------------------------------------
-
-/// 映射后的长度：设计单位 → 像素。
-fn u(rect: Rect, v: f32) -> f32 {
-    rect.width().min(rect.height()) / GRID * v
-}
-
-/// 把设计坐标映射到目标矩形（保持中心对齐与等比缩放）。
-fn p(rect: Rect, x: f32, y: f32) -> Pos2 {
-    let s = rect.width().min(rect.height()) / GRID;
-    let c = rect.center();
-    Pos2::new(c.x + (x - GRID * 0.5) * s, c.y + (y - GRID * 0.5) * s)
-}
-
-fn stroke(rect: Rect, design_w: f32, color: Color32) -> Stroke {
-    Stroke::new(u(rect, design_w).max(0.75), color)
-}
-
-fn seg(painter: &Painter, rect: Rect, a: (f32, f32), b: (f32, f32), color: Color32, w: f32) {
-    painter.add(Shape::line(
-        vec![p(rect, a.0, a.1), p(rect, b.0, b.1)],
-        stroke(rect, w, color),
-    ));
-}
-
-/// 麦克风：胶囊 + 弧底 + 支杆（Neo 自有）。
-fn mic(painter: &Painter, rect: Rect, color: Color32, w: f32) {
-    for x in [9.0f32, 15.0f32] {
-        seg(painter, rect, (x, 8.4), (x, 12.4), color, w);
-    }
-    let top: Vec<Pos2> = (0..=14)
-        .map(|i| {
-            let a = std::f32::consts::PI * (i as f32 / 14.0) + std::f32::consts::PI;
-            p(rect, 12.0 + a.cos() * 3.0, 8.4 + a.sin() * 3.0)
-        })
-        .collect();
-    painter.add(Shape::line(top, stroke(rect, w, color)));
-    let bot: Vec<Pos2> = (0..=14)
-        .map(|i| {
-            let a = std::f32::consts::PI * (i as f32 / 14.0);
-            p(rect, 12.0 + a.cos() * 3.0, 12.4 + a.sin() * 3.0)
-        })
-        .collect();
-    painter.add(Shape::line(bot, stroke(rect, w, color)));
-    seg(painter, rect, (12.0, 15.4), (12.0, 18.2), color, w);
-    seg(painter, rect, (8.6, 18.4), (15.4, 18.4), color, w);
-}
-
-/// 星芒（✦）：大四角星 + 右上小四角星，实心填充（Neo 原创几何）。
-///
-/// 按自家图标规则画（docs/neo-brand.md §五）：24 栅格、尖角截角钝化
-/// （圆头近似）、凹点/尖半径比 0.30 —— 与 squircle(1.5) 的微鼓同族。
-fn sparkle(painter: &Painter, rect: Rect, color: Color32) {
-    // 大星偏左下、小星点缀右上（经典 sparkle 构图）。
-    fill_star(painter, rect, (10.3, 12.7), 8.1, 2.45, 1.15, color);
-    fill_star(painter, rect, (18.6, 5.4), 3.1, 1.0, 0.62, color);
-}
-
-/// 实心四角星：中心扇形三角化（四角星的核包含几何中心，扇形剖分无交叠；
-/// `PathShape::convex_polygon` 的三角扇只对凸多边形正确，不能用它）。
-fn fill_star(
-    painter: &Painter,
-    rect: Rect,
-    (cx, cy): (f32, f32),
-    r_out: f32,
-    r_in: f32,
-    tip: f32,
-    color: Color32,
-) {
-    let outline = star4_outline(cx, cy, r_out, r_in, tip);
-    let mut mesh = egui::epaint::Mesh::default();
-    mesh.vertices.push(egui::epaint::Vertex {
-        pos: p(rect, cx, cy),
-        uv: egui::epaint::WHITE_UV,
-        color,
-    });
-    for &(x, y) in &outline {
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos: p(rect, x, y),
-            uv: egui::epaint::WHITE_UV,
+        let size = rect.width().min(rect.height()) * 1.25;
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            self.glyph(),
+            FontId::proportional(size),
             color,
-        });
-    }
-    let n = outline.len() as u32;
-    for i in 0..n {
-        mesh.indices.extend_from_slice(&[0, 1 + i, 1 + (i + 1) % n]);
-    }
-    painter.add(Shape::mesh(mesh));
-}
-
-/// 四角星轮廓：四尖（轴向）四凹（45° 对角）交替；尖角截角钝化 ——
-/// 两臂各退 `tip` 得肩点，肩点中点向尖外鼓 0.42× 补出圆头的弧度。
-fn star4_outline(cx: f32, cy: f32, r_out: f32, r_in: f32, tip: f32) -> Vec<(f32, f32)> {
-    /// 从 p 朝 q 方向退 d 的点。
-    fn along(p: (f32, f32), q: (f32, f32), d: f32) -> (f32, f32) {
-        let (dx, dy) = (q.0 - p.0, q.1 - p.1);
-        let len = (dx * dx + dy * dy).sqrt();
-        (p.0 + dx / len * d, p.1 + dy / len * d)
-    }
-    let mut pts = Vec::with_capacity(16);
-    for k in 0..4 {
-        let tip_deg = -90.0f32 + 90.0 * k as f32; // 从顶尖起顺时针
-        let tip_a = tip_deg.to_radians();
-        let tip_p = (cx + r_out * tip_a.cos(), cy + r_out * tip_a.sin());
-        let d1 = (tip_deg - 45.0).to_radians();
-        let d2 = (tip_deg + 45.0).to_radians();
-        let q1 = (cx + r_in * d1.cos(), cy + r_in * d1.sin());
-        pts.push(q1);
-        let a = along(tip_p, q1, tip);
-        let b = along(tip_p, (cx + r_in * d2.cos(), cy + r_in * d2.sin()), tip);
-        let mid = (
-            (a.0 + b.0) * 0.5 + (tip_p.0 - (a.0 + b.0) * 0.5) * 0.42,
-            (a.1 + b.1) * 0.5 + (tip_p.1 - (a.1 + b.1) * 0.5) * 0.42,
         );
-        pts.push(a);
-        pts.push(mid);
-        pts.push(b);
     }
-    pts
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 覆盖率采样：按 viewBox 归一化坐标取一个像素的覆盖率。
-    fn coverage(glyph: &paths::Glyph, x: f32, y: f32) -> f32 {
-        let pixels = glyph.pixels();
-        let w = paths::TEXTURE_PX;
-        let h = ((w as f32 / glyph.aspect()).round() as usize).max(1);
-        let px = ((x / glyph.vw) * w as f32).clamp(0.0, (w - 1) as f32) as usize;
-        let py = ((y / glyph.vh) * h as f32).clamp(0.0, (h - 1) as f32) as usize;
-        pixels[py * w + px].a() as f32 / 255.0
-    }
-
-    /// 把光栅化结果打成字符画 —— 校验字形几何的"眼睛"。
-    ///
-    /// 默认 `#[ignore]`；需要看的时候：
-    /// `cargo test -p neo-ui dump_glyphs -- --ignored --nocapture`
+    /// 每个图标都映射到恰好一个私有使用区（PUA）字符 —— 守住码表别打错。
     #[test]
-    #[ignore]
-    fn dump_glyphs() {
-        for icon in [Icon::Moon, Icon::Plus, Icon::Folder, Icon::Sun, Icon::Cog] {
-            let g = icon.glyph().unwrap();
-            let px = g.pixels();
-            let w = paths::TEXTURE_PX;
-            let h = ((w as f32 / g.aspect()).round() as usize).max(1);
-            println!("=== {icon:?} ({w}×{h}) ===");
-            for row in 0..32 {
-                let mut line = String::new();
-                for col in 0..32 {
-                    let x = col * w / 32;
-                    let y = row * h / 32;
-                    let a = px[y * w + x].a();
-                    line.push(if a > 200 {
-                        '#'
-                    } else if a > 60 {
-                        '+'
-                    } else {
-                        '.'
-                    });
-                }
-                println!("{line}");
-            }
-        }
-    }
-
-    #[test]
-    fn every_icon_maps_to_a_glyph_except_the_hand_drawn_ones() {
+    fn every_icon_maps_to_a_single_pua_char() {
         for &icon in ALL {
-            assert_eq!(
-                icon.glyph().is_some(),
-                !matches!(icon, Icon::Mic | Icon::Sparkle),
-                "{icon:?} 的字形映射与预期不符"
+            let mut chars = icon.glyph().chars();
+            let Some(c) = chars.next() else {
+                panic!("{icon:?} 的字形是空串");
+            };
+            assert!(
+                ('\u{E000}'..='\u{F8FF}').contains(&c),
+                "{icon:?} 的码位 {c:?} 不在私有使用区"
             );
+            assert!(chars.next().is_none(), "{icon:?} 的字形不止一个字符");
         }
-    }
-
-    #[test]
-    fn no_glyph_rasterizes_empty() {
-        for &icon in ALL {
-            let Some(g) = icon.glyph() else { continue };
-            let ink = g.pixels().iter().filter(|c| c.a() > 8).count();
-            assert!(ink > 20, "{icon:?} 光栅化后几乎没墨：{ink} 个像素");
-        }
-    }
-
-    /// 上游月亮是**双轮廓挖空**的填充路径 —— 这条测试守住"填充规则别退化成实心"。
-    /// 手绘时代最容易错的正是这里（填实了就变成一坨饼）。
-    #[test]
-    fn moon_has_a_cut_out_and_no_solid_blob() {
-        let moon = Icon::Moon.glyph().unwrap();
-        // 外环左缘有墨（采样点按 32×32 字符画定过，避开线条边缘）
-        assert!(
-            coverage(moon, 2.0, 8.0) > 0.8,
-            "月亮外环没被填: {}",
-            coverage(moon, 2.0, 8.0)
-        );
-        // 圆环以内必须是空的（这就是上游的挖空）
-        assert!(
-            coverage(moon, 5.0, 8.0) < 0.1,
-            "月亮内侧没有挖空: {}",
-            coverage(moon, 5.0, 8.0)
-        );
-    }
-
-    /// 光栅化墨迹的包围盒（viewBox 单位）。
-    fn ink_bbox(glyph: &paths::Glyph) -> [f32; 4] {
-        let px = glyph.pixels();
-        let w = paths::TEXTURE_PX;
-        let h = ((w as f32 / glyph.aspect()).round() as usize).max(1);
-        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for y in 0..h {
-            for x in 0..w {
-                if px[y * w + x].a() > 8 {
-                    let vx = x as f32 / w as f32 * glyph.vw;
-                    let vy = y as f32 / h as f32 * glyph.vh;
-                    x0 = x0.min(vx);
-                    y0 = y0.min(vy);
-                    x1 = x1.max(vx);
-                    y1 = y1.max(vy);
-                }
-            }
-        }
-        [x0, y0, x1, y1]
-    }
-
-    /// **核心不变式**：光栅化出来的墨迹范围必须与路径自身的几何包围盒一致。
-    ///
-    /// 一次性守住一串容易错的地方：坐标翻转、viewBox 映射比例、漏掉的 `transform`
-    /// （上游有 5 个图标用 `translate` 把图案摆进 viewBox）、以及上限裁切。
-    /// 比手挑采样点可靠得多 —— 采到线条边缘就会得到 0.4 这种模棱两可的值。
-    #[test]
-    fn rasterized_ink_matches_path_bounds() {
-        use neo_theme::svg;
-        for &icon in ALL {
-            let Some(g) = icon.glyph() else { continue };
-            let mut contours = Vec::new();
-            for d in g.d {
-                contours.extend(svg::parse_subpaths(d));
-            }
-            let want = svg::bounds(&contours).expect("路径非空");
-            let got = ink_bbox(g);
-            for (i, axis) in ["x0", "y0", "x1", "y1"].iter().enumerate() {
-                assert!(
-                    (got[i] - want[i]).abs() < 0.35,
-                    "{icon:?} 的 {axis} 对不上：光栅化 {:.3}，路径 {:.3}",
-                    got[i],
-                    want[i]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn plus_is_ink_in_the_middle_and_empty_at_corners() {
-        let g = Icon::Plus.glyph().unwrap();
-        assert!(coverage(g, 8.0, 8.0) > 0.9, "加号中心应为实心");
-        assert!(coverage(g, 1.0, 1.0) < 0.1, "加号左上角应为空");
-    }
-}
-
-#[cfg(test)]
-mod cache_key_probe {
-    use super::paths;
-    use egui::Id;
-
-    /// 探测：两个不同字形会不会拿到同一个缓存键。
-    ///
-    /// 缓存键是「字形静态量的地址」。如果链接器把两个 `Glyph` 合并了
-    /// （identical-code-folding 之类），地址就会撞上，界面里会出现
-    /// "月亮的位置画出加号"这种荒谬现象。
-    #[test]
-    fn glyph_addresses_are_distinct() {
-        let a = &paths::PLUS as *const paths::Glyph as usize;
-        let b = &paths::MOON as *const paths::Glyph as usize;
-        let c = &paths::SUN as *const paths::Glyph as usize;
-        assert_ne!(a, b, "PLUS 与 MOON 的地址相同 —— 缓存键会撞");
-        assert_ne!(a, c, "PLUS 与 SUN 的地址相同 —— 缓存键会撞");
-        assert_ne!(b, c, "MOON 与 SUN 的地址相同 —— 缓存键会撞");
-
-        assert_ne!(
-            Id::new(("neo-icon-glyph", a)),
-            Id::new(("neo-icon-glyph", b)),
-            "Id 哈希撞了"
-        );
-    }
-
-    /// 探测：两个字形光栅化出来的像素必须不同（否则是渲染管线拿错了数据）。
-    #[test]
-    fn glyph_pixels_differ_between_icons() {
-        assert_ne!(
-            paths::PLUS.pixels(),
-            paths::MOON.pixels(),
-            "PLUS 与 MOON 的像素完全相同"
-        );
     }
 }

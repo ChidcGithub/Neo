@@ -253,7 +253,7 @@ pub(super) fn attachment_card(
             egui::Color32::WHITE,
         );
     } else {
-        icon.paint(&painter, preview.shrink(m.s(10.0)), p.label_tertiary, 1.5);
+        icon.paint(&painter, preview.shrink(m.s(10.0)), p.label_tertiary);
     }
     let left = preview.right() + m.s(10.0);
     let right = rect.right() - m.s(if removable.is_some() { 46.0 } else { 12.0 });

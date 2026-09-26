@@ -23,6 +23,13 @@ use egui::{Context, FontData, FontDefinitions, FontFamily, FontTweak};
 pub const FAMILY_BOLD: &str = "neo-bold";
 /// 等宽族名。
 pub const FAMILY_MONO: &str = "neo-mono";
+/// 图标字体在族链里的注册名（Phosphor，MIT 许可，内嵌 477KB）。
+///
+/// 图标字形在私有使用区（PUA），正文字体都没有这个区 —— 链上任何位置
+/// 都会被正确回退到这里；放在正文字体之后是为了不让它参与拉丁文排版。
+pub const ICON_FONT: &str = "phosphor";
+/// 图标字体字节（`neo_ui::Icon` 的全部字形来源）。
+const PHOSPHOR_TTF: &[u8] = include_bytes!("../assets/Phosphor.ttf");
 
 /// 粗体字族句柄。
 pub fn bold() -> FontFamily {
@@ -233,6 +240,7 @@ pub fn install(ctx: &Context) -> LoadedFonts {
         proportional.push("neo-ui-cjk".to_owned());
     }
     proportional.extend([
+        ICON_FONT.to_owned(),
         "Ubuntu-Light".to_owned(),
         "NotoEmoji-Regular".to_owned(),
         "emoji-icon-font".to_owned(),
@@ -260,7 +268,21 @@ pub fn install(ctx: &Context) -> LoadedFonts {
     if loaded.cjk.is_some() {
         bold_chain.push("neo-ui-cjk".to_owned());
     }
-    bold_chain.extend(["Ubuntu-Light".to_owned(), "NotoEmoji-Regular".to_owned()]);
+    bold_chain.extend([
+        ICON_FONT.to_owned(),
+        "Ubuntu-Light".to_owned(),
+        "NotoEmoji-Regular".to_owned(),
+    ]);
+
+    // 图标字体：单字体一族，正文/粗体链里都以 PUA 回退的方式引用它。
+    defs.font_data.insert(
+        ICON_FONT.to_owned(),
+        Arc::new(FontData {
+            font: PHOSPHOR_TTF.to_vec().into(),
+            index: 0,
+            tweak: FontTweak::default(),
+        }),
+    );
 
     defs.families
         .insert(FontFamily::Proportional, proportional.clone());

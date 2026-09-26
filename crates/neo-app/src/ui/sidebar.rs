@@ -177,7 +177,6 @@ pub fn draw(
         } else {
             p.label_secondary
         },
-        1.6,
     );
     text_left(
         ui.painter(),

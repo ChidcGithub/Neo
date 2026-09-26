@@ -117,7 +117,6 @@ impl<'a> EmptyState<'a> {
             painter,
             icon_rect,
             crate::base::translucent(p.label_caption, 0.7),
-            1.6,
         );
 
         let title_rect = Rect::from_min_size(
@@ -215,7 +214,7 @@ impl<'a> Toast<'a> {
             ToastKind::Warn => Icon::Warn,
             ToastKind::Error => Icon::Close,
         };
-        icon.paint(ui.painter(), icon_rect, self.accent(d), 1.7);
+        icon.paint(ui.painter(), icon_rect, self.accent(d));
         text_left(
             ui.painter(),
             inset(rect, m.s(38.0), 0.0, m.s(14.0), 0.0),

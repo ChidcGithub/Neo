@@ -73,7 +73,6 @@ impl<'a> NavItem<'a> {
             ui.painter(),
             icon_rect,
             if hot { p.accent } else { p.label_secondary },
-            1.8,
         );
         text_left(
             ui.painter(),
@@ -186,13 +185,11 @@ impl<'a> ListRow<'a> {
             ui.painter(),
             Rect::from_center_size(pen_rect.center(), glyph),
             if pen.hovered() { p.label_primary } else { idle },
-            1.6,
         );
         Icon::Trash.paint(
             ui.painter(),
             Rect::from_center_size(trash_rect.center(), glyph),
             if trash.hovered() { d.c().error } else { idle },
-            1.6,
         );
 
         let mut action = None;

@@ -455,7 +455,7 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     } else if cancelled {
         painter.circle_filled(lead_rect.center(), m.s(4.0), p.label_caption);
     } else {
-        icon_for(variant).paint(painter, lead_rect, p.label_tertiary, 1.5);
+        icon_for(variant).paint(painter, lead_rect, p.label_tertiary);
     }
 
     // ---- 标题 · 摘要 ----

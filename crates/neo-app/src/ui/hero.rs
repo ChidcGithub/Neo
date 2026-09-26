@@ -144,7 +144,7 @@ fn workspace_chip(ui: &Ui, skin: &Skin<'_>, rect: Rect, label: Option<&str>) -> 
         egui::pos2(rect.left() + m.s(14.0), rect.center().y),
         Vec2::splat(m.s(16.0)),
     );
-    Icon::Folder.paint(painter, icon_r, p.label_primary, 1.6);
+    Icon::Folder.paint(painter, icon_r, p.label_primary);
 
     let label_font = skin.bold(skin.t().label);
     let chevron_w = m.s(16.0);
@@ -173,7 +173,6 @@ fn workspace_chip(ui: &Ui, skin: &Skin<'_>, rect: Rect, label: Option<&str>) -> 
             Vec2::splat(m.s(10.0)),
         ),
         p.label_caption,
-        m.s(1.4),
     );
 
     resp.clicked()

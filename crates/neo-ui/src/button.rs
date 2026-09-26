@@ -262,7 +262,7 @@ impl<'a> Button<'a> {
                 egui::pos2(cx + m.s(8.0), draw_rect.center().y),
                 Vec2::splat(m.s(16.0)),
             );
-            icon.paint(painter, ir, label_color, 1.6);
+            icon.paint(painter, ir, label_color);
             cx += icon_w;
         }
         if self.loading {
@@ -460,7 +460,6 @@ impl IconButton {
             painter,
             Rect::from_center_size(center, Vec2::splat(self.icon_d(d))),
             glyph,
-            1.7,
         );
         resp
     }
@@ -557,7 +556,6 @@ impl<'a> Chip<'a> {
                 painter,
                 Rect::from_center_size(c, Vec2::splat(m.s(10.0))),
                 p.label_caption,
-                m.s(1.4),
             );
         }
         resp

@@ -83,7 +83,7 @@ impl<'a> TextField<'a> {
                 egui::pos2(rect.left() + m.s(14.0), rect.center().y),
                 Vec2::splat(m.s(16.0)),
             );
-            icon.paint(ui.painter(), ir, p.label_caption, 1.6);
+            icon.paint(ui.painter(), ir, p.label_caption);
             text_left_pad = m.s(34.0);
         }
 
