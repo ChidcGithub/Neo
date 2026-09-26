@@ -3264,7 +3264,7 @@ mod snapshot {
         ly += 46.0;
 
         // ---- 左列 5：反馈 ----
-        ly = section(&painter, &d, lx, ly, w, "反馈 · Badge / Spinner / 空态");
+        ly = section(&painter, &d, lx, ly, w, "反馈 · Badge / Spinner");
         let mut bx = lx;
         for (text, tone) in [
             ("v0.2.0", nui::BadgeTone::Neutral),
@@ -3289,40 +3289,6 @@ mod snapshot {
             d.p().label_tertiary,
         );
         ly += 44.0;
-        // 空态卡。
-        let empty_card = egui::Rect::from_min_size(egui::pos2(lx, ly), Vec2::new(400.0, 150.0));
-        nui::Card::new(nui::CardSurface::Tip).paint(ui, &d, empty_card);
-        nui::at(ui, nui::inset_all(empty_card, 12.0), |ui| {
-            nui::EmptyState::new(nui::Icon::Mic, "还没有语音记录")
-                .hint("点击麦克风开始")
-                .show(ui, &d, nui::inset_all(empty_card, 12.0));
-        });
-
-        // ---- 右列 1：卡片 ----
-        ry = section(&painter, &d, rx, ry, w, "卡片 · Card");
-        let cw3 = (w - 24.0) / 3.0;
-        for (i, (label, card)) in [
-            ("输入卡", nui::Card::input()),
-            ("气泡", nui::Card::bubble()),
-            ("选中态", nui::Card::raised().selected(true)),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let r = egui::Rect::from_min_size(
-                egui::pos2(rx + (cw3 + 12.0) * i as f32, ry),
-                Vec2::new(cw3, 120.0),
-            );
-            card.paint(ui, &d, r);
-            painter.text(
-                egui::pos2(r.left() + 14.0, r.bottom() - 12.0),
-                egui::Align2::LEFT_CENTER,
-                label,
-                d.font(d.t().caption),
-                d.p().label_caption,
-            );
-        }
-        ry += 136.0;
 
         // ---- 右列 2：列表行 ----
         ry = section(&painter, &d, rx, ry, w, "列表 · NavItem / ListRow / 确认条");
@@ -3399,8 +3365,8 @@ mod snapshot {
         );
         ry += dlg_h + 28.0;
 
-        // ---- 右列 4：Toast 与 Tooltip ----
-        ry = section(&painter, &d, rx, ry, w, "浮动提示 · Toast / Tooltip");
+        // ---- 右列 4：Toast ----
+        ry = section(&painter, &d, rx, ry, w, "浮动提示 · Toast");
         nui::Toast::new(nui::ToastKind::Success, "已保存到本机数据库").show_at(
             ui,
             &d,
@@ -3411,7 +3377,6 @@ mod snapshot {
             &d,
             egui::pos2(rx + 200.0, ry + 76.0),
         );
-        nui::Tooltip::new("Enter 发送").show_at(ui, &d, egui::pos2(rx + 440.0, ry + 16.0));
 
         let _ = ly;
         let _ = ry;

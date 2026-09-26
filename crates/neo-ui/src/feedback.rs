@@ -1,12 +1,12 @@
-//! 反馈类：加载、空态、浮动提示、悬浮提示。
+//! 反馈类：加载与浮动提示。
 //!
-//! 状态语言的统一出处："生成中"是转圈，"没有内容"是空态，"出错了"
-//! 是错误色的 toast —— 不再每次手搓一组脉冲点或一段红字。
+//! 状态语言的统一出处："生成中"是转圈，"出错了"是错误色的 toast ——
+//! 不再每次手搓一组脉冲点或一段红字。
 
 use egui::{Color32, Painter, Rect, Ui, Vec2};
 use neo_theme::SquirclePaint;
 
-use crate::base::{inset, text_center, text_left};
+use crate::base::{inset, text_left};
 use crate::icons::Icon;
 use crate::Design;
 
@@ -65,85 +65,6 @@ impl Spinner {
 impl Default for Spinner {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// 空态：图标 + 标题 + 说明。
-///
-/// 消息流为空、会话列表为空、搜索结果为空 —— 都走它，
-/// 不再各自拼一个居中的灰字。
-pub struct EmptyState<'a> {
-    icon: Icon,
-    title: &'a str,
-    hint: Option<&'a str>,
-}
-
-impl<'a> EmptyState<'a> {
-    pub fn new(icon: Icon, title: &'a str) -> Self {
-        Self {
-            icon,
-            title,
-            hint: None,
-        }
-    }
-    pub fn hint(mut self, h: &'a str) -> Self {
-        self.hint = Some(h);
-        self
-    }
-
-    pub fn show(&self, ui: &mut Ui, d: &Design, rect: Rect) {
-        let p = d.p();
-        let m = d.m();
-        let painter = ui.painter();
-
-        let icon_d = m.s(36.0);
-        let title_h = d.t().label_lh;
-        let hint_h = if self.hint.is_some() { m.s(18.0) } else { 0.0 };
-        let total = icon_d
-            + m.s(10.0)
-            + title_h
-            + if self.hint.is_some() {
-                m.s(4.0) + hint_h
-            } else {
-                0.0
-            };
-        let top = rect.center().y - total * 0.5;
-
-        let icon_rect = Rect::from_center_size(
-            egui::pos2(rect.center().x, top + icon_d * 0.5),
-            Vec2::splat(icon_d),
-        );
-        self.icon.paint(
-            painter,
-            icon_rect,
-            crate::base::translucent(p.label_caption, 0.7),
-        );
-
-        let title_rect = Rect::from_min_size(
-            egui::pos2(rect.left(), icon_rect.bottom() + m.s(10.0)),
-            Vec2::new(rect.width(), title_h),
-        );
-        text_center(
-            painter,
-            title_rect,
-            self.title,
-            d.font_bold(d.t().label),
-            p.label_secondary,
-        );
-
-        if let Some(hint) = self.hint {
-            let hint_rect = Rect::from_min_size(
-                egui::pos2(rect.left(), title_rect.bottom() + m.s(4.0)),
-                Vec2::new(rect.width(), hint_h),
-            );
-            text_center(
-                painter,
-                hint_rect,
-                hint,
-                d.font(d.t().caption),
-                p.label_caption,
-            );
-        }
     }
 }
 
@@ -222,40 +143,5 @@ impl<'a> Toast<'a> {
             font,
             d.p().label_primary,
         );
-    }
-}
-
-/// 悬浮提示（hover 某控件时弹出的小气泡）。
-///
-/// 教室触控场景用不上 hover，但为了"老师拿着鼠标调试"这条路径
-/// 仍保留；它只渲染一次内容，不管理出现/消失时机。
-pub struct Tooltip<'a> {
-    text: &'a str,
-}
-
-impl<'a> Tooltip<'a> {
-    pub fn new(text: &'a str) -> Self {
-        Self { text }
-    }
-
-    /// 在 `pos`（期望的左上角）绘制。
-    pub fn show_at(&self, ui: &Ui, d: &Design, pos: egui::Pos2) {
-        let m = d.m();
-        let font = d.font(d.t().caption);
-        let w = ui
-            .painter()
-            .layout_no_wrap(self.text.to_owned(), font.clone(), Color32::WHITE)
-            .size()
-            .x
-            + m.s(16.0);
-        let h = m.s(24.0);
-        let rect = Rect::from_min_size(pos, Vec2::new(w, h));
-        ui.painter().squircle(
-            rect,
-            m.s(6.0),
-            d.c().tooltip,
-            egui::Stroke::new(1.0, crate::base::translucent(d.p().border_l2, 0.4)),
-        );
-        text_center(ui.painter(), rect, self.text, font, d.p().label_primary);
     }
 }
