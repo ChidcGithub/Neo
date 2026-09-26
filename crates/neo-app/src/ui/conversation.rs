@@ -196,6 +196,7 @@ fn draw_one(
                 }
                 if !msg.content.trim().is_empty() {
                     // 用户气泡：右侧对齐，最大宽度取内容列的 76%。
+                    // 内边距 横 16 / 纵 12：文字与气泡边缘留出一口气的距离。
                     let font = skin.prop(skin.t().body);
                     let galley = ui.painter().layout(
                         msg.content.clone(),
@@ -204,13 +205,13 @@ fn draw_one(
                         (max_bubble - m.s(32.0)).max(1.0),
                     );
                     let w = (galley.size().x + m.s(32.0)).min(max_bubble);
-                    let h = galley.size().y + m.s(22.0);
+                    let h = galley.size().y + m.s(24.0);
                     let (r, _) = ui.allocate_exact_size(Vec2::new(content_w, h), Sense::hover());
                     let bubble =
                         Rect::from_min_size(egui::pos2(r.right() - w, r.top()), Vec2::new(w, h));
                     ui.painter().squircle_filled(bubble, m.s(16.0), p.bubble);
                     ui.painter().galley(
-                        egui::pos2(bubble.left() + m.s(16.0), bubble.top() + m.s(11.0)),
+                        egui::pos2(bubble.left() + m.s(16.0), bubble.top() + m.s(12.0)),
                         galley,
                         p.label_primary,
                     );
@@ -262,7 +263,7 @@ fn draw_one(
     }
 }
 
-/// 思考过程：浅色小字，带左侧竖条。
+/// 思考过程：浅色小字，左侧一条圆头细条。
 fn draw_reasoning(ui: &mut Ui, skin: &Skin<'_>, content_w: f32, text: &str) {
     let p = skin.p();
     let m = skin.m();
@@ -278,11 +279,15 @@ fn draw_reasoning(ui: &mut Ui, skin: &Skin<'_>, content_w: f32, text: &str) {
         .layout(text.to_owned(), font, p.label_tertiary, text_w);
     let h = galley.size().y + m.s(16.0);
     let (r, _) = ui.allocate_exact_size(Vec2::new(content_w, h), Sense::hover());
-    ui.painter().vline(
-        r.left(),
-        r.y_range(),
-        egui::Stroke::new(m.s(2.0), p.border_l3),
+    // 圆头细条（3pt 宽、两端半圆）：比直角 vline 更精致，也呼应整套 squircle 语言。
+    // 45% 品牌色 —— 中性描边色在暗底下几乎隐形，竖条要「可见但不抢正文」。
+    let bar_w = m.s(3.0);
+    let bar = Rect::from_min_max(
+        egui::pos2(r.left(), r.top() + m.s(8.0)),
+        egui::pos2(r.left() + bar_w, r.bottom() - m.s(8.0)),
     );
+    ui.painter()
+        .squircle_filled(bar, bar_w * 0.5, super::translucent(p.accent, 0.45));
     ui.painter().galley(
         egui::pos2(r.left() + pad_l, r.top() + m.s(8.0)),
         galley,

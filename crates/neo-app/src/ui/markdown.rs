@@ -78,8 +78,10 @@ fn configure(ui: &mut Ui, skin: &Skin<'_>) {
     style.visuals.code_bg_color = p.components().code_inline;
     style.visuals.extreme_bg_color = p.components().code_block;
     style.visuals.widgets.noninteractive.fg_stroke.color = p.label_primary;
-    style.spacing.item_spacing.y = body * 0.32;
-    style.spacing.interact_size.y = body * 1.35;
+    // 节奏：段距 0.42×body（比 egui 默认的 0.32 略开），行间 1.45× ——
+    // 课堂大屏远距离阅读，宁松勿挤。
+    style.spacing.item_spacing.y = body * 0.42;
+    style.spacing.interact_size.y = body * 1.45;
     style.spacing.icon_width = body;
     style.spacing.icon_width_inner = body * 0.65;
     style.url_in_tooltip = true;
