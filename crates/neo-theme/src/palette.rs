@@ -5,6 +5,12 @@
 //!
 //! 命名保留了 Harness 的语义分层（base / layer / label / border / interactive），
 //! 便于对照上游规范继续演进。
+//!
+//! # 修剪原则
+//!
+//! 只保留**真正被绘制代码读到的** token。上游有定义但 Neo 没用到的
+//! （tooltip 底、三级遮罩、ghost 按钮三态等）一律删除 —— 留着只会让
+//! 「加一套主题」变成「填一堆没人看的格子」。需要时按上游定义加回来。
 
 use egui::Color32;
 
@@ -34,9 +40,6 @@ pub const fn black_a(a: u8) -> Color32 {
 }
 
 /// DeepSeek 品牌蓝阶梯（`--dsw-static-deepseek-*`）。
-///
-/// 历史来源层：Neo 的 accent 已迁往「鲸青」（[`whale`]），本阶梯仅留作
-/// 对照上游与个别遗留引用，**新代码不要用**。
 pub mod deepseek {
     use super::{rgb, Color32};
 
@@ -49,25 +52,6 @@ pub mod deepseek {
     pub const D500: Color32 = rgb(65, 118, 230);
     pub const D600: Color32 = rgb(72, 104, 178);
     pub const D800: Color32 = rgb(52, 65, 91);
-}
-
-/// 鲸青（Whale Teal）阶梯 —— Neo 的品牌色（`docs/neo-brand.md`）。
-///
-/// 深海海水的青蓝（色相 ≈192°），与上游的紫向蓝（≈222°）差 30° 色相。
-/// 对比度承诺：T600 白底 ≈4.9:1、T400 暗底(#151517) ≈9.0:1，双过 AA。
-pub mod whale {
-    use super::{rgb, Color32};
-
-    pub const T50: Color32 = rgb(233, 248, 251);
-    pub const T100: Color32 = rgb(205, 239, 245);
-    pub const T200: Color32 = rgb(160, 224, 236);
-    pub const T300: Color32 = rgb(111, 204, 223);
-    pub const T400: Color32 = rgb(79, 195, 220);
-    pub const T500: Color32 = rgb(23, 168, 198);
-    pub const T600: Color32 = rgb(14, 122, 153);
-    pub const T700: Color32 = rgb(10, 94, 119);
-    pub const T800: Color32 = rgb(13, 61, 78);
-    pub const T900: Color32 = rgb(7, 42, 54);
 }
 
 /// 上游 `--dsw-static-neutral-bluish-*` 中性偏蓝阶梯（组件 token 的取值来源）。
@@ -120,15 +104,11 @@ pub mod neutral {
 /// 等的语义封装。
 ///
 /// [`Palette`] 负责"基底表面与文字"，这里负责"控件怎么长"：
-/// 按钮的三种填充、遮罩的四个层级、浮层底色。分开的理由是
+/// 按钮填充、遮罩、浮层底色。分开的理由是
 /// 前者被几乎所有绘制调用到，后者只在组件库里出现。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Components {
     // ---- 按钮 ----
-    /// `--dsw-alias-button-primary-fill`：主按钮（= brand-primary，上游是墨色）。
-    pub btn_primary: Color32,
-    /// `--dsw-alias-button-primary-hover`
-    pub btn_primary_hover: Color32,
     /// `--dsw-alias-button-primary-dimmed`：主按钮禁用态。
     pub btn_primary_dimmed: Color32,
     /// `--dsw-alias-button-elevated-fill`：次级按钮（抬升表面）。
@@ -141,10 +121,6 @@ pub struct Components {
     /// `--dsw-alias-button-info-fill` / `-hover`：业务蓝按钮（发送）。
     pub btn_info: Color32,
     pub btn_info_hover: Color32,
-    /// `--dsw-alias-button-ghost-active-fill` / `-border` / `-hover`：幽灵按钮选中态。
-    pub btn_ghost_active: Color32,
-    pub btn_ghost_border: Color32,
-    pub btn_ghost_active_hover: Color32,
     /// 业务蓝按钮上的前景色（发送按钮）。
     pub on_info: Color32,
     /// 危险红按钮上的前景色。
@@ -155,20 +131,12 @@ pub struct Components {
     pub on_contrast: Color32,
 
     // ---- 遮罩 / 浮层 ----
-    /// `--dsw-alias-bg-mask-1`：模态遮罩（最重）。
+    /// `--dsw-alias-bg-mask-1`：模态遮罩。
     pub mask_modal: Color32,
-    /// `--dsw-alias-bg-mask-2`：轻度遮罩。
-    pub mask_soft: Color32,
-    /// `--dsw-alias-bg-mask-3`：图库 / 沉浸态遮罩。
-    pub mask_deep: Color32,
     /// `--dsw-alias-bg-overlay`：浮层底（popover / menu 之外的轻浮层）。
     pub overlay: Color32,
     /// `--dsw-alias-toast-bg`
     pub toast: Color32,
-    /// `--dsw-alias-tooltip-bg`
-    pub tooltip: Color32,
-    /// `--dsw-alias-border-inverted`：反色块上的描边。
-    pub border_inverted: Color32,
 
     // ---- 状态语义 ----
     pub error: Color32,
@@ -179,55 +147,36 @@ pub struct Components {
     pub warn_label: Color32,
     pub warn_soft: Color32,
     pub business: Color32,
-    pub business_soft: Color32,
 
     // ---- 交互态（组件内的 hover / active 底） ----
     pub hover: Color32,
     pub hover_solid: Color32,
     pub hover_danger: Color32,
-    pub hover_accent: Color32,
-    pub active: Color32,
 
     // ---- markdown ----
     pub code_inline: Color32,
     pub code_block: Color32,
-    pub code_banner: Color32,
-    pub citation: Color32,
-    pub md_tag: Color32,
     pub placeholder: Color32,
-
-    // ---- 侧栏 ----
-    pub nav_hover: Color32,
-    pub nav_active: Color32,
 }
 
 impl Components {
     /// 亮色：逐条对应上游 `body { }` 的组件 token。
     pub const LIGHT: Self = Self {
-        btn_primary: crate::palette::neutral::N_1000, // = alias-brand-primary（墨色）
-        btn_primary_hover: neutral::N_750,
         btn_primary_dimmed: neutral::N_100,
         btn_elevated: neutral::N_00,
         btn_contrast: neutral::N_700,
         btn_floating: neutral::N_00,
         btn_floating_hover: neutral::N_75,
-        btn_info: crate::palette::whale::T600,
-        btn_info_hover: crate::palette::whale::T500,
-        btn_ghost_active: neutral::N_100,
-        btn_ghost_border: neutral::N_500,
-        btn_ghost_active_hover: neutral::N_150,
+        btn_info: crate::palette::deepseek::D500,
+        btn_info_hover: crate::palette::deepseek::D400,
         on_info: neutral::N_00,
         on_danger: neutral::N_00,
         on_primary: neutral::N_00,
         on_contrast: neutral::N_00,
 
         mask_modal: rgba(0, 0, 0, 61), // 0.24
-        mask_soft: rgba(0, 0, 0, 31),  // 0.12
-        mask_deep: rgba(0, 0, 0, 122), // 0.48
         overlay: neutral::N_150,
         toast: neutral::N_800,
-        tooltip: neutral::N_850,
-        border_inverted: rgba(0, 0, 0, 0),
 
         error: neutral::RED_600,
         error_soft: rgba(236, 19, 19, 13), // .05
@@ -236,52 +185,34 @@ impl Components {
         warn: neutral::AMBER_500,
         warn_label: neutral::AMBER_600,
         warn_soft: rgba(245, 158, 11, 26),
-        business: crate::palette::whale::T600,
-        business_soft: crate::palette::whale::T100,
+        business: crate::palette::deepseek::D500,
 
         hover: rgba(38, 49, 72, 15), // .06
         hover_solid: neutral::N_75,
         hover_danger: rgba(236, 19, 19, 13),
-        hover_accent: rgba(38, 49, 72, 36), // .14
-        active: rgba(38, 49, 72, 26),       // .10
 
         code_inline: neutral::NEUTRAL_50,
         code_block: neutral::N_50,
-        code_banner: neutral::N_50,
-        citation: neutral::N_100,
-        md_tag: neutral::N_75,
         placeholder: neutral::N_60,
-
-        nav_hover: neutral::N_75,
-        nav_active: neutral::N_100,
     };
 
     /// 暗色：逐条对应上游 `body[data-ds-dark-theme] { }`。
     pub const DARK: Self = Self {
-        btn_primary: crate::palette::neutral::N_00, // = alias-brand-primary（暗色下是白）
-        btn_primary_hover: neutral::N_100,
         btn_primary_dimmed: neutral::N_750,
         btn_elevated: neutral::N_750,
         btn_contrast: neutral::N_50,
         btn_floating: neutral::N_850,
         btn_floating_hover: neutral::N_800,
-        btn_info: crate::palette::whale::T400,
-        btn_info_hover: crate::palette::whale::T300,
-        btn_ghost_active: neutral::N_750,
-        btn_ghost_border: neutral::N_600,
-        btn_ghost_active_hover: neutral::N_700,
+        btn_info: crate::palette::deepseek::D400,
+        btn_info_hover: crate::palette::deepseek::D500,
         on_info: neutral::N_1000,
         on_danger: neutral::N_00,
         on_primary: neutral::N_00,
         on_contrast: neutral::N_1000,
 
         mask_modal: rgba(0, 0, 0, 128), // 0.5
-        mask_soft: rgba(0, 0, 0, 51),   // 0.2
-        mask_deep: rgba(0, 0, 0, 122),  // 0.48
         overlay: neutral::N_700,
         toast: neutral::N_750,
-        tooltip: neutral::N_750,
-        border_inverted: rgba(255, 255, 255, 15),
 
         error: neutral::RED_400,
         error_soft: rgba(242, 90, 90, 38), // .15
@@ -290,24 +221,15 @@ impl Components {
         warn: neutral::AMBER_500,
         warn_label: neutral::AMBER_600,
         warn_soft: rgba(245, 158, 11, 38),
-        business: crate::palette::whale::T400,
-        business_soft: crate::palette::whale::T800,
+        business: crate::palette::deepseek::D400,
 
         hover: rgba(255, 255, 255, 20), // .08
         hover_solid: neutral::N_800,
         hover_danger: rgba(242, 90, 90, 38),
-        hover_accent: rgba(255, 255, 255, 61), // .24
-        active: rgba(255, 255, 255, 36),       // .14
 
         code_inline: neutral::NEUTRAL_800,
         code_block: neutral::N_900,
-        code_banner: neutral::N_850,
-        citation: neutral::N_800,
-        md_tag: neutral::N_850,
         placeholder: neutral::N_850,
-
-        nav_hover: neutral::N_850,
-        nav_active: neutral::N_750,
     };
 }
 
@@ -344,8 +266,6 @@ pub struct Palette {
     pub selector: Color32,
     /// `--dsw-specific-bubble`：消息气泡底。
     pub bubble: Color32,
-    /// `--dsw-specific-tip` / 次级区块底。
-    pub tip: Color32,
 
     // ---- 文字 ----
     /// `--dsw-alias-label-primary`
@@ -360,12 +280,8 @@ pub struct Palette {
     pub label_on_accent: Color32,
 
     // ---- 品牌 / 强调 ----
-    /// `--dsw-alias-brand-primary`：该 token 在本套规范里解析为「墨色」（不是蓝）。
-    pub brand_ink: Color32,
     /// `--dsw-alias-button-info-fill`：发送按钮 / 主强调蓝。
     pub accent: Color32,
-    /// `--dsw-alias-button-info-hover`
-    pub accent_hover: Color32,
     /// `--dsw-alias-state-business-tertiary`：强调蓝的弱底。
     pub accent_soft: Color32,
     /// `--dsw-alias-link`
@@ -380,7 +296,6 @@ pub struct Palette {
     pub border_l1: Color32,
     pub border_l2: Color32,
     pub border_l3: Color32,
-    pub border_l4: Color32,
 
     // ---- 交互态 ----
     /// `--dsw-alias-interactive-bg-hover`
@@ -392,11 +307,6 @@ pub struct Palette {
     /// 侧栏导航项 hover / active
     pub nav_hover: Color32,
     pub nav_active: Color32,
-
-    // ---- 杂项 ----
-    pub scrollbar: Color32,
-    pub scrollbar_hover: Color32,
-    pub tooltip_bg: Color32,
 }
 
 impl Palette {
@@ -413,7 +323,6 @@ impl Palette {
         input_surface: neutral::N_850,
         selector: neutral::N_800,
         bubble: neutral::N_850,
-        tip: neutral::N_800,
 
         label_primary: neutral::N_50,
         label_secondary: neutral::N_300,
@@ -421,11 +330,9 @@ impl Palette {
         label_caption: neutral::N_600,
         label_on_accent: neutral::N_1000,
 
-        brand_ink: neutral::N_50,
-        accent: whale::T400,
-        accent_hover: whale::T300,
-        accent_soft: whale::T800,
-        link: whale::T400,
+        accent: deepseek::D400,
+        accent_soft: deepseek::D800,
+        link: deepseek::D400,
 
         success: neutral::GREEN_500,
         warn: neutral::AMBER_500,
@@ -434,17 +341,12 @@ impl Palette {
         border_l1: white_a(15),
         border_l2: white_a(31),
         border_l3: white_a(41),
-        border_l4: white_a(51),
 
         hover: white_a(20),
         hover_solid: neutral::N_800,
         active: white_a(36),
         nav_hover: neutral::N_850,
         nav_active: neutral::N_750,
-
-        scrollbar: rgb(60, 60, 61),
-        scrollbar_hover: rgb(84, 85, 87),
-        tooltip_bg: neutral::N_750,
     };
 
     /// 亮色主题 —— 与 Harness 默认（无 `data-ds-dark-theme`）一一对应。
@@ -457,8 +359,7 @@ impl Palette {
         sidebar_fill: rgb(249, 250, 251),
         input_surface: neutral::N_00,
         selector: neutral::N_60,
-        bubble: whale::T50,
-        tip: neutral::N_60,
+        bubble: deepseek::D50,
 
         label_primary: neutral::N_1000,
         label_secondary: neutral::N_700,
@@ -466,11 +367,9 @@ impl Palette {
         label_caption: neutral::N_400,
         label_on_accent: neutral::N_00,
 
-        brand_ink: neutral::N_1000,
-        accent: whale::T600,
-        accent_hover: whale::T500,
-        accent_soft: whale::T100,
-        link: whale::T600,
+        accent: deepseek::D500,
+        accent_soft: deepseek::D100,
+        link: deepseek::D500,
 
         success: neutral::GREEN_500,
         warn: neutral::AMBER_500,
@@ -479,17 +378,12 @@ impl Palette {
         border_l1: black_a(10),
         border_l2: black_a(26),
         border_l3: black_a(31),
-        border_l4: black_a(41),
 
         hover: rgba(38, 49, 72, 15),
         hover_solid: neutral::N_75,
         active: rgba(38, 49, 72, 26),
         nav_hover: neutral::N_75,
         nav_active: neutral::N_100,
-
-        scrollbar: rgb(229, 229, 229),
-        scrollbar_hover: rgb(212, 212, 212),
-        tooltip_bg: neutral::N_850,
     };
 
     /// 适用于教室大屏的默认主题：亮环境优先选亮色。
