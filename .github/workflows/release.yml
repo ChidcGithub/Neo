@@ -105,7 +105,11 @@ jobs:
           $v = "${{ steps.ver.outputs.version }}"
           $p = @(($v -replace '-.*$', '').Split('.')) + @('0', '0', '0')
           $vi = ($p[0..2] -join '.') + '.0'
-          & $mk "/DVERSION=$v" "/DVI_VERSION=$vi" tools\installer.nsi | Select-Object -Last 4
+          # 美术缺失宁可失败也不悄悄出个无品牌安装包
+          if (-not (Test-Path build\installer-art\neo.ico)) { throw "installer art missing" }
+          # makensis 会把编译工作目录切到脚本所在目录（tools\），
+          # 脚本里的相对路径全部以 /CWD 指回的仓库根为基准
+          & $mk /CWD "$PWD" "/DVERSION=$v" "/DVI_VERSION=$vi" tools\installer.nsi | Select-Object -Last 4
           if ($LASTEXITCODE -ne 0) { throw "makensis exit $LASTEXITCODE" }
 
       - name: Generate changelog

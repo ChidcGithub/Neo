@@ -1,6 +1,8 @@
 ; Neo Windows x64 安装包（per-user 安装，免 UAC 提权）。
-; 由 .github/workflows/release.yml 调用：
-;   makensis /DVERSION=1.2.3 /DVI_VERSION=1.2.3.0 tools\installer.nsi
+; 由 .github/workflows/release.yml 调用（/CWD 指回仓库根）：
+;   makensis /CWD . /DVERSION=1.2.3 /DVI_VERSION=1.2.3.0 tools\installer.nsi
+; ⚠️ makensis 会把编译工作目录切到**脚本所在目录**（tools\），所以 /CWD
+; 不能省 —— 本脚本里所有相对路径（dist\、build\）都以仓库根为基准。
 ; 输入：dist\neo\（已装配好的发行目录）+ build\installer-art\（美术资源，
 ; 由 tools/make_installer_art.py 生成；缺失时自动退化为无图标版式，
 ; 本地不生成美术也能编译通过）
