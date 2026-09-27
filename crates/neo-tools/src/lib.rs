@@ -67,6 +67,7 @@
 //! `summary` 给人看（UI 卡片一行），`data` / `error` 给模型看（结构化）。
 
 pub mod classlog;
+pub mod dailylog;
 pub mod documents;
 pub mod policy;
 pub mod present;

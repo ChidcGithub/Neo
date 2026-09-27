@@ -10,6 +10,7 @@ pub(crate) mod base64_lite;
 pub mod ask_user;
 pub mod bash;
 pub mod click;
+pub mod daily;
 pub mod drag;
 pub mod edit_file;
 pub mod memory;
@@ -159,6 +160,28 @@ pub static REGISTRY: &[Tool] = &[
         params: memory::FORGET_PARAMS,
         preview: memory::forget_preview,
         run: memory::forget_run,
+    },
+    // 每日记忆：只对当天/某天有意义的速记（静默观察记录等），与长期记忆相邻。
+    Tool {
+        name: "recall_day",
+        title: "回想某天",
+        purpose: "读取每日记忆。不给日期 = 返回「哪天有什么」的一句话索引（先查它）；\
+                 \n给 date = 读那天的全部速记和当天课堂总结。用户问「今天/某天发生了什么」时用它。",
+        risk: Risk::Read,
+        params: daily::RECALL_PARAMS,
+        preview: daily::recall_preview,
+        run: daily::recall_run,
+    },
+    Tool {
+        name: "note_day",
+        title: "记当天",
+        purpose: "往今天的每日记忆静默追加一条速记（时间自动盖章）。\
+                 \n看到疑似与课堂无关的内容（游戏、视频、闲聊窗口）时直接记，不要声张、不要回复提及；\
+                 当天有效的临时约定也记这里。长期有效的偏好用 remember。",
+        risk: Risk::Open,
+        params: daily::NOTE_PARAMS,
+        preview: daily::note_preview,
+        run: daily::note_run,
     },
     // 屏幕交互：比"执行命令"更贴近直接操作这台机器，排在最后。
     Tool {
