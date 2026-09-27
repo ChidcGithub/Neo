@@ -41,9 +41,13 @@ const SHOT_HIDE: Duration = Duration::from_millis(950);
 /// 小窗开着时的轮询节拍（避让 / 截屏信号 / 打断点击都靠它）。
 /// 16ms ≈ 60fps：避让、淡入、呼吸点都是动画，再低肉眼能看出顿。
 const POLL: Duration = Duration::from_millis(16);
-/// 任务执行完后小窗继续驻留的时长：老师扫一眼角落就知道「做完了」
-///（标题变「已完成」），而不是无声消失。
+/// 任务执行完后小窗继续驻留的时长：老师扫一眼角落就知道「做完了」，
+/// 然后播淡出动画消失（见 `FADEOUT_SECS`），而不是无声瞬没。
 const LINGER: Duration = Duration::from_secs(5);
+/// 驻留结束的淡出时长（透明度渐隐 + 轻轻上飘）。
+const FADEOUT_SECS: f32 = 0.45;
+/// 卡片高度自适应动画时长（朝测量出的目标高缓动）。
+const HEIGHT_ANIM_SECS: f32 = 0.22;
 /// 工具流水最多保留的步数（旧的滚出，最近的排最下）。
 const MAX_STEPS: usize = 4;
 /// 休眠位：屏幕外远处。本文件的所有视口都**不切 `Visible`**——透明视口
@@ -200,27 +204,42 @@ struct Step {
     tone: StepTone,
 }
 
+/// 取最后一段正文（markdown 段落按空行分隔；代码栅栏内不拆 —
+/// 栅栏数配不平就向前合并，直到成对）。
+fn last_paragraph(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<&str> = text.split("\n\n").collect();
+    let mut start = parts.len() - 1;
+    let mut fences = parts[start].matches("```").count();
+    while fences % 2 == 1 && start > 0 {
+        start -= 1;
+        fences += parts[start].matches("```").count();
+    }
+    parts[start..].join("\n\n")
+}
+
 /// 一帧要画的内容。视口回调是 `'static` 的，数据必须整份搬走。
 ///
-/// 注意**没有** fade 与位置：主视口藏托盘后被 eframe 节流到 10fps，
-/// 这两个动画量改由回调自驱（fade 走共享的 `refade_since`，位置走
-/// 回调里现算现发的 `OuterPosition`）。
+/// 注意**没有** fade、位置与高度：主视口藏托盘后被 eframe 节流到 10fps，
+/// 这些动画量改由回调自驱（fade 走共享槽、位置走 `OuterPosition`、
+/// 高度朝 `target_h` 做 egui 动画）。
 struct Snapshot {
     theme: Theme,
-    /// 卡片尺寸（回调里的避让判定要用）。
-    size: Vec2,
+    /// 卡片宽（避让端点判定要用）。
+    width: f32,
+    /// 目标高：tick 按上帧量到的内容高算出（自适应正文），回调朝它动画。
+    target_h: f32,
     /// 主显示器尺寸（点）：渲染层里 `ctx` 的 monitor_size 不可靠
     /// （那是整层窗口），避让端点判定由快照下发。
     monitor: Vec2,
-    /// 已完成驻留态（忙完后的 5s）：标题变「已完成」、圆点变绿。
+    /// 已完成驻留态（忙完后的 5s）：正文切到最后一段完整渲染。
     done: bool,
     interrupt_open: bool,
-    title: String,
     steps: Vec<Step>,
-    /// 思考过程尾部一行（与主界面「思考过程」块同源；模型不出推理则不画）。
-    /// 独立于正文：正文一旦被 content 占据，思考也不该被顶掉 —— 两块并存，
-    /// 和主界面一样。
-    thinking: Option<String>,
+    /// 正文（markdown 源串，由 `markdown::render` 渲染，支持 LaTeX）。
     body: String,
     /// 正文是占位文案（「正在处理…」）时的淡色标记。
     body_dim: bool,
@@ -231,11 +250,11 @@ impl Snapshot {
     fn build(
         state: &AppState,
         theme: Theme,
-        size: Vec2,
+        width: f32,
+        target_h: f32,
         monitor: Vec2,
         done: bool,
         interrupt_open: bool,
-        busy_secs: u64,
     ) -> Self {
         let last_assistant = state
             .messages
@@ -243,18 +262,15 @@ impl Snapshot {
             .rev()
             .find(|msg| msg.role == Role::Assistant);
         let streaming = last_assistant.is_some_and(|msg| msg.streaming);
-        // 正文只放正式回复；思考过程有专行（见下）。content 还空着时给占位。
+        // 正文只放正式回复；content 还空着时给占位。
         let (body_src, body_dim) = match last_assistant {
             Some(msg) if !msg.content.trim().is_empty() => (msg.content.trim(), false),
             _ => ("正在处理…", true),
         };
-        // 正文最多三行：按 CJK 最宽情形（一字符 ≈ 一个字号）估算每行字数，留尾巴。
-        let m = theme.metrics;
-        let inner_w = m.s(340.0 - 28.0);
-        let body_px = theme.typo.body.max(1.0);
-        let per_line = (inner_w / body_px).floor().max(6.0) as usize;
         // 本轮工具流水（自最后一条用户消息起）：最近 MAX_STEPS 步，旧的在上。
         // 倒序收集到量即停，再翻回正序 —— 老消息成堆时不全扫。
+        let m = theme.metrics;
+        let inner_w = m.s(340.0 - 28.0);
         let step_px = theme.typo.caption.max(1.0);
         let step_chars =
             ((inner_w - m.s(12.0)) / step_px).floor().max(6.0) as usize;
@@ -288,47 +304,41 @@ impl Snapshot {
             }
         }
         steps.reverse();
-        // 思考过程：本轮（倒序到最后一条用户消息为止）最近一条有 reasoning 的
-        // 助手消息，留一行尾巴。模型不出推理（reasoning 恒空）则不画。
-        let thinking = state
-            .messages
-            .iter()
-            .rev()
-            .take_while(|msg| msg.role != Role::User)
-            .filter(|msg| msg.role == Role::Assistant)
-            .find_map(|msg| {
-                let r = msg.reasoning.trim();
-                (!r.is_empty()).then(|| tail(r, per_line))
-            });
-        // 标题带已用时长：后台跑久了，一眼知道这轮已经花了多久。
-        let elapsed = if busy_secs >= 60 {
-            format!("{}m{:02}s", busy_secs / 60, busy_secs % 60)
+        // 正文：执行中只留尾巴三行（流式一瞥）；完成后换成**最后一段**的
+        // 完整 markdown（卡片高度会自适应到放得下它）。
+        let body = if done {
+            last_paragraph(body_src)
         } else {
-            format!("{busy_secs}s")
+            let body_px = theme.typo.body.max(1.0);
+            let per_line = (inner_w / body_px).floor().max(6.0) as usize;
+            tail(body_src, per_line * 3)
         };
         Self {
             theme,
-            size,
+            width,
+            target_h,
             monitor,
             done,
             interrupt_open,
-            title: if done {
-                format!("Neo · 已完成 · 共 {elapsed}")
-            } else {
-                format!("Neo 执行中 · {elapsed}")
-            },
             steps,
-            thinking,
-            // 正文是 markdown 源串，反引号等记号在小窗裸奔很扎眼，极简清洗。
-            body: tail(&body_src.replace('`', ""), per_line * 3),
+            body,
             body_dim,
             streaming,
         }
     }
 }
 
-/// 画一帧小窗内容（纯 painter 自绘：这里拿不到 `&WhaleMark`，也用不上）。
-fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>, fade: f32) {
+/// 画一帧小窗内容：工具流水 + 正文（markdown / LaTeX 渲染）。
+///
+/// 正文用组件布局（不再是纯 painter 排版），量到的内容高写进 `measure`
+/// 槽 —— tick 下一帧据此算卡片目标高（自适应最后一段正文）。
+fn paint(
+    ui: &mut egui::Ui,
+    snap: &Snapshot,
+    result: &Arc<AtomicU8>,
+    fade: f32,
+    measure: &Arc<Mutex<f32>>,
+) {
     let d = Design::new(snap.theme);
     let p = d.p();
     let m = d.m();
@@ -360,92 +370,68 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>, fade: f32) 
     }
 
     let inner = rect.shrink(m.s(14.0));
-    let mut y = inner.top();
-    // 标题行：accent 小圆点 + 标题，下面压一条细分隔线。
-    let title_r = m.s(3.5);
-    painter.circle_filled(
-        Pos2::new(inner.left() + title_r, y + d.t().caption * 0.8),
-        title_r,
-        // 已完成驻留态：圆点变绿（成功色），一眼区分「还在跑 / 做完了」。
-        tint(if snap.done { p.success } else { p.accent }),
-    );
-    painter.text(
-        Pos2::new(inner.left() + m.s(11.0), y),
-        Align2::LEFT_TOP,
-        &snap.title,
-        d.font_bold(d.t().caption),
-        tint(p.label_tertiary),
-    );
-    y += d.t().caption * 1.6 + m.s(4.0);
-    painter.line_segment(
-        [Pos2::new(inner.left(), y), Pos2::new(inner.right(), y)],
-        Stroke::new(1.0, tint(p.border_l1)),
-    );
-    y += m.s(6.0);
-
-    // 工具流水：状态圆点 + 单行摘要，最近的在最下。
     let step_lh = d.t().caption * 1.55;
-    let dot_r = m.s(3.0);
-    let text_x = inner.left() + m.s(12.0);
-    for step in &snap.steps {
-        let cy = y + step_lh * 0.5;
-        let dot = match step.tone {
-            StepTone::Active => p.accent,
-            StepTone::Ok => p.success,
-            StepTone::Failed => p.error,
-            StepTone::Muted => p.label_caption,
-        };
-        painter.circle_filled(Pos2::new(inner.left() + dot_r, cy), dot_r, tint(dot));
-        let ink = match step.tone {
-            StepTone::Active => p.label_primary,
-            _ => p.label_secondary,
-        };
-        painter.text(
-            Pos2::new(text_x, y),
-            Align2::LEFT_TOP,
-            &step.line,
-            d.font(d.t().caption),
-            tint(ink),
-        );
-        y += step_lh;
-    }
-    if !snap.steps.is_empty() {
-        y += m.s(4.0);
-    }
+    super::at(ui, inner, |ui| {
+        ui.set_opacity(fade);
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+        ui.set_max_width(inner.width());
 
-    // 思考过程：淡色小字一行，与正文并存（像主界面展开的思考块最新一句）。
-    if let Some(thinking) = &snap.thinking {
-        painter.text(
-            Pos2::new(inner.left(), y),
-            Align2::LEFT_TOP,
-            format!("思考 · {thinking}"),
-            d.font(d.t().caption),
-            tint(p.label_caption),
-        );
-        y += d.t().caption * 1.55 + m.s(2.0);
-    }
+        // 工具流水：状态圆点 + 单行摘要，最近的在最下。
+        for step in &snap.steps {
+            let (row, _) = ui.allocate_exact_size(
+                Vec2::new(inner.width(), step_lh),
+                egui::Sense::hover(),
+            );
+            let dot = match step.tone {
+                StepTone::Active => p.accent,
+                StepTone::Ok => p.success,
+                StepTone::Failed => p.error,
+                StepTone::Muted => p.label_caption,
+            };
+            let ink = match step.tone {
+                StepTone::Active => p.label_primary,
+                _ => p.label_secondary,
+            };
+            ui.painter().circle_filled(
+                Pos2::new(row.left() + m.s(3.0), row.center().y),
+                m.s(3.0),
+                dot,
+            );
+            ui.painter().text(
+                Pos2::new(row.left() + m.s(12.0), row.top()),
+                Align2::LEFT_TOP,
+                &step.line,
+                d.font(d.t().caption),
+                ink,
+            );
+        }
+        if !snap.steps.is_empty() {
+            ui.add_space(m.s(6.0));
+        }
 
-    let mut body = snap.body.clone();
-    if snap.streaming {
-        body.push('▍');
-    }
-    // 思考过程用淡色：与正式回答拉开层次，也暗示「还没落定」。
-    let ink = if snap.body_dim {
-        p.label_secondary
-    } else {
-        p.label_primary
-    };
-    // break_anywhere：URL/长 token 这类无空格串冲出卡片右缘被硬切不如断行
-    // （会话页的气泡/错误框同款处理）。
-    let mut job = egui::text::LayoutJob::simple(body, d.font(d.t().body), tint(ink), inner.width());
-    job.wrap.break_anywhere = true;
-    let galley = painter.layout_job(job);
-    painter.galley(Pos2::new(inner.left(), y), galley, tint(ink));
+        // 正文：占位文案淡色直排；正式内容走 markdown（CommonMark + LaTeX，
+        // 与主界面同一条渲染管线）。
+        if snap.body_dim {
+            ui.label(
+                egui::RichText::new(&snap.body)
+                    .font(d.font(d.t().body))
+                    .color(p.label_secondary),
+            );
+        } else {
+            let whale = crate::brand::WhaleMark::cached(ui.ctx());
+            let skin = super::Skin::new(snap.theme, &whale);
+            super::markdown::render(ui, &skin, &snap.body, snap.streaming);
+        }
 
-    // 边缘流光：小窗只在后台执行中露面，这道光就是「还在跑」的持续信号。
-    // 截屏淡出时随卡片一起淡（tint 已乘 fade）。
-    let now = ui.ctx().input(|i| i.time);
-    paint_border_beam(&painter, rect, m.s(18.0), now, tint(p.accent), m.s(1.4));
+        // 量到的内容高写回共享槽：卡片高度自适应的依据（tick 下一帧读取）。
+        *measure.lock().unwrap() = ui.min_rect().height();
+    });
+
+    // 边缘流光 = 「还在跑」的持续信号：完成驻留与淡出时不再播。
+    if !snap.done {
+        let now = ui.ctx().input(|i| i.time);
+        paint_border_beam(&painter, rect, m.s(18.0), now, tint(p.accent), m.s(1.4));
+    }
 }
 
 /// 边缘流光：一段细线沿卡片边缘顺时针匀速循环，头部实、拖尾渐隐。
@@ -532,10 +518,15 @@ pub struct MiniWin {
     interrupt_result: Arc<AtomicU8>,
     /// 已消费的左键按下沿时刻（同一沿在 250ms 窗口内不重复触发）。
     lmb_edge_consumed: u64,
-    /// 本轮后台执行的起点（标题里的已用时长靠它）；闲下来清零。
-    busy_since: Option<Instant>,
     /// 忙完后的驻留截止时刻（忙时持续刷新，闲下来那一刻起算 5s）。
     linger_until: Option<Instant>,
+    /// 淡出起点（驻留结束 → 播完才收窗）；回调里读它算透明度与上飘，
+    /// 所以走共享槽（与 refade 同理：主视口托盘态只有 10fps）。
+    fadeout_since: Arc<Mutex<Option<Instant>>>,
+    /// 内容高度测量槽：paint 写（回调里现量）、tick 读（算目标高）。
+    content_h: Arc<Mutex<f32>>,
+    /// 测试回退路径最近下发的视口尺寸（没变就不重发 InnerSize）。
+    legacy_sent: Vec2,
     /// 渲染层卡片的共享矩形（主屏点）：tick 写静止位、层内绘制闭包写
     /// 避让动画位；层的 Area 定位与命中测试每帧重读它。打断判定的
     /// 「点在小窗自己身上」也读它（替代旧视口的 ctx.data 通道）。
@@ -597,10 +588,12 @@ impl MiniWin {
         let shot_hiding = self.shot_hide_until.is_some();
 
         // 2. 显隐目标：主窗已藏到托盘 且 AI 正在生成 / 执行工具。
-        //    忙完后再驻留 LINGER（5s）播「已完成」态，而不是无声消失。
+        //    忙完后驻留 LINGER（5s）播完成态，驻留结束再播一段淡出才收窗。
         let busy = state.generating || state.tool_open || state.tool_round;
         if busy {
             self.linger_until = Some(Instant::now() + LINGER);
+            // 重新忙起来：进行中的淡出立即取消（接着播内容）。
+            *self.fadeout_since.lock().unwrap() = None;
         }
         let lingering = !busy && self.linger_until.is_some_and(|t| Instant::now() < t);
         if !busy {
@@ -608,14 +601,20 @@ impl MiniWin {
             self.interrupt_open = false;
             self.interrupt_result.store(0, Ordering::Relaxed);
         }
-        if !busy && !lingering {
-            self.busy_since = None;
+        // 驻留结束 → 淡出（回调里播透明度 + 上飘），播完才真正收窗。
+        // 只在「曾露过面」时起播：小窗没开过的静默期不该刷出一张淡出中的卡。
+        let mut fadeout = self.fadeout_since.lock().unwrap();
+        if !busy && !lingering && fadeout.is_none() && self.shown && !shot_hiding {
+            *fadeout = Some(Instant::now());
+        }
+        let fading = fadeout.is_some();
+        let faded = fadeout.is_some_and(|t| t.elapsed().as_secs_f32() >= FADEOUT_SECS);
+        if faded {
+            *fadeout = None;
             self.linger_until = None;
         }
-        let open = hidden_to_tray && (busy || lingering) && !shot_hiding;
-        if open && self.busy_since.is_none() {
-            self.busy_since = Some(Instant::now());
-        }
+        drop(fadeout);
+        let open = hidden_to_tray && (busy || lingering || (fading && !faded)) && !shot_hiding;
 
         // 3. 全局输入（由视口回调单点采样转发，见 LMB_EDGE_MS 注释）：
         //    逻辑坐标光标 + 左键按下沿。沿带 250ms 窗口并记消费，托盘态
@@ -636,20 +635,25 @@ impl MiniWin {
             self.lmb_edge_consumed = edge_ms;
         }
 
-        // 4. 几何：常态贴右上、避让时躲左上。窗口位置的动画挪到了视口回调里
-        //    自驱（主视口托盘态被节流，跑不动动画）；这里只留两个静止端点，
-        //    供打断判定「点在小窗自己身上不算」用 —— 两端都算上，覆盖移动途中。
+        // 4. 几何：常态贴右上、避让时躲左上。宽度固定；高度**自适应内容** ——
+        //    paint 量到的内容高（上一帧）+ 边距，钳制后由回调朝它做缓动。
+        //    打断弹窗打开时用固定大窗（模态需要稳定的落点）。
         let m = theme.metrics;
-        let size = if self.interrupt_open {
-            Vec2::new(m.s(380.0), m.s(280.0))
-        } else {
-            Vec2::new(m.s(340.0), m.s(236.0))
-        };
-        let margin = m.s(16.0);
         let monitor = ctx
             .input(|i| i.viewport().monitor_size)
             .unwrap_or(Vec2::new(1920.0, 1080.0));
-        let home = Pos2::new((monitor.x - size.x - margin).max(margin), margin);
+        let (width, target_h) = if self.interrupt_open {
+            (m.s(380.0), m.s(280.0))
+        } else {
+            let content = *self.content_h.lock().unwrap();
+            (
+                m.s(340.0),
+                (content + m.s(28.0)).clamp(m.s(96.0), (monitor.y - m.s(32.0)) * 0.62),
+            )
+        };
+        let size = Vec2::new(width, target_h);
+        let margin = m.s(16.0);
+        let home = Pos2::new((monitor.x - width - margin).max(margin), margin);
         let away = Pos2::new(margin, margin);
 
         // 5. 打断确认：后台执行中 + 本轮动过鼠标/键盘 + 左键按下沿。
@@ -658,6 +662,7 @@ impl MiniWin {
         //    点在课堂总结弹窗上不算；AI 自己注入的点击（click/drag）更不算。
         if lmb_edge
             && open
+            && busy // 驻留/淡出中不弹打断（已经做完了，没什么可打断的）
             && !self.interrupt_open
             && state.awaiting_tool().is_none()
             && used_mouse_or_keyboard(state)
@@ -700,18 +705,14 @@ impl MiniWin {
         //    避让/淡入动画由卡片的绘制闭包在层里以 vsync 自驱 —— 主视口
         //    托盘态 10fps 的节拍只负责内容快照，与旧架构的权责划分一致。
         let snapshot = if open {
-            let busy_secs = self
-                .busy_since
-                .map(|t0| t0.elapsed().as_secs())
-                .unwrap_or(0);
             Some(Snapshot::build(
                 state,
                 theme,
-                size,
+                width,
+                target_h,
                 monitor,
-                !busy && lingering,
+                !busy && (lingering || fading),
                 self.interrupt_open,
-                busy_secs,
             ))
         } else {
             // 隐藏中不供内容：回调空转，Visible(false) 生效前的缝隙帧
@@ -722,20 +723,23 @@ impl MiniWin {
         if let Some(layer) = overlay {
             if open {
                 if !self.shown {
-                    // 露面沿：先落静止位（下一帧起避让动画由闭包覆写）。
-                    *self.layer_rect.lock().unwrap() = [home.x, home.y, size.x, size.y];
+                    // 露面沿：先落静止位 + 播淡入（下一帧起避让/高度动画由闭包覆写）。
+                    *self.layer_rect.lock().unwrap() = [home.x, home.y, width, target_h];
+                    *self.refade_since.lock().unwrap() = Some(Instant::now());
                 }
                 let snap = snapshot.expect("open 必有快照");
                 let result = Arc::clone(&self.interrupt_result);
                 let refade = Arc::clone(&self.refade_since);
                 let rect_slot = Arc::clone(&self.layer_rect);
+                let fadeout = Arc::clone(&self.fadeout_since);
+                let measure = Arc::clone(&self.content_h);
                 let card = neo_overlay::Card {
                     rect: Arc::clone(&self.layer_rect),
                     interactive: true,
                     draw: Box::new(move |ui| {
                         let ctx = ui.ctx().clone();
                         // 淡入：起点由 tick 写进共享槽，插值在这里现算。
-                        let fade = {
+                        let fade_in = {
                             let mut slot = refade.lock().unwrap();
                             match *slot {
                                 Some(t0) => {
@@ -750,12 +754,27 @@ impl MiniWin {
                                 None => 1.0,
                             }
                         };
+                        // 淡出：驻留结束后透明度渐隐 + 轻轻上飘。
+                        let fade_out = fadeout
+                            .lock()
+                            .unwrap()
+                            .map(|t0| {
+                                (t0.elapsed().as_secs_f32() / FADEOUT_SECS).clamp(0.0, 1.0)
+                            })
+                            .unwrap_or(0.0);
+                        let fade = fade_in * (1.0 - ease_out_cubic(fade_out));
                         // 避让：只盯「静止位」判定（卡片移动本身不会让光标
                         // 反复进出，否则会在两个角之间振荡）；弹窗打开时不躲。
                         let m = snap.theme.metrics;
-                        let size = snap.size;
                         let margin = m.s(16.0);
                         let monitor = snap.monitor;
+                        // 高度自适应：朝 tick 按内容测量算出的目标高缓动。
+                        let h = ctx.animate_value_with_time(
+                            Id::new("neo-miniwin-h"),
+                            snap.target_h,
+                            HEIGHT_ANIM_SECS,
+                        );
+                        let size = Vec2::new(snap.width, h);
                         let home =
                             Pos2::new((monitor.x - size.x - margin).max(margin), margin);
                         let away = Pos2::new(margin, margin);
@@ -778,11 +797,12 @@ impl MiniWin {
                             if dodge { 1.0 } else { 0.0 },
                             AVOID_SECS,
                         );
-                        let pos = home + (away - home) * ease_out_cubic(t);
+                        let mut pos = home + (away - home) * ease_out_cubic(t);
+                        pos.y -= m.s(10.0) * ease_out_cubic(fade_out);
                         // 写回共享矩形：层的 Area 定位 + 命中测试 + tick 的
                         // 打断排除区下一帧都用它（一帧延迟无感）。
                         *rect_slot.lock().unwrap() = [pos.x, pos.y, size.x, size.y];
-                        paint(ui, &snap, &result, fade);
+                        paint(ui, &snap, &result, fade, &measure);
                     }),
                 };
                 layer.set_card(neo_overlay::card_id::MINI, Some(card));
@@ -822,14 +842,26 @@ impl MiniWin {
                     viewport_id(),
                     ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop),
                 );
+                // 露面淡入（与层内路径同通道）。
+                *self.refade_since.lock().unwrap() = Some(Instant::now());
+                self.legacy_sent = size;
             } else {
                 ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::InnerSize(Vec2::new(1.0, 1.0)));
                 ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(OFFSCREEN));
+                self.legacy_sent = Vec2::ZERO;
             }
             self.shown = open;
+        } else if open {
+            // 高度自适应（测试回退路径不播动画，量到多少直接贴）。
+            if (size - self.legacy_sent).length() > 1.0 {
+                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::InnerSize(size));
+                self.legacy_sent = size;
+            }
         }
         let result = Arc::clone(&self.interrupt_result);
         let refade = Arc::clone(&self.refade_since);
+        let fadeout = Arc::clone(&self.fadeout_since);
+        let measure = Arc::clone(&self.content_h);
         ctx.show_viewport_deferred(
             viewport_id(),
             Self::builder(size, open),
@@ -839,7 +871,7 @@ impl MiniWin {
                 // ---- 回调自驱的动画（主视口托盘态被 eframe 节流到 10fps，
                 // 这些量若靠快照下发全会卡；本视口可见、不被节流）----
                 // 淡入：起点由 tick 写进共享槽，插值在这里现算。
-                let fade = {
+                let fade_in = {
                     let mut slot = refade.lock().unwrap();
                     match *slot {
                         Some(t0) => {
@@ -854,10 +886,17 @@ impl MiniWin {
                         None => 1.0,
                     }
                 };
+                // 淡出：驻留结束后透明度渐隐 + 轻轻上飘。
+                let fade_out = fadeout
+                    .lock()
+                    .unwrap()
+                    .map(|t0| (t0.elapsed().as_secs_f32() / FADEOUT_SECS).clamp(0.0, 1.0))
+                    .unwrap_or(0.0);
+                let fade = fade_in * (1.0 - ease_out_cubic(fade_out));
                 // 避让：只盯「静止位」判定（窗口移动本身不会让光标反复进出，
                 // 否则会在两个角之间振荡）；弹窗打开时不躲（用户正要去点按钮）。
                 let m = snapshot.theme.metrics;
-                let size = snapshot.size;
+                let size = Vec2::new(snapshot.width, snapshot.target_h);
                 let margin = m.s(16.0);
                 let monitor = ctx
                     .input(|i| i.viewport().monitor_size)
@@ -883,7 +922,8 @@ impl MiniWin {
                     if dodge { 1.0 } else { 0.0 },
                     AVOID_SECS,
                 );
-                let pos = home + (away - home) * ease_out_cubic(t);
+                let mut pos = home + (away - home) * ease_out_cubic(t);
+                pos.y -= m.s(10.0) * ease_out_cubic(fade_out);
                 // 位置没变就不发：每条命令都是一次 SetWindowPos + DWM 重合成，
                 // 静止时每帧白调是纯开销。
                 let pos_id = Id::new("neo-miniwin-pos");
@@ -892,8 +932,8 @@ impl MiniWin {
                     ctx.data_mut(|d| d.insert_temp(pos_id, pos));
                     ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(pos));
                 }
-                paint(ui, &snapshot, &result, fade);
-                // 本视口自驱 60fps：流光 / 避让 / 淡入全靠它。
+                paint(ui, &snapshot, &result, fade, &measure);
+                // 本视口自驱 60fps：流光 / 避让 / 淡入淡出全靠它。
                 ctx.request_repaint_after(POLL);
             },
         );

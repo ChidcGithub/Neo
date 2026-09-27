@@ -92,6 +92,8 @@ pub struct NeoApp {
     quitting: bool,
     /// 上一帧是否在忙（生成/工具轮）：忙→闲沿驱动「任务完成」系统通知。
     was_busy: bool,
+    /// 上一轮对话完成的时刻（忙→闲沿写入）：5 分钟内再次唤醒续聊用。
+    last_round_done: Option<std::time::Instant>,
     /// 待投递的轻提示（类别 + 内容 + 截止时间）。渲染段统一喂给 toast 队列。
     /// 存截止时间而不是时长：主窗藏在托盘时提示只积不播，重开那一帧把
     /// 早就过期的丢掉、没过期的按**剩余**时间播 —— 不当陈年弹幕补播。
@@ -179,6 +181,7 @@ impl NeoApp {
             quitting: false,
             pending_toasts: Vec::new(),
             was_busy: false,
+            last_round_done: None,
             persistence_ok: true,
             overlay: None,
             miniwin: Default::default(),
@@ -898,9 +901,16 @@ impl NeoApp {
                             std::time::Instant::now() + std::time::Duration::from_secs(4),
                         ));
                     } else {
-                        // 每次语音唤醒都是一段全新对话：不续上次的上下文，
+                        // 完成 5 分钟内再次唤醒 = 接着说（保留上下文接着问
+                        // 「那第二问呢」）；超时或当前没有对话内容才开新会话，
                         // 免得隔了几个小时的提问被旧话题带偏。
-                        self.state.new_session();
+                        let resume = self
+                            .last_round_done
+                            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(300))
+                            && !self.state.messages.is_empty();
+                        if !resume {
+                            self.state.new_session();
+                        }
                         self.state.draft = text;
                         Self::send_input(&mut self.state, self.store.as_ref());
                     }
@@ -982,6 +992,9 @@ impl NeoApp {
         // （round_cancelled）或出错的轮次不报「完成」——那不是完成。
         let busy = self.state.generating || self.state.tool_open || self.state.tool_round;
         if self.was_busy && !busy {
+            // 记「上次对话完成时刻」：5 分钟内再次语音唤醒会续上这段对话
+            // （见 STT 转写收取处），而不是开一段全新对话。
+            self.last_round_done = Some(std::time::Instant::now());
             if self.state.round_cancelled {
                 self.state.round_cancelled = false;
             } else if self.tray.is_some() {
@@ -2734,6 +2747,49 @@ mod snapshot {
             )];
             app.state.tool_round = true;
             app.state.begin_tool_round();
+        });
+        assert!(p.is_file());
+    }
+
+    /// 小窗完成态：只留工具流水 + 正文（markdown/LaTeX），高度自适应最后一段。
+    #[test]
+    fn miniwin_done_1080p() {
+        let p = shoot_steps("30-miniwin-done-1080p", Vec2::new(1920.0, 1080.0), 8, |app| {
+            app.hidden_to_tray = true;
+            app.state.theme_mode = ThemeMode::Dark;
+            app.state.distance = Distance::Classroom;
+            app.state
+                .messages
+                .push(ChatMessage::new(Role::User, "总结一下楞次定律"));
+            let mut reply = ChatMessage::new(
+                Role::Assistant,
+                "先回顾磁通量的定义与变化方式。\n\n**结论**：感应电流的效果总是阻碍磁通量的变化，\
+                 即 $E = -\\frac{d\\Phi}{dt}$；判断方向用右手定则。"
+                    .to_owned(),
+            );
+            reply.streaming = false;
+            app.state.messages.push(reply);
+            // 一条已完成的工具记录：覆盖工具流水行。
+            let meta = crate::state::ToolMeta {
+                call_id: "call_rf".into(),
+                name: "read_file".into(),
+                title: "查看文件",
+                risk: "read",
+                preview: "查看 板书设计.md".into(),
+                args: serde_json::json!({"path": "板书设计.md"}),
+                state: crate::state::ToolState::Done,
+                outcome: Some(neo_tools::Outcome::ok(
+                    "read_file",
+                    "已读取 板书设计.md",
+                    serde_json::json!({"bytes": 512}),
+                )),
+            };
+            app.state.messages.push(crate::state::ChatMessage::tool_result(
+                meta,
+                String::new(),
+            ));
+            // 首帧忙（驱动驻留排程），tick 内泵完即闲 → 进入完成驻留态。
+            app.state.generating = true;
         });
         assert!(p.is_file());
     }

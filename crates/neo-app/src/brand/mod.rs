@@ -29,6 +29,7 @@ const TEXTURE_W: usize = 512;
 const SUPERSAMPLE: usize = 4;
 
 /// 鲸鱼标志：预光栅化的纹理 + 宽高比。
+#[derive(Clone)]
 pub struct WhaleMark {
     texture: TextureHandle,
     aspect: f32,
@@ -63,6 +64,21 @@ impl WhaleMark {
         let texture = ctx.load_texture("neo-whale", image, TextureOptions::LINEAR);
 
         Self { texture, aspect }
+    }
+
+    /// 每上下文只光栅化一次：确认卡 / 小窗这类逐帧绘制处用缓存版，
+    /// 每帧 `load` 重光栅化 512px 是纯浪费。
+    ///
+    /// 注意两段式（先查再插）：`load` 内部会 `ctx.input(...)` 读统一锁，
+    /// 放进 `data_mut` 的写锁闭包里就是同线程自死锁。
+    pub fn cached(ctx: &Context) -> Self {
+        let id = egui::Id::new("neo-whale-mark");
+        if let Some(mark) = ctx.data(|d| d.get_temp::<Self>(id)) {
+            return mark;
+        }
+        let mark = Self::load(ctx);
+        ctx.data_mut(|d| d.insert_temp(id, mark.clone()));
+        mark
     }
 
     /// 标志的宽高比（宽 / 高）。
