@@ -405,10 +405,23 @@ impl NeoApp {
             if event.id == self.tray_show_id {
                 self.show_window(ctx);
             } else if event.id == self.tray_quit_id {
-                self.quitting = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.quit_now();
             }
         }
+    }
+
+    /// 立即退出：落盘剩余消息、收掉托盘图标，然后直接结束进程。
+    ///
+    /// 不走 `ViewportCommand::Close`：那条路要等 winit 事件循环的下一拍
+    /// 才处理，主窗藏托盘时 eframe 还要节流（~100ms 起步，忙时更久）——
+    /// 「点退出没反应」的来源。进程退出时窗口与工作线程由 OS 一并回收；
+    /// 会话消息平时逐帧增量落盘（见 `persist_ready`），这里只补最后一笔。
+    fn quit_now(&mut self) -> ! {
+        self.quitting = true;
+        Self::persist_ready(&mut self.state, self.store.as_ref());
+        // 显式先收托盘图标，不给它留残影的机会。
+        drop(self.tray.take());
+        std::process::exit(0);
     }
 
     /// 从托盘唤回主窗口。
