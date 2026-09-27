@@ -114,8 +114,10 @@ pub mod card_id {
     pub const MINI: u8 = 2;
     /// 课堂总结弹窗（classwin）。
     pub const CLASS: u8 = 3;
-    /// 截屏闪光（shotflash，passive）。
+    /// 截屏闪光（shotflash）。
     pub const FLASH: u8 = 4;
+    /// 总结起止红点（classwin::ClassDot）。
+    pub const DOT: u8 = 5;
 }
 
 /// 跑马灯控制柄，跨线程安全。Drop 时自动关停窗口线程。

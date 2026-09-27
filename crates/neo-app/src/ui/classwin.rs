@@ -296,3 +296,54 @@ fn paint(
 
     close
 }
+
+// ---------------------------------------------------------------------------
+// 总结起止红点
+// ---------------------------------------------------------------------------
+
+/// 红点亮起总时长（开始/结束总结各亮一次）：前 0.15s 淡入，末 0.4s 淡出。
+const DOT_SECS: Duration = Duration::from_secs(5);
+
+/// 左上角小红点：课堂总结「开始整理 / 整理完成」时亮 5s。
+///
+/// 只是个小小的状态信号 —— 老师不用盯屏幕也知道「后台开始/完成总结了」。
+/// 画在渲染层上的 passive 卡（不吃输入、不挡点击）；没有渲染层
+/// （离屏测试）就不画：纯装饰，不值得为它再撑一条测试视口路径。
+#[derive(Default)]
+pub struct ClassDot {
+    /// 本批红点的亮起起点；新的起止事件重置计时（连着来就连着亮）。
+    since: Option<Instant>,
+}
+
+impl ClassDot {
+    /// 标记一次「开始/结束总结」。
+    pub fn ping(&mut self) {
+        self.since = Some(Instant::now());
+    }
+
+    /// 每帧驱动（挂在 `NeoApp::tick`；有渲染层才画）。
+    pub fn tick(&mut self, overlay: Option<&neo_overlay::OverlayHandle>, theme: Theme) {
+        if self.since.is_some_and(|t| t.elapsed() >= DOT_SECS) {
+            self.since = None;
+        }
+        let Some(layer) = overlay else { return };
+        let card = self.since.map(|t0| {
+            let m = theme.metrics;
+            // 直径随大屏度量缩放：这就是「自适应大小，比较小」。
+            let d = m.s(12.0);
+            let margin = m.s(14.0);
+            neo_overlay::Card::passive([margin, margin, d, d], move |ui| {
+                let k = (t0.elapsed().as_secs_f32() / DOT_SECS.as_secs_f32()).clamp(0.0, 1.0);
+                // 淡入（前 3%）→ 保持 → 淡出（末 8%）。
+                let a = (k / 0.03).min(1.0) * (1.0 - ((k - 0.92) / 0.08).clamp(0.0, 1.0));
+                let p = neo_ui::Design::new(theme).p();
+                let c = ui.max_rect().center();
+                let r = ui.max_rect().width() * 0.5;
+                // 外圈微光晕 + 实心红点。
+                ui.painter().circle_filled(c, r, p.error.gamma_multiply(0.16 * a));
+                ui.painter().circle_filled(c, r * 0.62, p.error.gamma_multiply(a));
+            })
+        });
+        layer.set_card(neo_overlay::card_id::DOT, card);
+    }
+}

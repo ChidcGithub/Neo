@@ -107,6 +107,10 @@ pub struct NeoApp {
     miniwin: ui::miniwin::MiniWin,
     /// 截屏完成后的区域闪光（整屏截图 = 全屏边框一闪）。
     shotflash: ui::miniwin::ShotFlash,
+    /// 课堂总结起止的左上角红点（开始/结束打磨各亮 5s）。
+    class_dot: ui::classwin::ClassDot,
+    /// 已见到的总结起止计数（差值 = 新的红点事件）。
+    class_pings_seen: u64,
     /// 工具权限确认窗（独立弹出，不绑定主窗）。
     confirmwin: ui::confirmwin::ConfirmWin,
     /// 课堂总结的顶部弹窗（打磨完成后从屏幕上方滑入）。
@@ -186,6 +190,8 @@ impl NeoApp {
             overlay: None,
             miniwin: Default::default(),
             shotflash: Default::default(),
+            class_dot: Default::default(),
+            class_pings_seen: 0,
             confirmwin: Default::default(),
             classwin: Default::default(),
             show_window_seen: 0,
@@ -986,6 +992,13 @@ impl NeoApp {
             .tick(&ctx, &self.state, self.state.class_enabled);
         // 课堂总结弹窗：打磨就绪后从屏幕上方滑入。
         self.classwin.tick(&ctx, &mut self.class, self.theme, overlay);
+        // 总结起止红点：开始/结束打磨时左上角亮 5s（计数差值驱动）。
+        let pings = self.class.summary_pings;
+        if pings != self.class_pings_seen {
+            self.class_pings_seen = pings;
+            self.class_dot.ping();
+        }
+        self.class_dot.tick(overlay, self.theme);
         // 状态行同步给设置页（开关下方的「记录中…」提示）。
         self.state.class_status = self.class.status().map(|s| s.to_owned());
         // 忙→闲沿：任务收尾，弹一条 Windows 原生通知。被打断

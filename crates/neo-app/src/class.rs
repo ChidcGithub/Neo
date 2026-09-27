@@ -136,6 +136,8 @@ pub struct ClassMonitor {
     seen_key_ms: u64,
     /// 打磨结果，等弹窗取走。
     ready: Option<ReadySummary>,
+    /// 总结起止计数（开始打磨 +1、总结就绪 +1）：app 按差值点亮左上角红点。
+    pub summary_pings: u64,
     /// 状态行（设置页显示「记录中…」之类）。
     status: String,
 }
@@ -153,6 +155,7 @@ impl Default for ClassMonitor {
             stt_engine: Arc::new(std::sync::Mutex::new(None)),
             seen_key_ms: 0,
             ready: None,
+            summary_pings: 0,
             status: String::new(),
         }
     }
@@ -432,6 +435,7 @@ impl ClassMonitor {
             over_limit,
             date,
         });
+        self.summary_pings += 1; // 「总结完成」红点（交叉新课也算完成）
         if crossing {
             // 新课进行中：结果存进 ready 即可，弹窗会被用户看到；
             // phase 与状态行都别动新课的。
@@ -515,6 +519,7 @@ impl ClassMonitor {
     fn spawn_polish(&mut self, state: &AppState, session: Session) {
         self.analysis_in_flight = true;
         self.status = "正在整理课堂总结…".into();
+        self.summary_pings += 1; // 「开始总结」红点
         let tx = self.tx.clone();
         let Some(cfg) = llm_config(state) else {
             let _ = tx.send(ClassEvent::PolishFailed {
