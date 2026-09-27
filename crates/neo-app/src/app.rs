@@ -90,6 +90,8 @@ pub struct NeoApp {
     hidden_to_tray: bool,
     /// 托盘菜单点了「退出」：下一次 close 请求直接放行，不再拦截。
     quitting: bool,
+    /// 上一帧是否在忙（生成/工具轮）：忙→闲沿驱动「任务完成」系统通知。
+    was_busy: bool,
     /// 待投递的轻提示（类别 + 内容 + 截止时间）。渲染段统一喂给 toast 队列。
     /// 存截止时间而不是时长：主窗藏在托盘时提示只积不播，重开那一帧把
     /// 早就过期的丢掉、没过期的按**剩余**时间播 —— 不当陈年弹幕补播。
@@ -176,6 +178,7 @@ impl NeoApp {
             hidden_to_tray: false,
             quitting: false,
             pending_toasts: Vec::new(),
+            was_busy: false,
             persistence_ok: true,
             overlay: None,
             miniwin: Default::default(),
@@ -975,6 +978,31 @@ impl NeoApp {
         self.classwin.tick(&ctx, &mut self.class, self.theme, overlay);
         // 状态行同步给设置页（开关下方的「记录中…」提示）。
         self.state.class_status = self.class.status().map(|s| s.to_owned());
+        // 忙→闲沿：任务收尾，弹一条 Windows 原生通知。被打断
+        // （round_cancelled）或出错的轮次不报「完成」——那不是完成。
+        let busy = self.state.generating || self.state.tool_open || self.state.tool_round;
+        if self.was_busy && !busy {
+            if self.state.round_cancelled {
+                self.state.round_cancelled = false;
+            } else if self.tray.is_some() {
+                // tray 存在 = 真实客户端（离屏测试不装托盘），借它当门槛。
+                let last = self
+                    .state
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == Role::Assistant);
+                let failed = last.is_some_and(|m| m.error.is_some());
+                if !failed {
+                    let line: String = last
+                        .and_then(|m| m.content.lines().find(|l| !l.trim().is_empty()))
+                        .map(|l| l.trim().chars().take(80).collect())
+                        .unwrap_or_default();
+                    crate::notify::task_done(&line);
+                }
+            }
+        }
+        self.was_busy = busy;
         // 记忆热重载：remember/forget 工具在工具线程写盘，这里 2s 一拍沿检。
         if self.memory_poll.elapsed() > std::time::Duration::from_secs(2) {
             self.memory_poll = std::time::Instant::now();

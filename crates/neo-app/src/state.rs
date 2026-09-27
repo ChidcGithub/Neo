@@ -415,6 +415,8 @@ pub struct AppState {
     pub tool_open: bool,
     /// 本会话是否已允许「自动批准」写与执行类工具。
     pub auto_approve_tools: bool,
+    /// 本轮是用户主动停止的（完成通知不该把「打断」报成「任务完成」）。
+    pub round_cancelled: bool,
 
     /// 思考强度档位（对应请求体的 `thinking` / `reasoning_effort`）。
     pub thinking: neo_llm::Thinking,
@@ -502,6 +504,7 @@ impl Default for AppState {
             tool_round: false,
             tool_open: false,
             auto_approve_tools: false,
+            round_cancelled: false,
             thinking: neo_llm::Thinking::Model,
             tool_jobs: Vec::new(),
             // 默认为空：模型列表由模型商拉取，不在代码里写死。
@@ -1456,6 +1459,7 @@ impl AppState {
         if !self.can_submit() {
             return false;
         }
+        self.round_cancelled = false;
         let mut message = ChatMessage::new(Role::User, self.draft.trim());
         message.attachments = std::mem::take(&mut self.draft_attachments);
         self.messages.push(message);
@@ -1605,6 +1609,7 @@ impl AppState {
         if let Some(StreamSource::Real(s)) = self.stream.take() {
             s.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.round_cancelled = true;
         self.stream_started = None;
         self.generating = false;
         self.tool_frags.clear();

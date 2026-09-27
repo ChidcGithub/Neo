@@ -41,6 +41,9 @@ const SHOT_HIDE: Duration = Duration::from_millis(950);
 /// 小窗开着时的轮询节拍（避让 / 截屏信号 / 打断点击都靠它）。
 /// 16ms ≈ 60fps：避让、淡入、呼吸点都是动画，再低肉眼能看出顿。
 const POLL: Duration = Duration::from_millis(16);
+/// 任务执行完后小窗继续驻留的时长：老师扫一眼角落就知道「做完了」
+///（标题变「已完成」），而不是无声消失。
+const LINGER: Duration = Duration::from_secs(5);
 /// 工具流水最多保留的步数（旧的滚出，最近的排最下）。
 const MAX_STEPS: usize = 4;
 /// 休眠位：屏幕外远处。本文件的所有视口都**不切 `Visible`**——透明视口
@@ -209,6 +212,8 @@ struct Snapshot {
     /// 主显示器尺寸（点）：渲染层里 `ctx` 的 monitor_size 不可靠
     /// （那是整层窗口），避让端点判定由快照下发。
     monitor: Vec2,
+    /// 已完成驻留态（忙完后的 5s）：标题变「已完成」、圆点变绿。
+    done: bool,
     interrupt_open: bool,
     title: String,
     steps: Vec<Step>,
@@ -228,6 +233,7 @@ impl Snapshot {
         theme: Theme,
         size: Vec2,
         monitor: Vec2,
+        done: bool,
         interrupt_open: bool,
         busy_secs: u64,
     ) -> Self {
@@ -304,8 +310,13 @@ impl Snapshot {
             theme,
             size,
             monitor,
+            done,
             interrupt_open,
-            title: format!("Neo 执行中 · {elapsed}"),
+            title: if done {
+                format!("Neo · 已完成 · 共 {elapsed}")
+            } else {
+                format!("Neo 执行中 · {elapsed}")
+            },
             steps,
             thinking,
             // 正文是 markdown 源串，反引号等记号在小窗裸奔很扎眼，极简清洗。
@@ -355,7 +366,8 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>, fade: f32) 
     painter.circle_filled(
         Pos2::new(inner.left() + title_r, y + d.t().caption * 0.8),
         title_r,
-        tint(p.accent),
+        // 已完成驻留态：圆点变绿（成功色），一眼区分「还在跑 / 做完了」。
+        tint(if snap.done { p.success } else { p.accent }),
     );
     painter.text(
         Pos2::new(inner.left() + m.s(11.0), y),
@@ -522,6 +534,8 @@ pub struct MiniWin {
     lmb_edge_consumed: u64,
     /// 本轮后台执行的起点（标题里的已用时长靠它）；闲下来清零。
     busy_since: Option<Instant>,
+    /// 忙完后的驻留截止时刻（忙时持续刷新，闲下来那一刻起算 5s）。
+    linger_until: Option<Instant>,
     /// 渲染层卡片的共享矩形（主屏点）：tick 写静止位、层内绘制闭包写
     /// 避让动画位；层的 Area 定位与命中测试每帧重读它。打断判定的
     /// 「点在小窗自己身上」也读它（替代旧视口的 ctx.data 通道）。
@@ -583,14 +597,22 @@ impl MiniWin {
         let shot_hiding = self.shot_hide_until.is_some();
 
         // 2. 显隐目标：主窗已藏到托盘 且 AI 正在生成 / 执行工具。
+        //    忙完后再驻留 LINGER（5s）播「已完成」态，而不是无声消失。
         let busy = state.generating || state.tool_open || state.tool_round;
+        if busy {
+            self.linger_until = Some(Instant::now() + LINGER);
+        }
+        let lingering = !busy && self.linger_until.is_some_and(|t| Instant::now() < t);
         if !busy {
             // 执行结束（或刚被打断）：确认框一并收掉。
             self.interrupt_open = false;
             self.interrupt_result.store(0, Ordering::Relaxed);
-            self.busy_since = None;
         }
-        let open = hidden_to_tray && busy && !shot_hiding;
+        if !busy && !lingering {
+            self.busy_since = None;
+            self.linger_until = None;
+        }
+        let open = hidden_to_tray && (busy || lingering) && !shot_hiding;
         if open && self.busy_since.is_none() {
             self.busy_since = Some(Instant::now());
         }
@@ -687,6 +709,7 @@ impl MiniWin {
                 theme,
                 size,
                 monitor,
+                !busy && lingering,
                 self.interrupt_open,
                 busy_secs,
             ))

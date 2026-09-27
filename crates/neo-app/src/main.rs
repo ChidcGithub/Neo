@@ -30,6 +30,7 @@ mod app;
 mod attachments;
 mod brand;
 mod class;
+mod notify;
 mod state;
 mod ui;
 
@@ -66,6 +67,8 @@ fn main() -> eframe::Result {
             // 系统托盘：关窗转后台运行，托盘菜单提供「显示主界面 / 退出」。
             // 装配失败只打日志降级为无托盘，不挡启动。
             app.start_tray();
+            // 原生消息弹窗：告诉老师 Neo 起来了（失败只记日志）。
+            notify::app_started();
             Ok(Box::new(app))
         }),
     )

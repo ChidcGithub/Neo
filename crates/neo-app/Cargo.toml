@@ -44,6 +44,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# Windows 原生消息通知（WinRT toast）：启动与任务完成时弹系统通知。
+windows = { version = "0.62", features = [
+    "UI_Notifications",
+    "Data_Xml_Dom",
+    "Win32_UI_Shell",
+] }
 
 [dev-dependencies]
 # 打开组件库的 Id 探针，供端到端 Id 冲突测试使用
