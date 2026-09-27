@@ -2,19 +2,31 @@
 # 产物：neo-<ver>-installer-x64.exe（NSIS 安装包）+ neo-<ver>-portable-x64.zip（便携包）。
 # 触发：推送 v* 标签，或手动 workflow_dispatch（版本号取自根 Cargo.toml）。
 # 版本号含 "-"（如 -rc...）时发布为 pre-release。
+#
+# 也监听 main 推送，但只跑到 cargo build 为止：
+# GitHub 缓存按 ref 隔离，工作流只能恢复「本 ref 或默认分支」的缓存 ——
+# 纯 tag 触发的工作流永远救不回自己在旧 tag 上存的缓存（每次都 No cache found）。
+# main 上跑一遍完整 build，tag 构建才能经 restore-keys 命中默认分支的缓存。
 
 name: Release
 
 on:
   push:
     tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
 
+# 打包/发布步骤只在 tag（或手动触发）时跑；main 推送仅暖缓存。
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+
+# main 上的暖缓存跑被新推送取代即可取消；tag 发布永不取消。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
   release:
@@ -51,7 +63,10 @@ jobs:
       - name: Build
         run: cargo build --release -p neo-app
 
+      # ---- 以下全部为打包/发布步骤：main 暖缓存跑不执行 ----
+
       - name: Download STT models
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -64,11 +79,13 @@ jobs:
           Invoke-WebRequest "$base/silero_vad.onnx" -OutFile assets-stt\vad\silero_vad.onnx
 
       - name: Fetch MinGit runtime
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         env:
           PYTHONUTF8: "1" # runner 默认 cp1252，脚本输出中文会炸
         run: python tools/fetch_runtime.py --mirror github
 
       - name: Assemble package
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
           $pkg = "dist\neo"
@@ -80,6 +97,7 @@ jobs:
           Copy-Item README.md, LICENSE $pkg\ -ErrorAction SilentlyContinue
 
       - name: Zip portable package
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
           $zip = "dist\neo-${{ steps.ver.outputs.version }}-portable-x64.zip"
@@ -88,11 +106,13 @@ jobs:
         id: zip
 
       - name: Generate installer art
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         run: |
           python -m pip install --quiet pillow
           python tools/make_installer_art.py --out build/installer-art
 
       - name: Build installer (NSIS)
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
           # runner 镜像自带 NSIS；没有则走 choco 兜底
@@ -114,6 +134,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "makensis exit $LASTEXITCODE" }
 
       - name: Generate changelog
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         id: log
         shell: pwsh
         run: |
@@ -144,6 +165,7 @@ jobs:
           Get-Content dist\notes.md
 
       - name: Create release
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
