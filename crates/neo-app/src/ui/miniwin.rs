@@ -25,8 +25,7 @@ use egui::{
     ViewportId, WindowLevel,
 };
 use neo_theme::{SquirclePaint, Theme};
-use neo_ui::modal::Confirm;
-use neo_ui::Design;
+use neo_ui::{Button, Design};
 
 use crate::state::{AppState, Role, ToolState};
 
@@ -357,13 +356,41 @@ fn paint(
     painter.squircle_filled(rect, m.s(18.0), tint(p.bg_layer_1));
     painter.squircle_stroked(rect, m.s(18.0), Stroke::new(1.0, tint(p.border_l1)));
 
-    // 打断确认：模态居中在小窗自己的视口里，遮住下方内容。
+    // 打断确认：**内联画在卡片里**（不能用模态 —— 模态居中到整层屏幕，
+    // 逃出卡片命中矩形，按钮永远点不到）。
     if snap.interrupt_open {
-        let answer = Confirm::new("打断执行？", "AI 本轮正在操作鼠标 / 键盘，确认打断吗？")
-            .danger(true)
-            .labels("打断", "继续")
-            .show(ui, &d);
-        if let Some(yes) = answer {
+        let inner = rect.shrink(m.s(18.0));
+        painter.text(
+            inner.left_top(),
+            Align2::LEFT_TOP,
+            "打断执行？",
+            d.font_bold(d.t().headline),
+            tint(p.label_primary),
+        );
+        let body_y = inner.top() + d.t().headline * 1.6;
+        let body = ui.painter().layout(
+            "AI 本轮正在操作鼠标 / 键盘。打断会立即取消当前任务。".to_owned(),
+            d.font(d.t().body),
+            tint(p.label_secondary),
+            inner.width(),
+        );
+        painter.galley(Pos2::new(inner.left(), body_y), body, tint(p.label_secondary));
+        // 底部按钮行：右对齐 [继续][打断]。
+        let btn_h = m.s(34.0);
+        let footer =
+            Rect::from_min_max(Pos2::new(inner.left(), inner.bottom() - btn_h), inner.max);
+        let mut clicked: Option<bool> = None;
+        super::at(ui, footer, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if Button::new("打断").danger().show(ui, &d).clicked() {
+                    clicked = Some(true);
+                }
+                if Button::new("继续").ghost().show(ui, &d).clicked() {
+                    clicked = Some(false);
+                }
+            });
+        });
+        if let Some(yes) = clicked {
             result.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
         }
         return;
@@ -395,14 +422,14 @@ fn paint(
             ui.painter().circle_filled(
                 Pos2::new(row.left() + m.s(3.0), row.center().y),
                 m.s(3.0),
-                dot,
+                tint(dot),
             );
             ui.painter().text(
                 Pos2::new(row.left() + m.s(12.0), row.top()),
                 Align2::LEFT_TOP,
                 &step.line,
                 d.font(d.t().caption),
-                ink,
+                tint(ink),
             );
         }
         if !snap.steps.is_empty() {
@@ -596,8 +623,9 @@ impl MiniWin {
             *self.fadeout_since.lock().unwrap() = None;
         }
         let lingering = !busy && self.linger_until.is_some_and(|t| Instant::now() < t);
-        if !busy {
-            // 执行结束（或刚被打断）：确认框一并收掉。
+        if !busy && !lingering {
+            // 真正闲下来才收确认框 —— 只判 !busy 的话，流结束与下一轮工具
+            // 启动之间的空档会把弹窗闪掉（用户正点着呢，框没了）。
             self.interrupt_open = false;
             self.interrupt_result.store(0, Ordering::Relaxed);
         }

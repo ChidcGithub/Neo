@@ -42,9 +42,9 @@ impl Geometry {
             egui::pos2(inner.left(), title.bottom() + gap),
             egui::pos2(inner.right(), footer.top() - gap),
         );
-        debug_assert!(panel.contains_rect(title));
-        debug_assert!(panel.contains_rect(footer));
-        debug_assert!(body.height() > 0.0);
+        debug_assert!(panel.contains_rect(title), "panel={panel:?} title={title:?} pad={pad} title_h={title_h} footer_h={footer_h}");
+        debug_assert!(panel.contains_rect(footer), "panel={panel:?} footer={footer:?}");
+        debug_assert!(body.height() > 0.0, "body={body:?}");
         Self {
             panel,
             title,
@@ -54,19 +54,39 @@ impl Geometry {
     }
 }
 
-/// 弹窗遮罩淡入时长：spec 标准档（0.2s）。
-const ENTER_FADE: f32 = 0.2;
+/// 卡矩形：渲染层和独立视口里 `ui.max_rect()` 就是整张卡，直接用。
+/// 离屏测试把确认视口嵌进根窗口、窗体按内容自收缩 —— 首帧 max_rect 极小，
+/// 这时自报标准尺寸（以当前 min 为左上角，与自收缩生长方向一致），
+/// 并向宿主 `allocate_rect` 报备尺寸，下一帧窗体长大即稳定在 max_rect 分支。
+fn panel_rect(ui: &mut Ui, m: neo_theme::Metrics) -> Rect {
+    let rect = ui.max_rect();
+    let min = Vec2::new(m.s(280.0), m.s(180.0));
+    let panel = if rect.width() < min.x || rect.height() < min.y {
+        let screen = ui.ctx().content_rect();
+        let size = Vec2::new(m.s(560.0), m.s(420.0))
+            .min(screen.size() - egui::vec2(m.s(32.0), m.s(32.0)))
+            .max(min);
+        Rect::from_min_size(rect.min, size)
+    } else {
+        rect
+    };
+    ui.allocate_rect(panel, egui::Sense::hover());
+    panel
+}
 
-/// 画确认弹窗。只有点击明确的授权/拒绝按钮才返回答复；点遮罩不会批准。
+/// 画确认弹窗。只有点击明确的授权/拒绝按钮才返回答复。
+///
+/// **内联渲染，不开模态**：渲染层里这张卡就是全部可点区域（命中测试只认
+/// 卡矩形）；`egui::Modal` 会把面板居中到整层屏幕、逃出命中区 —— 按钮
+/// 看着在，点击全穿透。
 pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize) -> Option<Answer> {
     let d = skin.d();
     let p = skin.p();
     let m = skin.m();
-    let screen = ui.ctx().content_rect();
+    let panel = panel_rect(ui, m);
     let pad = m.s(22.0);
     let gap = m.s(12.0);
-    let width = m.s(520.0).min((screen.width() - m.s(32.0)).max(1.0));
-    let inner_w = (width - pad * 2.0).max(1.0);
+    let inner_w = (panel.width() - pad * 2.0).max(1.0);
     // 始终给正文预留滚动条宽度，测量宽度与最终绘制宽度一致。
     let scroll_w = m.s(16.0);
     let body_w = (inner_w - scroll_w).max(1.0);
@@ -114,7 +134,6 @@ pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize) 
     );
     let preview_h = preview.size().y + m.s(16.0);
     let args_h = args.size().y + m.s(16.0);
-    let body_h = badge.size().y + gap + preview_h + gap + args_label.size().y + m.s(6.0) + args_h;
     let button_h = m.s(36.0);
     let labels = ["允许", "本会话都允许", "拒绝"];
     let button_width: f32 = labels
@@ -134,109 +153,86 @@ pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize) 
     } else {
         button_h
     };
-    let fixed_h = 2.0 * pad + title.size().y + 2.0 * gap + footer_h;
-    let height = (fixed_h + body_h).min((screen.height() - m.s(32.0)).max(fixed_h + 1.0));
-    let ctx = ui.ctx().clone();
-    // 弹出淡入：身份随 call_id。egui 动画首调直接返回目标值，所以第一次
-    // 见到这个弹窗时先播种 0 再启动到 1，并用一条 temp 标记记住「见过」。
-    // 只有遮罩随 k 淡入：面板内部是预排版的 galley，缩放/平移都会溢出。
-    let enter_id = egui::Id::new(("neo-tool-enter", &meta.call_id));
-    let seen = ctx.memory(|m| m.data.get_temp::<bool>(enter_id).unwrap_or(false));
-    let enter_k = if seen {
-        ctx.animate_value_with_time(enter_id, 1.0, ENTER_FADE)
-    } else {
-        ctx.animate_value_with_time(enter_id, 0.0, ENTER_FADE);
-        let k = ctx.animate_value_with_time(enter_id, 1.0, ENTER_FADE);
-        ctx.memory_mut(|m| m.data.insert_temp(enter_id, true));
-        k
-    };
-    let response = egui::Modal::new(egui::Id::new(("neo-tool-confirm", &meta.call_id)))
-        .frame(egui::Frame::NONE)
-        .backdrop_color(d.c().mask_modal.gamma_multiply(enter_k))
-        .show(&ctx, |ui| {
-            let (panel, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
-            Panel::new().paint(ui, &d, panel, pad);
-            let g = Geometry::new(panel, pad, title.size().y, footer_h, gap);
-            ui.painter().galley(g.title.min, title, p.label_primary);
-            super::at(ui, g.body, |ui| {
-                ui.set_clip_rect(ui.clip_rect().intersect(g.body));
-                let scroll = egui::ScrollArea::vertical()
-                    .id_salt(("neo-confirm-body", &meta.call_id))
-                    .auto_shrink([false, false])
-                    .max_height(g.body.height())
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = Vec2::ZERO;
-                        ui.set_width(body_w);
-                        let (r, _) = ui.allocate_exact_size(
-                            Vec2::new(body_w, badge.size().y),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().galley(r.min, badge, p.label_caption);
-                        ui.add_space(gap);
-                        let (r, _) = ui.allocate_exact_size(
-                            Vec2::new(body_w, preview_h),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().squircle_filled(r, m.s(10.0), p.bg_layer_1);
-                        ui.painter().galley(
-                            r.min + egui::vec2(m.s(10.0), m.s(8.0)),
-                            preview,
-                            p.label_primary,
-                        );
-                        ui.add_space(gap);
-                        let (r, _) = ui.allocate_exact_size(
-                            Vec2::new(body_w, args_label.size().y),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().galley(r.min, args_label, p.label_caption);
-                        ui.add_space(m.s(6.0));
-                        let (r, _) =
-                            ui.allocate_exact_size(Vec2::new(body_w, args_h), egui::Sense::hover());
-                        ui.painter().squircle_filled(r, m.s(8.0), p.bg_layer_1);
-                        ui.painter().galley(
-                            r.min + egui::vec2(m.s(10.0), m.s(8.0)),
-                            args,
-                            p.label_secondary,
-                        );
-                    });
-                #[cfg(test)]
-                ui.ctx().data_mut(|data| {
-                    data.insert_temp(
-                        egui::Id::new("neo-confirm-scroll-probe"),
-                        (
-                            scroll.inner_rect,
-                            scroll.state.offset.y,
-                            scroll.content_size.y,
-                        ),
-                    )
-                });
-                let _ = scroll;
+    Panel::new().paint(ui, &d, panel, pad);
+    let g = Geometry::new(panel, pad, title.size().y, footer_h, gap);
+    ui.painter().galley(g.title.min, title, p.label_primary);
+    super::at(ui, g.body, |ui| {
+        ui.set_clip_rect(ui.clip_rect().intersect(g.body));
+        let scroll = egui::ScrollArea::vertical()
+            .id_salt(("neo-confirm-body", &meta.call_id))
+            .auto_shrink([false, false])
+            .max_height(g.body.height())
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                ui.set_width(body_w);
+                let (r, _) = ui.allocate_exact_size(
+                    Vec2::new(body_w, badge.size().y),
+                    egui::Sense::hover(),
+                );
+                ui.painter().galley(r.min, badge, p.label_caption);
+                ui.add_space(gap);
+                let (r, _) = ui.allocate_exact_size(
+                    Vec2::new(body_w, preview_h),
+                    egui::Sense::hover(),
+                );
+                ui.painter().squircle_filled(r, m.s(10.0), p.bg_layer_1);
+                ui.painter().galley(
+                    r.min + egui::vec2(m.s(10.0), m.s(8.0)),
+                    preview,
+                    p.label_primary,
+                );
+                ui.add_space(gap);
+                let (r, _) = ui.allocate_exact_size(
+                    Vec2::new(body_w, args_label.size().y),
+                    egui::Sense::hover(),
+                );
+                ui.painter().galley(r.min, args_label, p.label_caption);
+                ui.add_space(m.s(6.0));
+                let (r, _) =
+                    ui.allocate_exact_size(Vec2::new(body_w, args_h), egui::Sense::hover());
+                ui.painter().squircle_filled(r, m.s(8.0), p.bg_layer_1);
+                ui.painter().galley(
+                    r.min + egui::vec2(m.s(10.0), m.s(8.0)),
+                    args,
+                    p.label_secondary,
+                );
             });
-            let mut out = None;
-            super::at(ui, g.footer, |ui| {
-                ui.spacing_mut().item_spacing = Vec2::splat(gap);
-                let layout = if stacked {
-                    egui::Layout::top_down(egui::Align::Max)
-                } else {
-                    egui::Layout::right_to_left(egui::Align::Center)
-                };
-                ui.with_layout(layout, |ui| {
-                    for (button, answer) in [
-                        (Button::new("允许").primary(), Answer::Once),
-                        (Button::new("本会话都允许").elevated(), Answer::Always),
-                        (Button::new("拒绝").ghost(), Answer::Deny),
-                    ] {
-                        let response = button.show(ui, &d);
-                        debug_assert!(g.panel.expand(0.5).contains_rect(response.rect));
-                        if response.clicked() {
-                            out = Some(answer);
-                        }
-                    }
-                });
-            });
-            out
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("neo-confirm-scroll-probe"),
+                (
+                    scroll.inner_rect,
+                    scroll.state.offset.y,
+                    scroll.content_size.y,
+                ),
+            )
         });
-    response.inner
+        let _ = scroll;
+    });
+    let mut out = None;
+    super::at(ui, g.footer, |ui| {
+        ui.spacing_mut().item_spacing = Vec2::splat(gap);
+        let layout = if stacked {
+            egui::Layout::top_down(egui::Align::Max)
+        } else {
+            egui::Layout::right_to_left(egui::Align::Center)
+        };
+        ui.with_layout(layout, |ui| {
+            for (button, answer) in [
+                (Button::new("允许").primary(), Answer::Once),
+                (Button::new("本会话都允许").elevated(), Answer::Always),
+                (Button::new("拒绝").ghost(), Answer::Deny),
+            ] {
+                let response = button.show(ui, &d);
+                debug_assert!(g.panel.expand(0.5).contains_rect(response.rect));
+                if response.clicked() {
+                    out = Some(answer);
+                }
+            }
+        });
+    });
+    out
 }
 
 /// 用户对一次提问（`ask_user`）的答复。
@@ -250,15 +246,15 @@ pub enum AskAnswer {
 
 /// 画提问弹窗（`ask_user`）。与确认窗同骨架：标题 + 问题面板 + 操作区。
 /// 选项纵向排列、第一个（模型认为最可能的）高亮；「跳过」在右下角。
+/// 与 confirm 同样内联渲染（不进模态，原因见 confirm 的文档注释）。
 pub fn ask(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta) -> Option<AskAnswer> {
     let d = skin.d();
     let p = skin.p();
     let m = skin.m();
-    let screen = ui.ctx().content_rect();
+    let panel = panel_rect(ui, m);
     let pad = m.s(22.0);
     let gap = m.s(12.0);
-    let width = m.s(480.0).min((screen.width() - m.s(32.0)).max(1.0));
-    let inner_w = (width - pad * 2.0).max(1.0);
+    let inner_w = (panel.width() - pad * 2.0).max(1.0);
 
     let question = meta
         .args
@@ -281,51 +277,29 @@ pub fn ask(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta) -> Option<AskAnswer> {
         p.label_primary,
         inner_w,
     );
-    let question_g = ui.painter().layout(
-        question,
-        skin.prop(skin.t().body),
-        p.label_primary,
-        (inner_w - m.s(20.0)).max(1.0),
-    );
-    let question_h = question_g.size().y + m.s(16.0);
-    let button_h = m.s(36.0);
-    let options_h = if options.is_empty() {
-        0.0
-    } else {
-        options.len() as f32 * button_h + (options.len() - 1) as f32 * gap
-    };
-    let body_h = question_h + if options_h > 0.0 { gap + options_h } else { 0.0 };
-    let footer_h = button_h;
-    let fixed_h = 2.0 * pad + title.size().y + 2.0 * gap + footer_h;
-    let height = fixed_h + body_h;
+    let footer_h = m.s(36.0);
 
-    // 弹出淡入：与确认窗同一播种手法（身份 = call_id）。
-    let ctx = ui.ctx().clone();
-    let enter_id = egui::Id::new(("neo-ask-enter", &meta.call_id));
-    let seen = ctx.memory(|m| m.data.get_temp::<bool>(enter_id).unwrap_or(false));
-    let enter_k = if seen {
-        ctx.animate_value_with_time(enter_id, 1.0, ENTER_FADE)
-    } else {
-        ctx.animate_value_with_time(enter_id, 0.0, ENTER_FADE);
-        let k = ctx.animate_value_with_time(enter_id, 1.0, ENTER_FADE);
-        ctx.memory_mut(|m| m.data.insert_temp(enter_id, true));
-        k
-    };
-    let response = egui::Modal::new(egui::Id::new(("neo-ask", &meta.call_id)))
-        .frame(egui::Frame::NONE)
-        .backdrop_color(d.c().mask_modal.gamma_multiply(enter_k))
-        .show(&ctx, |ui| {
-            let (panel, _) =
-                ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
-            Panel::new().paint(ui, &d, panel, pad);
-            let g = Geometry::new(panel, pad, title.size().y, footer_h, gap);
-            ui.painter().galley(g.title.min, title, p.label_primary);
-            let mut out = None;
-            super::at(ui, g.body, |ui| {
+    Panel::new().paint(ui, &d, panel, pad);
+    let g = Geometry::new(panel, pad, title.size().y, footer_h, gap);
+    ui.painter().galley(g.title.min, title, p.label_primary);
+    let mut out = None;
+    super::at(ui, g.body, |ui| {
+        ui.set_clip_rect(ui.clip_rect().intersect(g.body));
+        egui::ScrollArea::vertical()
+            .id_salt(("neo-ask-body", &meta.call_id))
+            .auto_shrink([false, false])
+            .max_height(g.body.height())
+            .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 ui.set_width(inner_w);
+                let question_g = ui.painter().layout(
+                    question.clone(),
+                    skin.prop(skin.t().body),
+                    p.label_primary,
+                    (inner_w - m.s(20.0)).max(1.0),
+                );
                 let (r, _) = ui.allocate_exact_size(
-                    Vec2::new(inner_w, question_h),
+                    Vec2::new(inner_w, question_g.size().y + m.s(16.0)),
                     egui::Sense::hover(),
                 );
                 ui.painter().squircle_filled(r, m.s(10.0), p.bg_layer_1);
@@ -347,16 +321,15 @@ pub fn ask(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta) -> Option<AskAnswer> {
                     }
                 }
             });
-            super::at(ui, g.footer, |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if Button::new("跳过").ghost().show(ui, &d).clicked() {
-                        out = Some(AskAnswer::Skip);
-                    }
-                });
-            });
-            out
+    });
+    super::at(ui, g.footer, |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if Button::new("跳过").ghost().show(ui, &d).clicked() {
+                out = Some(AskAnswer::Skip);
+            }
         });
-    response.inner
+    });
+    out
 }
 
 #[cfg(test)]
