@@ -40,6 +40,8 @@ pub struct ClassWin {
     close_wanted: Arc<AtomicBool>,
     /// 滑入起点（打开沿置位，回调读完动画进度）。
     open_since: Arc<Mutex<Option<Instant>>>,
+    /// 渲染层卡片的共享矩形（滑入动画由绘制闭包逐帧改写）。
+    layer_rect: Arc<Mutex<[f32; 4]>>,
 }
 
 impl ClassWin {
@@ -58,7 +60,13 @@ impl ClassWin {
     }
 
     /// 每帧驱动一次，挂在 `NeoApp::tick`（与确认窗同路，logic-only 也经过）。
-    pub fn tick(&mut self, ctx: &Context, monitor: &mut ClassMonitor, theme: Theme) {
+    pub fn tick(
+        &mut self,
+        ctx: &Context,
+        monitor: &mut ClassMonitor,
+        theme: Theme,
+        overlay: Option<&neo_overlay::OverlayHandle>,
+    ) {
         // 1. 关闭回传先行：dismiss 后 presenting 转 None，本轮即走关闭沿。
         if self.close_wanted.swap(false, Ordering::Relaxed) {
             monitor.dismiss();
@@ -74,7 +82,60 @@ impl ClassWin {
         let size = rect.size();
         let target = rect.min;
 
-        // 3. 显隐沿：露面时提顶 + 记滑入起点；休眠缩 1x1 回 OFFSCREEN。
+        // 3. 内容快照（两条路径共用）。
+        let snapshot: Option<(String, String, bool, String)> = monitor.presenting().map(|r| {
+            (r.subject.clone(), r.summary.clone(), r.over_limit, r.date.clone())
+        });
+
+        // 4a. 渲染层：卡片注册；滑入动画由绘制闭包在层内 vsync 自驱
+        //     （改写共享矩形，层的 Area 定位与命中测试下一帧生效）。
+        if let Some(layer) = overlay {
+            if open {
+                if !self.open {
+                    // 露面沿：从屏幕顶外起滑。
+                    *self.layer_rect.lock().unwrap() = [target.x, -size.y, size.x, size.y];
+                    *self.open_since.lock().unwrap() = Some(Instant::now());
+                }
+                let close_wanted = Arc::clone(&self.close_wanted);
+                let open_since = Arc::clone(&self.open_since);
+                let rect_slot = Arc::clone(&self.layer_rect);
+                let card = neo_overlay::Card {
+                    rect: Arc::clone(&self.layer_rect),
+                    interactive: true,
+                    draw: Box::new(move |ui| {
+                        let Some((subject, summary, over_limit, date)) = &snapshot else {
+                            return;
+                        };
+                        // 渲染层的 egui 上下文不管主题：同步一次（幂等、便宜）。
+                        theme.apply(ui.ctx());
+                        // 滑入：从顶外到目标位，ease-out；层内渲染连续，无需拉帧。
+                        let since = open_since.lock().unwrap();
+                        if let Some(t0) = *since {
+                            let t = (t0.elapsed().as_secs_f32() / SLIDE_SECS).clamp(0.0, 1.0);
+                            let eased = 1.0 - (1.0 - t).powi(3);
+                            let y = target.y * eased + (-size.y) * (1.0 - eased);
+                            *rect_slot.lock().unwrap() = [target.x, y, size.x, size.y];
+                        }
+                        drop(since);
+
+                        let whale = WhaleMark::load(ui.ctx());
+                        let skin = Skin::new(theme, &whale);
+                        if paint(ui, &skin, subject, summary, *over_limit, date) {
+                            close_wanted.store(true, Ordering::Relaxed);
+                        }
+                    }),
+                };
+                layer.set_card(neo_overlay::card_id::CLASS, Some(card));
+            } else {
+                layer.set_card(neo_overlay::card_id::CLASS, None);
+                self.open_since.lock().unwrap().take();
+            }
+            self.open = open;
+            return;
+        }
+
+        // ---- 测试回退路径：独立视口（无渲染层时） ----
+        // 4b. 显隐沿：露面时提顶 + 记滑入起点；休眠缩 1x1 回 OFFSCREEN。
         if open != self.open {
             if open {
                 ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(target));
@@ -94,10 +155,7 @@ impl ClassWin {
             self.open = open;
         }
 
-        // 4. 每帧注册（防回收 + 内容增量）。
-        let snapshot: Option<(String, String, bool, String)> = monitor.presenting().map(|r| {
-            (r.subject.clone(), r.summary.clone(), r.over_limit, r.date.clone())
-        });
+        // 5. 每帧注册（防回收 + 内容增量）。
         let close_wanted = Arc::clone(&self.close_wanted);
         let open_since = Arc::clone(&self.open_since);
         ctx.show_viewport_deferred(
@@ -156,7 +214,8 @@ fn paint(
     let d = skin.d();
     let p = skin.p();
     let m = skin.m();
-    let rect = Rect::from_min_size(Pos2::ZERO, ui.available_size());
+    // 卡片矩形：旧视口里 = 视口内容区；渲染层里 = Area 钉住的卡矩形。
+    let rect = ui.max_rect();
 
     // 假阴影 + 卡片底（参数与迷你窗一致：偏移 2pt、26α 黑、圆角 18）。
     let shadow = rect.translate(egui::vec2(0.0, m.s(2.0)));

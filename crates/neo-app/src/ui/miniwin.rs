@@ -206,6 +206,9 @@ struct Snapshot {
     theme: Theme,
     /// 卡片尺寸（回调里的避让判定要用）。
     size: Vec2,
+    /// 主显示器尺寸（点）：渲染层里 `ctx` 的 monitor_size 不可靠
+    /// （那是整层窗口），避让端点判定由快照下发。
+    monitor: Vec2,
     interrupt_open: bool,
     title: String,
     steps: Vec<Step>,
@@ -220,7 +223,14 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn build(state: &AppState, theme: Theme, size: Vec2, interrupt_open: bool, busy_secs: u64) -> Self {
+    fn build(
+        state: &AppState,
+        theme: Theme,
+        size: Vec2,
+        monitor: Vec2,
+        interrupt_open: bool,
+        busy_secs: u64,
+    ) -> Self {
         let last_assistant = state
             .messages
             .iter()
@@ -293,6 +303,7 @@ impl Snapshot {
         Self {
             theme,
             size,
+            monitor,
             interrupt_open,
             title: format!("Neo 执行中 · {elapsed}"),
             steps,
@@ -310,7 +321,9 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, result: &Arc<AtomicU8>, fade: f32) 
     let d = Design::new(snap.theme);
     let p = d.p();
     let m = d.m();
-    let rect = ui.ctx().content_rect();
+    // 卡片矩形：旧视口里 = 视口内容区；渲染层里 = Area 钉住的卡矩形。
+    // max_rect 在两个世界都恰好是它（content_rect 在层里会是整层窗口）。
+    let rect = ui.max_rect();
     let painter = ui.painter().clone();
     let tint = |c: Color32| c.gamma_multiply(fade);
 
@@ -509,6 +522,10 @@ pub struct MiniWin {
     lmb_edge_consumed: u64,
     /// 本轮后台执行的起点（标题里的已用时长靠它）；闲下来清零。
     busy_since: Option<Instant>,
+    /// 渲染层卡片的共享矩形（主屏点）：tick 写静止位、层内绘制闭包写
+    /// 避让动画位；层的 Area 定位与命中测试每帧重读它。打断判定的
+    /// 「点在小窗自己身上」也读它（替代旧视口的 ctx.data 通道）。
+    layer_rect: Arc<Mutex<[f32; 4]>>,
 }
 
 impl MiniWin {
@@ -546,6 +563,7 @@ impl MiniWin {
         theme: Theme,
         hidden_to_tray: bool,
         classwin_rect: Option<Rect>,
+        overlay: Option<&neo_overlay::OverlayHandle>,
     ) {
         // 1. 截屏信号：时间戳一变就进入短暂隐藏；隐藏结束后播淡入。
         let shot_at = neo_tools::tools::screen::SCREENSHOT_AT.load(Ordering::Relaxed);
@@ -624,11 +642,15 @@ impl MiniWin {
             && !synthetic_click_recent()
         {
             let on_miniwin = cursor.is_some_and(|c| {
-                // 实时位置优先（避让动画途中窗体不在任何一个静止端点上）；
-                // 子视口回调还没写过时退回 home/away 两端点。
-                let live = ctx
-                    .data(|d| d.get_temp::<Pos2>(Id::new("neo-miniwin-pos")))
-                    .map(|pos| Rect::from_min_size(pos, size));
+                // 实时位置优先（避让动画途中窗体不在任何一个静止端点上）：
+                // 渲染层模式读共享矩形，旧视口模式读回调写进 ctx.data 的位置。
+                let live = if overlay.is_some() {
+                    let r = *self.layer_rect.lock().unwrap();
+                    Some(Rect::from_min_size(Pos2::new(r[0], r[1]), Vec2::new(r[2], r[3])))
+                } else {
+                    ctx.data(|d| d.get_temp::<Pos2>(Id::new("neo-miniwin-pos")))
+                        .map(|pos| Rect::from_min_size(pos, size))
+                };
                 live.is_some_and(|r| r.contains(c))
                     || Rect::from_min_size(home, size).contains(c)
                     || Rect::from_min_size(away, size).contains(c)
@@ -651,6 +673,108 @@ impl MiniWin {
         }
 
         // 6. 显隐与内容。
+        //
+        //    渲染层路径：每帧覆写卡片（与旧视口「每帧注册防回收」同构），
+        //    避让/淡入动画由卡片的绘制闭包在层里以 vsync 自驱 —— 主视口
+        //    托盘态 10fps 的节拍只负责内容快照，与旧架构的权责划分一致。
+        let snapshot = if open {
+            let busy_secs = self
+                .busy_since
+                .map(|t0| t0.elapsed().as_secs())
+                .unwrap_or(0);
+            Some(Snapshot::build(
+                state,
+                theme,
+                size,
+                monitor,
+                self.interrupt_open,
+                busy_secs,
+            ))
+        } else {
+            // 隐藏中不供内容：回调空转，Visible(false) 生效前的缝隙帧
+            // 不会画出一张空卡片。
+            None
+        };
+
+        if let Some(layer) = overlay {
+            if open {
+                if !self.shown {
+                    // 露面沿：先落静止位（下一帧起避让动画由闭包覆写）。
+                    *self.layer_rect.lock().unwrap() = [home.x, home.y, size.x, size.y];
+                }
+                let snap = snapshot.expect("open 必有快照");
+                let result = Arc::clone(&self.interrupt_result);
+                let refade = Arc::clone(&self.refade_since);
+                let rect_slot = Arc::clone(&self.layer_rect);
+                let card = neo_overlay::Card {
+                    rect: Arc::clone(&self.layer_rect),
+                    interactive: true,
+                    draw: Box::new(move |ui| {
+                        let ctx = ui.ctx().clone();
+                        // 淡入：起点由 tick 写进共享槽，插值在这里现算。
+                        let fade = {
+                            let mut slot = refade.lock().unwrap();
+                            match *slot {
+                                Some(t0) => {
+                                    let k = t0.elapsed().as_secs_f32() / REFADE_SECS;
+                                    if k >= 1.0 {
+                                        *slot = None;
+                                        1.0
+                                    } else {
+                                        ease_out_cubic(k)
+                                    }
+                                }
+                                None => 1.0,
+                            }
+                        };
+                        // 避让：只盯「静止位」判定（卡片移动本身不会让光标
+                        // 反复进出，否则会在两个角之间振荡）；弹窗打开时不躲。
+                        let m = snap.theme.metrics;
+                        let size = snap.size;
+                        let margin = m.s(16.0);
+                        let monitor = snap.monitor;
+                        let home =
+                            Pos2::new((monitor.x - size.x - margin).max(margin), margin);
+                        let away = Pos2::new(margin, margin);
+                        let ppp = ctx.pixels_per_point();
+                        let cursor = {
+                            // 采样顺带刷新槽位（层内 vsync 单点采样，tick 的
+                            // 沿检测靠它喂 —— 见 LMB_EDGE_MS 注释）。
+                            poll_global_input();
+                            CURSOR
+                                .lock()
+                                .ok()
+                                .and_then(|g| *g)
+                                .map(|(p, _)| Pos2::new(p.x / ppp, p.y / ppp))
+                        };
+                        let dodge = !snap.interrupt_open
+                            && cursor
+                                .is_some_and(|c| Rect::from_min_size(home, size).contains(c));
+                        let t = ctx.animate_value_with_time(
+                            Id::new("neo-miniwin-avoid"),
+                            if dodge { 1.0 } else { 0.0 },
+                            AVOID_SECS,
+                        );
+                        let pos = home + (away - home) * ease_out_cubic(t);
+                        // 写回共享矩形：层的 Area 定位 + 命中测试 + tick 的
+                        // 打断排除区下一帧都用它（一帧延迟无感）。
+                        *rect_slot.lock().unwrap() = [pos.x, pos.y, size.x, size.y];
+                        paint(ui, &snap, &result, fade);
+                    }),
+                };
+                layer.set_card(neo_overlay::card_id::MINI, Some(card));
+            } else {
+                layer.set_card(neo_overlay::card_id::MINI, None);
+            }
+            self.shown = open;
+            // 主视口侧的刷新请求只负责「内容快照」（流式文字 / 工具流水）。
+            if open {
+                ctx.request_repaint_after(POLL);
+            }
+            return;
+        }
+
+        // ---- 测试回退路径：独立视口（无渲染层时） ----
         //
         //    **每帧无条件注册视口**：egui 在真渲染 pass 结束时会回收本帧没被
         //    `show_viewport_deferred` 触碰的子视口（"never used this pass"）。
@@ -681,17 +805,6 @@ impl MiniWin {
             }
             self.shown = open;
         }
-        let snapshot = if open {
-            let busy_secs = self
-                .busy_since
-                .map(|t0| t0.elapsed().as_secs())
-                .unwrap_or(0);
-            Some(Snapshot::build(state, theme, size, self.interrupt_open, busy_secs))
-        } else {
-            // 隐藏中不供内容：回调空转，Visible(false) 生效前的缝隙帧
-            // 不会画出一张空卡片。
-            None
-        };
         let result = Arc::clone(&self.interrupt_result);
         let refade = Arc::clone(&self.refade_since);
         ctx.show_viewport_deferred(
@@ -806,7 +919,7 @@ pub struct ShotFlash {
 
 impl ShotFlash {
     /// 每帧驱动一次，挂在 `NeoApp::tick` 里（与迷你窗同路）。
-    pub fn tick(&mut self, ctx: &Context) {
+    pub fn tick(&mut self, ctx: &Context, overlay: Option<&neo_overlay::OverlayHandle>) {
         use neo_tools::tools::screen;
 
         // 1. 截屏信号：时间戳一变就锁定区域并排程闪光。
@@ -830,7 +943,7 @@ impl ShotFlash {
         }
         let on = self.flashing_since.is_some();
 
-        // 2. 视口几何：盖满整个虚拟屏（多屏时原点可为负）。
+        // 2. 几何：虚拟屏物理像素 → 点（多屏时原点可为负）。
         let ppp = ctx
             .input(|i| i.viewport().native_pixels_per_point)
             .unwrap_or(1.0);
@@ -841,7 +954,35 @@ impl ShotFlash {
         );
         let origin = Pos2::new(vs.x as f32 / ppp, vs.y as f32 / ppp);
 
-        // 3. 显隐沿：不切 `Visible`（恒 true）——全屏透明视口的「隐藏→可见」
+        // 3a. 渲染层：闪光是一张 passive 卡（只画不收点击），区域即卡矩形。
+        if let Some(layer) = overlay {
+            if on {
+                let region = self.region.unwrap_or(vs);
+                let rect = [
+                    region.x as f32 / ppp,
+                    region.y as f32 / ppp,
+                    region.width as f32 / ppp,
+                    region.height as f32 / ppp,
+                ];
+                let t0 = self.flashing_since.unwrap_or_else(Instant::now);
+                let card = neo_overlay::Card::passive(rect, move |ui| {
+                    let r = ui.max_rect();
+                    paint_flash(ui, Some((r, t0)));
+                });
+                layer.set_card(neo_overlay::card_id::FLASH, Some(card));
+            } else {
+                layer.set_card(neo_overlay::card_id::FLASH, None);
+            }
+            self.shown = on;
+            // 闪光与排程期间保持帧率（起燃时刻靠它）。
+            if on || self.flash_at.is_some() {
+                ctx.request_repaint_after(POLL);
+            }
+            return;
+        }
+
+        // ---- 测试回退路径：独立视口（无渲染层时） ----
+        // 3b. 显隐沿：不切 `Visible`（恒 true）——全屏透明视口的「隐藏→可见」
         //    首帧 surface 无内容，DWM 补一帧全屏黑，正是「截屏时屏幕闪黑」。
         //    起闪 = 恢复全屏尺寸 + 挪到虚拟屏原点；熄闪 = 缩 1x1 回 OFFSCREEN。
         if on != self.shown {

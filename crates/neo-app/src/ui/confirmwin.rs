@@ -1,12 +1,11 @@
-//! 工具确认窗：模型请求权限时**独立弹出**的窗口，不绑定主窗。
+//! 工具确认卡：模型请求权限时弹出，**画在统一渲染层里**（不再是独立窗口）。
 //!
 //! 后台静默执行时主窗藏在托盘 —— 确认请求若画在主窗里，用户根本看不见，
-//! 授权就等于必须先把主窗叫出来。独立弹出后这套依赖没了：主窗开着也好、
-//! 藏着也好，确认窗都直接出现在屏幕中央。
+//! 授权就等于必须先把主窗叫出来。画进常驻渲染层后：主窗开着也好、藏着也好，
+//! 确认卡都直接出现在屏幕中央，且**没有新建窗口**（闪黑在结构上不存在）。
 //!
-//! 机制与迷你窗一致（见 miniwin.rs 的 `OFFSCREEN` 注释）：每帧注册防回收，
-//! 恒可见、休眠时缩 1x1 挪屏幕外（透明视口切 `Visible` 的首帧会闪黑），
-//! 显隐走尺寸/位置命令。
+//! 离屏测试没有渲染层（`overlay == None`）：退回旧的 egui 视口路径，
+//! 让快照测试照常覆盖确认 UI 的观感。
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -19,6 +18,9 @@ use crate::state::AppState;
 use crate::ui::{Skin, tools};
 
 use super::miniwin::OFFSCREEN;
+
+/// 渲染层里的卡片 id（分配表在 neo_overlay::card_id）。
+const CARD_ID: u8 = neo_overlay::card_id::CONFIRM;
 
 fn viewport_id() -> ViewportId {
     ViewportId::from_hash_of("neo-confirmwin")
@@ -35,7 +37,13 @@ pub struct ConfirmWin {
 
 impl ConfirmWin {
     /// 每帧驱动一次，挂在 `NeoApp::tick` 里（与迷你窗同路，logic-only 也经过）。
-    pub fn tick(&mut self, ctx: &Context, state: &mut AppState, theme: Theme) {
+    pub fn tick(
+        &mut self,
+        ctx: &Context,
+        state: &mut AppState,
+        theme: Theme,
+        overlay: Option<&neo_overlay::OverlayHandle>,
+    ) {
         let pending = state.awaiting_tool();
         let open = pending.is_some();
 
@@ -70,8 +78,42 @@ impl ConfirmWin {
             ((monitor.y - size.y) * 0.42).max(m.s(16.0)),
         );
 
-        // 3. 显隐沿：先落位再恢复尺寸；休眠缩 1x1 回 OFFSCREEN。
-        //    确认是要用户马上看见的东西，露面时重新提顶。
+        // 3. 内容快照与答案句柄（两条路径共用）。
+        let snapshot = pending.and_then(|i| state.messages[i].tool.clone());
+        let remaining = state.awaiting_tool_count();
+        let answer = Arc::clone(&self.answer);
+        let draw = move |ui: &mut egui::Ui| {
+            // 渲染层的 egui 上下文不管主题：卡片每次露面都同步一次（幂等、便宜）。
+            theme.apply(ui.ctx());
+            let Some(meta) = &snapshot else { return };
+            let whale = WhaleMark::load(ui.ctx());
+            let skin = Skin::new(theme, &whale);
+            match tools::confirm(ui, &skin, meta, remaining) {
+                Some(tools::Answer::Once) => answer.store(1, Ordering::Relaxed),
+                Some(tools::Answer::Always) => answer.store(2, Ordering::Relaxed),
+                Some(tools::Answer::Deny) => answer.store(3, Ordering::Relaxed),
+                None => {}
+            }
+        };
+
+        // 4. 渲染层优先；没有层（离屏测试 / 初始化失败）退回独立视口。
+        //    draw 只读捕获（theme Copy / 其余都是共享句柄），天然 Fn，
+        //    两条路径都直接用。
+        if let Some(layer) = overlay {
+            let card = if open {
+                Some(neo_overlay::Card::interactive(
+                    [center.x, center.y, size.x, size.y],
+                    draw,
+                ))
+            } else {
+                None
+            };
+            layer.set_card(CARD_ID, card);
+            self.open = open;
+            return;
+        }
+
+        // ---- 测试回退路径：独立视口（每帧注册防回收，休眠缩 1x1 挪屏外） ----
         if open != self.open {
             if open {
                 ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(center));
@@ -90,10 +132,6 @@ impl ConfirmWin {
             self.open = open;
         }
 
-        // 4. 每帧注册（防回收 + 内容增量；主视口托盘态 10fps，够刷确认文案）。
-        let snapshot = pending.and_then(|i| state.messages[i].tool.clone());
-        let remaining = state.awaiting_tool_count();
-        let answer = Arc::clone(&self.answer);
         ctx.show_viewport_deferred(
             viewport_id(),
             ViewportBuilder::default()
@@ -108,17 +146,7 @@ impl ConfirmWin {
                 .with_visible(true)
                 .with_inner_size(if open { size } else { Vec2::new(1.0, 1.0) })
                 .with_position(if open { center } else { OFFSCREEN }),
-            move |ui, _class| {
-                let Some(meta) = &snapshot else { return };
-                let whale = WhaleMark::load(ui.ctx());
-                let skin = Skin::new(theme, &whale);
-                match tools::confirm(ui, &skin, meta, remaining) {
-                    Some(tools::Answer::Once) => answer.store(1, Ordering::Relaxed),
-                    Some(tools::Answer::Always) => answer.store(2, Ordering::Relaxed),
-                    Some(tools::Answer::Deny) => answer.store(3, Ordering::Relaxed),
-                    None => {}
-                }
-            },
+            move |ui, _class| draw(ui),
         );
     }
 }

@@ -952,22 +952,27 @@ impl NeoApp {
         } else {
             None
         };
+        // 迷你窗 / 确认卡 / 课堂总结窗：有渲染层就画进层（无新建窗口、
+        // 无闪黑）；离屏测试没有层，各窗口内部退回独立视口路径。
+        let overlay = self.overlay.as_ref();
         self.miniwin.tick(
             &ctx,
             &mut self.state,
             self.theme,
             self.hidden_to_tray,
             classwin_rect,
+            overlay,
         );
         // 截屏闪光：抓帧完成后在被抓区域边缘闪一道白框。
-        self.shotflash.tick(&ctx);
-        // 工具确认窗：模型请求权限时独立弹出（不绑主窗，后台也能授权）。
-        self.confirmwin.tick(&ctx, &mut self.state, self.theme);
+        self.shotflash.tick(&ctx, overlay);
+        // 工具确认卡：画进统一渲染层（没有新建窗口，闪黑在结构上不存在）；
+        // 离屏测试没有渲染层，confirmwin 内部退回独立视口路径。
+        self.confirmwin.tick(&ctx, &mut self.state, self.theme, overlay);
         // 课堂总结：最大化监听 / 转写 / 打磨状态机（默认关，设置里开）。
         self.class
             .tick(&ctx, &self.state, self.state.class_enabled);
         // 课堂总结弹窗：打磨就绪后从屏幕上方滑入。
-        self.classwin.tick(&ctx, &mut self.class, self.theme);
+        self.classwin.tick(&ctx, &mut self.class, self.theme, overlay);
         // 状态行同步给设置页（开关下方的「记录中…」提示）。
         self.state.class_status = self.class.status().map(|s| s.to_owned());
         // 记忆热重载：remember/forget 工具在工具线程写盘，这里 2s 一拍沿检。

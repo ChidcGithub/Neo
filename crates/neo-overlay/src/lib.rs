@@ -1,19 +1,26 @@
-//! neo-overlay：全屏流光跑马灯覆盖层（对标 Apple Intelligence 满血特效）。
+//! neo-overlay：统一渲染层 —— 全屏流光跑马灯 + 所有辅助卡片窗口。
 //!
-//! 架构：独立窗口线程 + 专属 wgpu/Dx12 渲染，与 egui 主界面完全解耦。
+//! 架构：独立窗口线程 + 专属 wgpu/Dx12 渲染 + 内嵌独立 egui 上下文，
+//! 与 egui 主界面（eframe 占着进程级 winit EventLoop 单例）完全解耦。
 //!
-//! **为什么不用 winit**：winit 的 `EventLoop` 是进程级单例
-//! （`static EVENT_LOOP_CREATED: AtomicBool`），eframe 主界面已经占掉，
-//! 覆盖层只能用裸 Win32 自建窗口与消息循环。
+//! **一个窗口画所有东西**：迷你窗、确认窗、课堂总结窗不再各自创建原生
+//! 窗口（新建窗口在首个 wgpu 帧落地前会闪黑 1~3 帧），而是作为「卡片」
+//! 画进这个常驻层 —— 没有新建窗口就没有闪黑，且与波纹同一条渲染管线。
 //!
 //! 关键点：
 //! - DX12 透明交换链必须用 `Dx12SwapchainKind::DxgiFromVisual`（默认 DxgiFromHwnd 只有 Opaque alpha）
 //! - `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` 让抓屏拍不到自己，从而能持续抓桌面做实时折射
-//! - `WS_EX_TRANSPARENT` 全屏窗口鼠标穿透，`WS_EX_NOACTIVATE` + `SW_SHOWNA` 显示不抢焦点
+//! - 输入路由：无卡时 `WS_EX_TRANSPARENT` 整窗穿透；有卡时清掉它、
+//!   靠 `WM_NCHITTEST` 命中卡矩形外返回 `HTTRANSPARENT` —— 卡片收点击、
+//!   桌面其余区域照常穿透（Rainmeter 式做法）
+//! - `WS_EX_NOACTIVATE` + `SW_SHOWNA` 永不抢焦点；卡片全是纯鼠标交互，无需键盘
+//! - 窗口每次露面（含卡片首次出现）都先离屏渲好一帧再 `SW_SHOWNA` ——
+//!   用户看到的第一个画面就是成品，没有黑帧
 //! - 抓屏线程 ~30fps 把桌面帧喂给渲染线程，shader 做边缘折射采样
 //! - 控制命令走 mpsc + `PostThreadMessageW` 唤醒（消息循环在隐藏时整块睡眠）
 //! - 视觉为 VCC edgeglow v2 移植：0.6x 离屏渲染光环 + 线性放大 blit 上屏（低频内容几乎无损，省 ~65% GPU）
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -26,12 +33,17 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PeekMessageW,
-    PostThreadMessageW, RegisterClassExW, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_QUIT,
-    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    GetWindowLongPtrW, LoadCursorW, PeekMessageW, PostThreadMessageW, RegisterClassExW,
+    SetCursor, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GWLP_USERDATA, HCURSOR,
+    HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE,
+    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WDA_EXCLUDEFROMCAPTURE, WM_APP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 /// 相位目标表（VCC TARGETS 照搬）：(强度, 速度, 环流)。
@@ -53,6 +65,59 @@ enum Cmd {
 /// 抓屏帧槽：抓屏线程放最新一帧，渲染线程每帧取走。
 type FrameSlot = Arc<Mutex<Option<Shot>>>;
 
+/// 一张画进渲染层的卡片（替代过去的独立原生子窗口）。
+///
+/// - `rect`：主显示器坐标系的 egui 点（主屏原点 = 虚拟屏原点 (0,0)，
+///   层内会换算成窗口客户区像素）。**共享槽**：层的 Area 定位与命中测试
+///   每帧都重读它 —— 应用线程（10fps 内容节拍）与绘制闭包（层内 vsync
+///   自驱动画，如迷你窗的避让滑动）都可以随时改写；
+/// - `interactive`：false 的卡（截屏闪光）只画不收点击，也不进命中矩形；
+/// - `draw`：每帧在**窗口线程**的 egui Ui 里执行（Ui 已钉在卡片矩形内，
+///   按「填满整个矩形」画即可，与旧视口回调的体感一致）。只准画，不准
+///   阻塞；需要的数据捕获进闭包（沿用旧视口的 `Arc<AtomicU8>` 回答案
+///   的模式）。**闭包内不得调用 `set_card`（卡片锁正被持着，会死锁）**。
+pub struct Card {
+    pub rect: Arc<Mutex<[f32; 4]>>,
+    pub interactive: bool,
+    pub draw: Box<dyn FnMut(&mut egui::Ui) + Send>,
+}
+
+impl Card {
+    /// 交互卡的便捷构造。
+    pub fn interactive(rect: [f32; 4], draw: impl FnMut(&mut egui::Ui) + Send + 'static) -> Self {
+        Self {
+            rect: Arc::new(Mutex::new(rect)),
+            interactive: true,
+            draw: Box::new(draw),
+        }
+    }
+
+    /// 只画不收点击的卡（截屏闪光这类纯视觉反馈）。
+    pub fn passive(rect: [f32; 4], draw: impl FnMut(&mut egui::Ui) + Send + 'static) -> Self {
+        Self {
+            rect: Arc::new(Mutex::new(rect)),
+            interactive: false,
+            draw: Box::new(draw),
+        }
+    }
+}
+
+/// 卡片槽：应用线程每帧按需覆写，渲染线程每帧读最新。
+/// BTreeMap 让同 id 覆盖天然幂等、遍历顺序稳定。
+type CardSlot = Arc<Mutex<BTreeMap<u8, Card>>>;
+
+/// 卡片 id 分配表（neo-app 各窗口引用这里的常量，不自己造数）。
+pub mod card_id {
+    /// 工具确认卡（confirmwin）。
+    pub const CONFIRM: u8 = 1;
+    /// 迷你窗（miniwin）。
+    pub const MINI: u8 = 2;
+    /// 课堂总结弹窗（classwin）。
+    pub const CLASS: u8 = 3;
+    /// 截屏闪光（shotflash，passive）。
+    pub const FLASH: u8 = 4;
+}
+
 /// 跑马灯控制柄，跨线程安全。Drop 时自动关停窗口线程。
 pub struct OverlayHandle {
     tx: Sender<Cmd>,
@@ -61,6 +126,7 @@ pub struct OverlayHandle {
     level: Arc<AtomicU32>,
     visible: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    cards: CardSlot,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -82,6 +148,26 @@ impl OverlayHandle {
 
     pub fn is_visible(&self) -> bool {
         self.visible.load(Ordering::Relaxed)
+    }
+
+    /// 注册/更新/撤下一张卡片（`None` = 撤下）。窗口线程被唤醒后
+    /// 下一帧生效：卡片出现会露面窗口、打开输入路由；最后一张撤下且
+    /// 波纹已停时窗口回到隐藏睡眠。
+    pub fn set_card(&self, id: u8, card: Option<Card>) {
+        if let Ok(mut cards) = self.cards.lock() {
+            match card {
+                Some(c) => {
+                    cards.insert(id, c);
+                }
+                None => {
+                    cards.remove(&id);
+                }
+            }
+        }
+        // 唤醒隐藏中的消息循环（队列为空时 WM_NEO_CMD 也无妨：兜底排空而已）。
+        unsafe {
+            PostThreadMessageW(self.tid, WM_NEO_CMD, 0, 0);
+        }
     }
 
     /// 关停窗口线程并等待退出。
@@ -109,14 +195,15 @@ impl Drop for OverlayHandle {
     }
 }
 
-/// 启动跑马灯引擎（窗口初始隐藏，等 `show()`）。
+/// 启动渲染层引擎（窗口初始隐藏，等 `show()` / 首张卡片）。
 ///
 /// 窗口与 wgpu 初始化在窗口线程里同步完成，失败（无 DX12 / 建窗失败）
-/// 通过 `Err` 上报，调用方降级为无跑马灯即可。
+/// 通过 `Err` 上报，调用方降级为无跑马灯/无层即可。
 pub fn start() -> Result<OverlayHandle, String> {
     let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
     let visible = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
+    let cards: CardSlot = Arc::new(Mutex::new(BTreeMap::new()));
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
     // 窗口线程初始化完成后回传线程 id（命令唤醒要靠它）。
     let (ready_tx, ready_rx) = channel::<Result<u32, String>>();
@@ -124,9 +211,10 @@ pub fn start() -> Result<OverlayHandle, String> {
         let level = level.clone();
         let visible = visible.clone();
         let stop = stop.clone();
+        let cards = cards.clone();
         std::thread::Builder::new()
             .name("neo-overlay".into())
-            .spawn(move || run(ready_tx, cmd_rx, level, visible, stop))
+            .spawn(move || run(ready_tx, cmd_rx, level, visible, stop, cards))
             .map_err(|e| format!("创建 neo-overlay 线程失败: {e}"))?
     };
     let tid = ready_rx
@@ -138,6 +226,7 @@ pub fn start() -> Result<OverlayHandle, String> {
         level,
         visible,
         stop,
+        cards,
         thread: Some(thread),
     })
 }
@@ -149,6 +238,7 @@ fn run(
     level: Arc<AtomicU32>,
     visible: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    cards: CardSlot,
 ) {
     // 无论正常退出还是 panic 展开（wgpu 的校验错误默认就是 panic），都要放
     // stop —— 否则抓屏线程跑到进程退出：迷你窗被永久压制、冻结的跑马灯残留
@@ -161,11 +251,13 @@ fn run(
     }
     let _stop_guard = StopGuard(stop.clone());
 
-    // 抓屏线程：可见时 ~30fps 抓虚拟桌面，供 shader 折射采样。
+    // 波纹是否在跑（决定抓屏线程是否工作；卡片单独露面时不抓屏）。
+    let ripple_on = Arc::new(AtomicBool::new(false));
+    // 抓屏线程：波纹可见时 ~30fps 抓虚拟桌面，供 shader 折射采样。
     let slot: FrameSlot = Arc::new(Mutex::new(None));
     {
         let slot = slot.clone();
-        let visible = visible.clone();
+        let ripple_on = ripple_on.clone();
         let stop = stop.clone();
         // spawn 失败（系统线程资源枯竭等）不必带崩窗口：slot 永远为空 →
         // desktop 保持 1x1 占位纹理 → render() 里 refr 自动为 0，
@@ -175,7 +267,7 @@ fn run(
             .spawn(move || {
                 screen::ensure_dpi_aware();
                 while !stop.load(Ordering::Relaxed) {
-                    if !visible.load(Ordering::Relaxed) {
+                    if !ripple_on.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(80));
                         continue;
                     }
@@ -196,13 +288,13 @@ fn run(
     }
 
     let tid = unsafe { GetCurrentThreadId() };
-    match Gfx::new(slot) {
+    match Gfx::new(slot, cards) {
         Ok(gfx) => {
             if ready.send(Ok(tid)).is_err() {
                 stop.store(true, Ordering::Relaxed);
                 return;
             }
-            msg_loop(gfx, cmd_rx, level, visible, stop);
+            msg_loop(gfx, cmd_rx, level, visible, ripple_on, stop);
         }
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -211,51 +303,38 @@ fn run(
     }
 }
 
-/// 消息循环：可见时连续渲染（交换链 vsync 限速），隐藏时整块睡眠等命令。
+/// 消息循环：活跃（波纹或任一卡片在）时连续渲染（交换链 vsync 限速），
+/// 全无时整块睡眠等命令。
 fn msg_loop(
     mut gfx: Gfx,
     cmd_rx: Receiver<Cmd>,
     level: Arc<AtomicU32>,
     visible: Arc<AtomicBool>,
+    ripple_on: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let hwnd = gfx.hwnd;
-    let mut active = false;
-    // 淡出中：渲染循环继续，等强度归零再真正隐藏窗口。
-    let mut hiding = false;
+    let mut ripple_showing = false; // 波纹相位目标是否亮着
+    let mut fading = false; // 波纹淡出中
+    let mut shown = false; // 窗口当前是否可见
     let mut shutdown = false;
     while !shutdown {
         // 先排空命令队列（PostThreadMessage 只负责唤醒，命令本体在 channel 里）
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::Show => {
-                    hiding = false;
-                    active = true;
-                    visible.store(true, Ordering::Relaxed);
+                    fading = false;
+                    ripple_showing = true;
+                    ripple_on.store(true, Ordering::Relaxed);
                     gfx.tgt = PH_LISTEN;
-                    // SW_SHOWNA：显示但不激活，焦点不能被抢（用户可能正在打字）。
-                    // SetWindowPos 重新提顶：创建时虽带 WS_EX_TOPMOST，但后到的
-                    // topmost 窗口（如小窗）会把它压下去，每次露面都要抢回最前。
-                    unsafe {
-                        ShowWindow(hwnd, SW_SHOWNA);
-                        SetWindowPos(
-                            hwnd,
-                            HWND_TOPMOST,
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                        );
-                    }
                 }
                 Cmd::Hide => {
-                    if active {
-                        // 目标相位归零，淡出完成后在渲染循环里真正隐藏
-                        hiding = true;
+                    if ripple_showing {
+                        // 目标相位归零，淡出完成后在渲染循环里真正收尾
+                        fading = true;
                         gfx.tgt = PH_IDLE;
                     } else {
-                        visible.store(false, Ordering::Relaxed);
+                        ripple_on.store(false, Ordering::Relaxed);
                     }
                 }
                 Cmd::Shutdown => shutdown = true,
@@ -264,8 +343,13 @@ fn msg_loop(
         if shutdown {
             break;
         }
-        if active {
-            // 非阻塞泵消息：线程消息不需要分发，系统消息（如 WM_QUIT）要处理
+
+        let have_cards = gfx.has_cards();
+        // 输入路由随卡片有无切换（改 WS_EX_TRANSPARENT 必须 FRAMECHANGED 才生效）。
+        gfx.set_hit_testable(hwnd, have_cards);
+
+        if ripple_showing || have_cards {
+            // 非阻塞泵消息：线程消息不需要分发，系统消息（含鼠标输入）要处理
             let mut msg = MSG::default();
             unsafe {
                 while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
@@ -278,13 +362,30 @@ fn msg_loop(
                 }
             }
             gfx.render(&level);
-            // 淡出完成：真正隐藏窗口并停渲染
-            if hiding && gfx.cur_i < 0.02 {
-                hiding = false;
-                active = false;
-                visible.store(false, Ordering::Relaxed);
-                // 桌面纹理一并重置：下次 show 的折射只对重新抓到的画面开，
-                // 不拿隐藏前的陈旧桌面冒充「实时」。
+            // 露面时机：先离屏渲好一帧再 SW_SHOWNA —— 用户看到的第一个
+            // 画面就是成品，新建窗口的黑帧在这套结构里不存在。
+            if !shown {
+                shown = true;
+                visible.store(true, Ordering::Relaxed);
+                unsafe {
+                    ShowWindow(hwnd, SW_SHOWNA);
+                    // 每次露面都抢回最前：后到的 topmost 窗口会把它压下去。
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            // 波纹淡出完成且没有卡片：真正隐藏窗口、停渲染、放掉陈旧桌面纹理
+            if fading && gfx.cur_i < 0.02 && !have_cards {
+                fading = false;
+                ripple_showing = false;
+                ripple_on.store(false, Ordering::Relaxed);
                 gfx.desktop = Gfx::placeholder_desktop(
                     &gfx.device,
                     &gfx.queue,
@@ -295,8 +396,18 @@ fn msg_loop(
                 unsafe {
                     ShowWindow(hwnd, SW_HIDE);
                 }
+                shown = false;
+                visible.store(false, Ordering::Relaxed);
             }
         } else {
+            if shown {
+                // 防御：正常路径在淡出分支里已隐藏；命令乱序时这里兜底。
+                unsafe {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+                shown = false;
+                visible.store(false, Ordering::Relaxed);
+            }
             // 隐藏期整块睡眠，WM_NEO_CMD 到达即醒
             let mut msg = MSG::default();
             let r = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
@@ -312,17 +423,129 @@ fn msg_loop(
     }
     stop.store(true, Ordering::Relaxed);
     unsafe {
+        // 取回 userdata 里的 Arc 所有权，随窗口一起释放。
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WndState;
+        if !ptr.is_null() {
+            drop(Arc::from_raw(ptr));
+        }
         DestroyWindow(hwnd);
     }
 }
 
-/// 窗口过程：覆盖层不响应任何交互（鼠标穿透），全部走默认处理。
+/// 窗口线程与窗口过程共享的状态（命中矩形 + 输入事件队列）。
+struct WndState {
+    /// 窗口左上角的虚拟屏坐标（可为负；本层窗口不移动不缩放）。
+    origin: (i32, i32),
+    /// 像素/点（f32 位模式）。物理像素 ↔ egui 点的换算系数。
+    ppp: AtomicU32,
+    /// 命中矩形（客户区物理像素 x,y,w,h）。
+    hit_rects: Mutex<Vec<[i32; 4]>>,
+    /// 排队给 egui 的输入事件。
+    events: Mutex<Vec<egui::Event>>,
+    /// 最近的指针位置（egui 需要持续 hover 态；wheel 事件也要带位置）。
+    pointer: Mutex<egui::Pos2>,
+    /// 指针上一帧是否在任一卡片内（离开沿补 PointerGone，否则 hover 卡住）。
+    inside: AtomicBool,
+}
+
+/// 客户区坐标拆包（WM_MOUSE* 的 lparam 是符号 16 位对）。
+fn unpack_client(lparam: LPARAM) -> (i32, i32) {
+    let v = lparam as usize;
+    (
+        (v & 0xFFFF) as u16 as i16 as i32,
+        ((v >> 16) & 0xFFFF) as u16 as i16 as i32,
+    )
+}
+
+/// 窗口过程：命中路由（卡矩形外 HTTRANSPARENT 穿透）+ 输入事件入队。
 unsafe extern "system" fn overlay_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WndState;
+    // SAFETY: userdata 在 CreateWindowExW 成功后立即设置、DestroyWindow 时才回收。
+    let state = unsafe { ptr.as_ref() };
+    let Some(st) = state else {
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    };
+    let ppp = f32::from_bits(st.ppp.load(Ordering::Relaxed));
+    match msg {
+        WM_NCHITTEST => {
+            // 屏幕坐标（符号 16 位对）→ 客户区
+            let (sx, sy) = unpack_client(lparam);
+            let (cx, cy) = (sx - st.origin.0, sy - st.origin.1);
+            let hit = st
+                .hit_rects
+                .lock()
+                .map(|rects| {
+                    rects
+                        .iter()
+                        .any(|[x, y, w, h]| cx >= *x && cx < x + w && cy >= *y && cy < y + h)
+                })
+                .unwrap_or(false);
+            // 离开沿：通知 egui 指针消失，卡片上的 hover 高亮才不会卡死。
+            if st.inside.swap(hit, Ordering::Relaxed) && !hit {
+                if let Ok(mut evs) = st.events.lock() {
+                    evs.push(egui::Event::PointerGone);
+                }
+            }
+            return if hit {
+                HTCLIENT as LRESULT
+            } else {
+                HTTRANSPARENT as LRESULT
+            };
+        }
+        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP => {
+            let (x, y) = unpack_client(lparam);
+            let pos = egui::pos2(x as f32 / ppp, y as f32 / ppp);
+            if let Ok(mut p) = st.pointer.lock() {
+                *p = pos;
+            }
+            let ev = match msg {
+                WM_MOUSEMOVE => egui::Event::PointerMoved(pos),
+                _ => egui::Event::PointerButton {
+                    pos,
+                    button: match msg {
+                        WM_LBUTTONDOWN | WM_LBUTTONUP => egui::PointerButton::Primary,
+                        _ => egui::PointerButton::Secondary,
+                    },
+                    pressed: matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN),
+                    modifiers: egui::Modifiers::default(),
+                },
+            };
+            if let Ok(mut evs) = st.events.lock() {
+                evs.push(ev);
+            }
+            return 0;
+        }
+        WM_MOUSEWHEEL => {
+            // 高位是有符号的 120 分度增量；本层只有纵向滚动（课堂总结）。
+            let delta = ((wparam >> 16) as u16 as i16) as f32 / 120.0;
+            if let Ok(mut evs) = st.events.lock() {
+                evs.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, delta),
+                    modifiers: egui::Modifiers::default(),
+                    phase: egui::TouchPhase::Move,
+                });
+            }
+            return 0;
+        }
+        WM_SETCURSOR => {
+            // 只有命中区内才轮到我们设光标（区外 HTTRANSPARENT 早穿透了）；
+            // 类没注册 hCursor，不设就是「无光标」闪烁。
+            if (lparam & 0xFFFF) as i32 == HTCLIENT as i32 {
+                unsafe {
+                    let arrow: HCURSOR = LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
+                    SetCursor(arrow);
+                }
+                return 1;
+            }
+        }
+        _ => {}
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
@@ -398,6 +621,18 @@ struct Gfx {
     t_acc: f32,
     last: Instant,
     smooth_level: f32,
+    // ---- 统一渲染层（卡片） ----
+    /// 卡片槽（应用线程写、本线程读）。
+    cards: CardSlot,
+    /// 内嵌 egui 上下文（独立字体装配，与主界面互不干扰）。
+    egui_ctx: egui::Context,
+    egui_renderer: egui_wgpu::Renderer,
+    /// egui 时钟起点（RawInput.time）。
+    egui_start: Instant,
+    /// 窗口过程共享状态（命中矩形 / 输入队列 / ppp / 原点）。
+    wnd: Arc<WndState>,
+    /// 当前是否收鼠标（WS_EX_TRANSPARENT 是否已清掉）。
+    hit_testable: bool,
 }
 
 impl Gfx {
@@ -473,7 +708,7 @@ impl Gfx {
         (pipeline, bind_layout)
     }
 
-    fn new(slot: FrameSlot) -> Result<Self, String> {
+    fn new(slot: FrameSlot, cards: CardSlot) -> Result<Self, String> {
         screen::ensure_dpi_aware();
         let rect = screen::virtual_screen();
         let width = rect.width.max(1) as u32;
@@ -520,12 +755,33 @@ impl Gfx {
         if hwnd.is_null() {
             return Err("CreateWindowExW 失败".into());
         }
+        // 窗口过程共享状态：origin = 窗口在虚拟屏的左上角（可为负），
+        // ppp 取系统主屏 DPI（v1：卡片都锚在主屏；副屏异 DPI 备案）。
+        let wnd = Arc::new(WndState {
+            origin: (rect.x, rect.y),
+            ppp: AtomicU32::new(((unsafe { GetDpiForSystem() } as f32) / 96.0).to_bits()),
+            hit_rects: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
+            pointer: Mutex::new(egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY)),
+            inside: AtomicBool::new(false),
+        });
+        unsafe {
+            // 所有权随窗口生命周期；msg_loop 在 DestroyWindow 前 from_raw 回收。
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::into_raw(wnd.clone()) as _);
+        }
         // 之后的初始化（surface/adapter/device…）任一步失败都要拆掉窗口，
         // 否则一个隐藏的全屏 topmost 句柄泄漏到进程退出。
+        // （userdata 里的 Arc 一并回收。）
         struct HwndGuard(HWND);
         impl Drop for HwndGuard {
             fn drop(&mut self) {
-                unsafe { DestroyWindow(self.0) };
+                unsafe {
+                    let ptr = GetWindowLongPtrW(self.0, GWLP_USERDATA) as *const WndState;
+                    if !ptr.is_null() {
+                        drop(Arc::from_raw(ptr));
+                    }
+                    DestroyWindow(self.0);
+                }
             }
         }
         let hwnd_guard = HwndGuard(hwnd);
@@ -696,6 +952,15 @@ impl Gfx {
             ((config.height as f32) * RENDER_SCALE).max(1.0) as u32,
         );
 
+        // 内嵌 egui：独立上下文 + 中文字体装配（卡片 UI 用它绘制）。
+        let egui_ctx = egui::Context::default();
+        neo_theme::fonts::install(&egui_ctx);
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            egui_wgpu::RendererOptions::default(),
+        );
+
         // 初始化全部完成：句柄的所有权移给返回的 Gfx，守卫解除。
         std::mem::forget(hwnd_guard);
         Ok(Self {
@@ -720,6 +985,12 @@ impl Gfx {
             t_acc: 0.0,
             last: Instant::now(),
             smooth_level: 0.0,
+            cards,
+            egui_ctx,
+            egui_renderer,
+            egui_start: Instant::now(),
+            wnd,
+            hit_testable: false,
         })
     }
 
@@ -793,6 +1064,138 @@ impl Gfx {
                 },
             ],
         })
+    }
+
+    /// 任一卡片在册？
+    fn has_cards(&self) -> bool {
+        self.cards.lock().map(|c| !c.is_empty()).unwrap_or(false)
+    }
+
+    /// 输入路由切换：有卡片时清掉 WS_EX_TRANSPARENT（改样式必须
+    /// SWP_FRAMECHANGED 才生效），靠 WM_NCHITTEST 穿透卡片外区域；
+    /// 无卡片时恢复整窗穿透（连 NCHITTEST 都不来，零开销）。
+    fn set_hit_testable(&mut self, hwnd: HWND, on: bool) {
+        if self.hit_testable == on {
+            return;
+        }
+        self.hit_testable = on;
+        unsafe {
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let ex = if on {
+                ex & !(WS_EX_TRANSPARENT as isize)
+            } else {
+                ex | (WS_EX_TRANSPARENT as isize)
+            };
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+        if !on {
+            // 回穿透模式：告知 egui 指针已走，hover 不残留。
+            if let Ok(mut evs) = self.wnd.events.lock() {
+                evs.push(egui::Event::PointerGone);
+            }
+        }
+    }
+
+    /// 跑一帧卡片 UI：排水输入事件 → egui 步进 → 命中矩形刷新。
+    /// 返回 tessellation 结果与纹理增量（None = 没有卡片）。
+    fn egui_frame(
+        &mut self,
+    ) -> Option<(
+        Vec<egui::ClippedPrimitive>,
+        egui::TexturesDelta,
+        egui_wgpu::ScreenDescriptor,
+    )> {
+        let ppp = f32::from_bits(self.wnd.ppp.load(Ordering::Relaxed));
+        let (vx, vy) = self.wnd.origin;
+        let (ox, oy) = (vx as f32 / ppp, vy as f32 / ppp);
+
+        let events = self
+            .wnd
+            .events
+            .lock()
+            .map(|mut e| std::mem::take(&mut *e))
+            .unwrap_or_default();
+        let screen_pts = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(
+                self.config.width as f32 / ppp,
+                self.config.height as f32 / ppp,
+            ),
+        );
+        let input = egui::RawInput {
+            screen_rect: Some(screen_pts),
+            time: Some(self.egui_start.elapsed().as_secs_f64()),
+            events,
+            // 本层永不抢键盘焦点（WS_EX_NOACTIVATE），但有焦点标记的控件
+            // （如按钮 hover/按下）需要它才正常响应指针事件。
+            focused: true,
+            ..Default::default()
+        };
+
+        let mut cards = self.cards.lock().ok()?;
+        if cards.is_empty() {
+            if let Ok(mut rects) = self.wnd.hit_rects.lock() {
+                rects.clear();
+            }
+            return None;
+        }
+
+        // 主屏点 → 层内点：减窗口原点（虚拟屏原点可为负）。
+        // 注意：draw 闭包内不得调用 set_card（锁重入会死锁）。
+        // egui 0.36 独立用法：begin_pass/end_pass（Context::run 只留给 runner）。
+        self.egui_ctx.set_pixels_per_point(ppp);
+        self.egui_ctx.begin_pass(input);
+        {
+            let ctx = &self.egui_ctx;
+            for (id, card) in cards.iter_mut() {
+                let [x, y, w, h] = *card.rect.lock().unwrap_or_else(|p| p.into_inner());
+                let pos = egui::pos2(x - ox, y - oy);
+                egui::Area::new(egui::Id::new(("neo-layer-card", *id)))
+                    .fixed_pos(pos)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        ui.set_width(w);
+                        ui.set_height(h);
+                        (card.draw)(ui);
+                    });
+            }
+        }
+        let full = self.egui_ctx.end_pass();
+
+        // 命中矩形（客户区物理像素）：层内点 × ppp；只收交互卡。
+        if let Ok(mut rects) = self.wnd.hit_rects.lock() {
+            *rects = cards
+                .values()
+                .filter(|c| c.interactive)
+                .map(|c| {
+                    let r = *c.rect.lock().unwrap_or_else(|p| p.into_inner());
+                    [
+                        ((r[0] - ox) * ppp) as i32,
+                        ((r[1] - oy) * ppp) as i32,
+                        (r[2] * ppp) as i32,
+                        (r[3] * ppp) as i32,
+                    ]
+                })
+                .collect();
+        }
+
+        let jobs = self
+            .egui_ctx
+            .tessellate(full.shapes, full.pixels_per_point);
+        let sd = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: full.pixels_per_point,
+        };
+        Some((jobs, full.textures_delta, sd))
     }
 
     /// 1x1 黑色桌面纹理占位（首帧抓屏到达前 / 隐藏后重置：
@@ -940,22 +1343,31 @@ impl Gfx {
         // 抓屏帧就位后才开折射（否则采样到 1x1 黑占位纹理）
         let refr = if self.desktop.w > 1 { 1.0 } else { 0.0 };
 
-        let uni: [f32; 12] = [
-            self.t_acc,
-            self.smooth_level,
-            self.cur_i,
-            self.cur_r,
-            refr,
-            0.0,
-            0.0,
-            0.0,
-            self.offscreen.w as f32,
-            self.offscreen.h as f32,
-            self.desktop.w as f32,
-            self.desktop.h as f32,
-        ];
-        self.queue
-            .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&uni));
+        // 波纹全停（只有卡片在）时跳过整条光环管线，两趟全屏 pass 全省。
+        let draw_ripple = self.cur_i > 0.004 || self.tgt.0 > 0.0;
+        let egui = self.egui_frame();
+        if !draw_ripple && egui.is_none() {
+            return; // 无事可画（正常不会走到：active 前提是波纹或卡片在）
+        }
+
+        if draw_ripple {
+            let uni: [f32; 12] = [
+                self.t_acc,
+                self.smooth_level,
+                self.cur_i,
+                self.cur_r,
+                refr,
+                0.0,
+                0.0,
+                0.0,
+                self.offscreen.w as f32,
+                self.offscreen.h as f32,
+                self.desktop.w as f32,
+                self.desktop.h as f32,
+            ];
+            self.queue
+                .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&uni));
+        }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
@@ -979,51 +1391,99 @@ impl Gfx {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("overlay-enc"),
             });
-        // pass 1：光环 → 0.6x 离屏纹理
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("overlay-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.offscreen.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.desktop.bind, &[]);
-            pass.draw(0..3, 0..1);
+        if draw_ripple {
+            // pass 1：光环 → 0.6x 离屏纹理
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("overlay-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.offscreen.view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.desktop.bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            // pass 2：离屏纹理线性放大 → 交换链
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("overlay-blit-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.blit_pipeline);
+                pass.set_bind_group(0, &self.offscreen.blit_bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
         }
-        // pass 2：离屏纹理线性放大 → 交换链
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("overlay-blit-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.blit_pipeline);
-            pass.set_bind_group(0, &self.offscreen.blit_bind, &[]);
-            pass.draw(0..3, 0..1);
+        // pass 3：卡片（egui tessellation → 交换链）。波纹在时 Load 保底层，
+        // 只有卡片时自己 Clear 出全透明底。
+        if let Some((jobs, delta, sd)) = egui {
+            for (id, deltas) in &delta.set {
+                for image_delta in deltas.iter() {
+                    self.egui_renderer
+                        .update_texture(&self.device, &self.queue, *id, image_delta);
+                }
+            }
+            let pre =
+                self.egui_renderer
+                    .update_buffers(&self.device, &self.queue, &mut enc, &jobs, &sd);
+            {
+                let load = if draw_ripple {
+                    wgpu::LoadOp::Load
+                } else {
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                };
+                let mut pass = enc
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("overlay-cards-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    })
+                    .forget_lifetime();
+                self.egui_renderer.render(&mut pass, &jobs, &sd);
+            }
+            // update_buffers 的拷贝命令必须先于主 encoder 执行。
+            self.queue
+                .submit(pre.into_iter().chain(std::iter::once(enc.finish())));
+            for id in &delta.free {
+                self.egui_renderer.free_texture(id);
+            }
+        } else {
+            self.queue.submit(std::iter::once(enc.finish()));
         }
-        self.queue.submit(std::iter::once(enc.finish()));
         self.queue.present(frame);
     }
 }
