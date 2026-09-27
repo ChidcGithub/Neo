@@ -239,6 +239,126 @@ pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize) 
     response.inner
 }
 
+/// 用户对一次提问（`ask_user`）的答复。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AskAnswer {
+    /// 点了第 N 个选项（下标按 options 参数顺序）。
+    Pick(usize),
+    /// 跳过不答；回灌「未作答」，模型按最合理假设继续。
+    Skip,
+}
+
+/// 画提问弹窗（`ask_user`）。与确认窗同骨架：标题 + 问题面板 + 操作区。
+/// 选项纵向排列、第一个（模型认为最可能的）高亮；「跳过」在右下角。
+pub fn ask(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta) -> Option<AskAnswer> {
+    let d = skin.d();
+    let p = skin.p();
+    let m = skin.m();
+    let screen = ui.ctx().content_rect();
+    let pad = m.s(22.0);
+    let gap = m.s(12.0);
+    let width = m.s(480.0).min((screen.width() - m.s(32.0)).max(1.0));
+    let inner_w = (width - pad * 2.0).max(1.0);
+
+    let question = meta
+        .args
+        .get("question")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&meta.preview)
+        .to_owned();
+    let options_raw = meta
+        .args
+        .get("options")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let options = neo_tools::tools::ask_user::parse_options(options_raw);
+
+    let title = ui.painter().layout(
+        "Neo 想问".into(),
+        skin.bold(skin.t().headline),
+        p.label_primary,
+        inner_w,
+    );
+    let question_g = ui.painter().layout(
+        question,
+        skin.prop(skin.t().body),
+        p.label_primary,
+        (inner_w - m.s(20.0)).max(1.0),
+    );
+    let question_h = question_g.size().y + m.s(16.0);
+    let button_h = m.s(36.0);
+    let options_h = if options.is_empty() {
+        0.0
+    } else {
+        options.len() as f32 * button_h + (options.len() - 1) as f32 * gap
+    };
+    let body_h = question_h + if options_h > 0.0 { gap + options_h } else { 0.0 };
+    let footer_h = button_h;
+    let fixed_h = 2.0 * pad + title.size().y + 2.0 * gap + footer_h;
+    let height = fixed_h + body_h;
+
+    // 弹出淡入：与确认窗同一播种手法（身份 = call_id）。
+    let ctx = ui.ctx().clone();
+    let enter_id = egui::Id::new(("neo-ask-enter", &meta.call_id));
+    let seen = ctx.memory(|m| m.data.get_temp::<bool>(enter_id).unwrap_or(false));
+    let enter_k = if seen {
+        ctx.animate_value_with_time(enter_id, 1.0, ENTER_FADE)
+    } else {
+        ctx.animate_value_with_time(enter_id, 0.0, ENTER_FADE);
+        let k = ctx.animate_value_with_time(enter_id, 1.0, ENTER_FADE);
+        ctx.memory_mut(|m| m.data.insert_temp(enter_id, true));
+        k
+    };
+    let response = egui::Modal::new(egui::Id::new(("neo-ask", &meta.call_id)))
+        .frame(egui::Frame::NONE)
+        .backdrop_color(d.c().mask_modal.gamma_multiply(enter_k))
+        .show(&ctx, |ui| {
+            let (panel, _) =
+                ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+            Panel::new().paint(ui, &d, panel, pad);
+            let g = Geometry::new(panel, pad, title.size().y, footer_h, gap);
+            ui.painter().galley(g.title.min, title, p.label_primary);
+            let mut out = None;
+            super::at(ui, g.body, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                ui.set_width(inner_w);
+                let (r, _) = ui.allocate_exact_size(
+                    Vec2::new(inner_w, question_h),
+                    egui::Sense::hover(),
+                );
+                ui.painter().squircle_filled(r, m.s(10.0), p.bg_layer_1);
+                ui.painter().galley(
+                    r.min + egui::vec2(m.s(10.0), m.s(8.0)),
+                    question_g,
+                    p.label_primary,
+                );
+                for (i, opt) in options.iter().enumerate() {
+                    ui.add_space(gap);
+                    // 第一个选项（模型认为最可能的）用主按钮，其余次按钮。
+                    let b = if i == 0 {
+                        Button::new(opt).primary()
+                    } else {
+                        Button::new(opt).elevated()
+                    };
+                    if b.show(ui, &d).clicked() {
+                        out = Some(AskAnswer::Pick(i));
+                    }
+                }
+            });
+            super::at(ui, g.footer, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if Button::new("跳过").ghost().show(ui, &d).clicked() {
+                        out = Some(AskAnswer::Skip);
+                    }
+                });
+            });
+            out
+        });
+    response.inner
+}
+
 #[cfg(test)]
 mod tests {
     use super::Geometry;

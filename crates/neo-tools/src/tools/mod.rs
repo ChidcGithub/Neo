@@ -7,6 +7,7 @@
 //! 两个 shell 工具只差方言和宿主，执行骨架共用 [`shell`]。
 
 pub(crate) mod base64_lite;
+pub mod ask_user;
 pub mod bash;
 pub mod click;
 pub mod drag;
@@ -89,6 +90,18 @@ pub static REGISTRY: &[Tool] = &[
         params: &[],
         preview: open_app::preview,
         run: open_app::run,
+    },
+    // 交互工具：不碰机器，只向用户要一个决定 —— 与「打开」同类相邻。
+    Tool {
+        name: "ask_user",
+        title: "向用户提问",
+        purpose: "拿不准用户意图时弹窗提问：给问题 + 2~4 个候选答案，用户点选后答案回给你。\
+                 \n题没拍全、要求有歧义、下一步有多种合理做法时用它确认，不要自己猜；\
+                 能合理假设的琐事不要打扰用户。",
+        risk: Risk::Read,
+        params: ask_user::PARAMS,
+        preview: ask_user::preview,
+        run: ask_user::run,
     },
     Tool {
         name: "write_file",

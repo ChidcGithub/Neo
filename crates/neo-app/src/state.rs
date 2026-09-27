@@ -1232,6 +1232,13 @@ impl AppState {
             let tool = neo_tools::find(&call.name);
             let parsed = call.parse_arguments();
             let (state, outcome, preview) = match (tool, parsed) {
+                // ask_user 不「执行」：挂起等提问卡回话，答案由
+                // `answer_question` 落成结果（见 neo-tools ask_user 模块头）。
+                (Some(t), Ok(args)) if t.name == "ask_user" => (
+                    ToolState::AwaitingConfirm,
+                    None,
+                    (t.preview)(&neo_tools::Args::new(t, &args)),
+                ),
                 (Some(t), Ok(args)) => match policy.decide(t, &args) {
                     neo_tools::Decision::Allow => (
                         ToolState::Running,
@@ -1426,6 +1433,29 @@ impl AppState {
             .iter()
             .filter(|m| m.tool.as_ref().is_some_and(|t| t.state.needs_answer()))
             .count()
+    }
+
+    /// 用户回答了 `ask_user` 的提问：`picked` 是选中的选项文本，`None` = 跳过。
+    /// 与批准/拒绝同级：直接把答案落成工具结果（Done），本轮工具因此落定回灌。
+    pub fn answer_question(&mut self, index: usize, picked: Option<String>) {
+        // 状态守卫与 approve/deny 对称：只动待确认的 ask_user，陈旧下标不重写。
+        match self.messages.get(index).and_then(|m| m.tool.as_ref()) {
+            Some(t) if t.state == ToolState::AwaitingConfirm && t.name == "ask_user" => {}
+            _ => return,
+        }
+        let outcome = neo_tools::tools::ask_user::answered(picked.as_deref());
+        let content = neo_tools::to_model_message(&outcome);
+        if let Some(msg) = self.messages.get_mut(index) {
+            msg.meta = match &picked {
+                Some(p) => format!("ask_user · 已回答：{p}"),
+                None => "ask_user · 已跳过".to_owned(),
+            };
+            msg.content = content;
+            if let Some(meta) = msg.tool.as_mut() {
+                meta.state = ToolState::Done;
+                meta.outcome = Some(outcome);
+            }
+        }
     }
 
     /// 用户拒绝了某次调用。拒绝也要说给模型听 —— 它常能换个做法。

@@ -49,15 +49,41 @@ impl ConfirmWin {
 
         // 1. 答案回传：回调里点出的按钮在这里落到 state。
         if let Some(index) = pending {
-            match self.answer.swap(0, Ordering::Relaxed) {
-                1 => state.approve_tool(index),
-                2 => {
-                    // 「都允许」只在本次会话内有效，重启即失效；
-                    // 且要追溯本轮已挂起的其它待确认项，不能光批当前这条。
-                    state.approve_all_awaiting();
+            // ask_user 的提问卡复用本条通道：10+i = 点中第 i 个选项，3 = 跳过。
+            let is_ask = state.messages[index]
+                .tool
+                .as_ref()
+                .is_some_and(|t| t.name == "ask_user");
+            let answer = self.answer.swap(0, Ordering::Relaxed);
+            if is_ask {
+                match answer {
+                    a @ 10..=13 => {
+                        let options = state.messages[index]
+                            .tool
+                            .as_ref()
+                            .and_then(|t| t.args.get("options"))
+                            .and_then(|v| v.as_str())
+                            .map(neo_tools::tools::ask_user::parse_options)
+                            .unwrap_or_default();
+                        state.answer_question(
+                            index,
+                            options.get((a - 10) as usize).cloned(),
+                        );
+                    }
+                    3 => state.answer_question(index, None),
+                    _ => {}
                 }
-                3 => state.deny_tool(index),
-                _ => {}
+            } else {
+                match answer {
+                    1 => state.approve_tool(index),
+                    2 => {
+                        // 「都允许」只在本次会话内有效，重启即失效；
+                        // 且要追溯本轮已挂起的其它待确认项，不能光批当前这条。
+                        state.approve_all_awaiting();
+                    }
+                    3 => state.deny_tool(index),
+                    _ => {}
+                }
             }
         } else {
             // 没有待确认项时清掉残留答案，下一个请求从 0 开始。
@@ -86,8 +112,19 @@ impl ConfirmWin {
             // 渲染层的 egui 上下文不管主题：卡片每次露面都同步一次（幂等、便宜）。
             theme.apply(ui.ctx());
             let Some(meta) = &snapshot else { return };
-            let whale = WhaleMark::load(ui.ctx());
+            let whale = WhaleMark::cached(ui.ctx());
             let skin = Skin::new(theme, &whale);
+            if meta.name == "ask_user" {
+                // 提问卡：问题 + 选项按钮（无「本会话都允许」——它不是权限请求）。
+                match tools::ask(ui, &skin, meta) {
+                    Some(tools::AskAnswer::Pick(i)) => {
+                        answer.store(10 + i as u8, Ordering::Relaxed)
+                    }
+                    Some(tools::AskAnswer::Skip) => answer.store(3, Ordering::Relaxed),
+                    None => {}
+                }
+                return;
+            }
             match tools::confirm(ui, &skin, meta, remaining) {
                 Some(tools::Answer::Once) => answer.store(1, Ordering::Relaxed),
                 Some(tools::Answer::Always) => answer.store(2, Ordering::Relaxed),
