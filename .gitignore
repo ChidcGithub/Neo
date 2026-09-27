@@ -13,6 +13,10 @@ desktop.ini
 /.tmp/
 *.log
 
+# 打包与安装包美术产物（CI 重新生成，不进版本库）
+/dist/
+/build/
+
 # 随包运行时（由 tools/fetch_runtime.py 下载，约 91 MB）
 # 能从 npmmirror 重新获取，不进版本库 —— 复制仓库时不该带着一份二进制发行版
 /runtime/
