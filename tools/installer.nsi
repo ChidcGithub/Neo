@@ -1,8 +1,9 @@
 ; Neo Windows x64 安装包（per-user 安装，免 UAC 提权）。
-; 由 .github/workflows/release.yml 调用（/CWD 指回仓库根）：
-;   makensis /CWD . /DVERSION=1.2.3 /DVI_VERSION=1.2.3.0 tools\installer.nsi
-; ⚠️ makensis 会把编译工作目录切到**脚本所在目录**（tools\），所以 /CWD
-; 不能省 —— 本脚本里所有相对路径（dist\、build\）都以仓库根为基准。
+; 由 .github/workflows/release.yml 调用（本地手动编译同）：
+;   makensis /NOCD /INPUTCHARSET UTF8 /DVERSION=1.2.3 /DVI_VERSION=1.2.3.0 tools\installer.nsi
+; ⚠️ 两个开关都不能省：/NOCD 保持工作目录在仓库根（默认会切到 tools\，
+; dist\ 与 build\ 的相对路径会全找不到）；/INPUTCHARSET UTF8 读本脚本的
+; 中文注释（默认 ACP 直接报 Bad text encoding）。
 ; 输入：dist\neo\（已装配好的发行目录）+ build\installer-art\（美术资源，
 ; 由 tools/make_installer_art.py 生成；缺失时自动退化为无图标版式，
 ; 本地不生成美术也能编译通过）
@@ -39,6 +40,7 @@ VIAddVersionKey /LANG=2052 "FileDescription" "Neo 安装程序"
 VIAddVersionKey /LANG=2052 "FileVersion" "${VERSION}"
 VIAddVersionKey /LANG=2052 "ProductVersion" "${VERSION}"
 VIAddVersionKey /LANG=2052 "CompanyName" "Neo"
+VIAddVersionKey /LANG=2052 "LegalCopyright" "MIT"
 
 ; ---- 版式（MUI_* define 必须先于 MUI2.nsh 引入）----
 !ifdef HAVE_ART
