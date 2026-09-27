@@ -128,6 +128,10 @@ pub struct ClassMonitor {
     stt_stop: Option<Arc<AtomicBool>>,
     /// 分析 worker 在飞标志（视觉与打磨共用，一次一个）。
     analysis_in_flight: bool,
+    /// 跨课复用的 STT 引擎（模型约数百 MB，每节课全量重载 + 最大化抖动
+    /// 时新旧线程并存，低配教室机器会双倍占内存）。线程退出前 reset
+    /// 并放回；None = 没有可用缓存。
+    stt_engine: Arc<std::sync::Mutex<Option<neo_stt::SttEngine>>>,
     /// 已见到的键盘活动时间戳（沿检测）。
     seen_key_ms: u64,
     /// 打磨结果，等弹窗取走。
@@ -146,6 +150,7 @@ impl Default for ClassMonitor {
             watch_stop: None,
             stt_stop: None,
             analysis_in_flight: false,
+            stt_engine: Arc::new(std::sync::Mutex::new(None)),
             seen_key_ms: 0,
             ready: None,
             status: String::new(),
@@ -159,11 +164,12 @@ impl ClassMonitor {
         self.ready.as_ref()
     }
 
-    /// 用户关掉弹窗：回 Idle，下一节课从头来。
+    /// 用户关掉弹窗：清掉待展示结果；只有状态机还在 Presenting 时才回 Idle
+    ///（打磨与新课交叉时，phase 可能是进行中的 Active —— 弹窗照样要关得上）。
     pub fn dismiss(&mut self) {
+        self.ready = None;
         if matches!(self.phase, ClassPhase::Presenting) {
             self.phase = ClassPhase::Idle;
-            self.ready = None;
             self.status.clear();
         }
     }
@@ -184,7 +190,8 @@ impl ClassMonitor {
             return;
         }
         if self.watch_stop.is_none() {
-            self.watch_stop = Some(watch::start(self.tx.clone()));
+            // None = 还没起，或上次 spawn 失败 —— 每帧重试，失败日志在 watch 里。
+            self.watch_stop = watch::start(self.tx.clone());
         }
         // 慢轮询节奏：首屏延迟 / 冷却 / 静默计时都靠帧循环推进。
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -236,7 +243,16 @@ impl ClassMonitor {
             _ => {}
         }
         match pending {
-            Some(Pending::Shot(first)) => self.spawn_vision(state, first),
+            Some(Pending::Shot(first)) => {
+                let started = self.spawn_vision(state, first);
+                if !started && first {
+                    // 首屏被在飞任务/未配置挡下：留 5s 后重试 —— 它是这节课
+                    // 唯一的科目来源，丢了这节课就永远「未知」。
+                    if let ClassPhase::Active(_, slot) = &mut self.phase {
+                        *slot = Some(Instant::now() + Duration::from_secs(5));
+                    }
+                }
+            }
             Some(Pending::Polish) => {
                 let old = std::mem::replace(&mut self.phase, ClassPhase::Polishing);
                 if let ClassPhase::Settling(session, _) = old {
@@ -256,6 +272,12 @@ impl ClassMonitor {
         self.phase = ClassPhase::Idle;
         self.ready = None;
         self.status.clear();
+        // 在飞的 worker 可能已 panic（结果事件永远不会来）：标志留着会把
+        // 重新开启后的状态机卡死在「分析中」。清掉；迟到的旧事件本就只
+        // 落到 Idle 分支被忽略。
+        self.analysis_in_flight = false;
+        // 缓存的 STT 引擎（数百 MB 模型）随功能关闭释放。
+        self.stt_engine.lock().unwrap().take();
     }
 
     fn stop_stt(&mut self) {
@@ -295,9 +317,11 @@ impl ClassMonitor {
                         self.status = "课堂记录中…".into();
                     }
                 }
-                // Polishing 期间最大化 = 新的一课：旧课在 worker 手里随结果送回，
-                // 这里照开新 session（罕见交叉，结果回来时 finish 优先展示）。
-                ClassPhase::Polishing => {
+                // Polishing / Presenting 期间最大化 = 新的一课：旧课结果随
+                // worker 送回（finish 只存好结果，不掐进行中的新课）。
+                // Presenting 的弹窗继续挂着，与新课的记录互不干扰 ——
+                // 之前这里落入 `_ => {}`，弹窗不关则后续课程全部静默漏记。
+                ClassPhase::Polishing | ClassPhase::Presenting => {
                     self.start_stt();
                     self.phase = ClassPhase::Active(
                         Session::new(),
@@ -329,6 +353,9 @@ impl ClassMonitor {
             },
             ClassEvent::SttDied(e) => {
                 eprintln!("[neo-class] 转写线程退出：{e}");
+                // 必须进状态行：只写 stderr 的话，用户以为整节课在录音，
+                // 实际转写早已中断 —— 课堂记录最怕「事后才发现没记上」。
+                self.status = format!("课堂转写已中断：{e}");
             }
             ClassEvent::Vision { subject, note } => {
                 self.analysis_in_flight = false;
@@ -364,8 +391,12 @@ impl ClassMonitor {
 
     /// 打磨完成（或兜底）：落分记忆 + 总记忆索引 + 弹窗。
     fn finish(&mut self, session: Session, summary: String) {
-        // 罕见交叉：打磨飞行期间又开了新课 —— 收尾优先，新课的转写停掉。
-        self.stop_stt();
+        // 罕见交叉：打磨飞行期间又开了新课。此时**只存结果** —— 掐新课
+        // 的转写、把 phase 顶回 Presenting，都会毁掉正在进行中的记录。
+        let crossing = !matches!(self.phase, ClassPhase::Polishing);
+        if !crossing {
+            self.stop_stt();
+        }
         let subject = session.subject.clone().unwrap_or_else(|| "未知".into());
         let date = neo_tools::classlog::today_key();
         let note = neo_tools::classlog::NewClassNote {
@@ -401,8 +432,13 @@ impl ClassMonitor {
             over_limit,
             date,
         });
-        self.phase = ClassPhase::Presenting;
-        self.status.clear();
+        if crossing {
+            // 新课进行中：结果存进 ready 即可，弹窗会被用户看到；
+            // phase 与状态行都别动新课的。
+        } else {
+            self.phase = ClassPhase::Presenting;
+            self.status.clear();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -415,9 +451,10 @@ impl ClassMonitor {
         let stop = Arc::new(AtomicBool::new(false));
         let tx = self.tx.clone();
         let stop2 = stop.clone();
+        let slot = self.stt_engine.clone();
         let spawned = std::thread::Builder::new()
             .name("neo-class-stt".into())
-            .spawn(move || stt_main(tx, stop2));
+            .spawn(move || stt_main(tx, stop2, slot));
         match spawned {
             Ok(_) => self.stt_stop = Some(stop),
             Err(e) => {
@@ -427,20 +464,51 @@ impl ClassMonitor {
     }
 
     /// 截屏 + 视觉分析（一次一个；飞行中来了直接丢，冷却外还会再触发）。
-    fn spawn_vision(&mut self, state: &AppState, first: bool) {
+    /// 返回是否真的启动了 —— 首屏被挡下时调用方要留标记重试。
+    fn spawn_vision(&mut self, state: &AppState, first: bool) -> bool {
         if self.analysis_in_flight {
-            return;
+            return false;
         }
         let Some(cfg) = llm_config(state) else {
-            return; // 没配模型：视觉分析整体跳过，转写不受影响
+            return false; // 没配模型：视觉分析整体跳过，转写不受影响
         };
         self.analysis_in_flight = true;
         let tx = self.tx.clone();
-        let _ = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("neo-class-vision".into())
             .spawn(move || {
-                let _ = tx.send(run_vision(&cfg, first));
+                // worker panic（GDI 抓帧 / 编码 / 网络栈任何一处展开）时不会有
+                // 任何事件回传，analysis_in_flight 永久卡死状态机。guard 兜底。
+                struct VisionGuard {
+                    tx: mpsc::Sender<ClassEvent>,
+                    armed: bool,
+                }
+                impl Drop for VisionGuard {
+                    fn drop(&mut self) {
+                        if self.armed {
+                            let _ = self
+                                .tx
+                                .send(ClassEvent::VisionFailed("分析线程异常中断".into()));
+                        }
+                    }
+                }
+                let mut guard = VisionGuard {
+                    tx: tx.clone(),
+                    armed: true,
+                };
+                let ev = run_vision(&cfg, first);
+                let _ = tx.send(ev);
+                guard.armed = false;
             });
+        match spawned {
+            Ok(_) => true,
+            Err(e) => {
+                // 线程起不来：没有 worker 也就永远等不到结果事件，当场复位。
+                self.analysis_in_flight = false;
+                eprintln!("[neo-class] 视觉分析线程启动失败：{e}");
+                false
+            }
+        }
     }
 
     /// 打磨收尾（调用方保证 !analysis_in_flight，且已把 phase 转到 Polishing）。
@@ -448,20 +516,63 @@ impl ClassMonitor {
         self.analysis_in_flight = true;
         self.status = "正在整理课堂总结…".into();
         let tx = self.tx.clone();
-        match llm_config(state) {
-            Some(cfg) => {
-                let _ = std::thread::Builder::new()
-                    .name("neo-class-polish".into())
-                    .spawn(move || {
-                        let _ = tx.send(run_polish(&cfg, session));
-                    });
-            }
-            None => {
-                let _ = tx.send(ClassEvent::PolishFailed {
-                    error: "未配置模型接口".into(),
-                    session: Box::new(session),
-                });
-            }
+        let Some(cfg) = llm_config(state) else {
+            let _ = tx.send(ClassEvent::PolishFailed {
+                error: "未配置模型接口".into(),
+                session: Box::new(session),
+            });
+            return;
+        };
+        // spawn 失败时闭包整个被丢弃、session 随之消失 —— 放进共享槽，
+        // 失败路径还能取回来（这节课的素材不能丢得无声无息）。
+        let slot = Arc::new(std::sync::Mutex::new(Some(session)));
+        let slot2 = slot.clone();
+        let spawned = std::thread::Builder::new()
+            .name("neo-class-polish".into())
+            .spawn(move || {
+                let session = slot2.lock().unwrap().take().unwrap_or_else(Session::new);
+                // 同 VisionGuard：panic 展开时用 Drop 补发失败事件，
+                // session 还在 guard 手里，素材不丢。
+                struct PolishGuard {
+                    tx: mpsc::Sender<ClassEvent>,
+                    session: Option<Session>,
+                }
+                impl Drop for PolishGuard {
+                    fn drop(&mut self) {
+                        if let Some(session) = self.session.take() {
+                            let _ = self.tx.send(ClassEvent::PolishFailed {
+                                error: "整理线程异常中断".into(),
+                                session: Box::new(session),
+                            });
+                        }
+                    }
+                }
+                let mut guard = PolishGuard {
+                    tx: tx.clone(),
+                    session: Some(session),
+                };
+                let result = match guard.session.as_ref() {
+                    Some(s) => run_polish(&cfg, s),
+                    None => Err("内部错误：打磨会话丢失".into()),
+                };
+                // 取出即解除 guard（正常路径不重复发事件）。
+                let session = guard
+                    .session
+                    .take()
+                    .map(Box::new)
+                    .unwrap_or_else(|| Box::new(Session::new()));
+                let ev = match result {
+                    Ok(summary) => ClassEvent::Polished { summary, session },
+                    Err(error) => ClassEvent::PolishFailed { error, session },
+                };
+                let _ = tx.send(ev);
+            });
+        if let Err(e) = spawned {
+            let session = slot.lock().unwrap().take().unwrap_or_else(Session::new);
+            let _ = self.tx.send(ClassEvent::PolishFailed {
+                error: format!("无法启动整理线程：{e}"),
+                session: Box::new(session),
+            });
         }
     }
 }
@@ -513,17 +624,30 @@ fn fallback_summary(session: &Session, err: &str) -> String {
 // STT 线程：AudioTap 采集 + SttEngine 连续转写
 // ---------------------------------------------------------------------------
 
-fn stt_main(tx: mpsc::Sender<ClassEvent>, stop: Arc<AtomicBool>) {
-    let engine = match neo_stt::SttEngine::create(&neo_stt::SttConfig::default()) {
-        Ok(e) => e,
-        Err(e) => {
-            let _ = tx.send(ClassEvent::SttDied(format!("加载 STT 模型失败：{e}")));
-            return;
-        }
+fn stt_main(
+    tx: mpsc::Sender<ClassEvent>,
+    stop: Arc<AtomicBool>,
+    engine_slot: Arc<std::sync::Mutex<Option<neo_stt::SttEngine>>>,
+) {
+    // 引擎跨课复用：每节课全量加载约数百 MB 模型；最大化抖动时旧线程
+    // 还在 flush、新线程又全量加载，两个实例并存会双倍占内存（低配
+    // 教室机器受不了）。回收的引擎已 reset，状态干净。
+    let cached = engine_slot.lock().unwrap().take();
+    let engine = match cached {
+        Some(e) => e,
+        None => match neo_stt::SttEngine::create(&neo_stt::SttConfig::default()) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = tx.send(ClassEvent::SttDied(format!("加载 STT 模型失败：{e}")));
+                return;
+            }
+        },
     };
     let tap = match neo_wake::AudioTap::start() {
         Ok(t) => t,
         Err(e) => {
+            // 没用过的引擎放回去，下节课直接复用。
+            *engine_slot.lock().unwrap() = Some(engine);
             let _ = tx.send(ClassEvent::SttDied(format!("打开麦克风失败：{e}")));
             return;
         }
@@ -539,7 +663,7 @@ fn stt_main(tx: mpsc::Sender<ClassEvent>, stop: Arc<AtomicBool>) {
                 let _ = tx.send(ClassEvent::SttDied(
                     "麦克风连接中断（设备被拔出或被安全软件拦截），请重新开启课堂记录".into(),
                 ));
-                return;
+                break;
             }
             continue;
         };
@@ -547,7 +671,7 @@ fn stt_main(tx: mpsc::Sender<ClassEvent>, stop: Arc<AtomicBool>) {
         while let Some(seg) = engine.take_segment() {
             if let Ok(text) = engine.transcribe(&seg) {
                 if !text.trim().is_empty() && tx.send(ClassEvent::Line(text)).is_err() {
-                    return;
+                    break;
                 }
             }
         }
@@ -560,6 +684,7 @@ fn stt_main(tx: mpsc::Sender<ClassEvent>, stop: Arc<AtomicBool>) {
         }
     }
     engine.reset();
+    *engine_slot.lock().unwrap() = Some(engine);
     eprintln!("[neo-class] 课堂转写结束");
 }
 
@@ -644,7 +769,8 @@ fn run_vision(cfg: &neo_llm::Config, first: bool) -> ClassEvent {
 }
 
 /// 把一节课的素材打磨成 ≤1500 字的课堂总结。
-fn run_polish(cfg: &neo_llm::Config, session: Session) -> ClassEvent {
+/// 只借用 session：worker 持有所有权，panic 兜底时素材还能随失败事件送回。
+fn run_polish(cfg: &neo_llm::Config, session: &Session) -> Result<String, String> {
     let system = "你是课堂记录整理器。把一节中学课的「屏幕笔记」和「老师讲课的语音转写」\
         整理成一份课堂总结。\n要求：\n\
         - 中文，Markdown，面向学生课后复习\n\
@@ -667,18 +793,9 @@ fn run_polish(cfg: &neo_llm::Config, session: Session) -> ClassEvent {
     let msgs = vec![Msg::new(Role::System, system), Msg::new(Role::User, user)];
     let stream = neo_llm::start(cfg.clone(), msgs);
     match drain_stream(&stream, POLISH_TIMEOUT) {
-        Ok(text) if !text.trim().is_empty() => ClassEvent::Polished {
-            summary: text,
-            session: Box::new(session),
-        },
-        Ok(_) => ClassEvent::PolishFailed {
-            error: "模型返回了空总结".into(),
-            session: Box::new(session),
-        },
-        Err(e) => ClassEvent::PolishFailed {
-            error: e,
-            session: Box::new(session),
-        },
+        Ok(text) if !text.trim().is_empty() => Ok(text),
+        Ok(_) => Err("模型返回了空总结".into()),
+        Err(e) => Err(e),
     }
 }
 
@@ -692,7 +809,7 @@ mod watch {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{mpsc, Arc};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-    use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+    use windows_sys::Win32::System::SystemInformation::{GetTickCount, GetTickCount64};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -722,18 +839,28 @@ mod watch {
         if ok == 0 {
             return Duration::ZERO;
         }
-        let now = unsafe { GetTickCount64() };
-        Duration::from_millis(now.saturating_sub(lii.dwTime as u64))
+        // dwTime 与 GetTickCount 同源、都是 32 位：开机超 49.7 天回绕时，
+        // 拿 64 位值去减会恒得「约 49.7 天」—— SETTLE_IDLE 判定静默失效
+        //（退出最大化立即打磨）。同位宽 wrapping_sub 天然消化回绕。
+        let now = unsafe { GetTickCount() };
+        Duration::from_millis(now.wrapping_sub(lii.dwTime) as u64)
     }
 
-    /// 启动监听线程；返回停止信号（置位即停）。
-    pub fn start(tx: mpsc::Sender<ClassEvent>) -> Arc<AtomicBool> {
+    /// 启动监听线程；返回停止信号（置位即停）。spawn 失败返回 None ——
+    /// 调用方（tick）下一帧会重试，别让「开关开着但什么都没在跑」静默发生。
+    pub fn start(tx: mpsc::Sender<ClassEvent>) -> Option<Arc<AtomicBool>> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
-        let _ = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("neo-class-watch".into())
-            .spawn(move || watch_main(tx, stop2));
-        stop
+            .spawn(move || watch_main(tx, stop2))
+        {
+            Ok(_) => Some(stop),
+            Err(e) => {
+                eprintln!("[neo-class] watch 线程启动失败（下一帧重试）：{e}");
+                None
+            }
+        }
     }
 
     fn watch_main(tx: mpsc::Sender<ClassEvent>, stop: Arc<AtomicBool>) {
@@ -766,7 +893,10 @@ mod watch {
                     break;
                 }
             }
-            std::thread::sleep(Duration::from_millis(500));
+            // 泵节奏 100ms：钩子回调靠本线程消息循环派发，泵得太慢会逼近
+            // LowLevelHooksTimeout 被系统静默摘钩（键盘沿截屏无声消失）；
+            // 100ms 下检测沿的额外延迟无感（首屏延迟 1.2s / 冷却 10s）。
+            std::thread::sleep(Duration::from_millis(100));
         }
         if !hook.is_null() {
             unsafe { UnhookWindowsHookEx(hook) };
@@ -834,7 +964,7 @@ mod watch {
     pub fn idle_duration() -> Duration {
         Duration::ZERO
     }
-    pub fn start(_tx: mpsc::Sender<ClassEvent>) -> Arc<AtomicBool> {
-        Arc::new(AtomicBool::new(false))
+    pub fn start(_tx: mpsc::Sender<ClassEvent>) -> Option<Arc<AtomicBool>> {
+        Some(Arc::new(AtomicBool::new(false)))
     }
 }

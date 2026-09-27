@@ -637,6 +637,11 @@ impl NeoApp {
                 // 「对话态 + 零消息 + 草稿已回输入框」的错觉里。
                 if state.messages.is_empty() {
                     state.stage = crate::state::Stage::Hero;
+                    // ensure_session 刚建行、append 就失败：空会话行一起收掉，
+                    // 免得重启后侧栏冒出一个 0 消息的「新对话」。
+                    if let (Some(id), Some(store)) = (state.active_session.take(), store) {
+                        let _ = store.delete_session(id);
+                    }
                 }
                 return;
             }
@@ -1079,6 +1084,13 @@ impl NeoApp {
                     self.state.tool_open = false;
                     if self.state.can_call_real() {
                         Self::start_real_stream(&mut self.state);
+                    } else {
+                        // 工具跑完了但接口配置已被清空：不说一声的话
+                        // 这轮「无声结束」，用户会以为卡死。
+                        self.state.attachment_error = Some(
+                            "工具已执行完，但模型接口未配置，结果未回灌；配置好后发条消息即可继续。"
+                                .into(),
+                        );
                     }
                 }
             }

@@ -11,7 +11,6 @@
 
 use egui::{Rect, Sense, Ui, Vec2};
 use neo_theme::fonts::LoadedFonts;
-use neo_theme::SquirclePaint;
 use neo_ui::{field, FieldRow, Icon, IconButton, NavItem, Panel, Switch, TextField};
 
 use super::{at, section_label, segmented, text_left, Skin};

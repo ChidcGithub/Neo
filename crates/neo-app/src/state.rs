@@ -110,7 +110,9 @@ pub enum ToolState {
     Done,
     /// 用户拒绝或策略拒绝 —— 结果会照常回灌给模型，让它换个做法。
     Denied,
-    /// 用户按了停止：整轮被打断，结果**不会**回灌（与 Denied 的区别）。
+    /// 用户按了停止：整轮被打断。为守住协议配对（每个 tool_call 都必须有
+    /// 一条非空 tool 消息），取消时补一条「用户取消了这次调用」的失败结果
+    /// 回灌 —— 与 Denied 的区别在于措辞与来源，不在于回不回灌。
     Cancelled,
 }
 
@@ -1054,6 +1056,12 @@ impl AppState {
             }
             lines.remove(0);
         }
+        // 兜底：单条记忆本身超限（剔除到只剩它也无法再退）时硬截断，
+        // 守住文档承诺的 3000 字上限。
+        if out.chars().count() > MAX_CHARS {
+            out = out.chars().take(MAX_CHARS).collect();
+            out.push('…');
+        }
         out
     }
 
@@ -1196,6 +1204,16 @@ impl AppState {
         self.tool_round = false;
         let calls = neo_llm::assemble(&frags);
         if calls.is_empty() {
+            // finish_reason=tool_calls 却聚合不出任何调用（服务端走了非
+            // delta 通道、或分片全被滤掉）：别让对话戛然而止留个空气泡。
+            if let Some(last) = self.messages.last_mut() {
+                if last.role == Role::Assistant {
+                    if !last.content.is_empty() {
+                        last.content.push_str("\n\n");
+                    }
+                    last.content.push_str("（本轮工具调用数据不完整，已中止；请重试）");
+                }
+            }
             return 0;
         }
         // 调用挂到刚结束的助手消息上（回灌协议要原样带回）。
@@ -1410,8 +1428,10 @@ impl AppState {
     /// 用户拒绝了某次调用。拒绝也要说给模型听 —— 它常能换个做法。
     pub fn deny_tool(&mut self, index: usize) {
         let name = match self.messages.get(index).and_then(|m| m.tool.as_ref()) {
-            Some(t) => t.name.clone(),
-            None => return,
+            // 与 approve_tool 对称的状态守卫：只动待确认的。陈旧下标误调
+            // 不改写已落定（甚至已落库）的工具消息。
+            Some(t) if t.state == ToolState::AwaitingConfirm => t.name.clone(),
+            _ => return,
         };
         let tool_name = neo_tools::find(&name).map(|t| t.name).unwrap_or("unknown");
         let outcome = neo_tools::Outcome::fail(
@@ -1499,6 +1519,13 @@ impl AppState {
                         }
                     }
                 }
+                // 线程异常退出（panic）：没发过 Done/Failed 通道就断了。
+                // 不补这一下，poll 每帧只回空 Vec，界面永远停在「生成中」。
+                if s.is_finished() {
+                    self.tool_frags.clear();
+                    self.end_stream(Some("连接异常中断（流线程退出），请重试".to_owned()));
+                    return false;
+                }
             }
             StreamSource::Demo { text, cursor } => {
                 // 每帧追加 2 个字符：约 60 字/秒，接近真实打字速度。
@@ -1585,14 +1612,30 @@ impl AppState {
         self.tool_open = false;
         // 丢掉接收端：后台工具线程跑完后 send 失败，结果直接丢弃、不会回灌。
         self.tool_jobs.clear();
-        // 挂起/执行中的工具标记为已取消：卡片上有个交代；
-        // 协议层（`api_messages`）会为没有结果的调用补一条说明。
+        // 挂起/执行中的工具标记为已取消，并补上对模型可见的结果：
+        // 只改 state 的话 content 是空的 —— call_id 在 answered 列表里，
+        // api_messages 的「无结果补说明」分支永远不会为它触发，模型每轮
+        // 都收到一条正文为空的 tool 消息（轻则困惑重请，重则服务端 400）。
         for msg in &mut self.messages {
-            if let Some(tool) = msg.tool.as_mut() {
-                if !tool.state.is_settled() {
-                    tool.state = ToolState::Cancelled;
-                }
+            let Some(tool) = msg.tool.as_ref() else {
+                continue;
+            };
+            if tool.state.is_settled() {
+                continue;
             }
+            let outcome = neo_tools::Outcome::fail(
+                neo_tools::find(&tool.name).map(|t| t.name).unwrap_or("unknown"),
+                neo_tools::ToolError::new(
+                    neo_tools::ErrorKind::Internal,
+                    "用户取消了这次调用",
+                )
+                .with_hint("不要重复请求同一操作；用户已明确表示中止"),
+            );
+            msg.content = neo_tools::to_model_message(&outcome);
+            msg.meta = format!("{} · 已取消", tool.name);
+            let meta = msg.tool.as_mut().expect("tool checked above");
+            meta.state = ToolState::Cancelled;
+            meta.outcome = Some(outcome);
         }
         if let Some(last) = self.messages.last_mut() {
             if last.streaming {
@@ -1885,6 +1928,125 @@ mod tests {
         assert!(!s.generating);
         assert_eq!(s.messages[1].error.as_deref(), Some("接口返回 401"));
         assert!(!s.messages[1].streaming);
+    }
+
+    /// 流线程异常退出（panic）：发送端直接断开、没有任何终止事件。
+    /// pump 必须察觉并收尾 —— 否则界面永远停在「生成中」，只能 Esc 解。
+    #[test]
+    fn dead_stream_thread_surfaces_error_instead_of_spinning() {
+        let mut s = AppState {
+            draft: "问题".to_owned(),
+            ..AppState::default()
+        };
+        s.submit();
+        let (tx, rx) = std::sync::mpsc::channel::<Event>();
+        drop(tx); // 模拟线程 panic：什么都没发就断开
+        s.start_generation(StreamSource::Real(Box::new(
+            neo_llm::Stream::new_for_test(rx),
+        )));
+        s.tool_frags.push(neo_llm::ToolCallFrag {
+            index: 0,
+            id: Some("c1".into()),
+            name: Some("read_file".into()),
+            args: "{".into(),
+        });
+        assert!(!s.pump(), "断开的流必须收尾，不能继续「生成中」");
+        assert!(!s.generating);
+        assert!(s.tool_frags.is_empty(), "异常中断也要清残留分片");
+        let last = s.messages.last().unwrap();
+        assert!(
+            last.error.as_deref().is_some_and(|e| e.contains("异常中断")),
+            "要给用户一句能看懂的失败，实际：{:?}",
+            last.error
+        );
+        assert!(!last.streaming);
+    }
+
+    /// 取消工具轮：Cancelled 调用要补一条非空的「已取消」结果回灌。
+    /// 空正文会让 call_id 落在 answered 列表里、绕过 api_messages 的补丁
+    /// 分支 —— 模型每轮收到一条空的 tool 消息，严苛的服务端直接 400。
+    #[test]
+    fn cancelled_tool_round_feeds_real_content_back() {
+        let mut s = AppState::default();
+        let call = neo_llm::ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        };
+        let mut assistant = ChatMessage::new(Role::Assistant, "我先读一下文件");
+        assistant.tool_calls = vec![call.clone()];
+        s.messages.push(assistant);
+        s.messages.push(ChatMessage::tool_result(
+            ToolMeta {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                title: "读取文件",
+                risk: "read",
+                preview: "读 a.txt".into(),
+                args: serde_json::json!({}),
+                state: ToolState::AwaitingConfirm,
+                outcome: None,
+            },
+            String::new(),
+        ));
+        s.cancel();
+
+        let wire = s.api_messages(24);
+        let tool_msg = wire
+            .iter()
+            .find(|m| m.role.as_str() == "tool")
+            .expect("取消的调用也要回灌配对结果");
+        assert!(
+            !tool_msg.content.is_empty() && tool_msg.content.contains("取消"),
+            "回灌正文必须说明「已取消」，实际：{:?}",
+            tool_msg.content
+        );
+        let card = &s.messages[1];
+        assert_eq!(card.tool.as_ref().unwrap().state, ToolState::Cancelled);
+        assert!(
+            card.meta.contains("已取消"),
+            "落库的 meta 应写「已取消」而不是执行前预览"
+        );
+    }
+
+    /// 「本会话都允许」要把所有挂起的待确认项一并推到 Running ——
+    /// 只批当前一条的话，确认窗会对剩下的逐条再弹。
+    #[test]
+    fn approve_all_awaiting_pushes_everything_to_running() {
+        let mut s = AppState::default();
+        for (i, state) in [
+            ToolState::AwaitingConfirm,
+            ToolState::AwaitingConfirm,
+            ToolState::Done, // 已落定的不许被碰
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.messages.push(ChatMessage::tool_result(
+                ToolMeta {
+                    call_id: format!("c{i}"),
+                    name: "write_file".into(),
+                    title: "写入文件",
+                    risk: "write",
+                    preview: format!("写 {i}.txt"),
+                    args: serde_json::json!({}),
+                    state,
+                    outcome: None,
+                },
+                String::new(),
+            ));
+        }
+        s.approve_all_awaiting();
+        assert!(s.auto_approve_tools);
+        let states: Vec<ToolState> = s
+            .messages
+            .iter()
+            .map(|m| m.tool.as_ref().unwrap().state)
+            .collect();
+        assert_eq!(
+            states,
+            vec![ToolState::Running, ToolState::Running, ToolState::Done]
+        );
     }
 
     /// 思考档位必须真的走到请求体里 —— 不是"设置里能点"就算完。

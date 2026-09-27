@@ -388,6 +388,8 @@ pub struct Stream {
     pub rx: Receiver<Event>,
     /// 置为 `true` 即请求取消。线程在下一个块边界退出。
     pub cancel: Arc<AtomicBool>,
+    /// 发送端已断开（线程结束）。用 Cell：`poll` 拿 &self 也能记账。
+    finished: std::cell::Cell<bool>,
 }
 
 impl Stream {
@@ -395,13 +397,39 @@ impl Stream {
     ///
     /// 返回空 `Vec` 只代表「此刻没有新事件」，**不代表流已结束** ——
     /// 请求刚发出、首个增量未到达时同样是空。以收到 [`Event::Done`] /
-    /// [`Event::Failed`] 为结束标志；通道断开（发送端被 drop）是兜底。
+    /// [`Event::Failed`] 为结束标志；若两者都没等到而 [`Stream::is_finished`]
+    /// 已成立，说明线程异常退出（panic），调用方应自行按失败收尾。
     pub fn poll(&self) -> Vec<Event> {
         let mut out = Vec::new();
-        while let Ok(ev) = self.rx.try_recv() {
-            out.push(ev);
+        loop {
+            match self.rx.try_recv() {
+                Ok(ev) => out.push(ev),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.finished.set(true);
+                    break;
+                }
+            }
         }
         out
+    }
+
+    /// 发送端已被 drop（流线程结束）。**正常结束**（Done/Failed 已发出）
+    /// 与**异常结束**（线程 panic，什么也没发）都会置位 —— 区别只在
+    /// 此前收没收到终止事件。
+    pub fn is_finished(&self) -> bool {
+        self.finished.get()
+    }
+
+    /// 测试用：手工组装一条流（事件由测试扮演；直接 drop 发送端即模拟
+    /// 线程异常退出）。
+    #[doc(hidden)]
+    pub fn new_for_test(rx: Receiver<Event>) -> Stream {
+        Stream {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            finished: std::cell::Cell::new(false),
+        }
     }
 }
 
@@ -504,7 +532,11 @@ pub fn start_with_tools(
         }
     }
 
-    Stream { rx, cancel }
+    Stream {
+        rx,
+        cancel,
+        finished: std::cell::Cell::new(false),
+    }
 }
 
 #[derive(Serialize)]
@@ -1061,6 +1093,18 @@ mod tests {
             arguments: "{not json".into(),
         };
         assert!(call.parse_arguments().is_err());
+    }
+
+    #[test]
+    fn poll_distinguishes_empty_from_finished() {
+        let (tx, rx) = mpsc::channel::<Event>();
+        let stream = Stream::new_for_test(rx);
+        // 空 Vec ≠ 结束：只是暂时没有新事件。
+        assert!(stream.poll().is_empty());
+        assert!(!stream.is_finished());
+        drop(tx); // 线程结束（正常或 panic 都一样断开）
+        assert!(stream.poll().is_empty());
+        assert!(stream.is_finished(), "发送端断开后必须能感知");
     }
 
     #[test]
