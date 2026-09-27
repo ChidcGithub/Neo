@@ -26,6 +26,10 @@
 //! 共用执行骨架，类 Unix 那一份走**随包提供的 Git Bash 运行时**
 //! （`tools/fetch_runtime.py` 下载，见 `tools/README.md`）。
 
+// 发行版是纯 GUI 进程：不挂靠控制台，双击启动不会先闪一个黑色命令行窗口。
+// debug 构建保留控制台（eprintln 日志与 panic 信息直接可见）。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod attachments;
 mod brand;
