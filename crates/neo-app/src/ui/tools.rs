@@ -79,7 +79,7 @@ fn panel_rect(ui: &mut Ui, m: neo_theme::Metrics) -> Rect {
 /// **内联渲染，不开模态**：渲染层里这张卡就是全部可点区域（命中测试只认
 /// 卡矩形）；`egui::Modal` 会把面板居中到整层屏幕、逃出命中区 —— 按钮
 /// 看着在，点击全穿透。
-pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize) -> Option<Answer> {
+pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize, allow_batch: bool) -> Option<Answer> {
     let d = skin.d();
     let p = skin.p();
     let m = skin.m();
@@ -221,10 +221,15 @@ pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize) 
         ui.with_layout(layout, |ui| {
             for (button, answer) in [
                 (Button::new("允许").primary(), Answer::Once),
-                (Button::new("本会话都允许").elevated(), Answer::Always),
+                (Button::new("本会话都允许").elevated().enabled(allow_batch), Answer::Always),
                 (Button::new("拒绝").ghost(), Answer::Deny),
             ] {
                 let response = button.show(ui, &d);
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new(("neo-confirm-button-probe", answer as u8)),
+                        (response.rect, ui.clip_rect()));
+                });
                 debug_assert!(g.panel.expand(0.5).contains_rect(response.rect));
                 if response.clicked() {
                     out = Some(answer);
@@ -291,15 +296,16 @@ pub fn ask(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta) -> Option<AskAnswer> {
             .max_height(g.body.height())
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
-                ui.set_width(inner_w);
+                let body_w = ui.available_width().min(inner_w).max(1.0);
+                ui.set_width(body_w);
                 let question_g = ui.painter().layout(
                     question.clone(),
                     skin.prop(skin.t().body),
                     p.label_primary,
-                    (inner_w - m.s(20.0)).max(1.0),
+                    (body_w - m.s(20.0)).max(1.0),
                 );
                 let (r, _) = ui.allocate_exact_size(
-                    Vec2::new(inner_w, question_g.size().y + m.s(16.0)),
+                    Vec2::new(body_w, question_g.size().y + m.s(16.0)),
                     egui::Sense::hover(),
                 );
                 ui.painter().squircle_filled(r, m.s(10.0), p.bg_layer_1);
@@ -310,13 +316,39 @@ pub fn ask(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta) -> Option<AskAnswer> {
                 );
                 for (i, opt) in options.iter().enumerate() {
                     ui.add_space(gap);
-                    // 第一个选项（模型认为最可能的）用主按钮，其余次按钮。
-                    let b = if i == 0 {
-                        Button::new(opt).primary()
-                    } else {
-                        Button::new(opt).elevated()
+                    // 完整排版选项，按实际换行高度分配触控区域，不省略待选择内容。
+                    let color = if i == 0 { d.c().on_info } else { p.label_primary };
+                    let text = ui.painter().layout(
+                        opt.clone(),
+                        d.font_bold(d.t().label),
+                        color,
+                        (body_w - m.s(32.0)).max(1.0),
+                    );
+                    let height = (text.size().y + m.s(20.0)).max(m.hit_target(m.s(36.0)));
+                    let (r, _) = ui.allocate_exact_size(
+                        Vec2::new(body_w, height),
+                        egui::Sense::hover(),
+                    );
+                    let response = super::tap(ui, r, ui.id().with(("ask-option", &meta.call_id, i)));
+                    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), opt));
+                    #[cfg(test)]
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(egui::Id::new(("neo-ask-option-probe", i)),
+                            (r, ui.clip_rect(), text.size(), text.rows.len(), response.enabled()));
+                    });
+                    let fill = match (i == 0, response.hovered()) {
+                        (true, true) => d.c().btn_info_hover,
+                        (true, false) => d.c().btn_info,
+                        (false, true) => d.c().hover_solid,
+                        (false, false) => d.c().btn_elevated,
                     };
-                    if b.show(ui, &d).clicked() {
+                    ui.painter().squircle_filled(r, m.radius_chip(), fill);
+                    ui.painter().galley(
+                        egui::pos2(r.left() + m.s(16.0), r.center().y - text.size().y * 0.5),
+                        text,
+                        color,
+                    );
+                    if response.clicked() {
                         out = Some(AskAnswer::Pick(i));
                     }
                 }
@@ -324,12 +356,137 @@ pub fn ask(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta) -> Option<AskAnswer> {
     });
     super::at(ui, g.footer, |ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if Button::new("跳过").ghost().show(ui, &d).clicked() {
+            let skip = Button::new("跳过").ghost().show(ui, &d);
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(egui::Id::new("neo-ask-skip-probe"), (skip.rect, ui.clip_rect()));
+            });
+            if skip.clicked() {
                 out = Some(AskAnswer::Skip);
             }
         });
     });
     out
+}
+
+#[cfg(test)]
+mod ui_regression {
+    use super::*;
+    use crate::ui::composer::ui_regression::{context, pointer, probe};
+
+    #[test]
+    fn long_confirmation_scrolls_without_moving_actions_and_blocks_batch_in_safe_mode() {
+        for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
+            for width in [320.0, 560.0] {
+                for (enabled, allow_batch) in [(true, false), (true, true), (false, true)] {
+                    let ctx = context();
+                    let mut meta = ToolMeta::restored("write_file");
+                    meta.call_id = "long-confirm".into();
+                    meta.preview = "完整动作预览 ".repeat(150);
+                    meta.args = serde_json::json!({"content": "long-content-without-spaces".repeat(100)});
+                    let size = Vec2::new(width, 420.0);
+                    let answer = std::cell::Cell::new(None);
+                    let mut render = |ui: &mut Ui, skin: &Skin<'_>| {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            answer.set(confirm(ui, skin, &meta, 3, allow_batch));
+                        });
+                    };
+                    let frame = |events, render: &mut dyn FnMut(&mut Ui, &Skin<'_>)| {
+                        crate::ui::composer::ui_regression::frame_themed(&ctx, size, events, mode, render)
+                    };
+                    for _ in 0..3 { frame(vec![], &mut render); }
+                    let (body, _, content_h): (Rect, f32, f32) = probe(&ctx, "neo-confirm-scroll-probe");
+                    assert!(content_h > body.height());
+                    let (batch, clip): (Rect, Rect) = probe(&ctx, ("neo-confirm-button-probe", Answer::Always as u8));
+                    assert!(clip.contains_rect(batch));
+                    assert!(batch.top() >= body.bottom());
+                    if enabled {
+                        for _ in 0..8 {
+                            frame(vec![egui::Event::PointerMoved(body.center()), egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -10000.0),
+                                phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE,
+                            }], &mut render);
+                        }
+                        let (body, offset, content_h): (Rect, f32, f32) = probe(&ctx, "neo-confirm-scroll-probe");
+                        assert!(offset > 0.0);
+                        assert!(offset + body.height() >= content_h - 1.0);
+                    }
+                    let (after, _): (Rect, Rect) = probe(&ctx, ("neo-confirm-button-probe", Answer::Always as u8));
+                    assert_eq!(batch, after);
+                    frame(pointer(batch.center(), true), &mut render);
+                    frame(pointer(batch.center(), false), &mut render);
+                    assert_eq!(answer.get(), (enabled && allow_batch).then_some(Answer::Always));
+                    for action in [Answer::Once, Answer::Deny] {
+                        let (button, _): (Rect, Rect) = probe(&ctx, ("neo-confirm-button-probe", action as u8));
+                        frame(pointer(button.center(), true), &mut render);
+                        frame(pointer(button.center(), false), &mut render);
+                        assert_eq!(answer.get(), enabled.then_some(action));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_ask_options_wrap_scroll_to_tail_and_respect_disabled() {
+        for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
+        let frame = |ctx: &egui::Context, size, events, draw: &mut dyn FnMut(&mut Ui, &Skin<'_>)| {
+            crate::ui::composer::ui_regression::frame_themed(ctx, size, events, mode, draw)
+        };
+        for enabled in [false, true] {
+            let ctx = context();
+            let meta = ToolMeta {
+                call_id: "pure-ask".into(), name: "ask_user".into(), title: "提问", risk: "read",
+                preview: "question".into(), state: crate::state::ToolState::AwaitingConfirm,
+                outcome: None,
+                args: serde_json::json!({"question": "Choose", "options": format!("{}|{}", "long option with wrapping ".repeat(35), "last option tail ".repeat(35))}),
+            };
+            let size = Vec2::new(360.0, 420.0);
+            let answer = std::cell::Cell::new(None);
+            let mut render = |ui: &mut Ui, skin: &Skin<'_>| {
+                ui.add_enabled_ui(enabled, |ui| { answer.set(ask(ui, skin, &meta)); });
+            };
+            for _ in 0..3 { frame(&ctx, size, vec![], &mut render); }
+            let (first, clip, text, rows, response_enabled): (Rect, Rect, Vec2, usize, bool) =
+                probe(&ctx, ("neo-ask-option-probe", 0usize));
+            assert!(rows > 1);
+            assert!(first.height() >= text.y + 19.0);
+            assert!(text.x <= first.width() - 31.0);
+            assert_eq!(response_enabled, enabled);
+            let (skip, skip_clip): (Rect, Rect) = probe(&ctx, "neo-ask-skip-probe");
+            assert!(skip_clip.contains_rect(skip));
+            let (tail, _, _, _, _): (Rect, Rect, Vec2, usize, bool) =
+                probe(&ctx, ("neo-ask-option-probe", 1usize));
+            assert!(tail.bottom() > clip.bottom());
+            // 实际滚轮事件只滚动正文，底部操作保持固定。
+            if enabled {
+                for _ in 0..8 {
+                    frame(&ctx, size, vec![egui::Event::PointerMoved(clip.center()), egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -2000.0), phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    }], &mut render);
+                }
+                let (tail, tail_clip, _, _, _): (Rect, Rect, Vec2, usize, bool) =
+                    probe(&ctx, ("neo-ask-option-probe", 1usize));
+                assert!(tail.bottom() <= tail_clip.bottom() + 1.0, "{tail:?}, {tail_clip:?}");
+                let pos = egui::pos2(tail.center().x, tail.bottom() - 12.0);
+                frame(&ctx, size, pointer(pos, true), &mut render);
+                frame(&ctx, size, pointer(pos, false), &mut render);
+                assert_eq!(answer.get(), Some(AskAnswer::Pick(1)));
+                let (after, _): (Rect, Rect) = probe(&ctx, "neo-ask-skip-probe");
+                assert_eq!(skip, after);
+            } else {
+                let pos = first.intersect(clip).center();
+                frame(&ctx, size, pointer(pos, true), &mut render);
+                frame(&ctx, size, pointer(pos, false), &mut render);
+                assert_eq!(answer.get(), None);
+                frame(&ctx, size, pointer(skip.center(), true), &mut render);
+                frame(&ctx, size, pointer(skip.center(), false), &mut render);
+                assert_eq!(answer.get(), None);
+            }
+        }
+        }
+    }
 }
 
 #[cfg(test)]

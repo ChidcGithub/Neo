@@ -47,6 +47,13 @@ pub fn parse_subpaths(d: &str) -> Vec<Vec<[f32; 2]>> {
     while let Some(cmd) = lex.next_command(last_cmd) {
         let rel = cmd.is_ascii_lowercase();
         let up = cmd.to_ascii_uppercase();
+        // SVG 2 §9.3.6–7：只有紧邻的同类曲线可供 S/T 反射。
+        if !matches!(up, 'C' | 'S') {
+            last_cubic = None;
+        }
+        if !matches!(up, 'Q' | 'T') {
+            last_quad = None;
+        }
         let shift = |p: [f32; 2]| -> [f32; 2] {
             if rel {
                 [pos[0] + p[0], pos[1] + p[1]]
@@ -440,8 +447,16 @@ impl<'a> Lexer<'a> {
 
     /// 圆弧的落点：跳过 rx ry rotation flag flag 五个参数，只取终点。
     fn arc_end(&mut self) -> Option<[f32; 2]> {
-        for _ in 0..4 {
+        for _ in 0..3 {
             self.number()?;
+        }
+        // flag 是单个 0/1，语法允许两个 flag 以及后续坐标之间不写分隔符。
+        for _ in 0..2 {
+            self.skip_separators();
+            match self.bytes.get(self.pos) {
+                Some(b'0' | b'1') => self.pos += 1,
+                _ => return None,
+            }
         }
         self.point()
     }
@@ -452,8 +467,78 @@ impl<'a> Lexer<'a> {
 const TAU: f32 = 2.0 * PI;
 
 #[cfg(test)]
+#[path = "../../neo-app/src/brand/whale_path.rs"]
+mod whale_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arcs_consume_seven_parameters_and_preserve_following_commands() {
+        assert_eq!(
+            parse_subpaths("M1 2 A3 4 45 0 1 10 20 L30 40"),
+            vec![vec![[1.0, 2.0], [10.0, 20.0], [30.0, 40.0]]],
+        );
+        assert_eq!(
+            parse_subpaths("M1 2 a3 4 0 01-5 6 3 4 0 10 2 3 l1 1"),
+            vec![vec![[1.0, 2.0], [-4.0, 8.0], [-2.0, 11.0], [-1.0, 12.0]]],
+        );
+        assert_eq!(
+            parse_subpaths("M0 0A3 4 0 0110 20L30 40"),
+            parse_subpaths("M0 0L10 20L30 40"),
+        );
+    }
+
+    #[test]
+    fn smooth_curves_reflect_only_the_immediately_preceding_curve_kind() {
+        for separator in ["L20 20", "H20", "V20", "A1 1 0 0 1 20 20", "M20 20", "ZM20 20"] {
+            let prefix = format!("M0 0C0 12 8 12 10 10{separator}");
+            let pos = if separator == "H20" { "20 10" } else if separator == "V20" { "10 20" } else { "20 20" };
+            assert_eq!(parse_subpaths(&format!("{prefix}S30 40 40 20")),
+                parse_subpaths(&format!("{prefix}C{pos} 30 40 40 20")), "{separator}");
+            let prefix = format!("M0 0Q8 12 10 10{separator}");
+            assert_eq!(parse_subpaths(&format!("{prefix}T40 20")),
+                parse_subpaths(&format!("{prefix}Q{pos} 40 20")), "{separator}");
+        }
+        assert_eq!(
+            parse_subpaths("M0 0C0 10 5 10 10 0Q15 10 20 0S25 10 30 0"),
+            parse_subpaths("M0 0C0 10 5 10 10 0Q15 10 20 0C20 0 25 10 30 0"),
+        );
+        assert_eq!(
+            parse_subpaths("M0 0Q5 10 10 0C15 10 15 10 20 0T30 0"),
+            parse_subpaths("M0 0Q5 10 10 0C15 10 15 10 20 0Q20 0 30 0"),
+        );
+    }
+
+    #[test]
+    fn smooth_curve_chains_keep_reflection_for_relative_and_implicit_segments() {
+        assert_eq!(
+            parse_subpaths("M0 0C0 10 5 10 10 0s5 -10 10 0 5 10 10 0"),
+            parse_subpaths("M0 0C0 10 5 10 10 0C15 -10 15 -10 20 0C25 10 25 10 30 0"),
+        );
+        assert_eq!(
+            parse_subpaths("M0 0Q5 10 10 0t10 0 10 0"),
+            parse_subpaths("M0 0Q5 10 10 0Q15 -10 20 0Q25 10 30 0"),
+        );
+    }
+
+    #[test]
+    fn current_whale_geometry_and_cutouts_are_preserved() {
+        use super::whale_fixture::*;
+        let paths = parse_subpaths(FISH_LOGO_PATH);
+        assert_eq!(paths.len(), 4);
+        for point in paths.iter().flatten() {
+            assert!((-1.0..=VIEWBOX_W + 1.0).contains(&point[0]));
+            assert!((-1.0..=VIEWBOX_H + 1.0).contains(&point[1]));
+        }
+        let coverage = rasterize(&paths, (VIEWBOX_W, VIEWBOX_H), 256, 188, 4, FillRule::EvenOdd);
+        let at = |x: f32, y: f32| coverage[(y / VIEWBOX_H * 188.0) as usize * 256 + (x / VIEWBOX_W * 256.0) as usize];
+        assert!(at(2.0, 10.0) > 0.9);
+        assert!(at(10.0, 8.0) > 0.9);
+        assert!(at(12.44, 8.26) < 0.2);
+        assert!(at(14.0, 8.5) < 0.2);
+    }
 
     #[test]
     fn parses_absolute_square() {

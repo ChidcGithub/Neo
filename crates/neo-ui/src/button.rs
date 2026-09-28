@@ -217,7 +217,7 @@ impl<'a> Button<'a> {
             };
             let label = match self.variant {
                 Variant::Ghost => translucent(p.label_secondary, 0.5),
-                _ => translucent(c.on_primary, 0.6),
+                _ => p.label_tertiary,
             };
             (fill, label)
         };

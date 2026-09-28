@@ -73,7 +73,9 @@ fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     let button = Button::parse(&args.opt_str("button")?)?;
     let duration_ms = args.opt_int("duration_ms")?.max(0) as u64;
 
+    let _interaction = super::screen_uia::INTERACTION.lock().unwrap();
     screen::ensure_dpi_aware();
+    super::screen_uia::cache_invalidate();
     screen::drag(from, to, button, duration_ms)?;
 
     Ok(Outcome::ok(
@@ -88,7 +90,9 @@ fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
             "button": button.name(),
             "duration_ms": duration_ms,
             "dpi_scale": screen::dpi_scale_at(to.0, to.1),
-            "next": "要确认拖出什么结果了，用 `screenshot` 再看一眼屏幕",
+            "snapshot_invalidated": true,
+            "target_identity_verified": false,
+            "next": "坐标拖动未验证目标身份；旧元素快照已失效，请运行 screen_elements 或 screenshot 确认结果。",
         }),
     ))
 }
@@ -106,6 +110,17 @@ mod tests {
         assert!(preview(&a).contains("(1, 2)"), "{}", preview(&a));
         assert!(preview(&a).contains("(300, 400)"), "{}", preview(&a));
         assert!(preview(&a).contains("300 ms"), "{}", preview(&a));
+    }
+
+    #[test]
+    fn incomplete_or_invalid_drag_is_rejected_before_desktop_access() {
+        let tool = crate::find("drag").unwrap();
+        let scope = Scope::new(std::env::temp_dir());
+        for value in [json!({"x": 1, "y": 2, "to_x": 3}),
+            json!({"x": 1, "y": 2, "to_x": 3, "to_y": 4, "button": "invalid"}),
+            json!({"x": 1, "y": 2, "to_x": 3, "to_y": 4, "duration_ms": 10001})] {
+            assert!(act(&scope, &Args::new(tool, &value)).is_err());
+        }
     }
 
     #[test]

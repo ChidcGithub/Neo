@@ -86,7 +86,9 @@ pub struct Rect {
 impl Rect {
     /// 半开区间：右/下边界不属于本块（虚拟桌面最右一列是 `x + width - 1`）。
     pub fn contains(&self, x: i32, y: i32) -> bool {
-        x >= self.x && y >= self.y && x < self.x + self.width && y < self.y + self.height
+        self.width > 0 && self.height > 0 && x >= self.x && y >= self.y
+            && i64::from(x) < i64::from(self.x) + i64::from(self.width)
+            && i64::from(y) < i64::from(self.y) + i64::from(self.height)
     }
 
     /// 越界的说明 —— **带上合法范围**，模型据此自己改，不用再问。
@@ -94,9 +96,9 @@ impl Rect {
         ToolError::bad_args(format!(
             "{what} ({x}, {y}) 不在屏幕内：虚拟桌面 x {}…{}、y {}…{}",
             self.x,
-            self.x + self.width - 1,
+            i64::from(self.x) + i64::from(self.width) - 1,
             self.y,
-            self.y + self.height - 1
+            i64::from(self.y) + i64::from(self.height) - 1
         ))
         .with_hint("先用 `screenshot` 看一眼，坐标照图里的像素位置写")
     }
@@ -160,6 +162,16 @@ impl Shot {
     }
 }
 
+#[cfg(any(windows, test))]
+fn capture_bytes(rect: Rect) -> Result<usize, ToolError> {
+    if rect.width <= 0 || rect.height <= 0 {
+        return Err(ToolError::bad_args("截屏区域必须是正的宽高"));
+    }
+    (rect.width as usize).checked_mul(rect.height as usize).and_then(|n| n.checked_mul(4))
+        .filter(|n| *n <= isize::MAX as usize && *n <= u32::MAX as usize)
+        .ok_or_else(|| ToolError::new(ErrorKind::TooLarge, "截图位图超出 GDI/内存切片尺寸限制"))
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -170,7 +182,7 @@ mod imp {
     use windows_sys::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
         MonitorFromPoint, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, CAPTUREBLT,
-        DIB_RGB_COLORS, MONITOR_DEFAULTTONEAREST, SRCCOPY,
+        DIB_RGB_COLORS, MONITOR_DEFAULTTONEAREST, SRCCOPY, GdiFlush,
     };
     use windows_sys::Win32::UI::HiDpi::{
         GetDpiForMonitor, SetProcessDpiAwareness, SetProcessDpiAwarenessContext,
@@ -202,8 +214,31 @@ mod imp {
         }
     }
 
+    pub struct DpiGuard {
+        previous: windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT,
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for DpiGuard {
+        fn drop(&mut self) {
+            unsafe { windows_sys::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(self.previous); }
+        }
+    }
+
+    /// 宿主可能已锁定为系统感知；使用线程上下文，结束后恢复，不改变宿主线程设置。
+    pub fn physical_pixels() -> Result<DpiGuard, ToolError> {
+        let previous = unsafe {
+            windows_sys::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        };
+        if previous.is_null() { return Err(ToolError::io("无法切换为物理像素 DPI 上下文，已拒绝桌面操作")); }
+        Ok(DpiGuard { previous, _thread: std::marker::PhantomData })
+    }
+
     /// 虚拟桌面（所有显示器的并集），物理像素。
     pub fn virtual_screen() -> Rect {
+        let Ok(_dpi) = physical_pixels() else {
+            return Rect { x: 0, y: 0, width: 0, height: 0 };
+        };
         unsafe {
             Rect {
                 x: GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -258,6 +293,11 @@ mod imp {
 
     /// 实际的 GDI 抓帧（`capture` / `capture_silent` 共用）。
     fn capture_impl(rect: Rect) -> Result<Shot, ToolError> {
+        let _dpi = physical_pixels()?;
+        let bytes = capture_bytes(rect)?;
+        // 分配失败必须在取得 GDI 资源之前返回，避免 Rust 提前退出泄漏句柄。
+        let mut rgba = Vec::new();
+        rgba.try_reserve_exact(bytes).map_err(|_| ToolError::io("截图缓冲区分配失败"))?;
         unsafe {
             let screen = GetDC(std::ptr::null_mut());
             if screen.is_null() {
@@ -292,11 +332,18 @@ mod imp {
                 0,
             );
             if dib.is_null() || bits.is_null() {
+                if !dib.is_null() { DeleteObject(dib); }
                 DeleteDC(mem);
                 ReleaseDC(std::ptr::null_mut(), screen);
                 return Err(ToolError::io("CreateDIBSection 失败（显存不足？）"));
             }
             let old = SelectObject(mem, dib);
+            if old.is_null() || old as isize == -1 {
+                DeleteObject(dib);
+                DeleteDC(mem);
+                ReleaseDC(std::ptr::null_mut(), screen);
+                return Err(ToolError::io("SelectObject 失败"));
+            }
 
             // `CAPTUREBLT`：把分层窗口也抓进来（否则某些浮层是黑的）。
             // `BitBlt` **不含光标** —— 对"给模型看屏幕"来说正好，光标只会挡住内容。
@@ -312,24 +359,27 @@ mod imp {
                 SRCCOPY | CAPTUREBLT,
             );
 
-            let mut rgba = Vec::new();
-            if ok != 0 {
-                let count = (rect.width as usize) * (rect.height as usize);
-                rgba.reserve(count * 4);
-                let src = std::slice::from_raw_parts(bits as *const u8, count * 4);
+            // DIB 指针只能在 GDI 批处理完成后读取。
+            let flushed = GdiFlush();
+            if ok != 0 && flushed != 0 {
+                let src = std::slice::from_raw_parts(bits as *const u8, bytes);
                 // GDI 给的是 BGRA，且 alpha 通道不可信（常为 0），一律按不透明处理。
                 for px in src.chunks_exact(4) {
                     rgba.extend_from_slice(&[px[2], px[1], px[0], 0xff]);
                 }
             }
 
-            SelectObject(mem, old);
-            DeleteObject(dib);
-            DeleteDC(mem);
-            ReleaseDC(std::ptr::null_mut(), screen);
+            let restored = SelectObject(mem, old);
+            // 先销毁 DC，即使恢复选入对象失败，也不会删除仍被选入的位图。
+            let dc_deleted = DeleteDC(mem);
+            let bitmap_deleted = DeleteObject(dib);
+            let released = ReleaseDC(std::ptr::null_mut(), screen);
 
-            if ok == 0 {
-                return Err(ToolError::io("BitBlt 失败：没能读回屏幕像素"));
+            if ok == 0 || flushed == 0 {
+                return Err(ToolError::io("BitBlt/GdiFlush 失败：没能读回屏幕像素"));
+            }
+            if restored.is_null() || restored as isize == -1 || dc_deleted == 0 || bitmap_deleted == 0 || released == 0 {
+                return Err(ToolError::io("截图 GDI 资源清理失败"));
             }
             Ok(Shot {
                 width: rect.width as u32,
@@ -366,10 +416,10 @@ mod imp {
     fn to_absolute(x: i32, y: i32, vs: Rect) -> (i32, i32) {
         let span_x = (vs.width - 1).max(1) as f64;
         let span_y = (vs.height - 1).max(1) as f64;
-        let nx = ((x - vs.x) as f64 / span_x * 65535.0)
+        let nx = ((i64::from(x) - i64::from(vs.x)) as f64 / span_x * 65535.0)
             .round()
             .clamp(0.0, 65535.0) as i32;
-        let ny = ((y - vs.y) as f64 / span_y * 65535.0)
+        let ny = ((i64::from(y) - i64::from(vs.y)) as f64 / span_y * 65535.0)
             .round()
             .clamp(0.0, 65535.0) as i32;
         (nx, ny)
@@ -386,6 +436,8 @@ mod imp {
         if events.is_empty() {
             return Ok(());
         }
+        // 底层也失效，覆盖绕过 click/drag 工具直接调用本层的输入。
+        super::super::screen_uia::cache_invalidate();
         // 注入前先置位：事件进系统队列的瞬间，全局左键就可能被采样到「按下」。
         SYNTHETIC_INPUT_AT.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
         let sent = unsafe {
@@ -419,6 +471,7 @@ mod imp {
     /// 时间间隔是否小于双击阈值来判定双击，拆成两次 `SendInput` 反而容易被
     /// 线程调度顶出阈值，变成一个单击加一个单击。
     pub fn click(x: i32, y: i32, button: Button, double: bool) -> Result<(), ToolError> {
+        let _dpi = physical_pixels()?;
         let vs = virtual_screen();
         if !vs.contains(x, y) {
             return Err(vs.outside_error("点击位置", x, y));
@@ -431,7 +484,12 @@ mod imp {
             events.push(mouse(down, 0, 0));
             events.push(mouse(up, 0, 0));
         }
-        send(&events)
+        let result = send(&events);
+        if result.is_err() {
+            // 批次可能只送达按下而未送达抬起；只释放，不再移动到潜在危险位置。
+            let _ = send(&[mouse(up, 0, 0)]);
+        }
+        result
     }
 
     /// 拖动：移过去 → 按下 → 分步移动到终点 → 抬起。
@@ -444,6 +502,7 @@ mod imp {
         button: Button,
         duration_ms: u64,
     ) -> Result<(), ToolError> {
+        let _dpi = physical_pixels()?;
         let vs = virtual_screen();
         if !vs.contains(from.0, from.1) {
             return Err(vs.outside_error("拖动起点", from.0, from.1));
@@ -454,20 +513,22 @@ mod imp {
 
         let (down, up) = down_up(button);
         let (fx, fy) = to_absolute(from.0, from.1, vs);
-        send(&[mouse(MOVE_ABS, fx, fy), mouse(down, 0, 0)])?;
+        if let Err(error) = send(&[mouse(MOVE_ABS, fx, fy), mouse(down, 0, 0)]) {
+            let _ = send(&[mouse(up, 0, 0)]);
+            return Err(error);
+        }
 
         // 每步固定 15ms：步数上限对齐参数声明的 duration_ms 上限（10s），
         // 否则慢拖（框选/滑块常要几秒）被静默压成 ~0.9s。
         let steps = (duration_ms / 15).clamp(1, 667) as i32;
         for i in 1..=steps {
             let t = f64::from(i) / f64::from(steps);
-            let x = from.0 + ((to.0 - from.0) as f64 * t).round() as i32;
-            let y = from.1 + ((to.1 - from.1) as f64 * t).round() as i32;
+            let x = (f64::from(from.0) + (f64::from(to.0) - f64::from(from.0)) * t).round() as i32;
+            let y = (f64::from(from.1) + (f64::from(to.1) - f64::from(from.1)) * t).round() as i32;
             let (nx, ny) = to_absolute(x, y, vs);
             if let Err(e) = send(&[mouse(MOVE_ABS, nx, ny)]) {
                 // 中途失败也要先把键松开，否则用户会留下一个"一直按着"的鼠标。
-                let (tx, ty) = to_absolute(to.0, to.1, vs);
-                let _ = send(&[mouse(MOVE_ABS, tx, ty), mouse(up, 0, 0)]);
+                let _ = send(&[mouse(up, 0, 0)]);
                 return Err(e);
             }
             if i < steps {
@@ -475,8 +536,9 @@ mod imp {
             }
         }
 
-        let (tx, ty) = to_absolute(to.0, to.1, vs);
-        send(&[mouse(MOVE_ABS, tx, ty), mouse(up, 0, 0)])
+        let result = send(&[mouse(up, 0, 0)]);
+        if result.is_err() { let _ = send(&[mouse(up, 0, 0)]); }
+        result
     }
 }
 
@@ -490,6 +552,8 @@ mod imp {
     }
 
     pub fn ensure_dpi_aware() {}
+
+    pub fn physical_pixels() -> Result<(), ToolError> { Err(unsupported()) }
 
     pub fn virtual_screen() -> Rect {
         Rect {
@@ -531,6 +595,17 @@ pub use imp::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geometry_and_capture_size_reject_overflow_without_desktop_access() {
+        let extreme = Rect { x: i32::MAX - 1, y: i32::MIN, width: 100, height: i32::MAX };
+        assert!(extreme.contains(i32::MAX, -2));
+        assert!(!extreme.contains(i32::MAX, 0));
+        assert!(extreme.outside_error("位置", 0, 0).message.contains("2147483745"));
+        assert!(capture_bytes(Rect { x: 0, y: 0, width: i32::MAX, height: i32::MAX }).is_err());
+        assert!(capture_bytes(Rect { x: 0, y: 0, width: 0, height: 10 }).is_err());
+        assert_eq!(capture_bytes(Rect { x: -1920, y: 0, width: 32, height: 32 }).unwrap(), 4096);
+    }
 
     #[test]
     fn button_parsing_is_forgiving_about_case_and_aliases() {

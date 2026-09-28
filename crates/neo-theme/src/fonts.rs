@@ -255,25 +255,6 @@ pub fn install(ctx: &Context) -> LoadedFonts {
     }
     monospace.extend(["Hack".to_owned(), "Ubuntu-Light".to_owned()]);
 
-    let mut bold_chain: Vec<String> = Vec::new();
-    if loaded.bold.is_some() {
-        bold_chain.push("neo-bold".to_owned());
-    }
-    if loaded.cjk.is_some() {
-        bold_chain.push("neo-bold-cjk".to_owned());
-    }
-    if loaded.ui.is_some() {
-        bold_chain.push("neo-ui".to_owned());
-    }
-    if loaded.cjk.is_some() {
-        bold_chain.push("neo-ui-cjk".to_owned());
-    }
-    bold_chain.extend([
-        ICON_FONT.to_owned(),
-        "Ubuntu-Light".to_owned(),
-        "NotoEmoji-Regular".to_owned(),
-    ]);
-
     // 图标字体：单字体一族，正文/粗体链里都以 PUA 回退的方式引用它。
     defs.font_data.insert(
         ICON_FONT.to_owned(),
@@ -287,6 +268,7 @@ pub fn install(ctx: &Context) -> LoadedFonts {
     defs.families
         .insert(FontFamily::Proportional, proportional.clone());
     defs.families.insert(FontFamily::Monospace, monospace);
+    let bold_chain = bold_family(&defs);
     defs.families.insert(bold(), bold_chain);
     defs.families.insert(mono(), monospace_family(&loaded));
 
@@ -331,6 +313,52 @@ pub fn katex_family(name: &str) -> FontFamily {
         FontFamily::Name(format!("{KATEX_PREFIX}{name}").into())
     } else {
         FontFamily::Proportional
+    }
+}
+
+fn bold_family(defs: &FontDefinitions) -> Vec<String> {
+    [
+        "neo-bold",
+        "neo-bold-cjk",
+        "neo-ui",
+        "neo-ui-cjk",
+        ICON_FONT,
+        "Ubuntu-Light",
+        "NotoEmoji-Regular",
+    ]
+    .into_iter()
+    .filter(|key| defs.font_data.contains_key(*key))
+    .map(str::to_owned)
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bold_chain_only_references_registered_fonts() {
+        for regular_cjk in [false, true] {
+            for bold_cjk in [false, true] {
+                let mut defs = FontDefinitions::default();
+                let fixture = Arc::new(FontData::from_static(PHOSPHOR_TTF));
+                if regular_cjk {
+                    defs.font_data.insert("neo-ui-cjk".into(), fixture.clone());
+                }
+                if bold_cjk {
+                    defs.font_data.insert("neo-bold-cjk".into(), fixture.clone());
+                }
+                let chain = bold_family(&defs);
+                assert!(!chain.is_empty());
+                assert!(chain.iter().all(|key| defs.font_data.contains_key(key)));
+                assert_eq!(chain.contains(&"neo-ui-cjk".to_owned()), regular_cjk);
+                assert_eq!(chain.contains(&"neo-bold-cjk".to_owned()), bold_cjk);
+                if regular_cjk && bold_cjk {
+                    assert!(chain.iter().position(|k| k == "neo-bold-cjk")
+                        < chain.iter().position(|k| k == "neo-ui-cjk"));
+                }
+            }
+        }
     }
 }
 

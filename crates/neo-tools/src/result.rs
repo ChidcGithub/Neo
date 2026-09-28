@@ -155,6 +155,8 @@ impl Outcome {
     /// `limit` 是**字符**上限 —— 超长输出（命令回显、整文件内容）在这里被截断
     /// 并打上标记，避免一次吃光上下文窗口。截断只影响回灌给模型的副本，
     /// [`Outcome::data`] 保持完整，UI 仍能展示全量。
+    /// 预算不足以保留外壳时依次退化为截断标记、空对象、`0`；
+    /// 合法 JSON 最少需要 1 字符，因此 `limit == 0` 也返回 `0`。
     pub fn to_model_json(&self, limit: usize) -> String {
         let body = if let Some(e) = &self.error {
             json!({ "ok": false, "tool": self.tool, "error": e.to_json() })
@@ -165,18 +167,55 @@ impl Outcome {
         if text.chars().count() <= limit {
             return text;
         }
-        // 截断后仍必须是合法 JSON —— 回灌的是协议消息，不能是坏 JSON。
-        let head: String = text.chars().take(limit).collect();
-        json!({
+        // 先预留外壳，再按 JSON 转义后的字符数分配 summary / head 的预算。
+        let mut truncated = json!({
             "ok": self.is_ok(),
             "tool": self.tool,
             "truncated": true,
-            "summary": self.summary,
+            "summary": "",
             "note": format!("结果过长，已截断到 {limit} 字符；完整内容见界面卡片，或缩小范围重试"),
-            "head": head,
-        })
-        .to_string()
+            "head": "",
+        });
+        let mut overhead = truncated.to_string().chars().count();
+        if overhead > limit {
+            truncated.as_object_mut().unwrap().remove("note");
+            overhead = truncated.to_string().chars().count();
+        }
+        if overhead > limit {
+            return if limit >= 18 {
+                "{\"truncated\":true}".to_owned()
+            } else if limit >= 2 {
+                "{}".to_owned()
+            } else {
+                "0".to_owned()
+            };
+        }
+        let remaining = limit - overhead;
+        let (summary, used) = json_string_prefix(&self.summary, remaining / 2);
+        let (head, _) = json_string_prefix(&text, remaining - used);
+        truncated["summary"] = json!(summary);
+        truncated["head"] = json!(head);
+        truncated.to_string()
     }
+}
+
+/// 返回前缀及其在 JSON 字符串内转义后的字符数（不含两端引号）。
+fn json_string_prefix(text: &str, budget: usize) -> (String, usize) {
+    let mut used = 0;
+    let prefix = text.chars().take_while(|c| {
+        let cost = match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+            '\u{00}'..='\u{1f}' => 6,
+            _ => 1,
+        };
+        if cost > budget - used {
+            false
+        } else {
+            used += cost;
+            true
+        }
+    }).collect();
+    (prefix, used)
 }
 
 /// 工具参数的取值包装：**唯一**的读参入口。
@@ -377,6 +416,38 @@ mod tests {
         let v: Value = serde_json::from_str(&out.to_model_json(200)).expect("截断后仍是合法 JSON");
         assert_eq!(v["truncated"], true);
         assert!(v["head"].as_str().unwrap().chars().count() <= 200);
+    }
+
+    #[test]
+    fn model_json_budget_counts_final_escaped_output_and_summary() {
+        for content in ["中文".repeat(500), "\\\"\n\u{00}".repeat(500)] {
+            let out = Outcome::ok("bash", content.clone(), json!({"stdout": content}));
+            let original = out.data.clone();
+            for limit in 0..=400 {
+                let text = out.to_model_json(limit);
+                assert!(text.chars().count() <= limit.max(1), "limit={limit}");
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if limit >= 200 {
+                    assert_eq!(value["ok"], true);
+                    assert_eq!(value["tool"], "bash");
+                    assert_eq!(value["truncated"], true);
+                    assert!(value["summary"].is_string());
+                    assert!(value["head"].is_string());
+                }
+            }
+            assert_eq!(out.data, original);
+        }
+        assert_eq!(outcome_ok().to_model_json(0), "0");
+        assert_eq!(outcome_ok().to_model_json(1), "0");
+        assert_eq!(outcome_ok().to_model_json(2), "{}");
+        let out = Outcome::ok("bash", "中文", json!({"text": "汉字"}));
+        let full = out.to_model_json(4096);
+        assert!(full.len() > full.chars().count());
+        assert_eq!(out.to_model_json(full.chars().count()), full);
+        let fail = Outcome::fail("bash", ToolError::io("\\".repeat(500)));
+        let text = fail.to_model_json(200);
+        assert!(text.chars().count() <= 200);
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["ok"], false);
     }
 
     #[test]

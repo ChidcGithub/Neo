@@ -138,14 +138,7 @@ fn shot(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     let png = img.to_png()?;
 
     // 存进工作区：模型之后能用这个路径做别的事（裁剪、比对、交给用户看）。
-    let rel = format!("screenshots/shot-{}.png", epoch_ms());
-    let path: PathBuf = scope.resolve(&rel)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ToolError::io(format!("创建 {} 失败：{e}", scope.display(parent))))?;
-    }
-    std::fs::write(&path, &png)
-        .map_err(|e| ToolError::io(format!("保存 {} 失败：{e}", scope.display(&path))))?;
+    let path = save_png(scope, &png)?;
 
     let scale = screen::dpi_scale_at(rect.x + rect.width / 2, rect.y + rect.height / 2);
     let shown = scope.display(&path);
@@ -189,6 +182,19 @@ fn shot(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     Ok(outcome)
 }
 
+fn save_png(scope: &Scope, png: &[u8]) -> Result<PathBuf, ToolError> {
+    let rel = format!("screenshots/shot-{}.png", epoch_ms());
+    let path = scope.resolve(&rel)?;
+    scope.verify_new(&path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ToolError::io(format!("创建 {} 失败：{e}", scope.display(parent))))?;
+    }
+    std::fs::write(&path, png)
+        .map_err(|e| ToolError::io(format!("保存 {} 失败：{e}", scope.display(&path))))?;
+    Ok(path)
+}
+
 /// 毫秒时间戳，用来给截图起不重名的文件名。
 fn epoch_ms() -> u128 {
     std::time::SystemTime::now()
@@ -201,6 +207,32 @@ fn epoch_ms() -> u128 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(windows)]
+    #[test]
+    fn saving_png_rejects_screenshot_directory_junction_escape() {
+        let dir = std::env::temp_dir().join(format!("neo-shot-fence-{}-{}", std::process::id(), epoch_ms()));
+        let workspace = dir.join("workspace");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = workspace.join("screenshots");
+        let status = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:NEO_TEST_LINK -Target $env:NEO_TEST_TARGET | Out-Null"])
+            .env("NEO_TEST_LINK", &link)
+            .env("NEO_TEST_TARGET", &outside)
+            .status().unwrap();
+        assert!(status.success());
+        let scope = Scope::new(&workspace);
+        let result = save_png(&scope, b"synthetic image bytes");
+        let outside_count = std::fs::read_dir(&outside).unwrap().count();
+        std::fs::remove_dir(&link).unwrap();
+        let normal = save_png(&scope, b"synthetic image bytes").unwrap();
+        assert_eq!(std::fs::read(normal).unwrap(), b"synthetic image bytes");
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(result.unwrap_err().kind, ErrorKind::NotAllowed);
+        assert_eq!(outside_count, 0);
+    }
 
     #[test]
     fn region_needs_all_four_or_none() {

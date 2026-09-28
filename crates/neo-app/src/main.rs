@@ -34,6 +34,7 @@ mod app;
 mod attachments;
 mod brand;
 mod class;
+mod diagnostics;
 mod notify;
 mod state;
 mod ui;

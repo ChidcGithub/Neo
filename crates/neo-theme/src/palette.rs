@@ -1,7 +1,7 @@
 //! Neo 调色板。
 //!
-//! 数值直接取自 DeepSeek Harness 的 `packages/client/ui-theme/src/styles/design-platform.css`
-//! 语义 token（`--dsw-*`），保留原始的 light / dark 两套取值，未做二次调色。
+//! 基于 DeepSeek Harness 语义 token（`--dsw-*`），针对教室屏幕调整
+//! 辅助文字对比度与强调色，保持 light / dark 两套一致的视觉层级。
 //!
 //! 命名保留了 Harness 的语义分层（base / layer / label / border / interactive），
 //! 便于对照上游规范继续演进。
@@ -49,7 +49,7 @@ pub mod deepseek {
     pub const D300: Color32 = rgb(183, 200, 254);
     pub const D400: Color32 = rgb(103, 158, 254);
     pub const D450: Color32 = rgb(86, 134, 254);
-    pub const D500: Color32 = rgb(65, 118, 230);
+    pub const D500: Color32 = rgb(52, 96, 180);
     pub const D600: Color32 = rgb(72, 104, 178);
     pub const D800: Color32 = rgb(52, 65, 91);
 }
@@ -168,7 +168,7 @@ impl Components {
         btn_floating: neutral::N_00,
         btn_floating_hover: neutral::N_75,
         btn_info: crate::palette::deepseek::D500,
-        btn_info_hover: crate::palette::deepseek::D400,
+        btn_info_hover: rgb(43, 80, 151),
         on_info: neutral::N_00,
         on_danger: neutral::N_00,
         on_primary: neutral::N_00,
@@ -204,7 +204,7 @@ impl Components {
         btn_floating: neutral::N_850,
         btn_floating_hover: neutral::N_800,
         btn_info: crate::palette::deepseek::D400,
-        btn_info_hover: crate::palette::deepseek::D500,
+        btn_info_hover: rgb(128, 174, 245),
         on_info: neutral::N_1000,
         on_danger: neutral::N_00,
         on_primary: neutral::N_00,
@@ -327,7 +327,7 @@ impl Palette {
         label_primary: neutral::N_50,
         label_secondary: neutral::N_300,
         label_tertiary: neutral::N_400,
-        label_caption: neutral::N_600,
+        label_caption: neutral::N_400,
         label_on_accent: neutral::N_1000,
 
         accent: deepseek::D400,
@@ -346,7 +346,7 @@ impl Palette {
         hover_solid: neutral::N_800,
         active: white_a(36),
         nav_hover: neutral::N_850,
-        nav_active: neutral::N_750,
+        nav_active: neutral::N_800,
     };
 
     /// 亮色主题 —— 与 Harness 默认（无 `data-ds-dark-theme`）一一对应。
@@ -359,12 +359,12 @@ impl Palette {
         sidebar_fill: rgb(249, 250, 251),
         input_surface: neutral::N_00,
         selector: neutral::N_60,
-        bubble: deepseek::D50,
+        bubble: neutral::N_75,
 
         label_primary: neutral::N_1000,
         label_secondary: neutral::N_700,
-        label_tertiary: neutral::N_600,
-        label_caption: neutral::N_400,
+        label_tertiary: rgb(100, 106, 114),
+        label_caption: rgb(100, 106, 114),
         label_on_accent: neutral::N_00,
 
         accent: deepseek::D500,
@@ -375,9 +375,9 @@ impl Palette {
         warn: neutral::AMBER_500,
         error: neutral::RED_600,
 
-        border_l1: black_a(10),
-        border_l2: black_a(26),
-        border_l3: black_a(31),
+        border_l1: black_a(16),
+        border_l2: black_a(38),
+        border_l3: black_a(52),
 
         hover: rgba(38, 49, 72, 15),
         hover_solid: neutral::N_75,
@@ -392,6 +392,55 @@ impl Palette {
             Self::DARK
         } else {
             Self::LIGHT
+        }
+    }
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    fn luminance(color: Color32) -> f32 {
+        let linear = |channel: u8| {
+            let value = channel as f32 / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let a = luminance(a);
+        let b = luminance(b);
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn supporting_text_and_primary_actions_remain_readable_in_both_themes() {
+        for p in [Palette::LIGHT, Palette::DARK] {
+            for bg in [
+                p.bg_base,
+                p.input_surface,
+                p.sidebar_fill,
+                p.bubble,
+                p.nav_active,
+            ] {
+                for fg in [
+                    p.label_primary,
+                    p.label_secondary,
+                    p.label_tertiary,
+                    p.label_caption,
+                ] {
+                    assert!(contrast(fg, bg) >= 4.5, "{fg:?} on {bg:?}");
+                }
+            }
+            let c = p.components();
+            for bg in [c.btn_info, c.btn_info_hover] {
+                assert!(contrast(c.on_info, bg) >= 4.5);
+            }
         }
     }
 }

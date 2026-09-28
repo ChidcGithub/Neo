@@ -40,7 +40,7 @@ impl<'a> NavItem<'a> {
     }
 
     pub fn height(d: &Design) -> f32 {
-        d.m().s(40.0)
+        d.m().hit_target(d.m().s(40.0))
     }
 
     pub fn show(self, ui: &mut Ui, d: &Design, width: f32) -> egui::Response {
@@ -164,18 +164,20 @@ impl<'a> ListRow<'a> {
         }
 
         // 行内动作：重命名 / 删除（恒显）。
-        let act_size = Vec2::splat(m.s(22.0));
+        let target = m.hit_target(m.s(24.0));
+        let act_size = Vec2::splat(target);
         let glyph = Vec2::splat(m.s(15.0));
         let pen_rect = Rect::from_center_size(
-            egui::pos2(rect.right() - m.s(48.0), rect.center().y),
+            egui::pos2(rect.right() - target * 1.5, rect.center().y),
             act_size,
         );
         let trash_rect = Rect::from_center_size(
-            egui::pos2(rect.right() - m.s(23.0), rect.center().y),
+            egui::pos2(rect.right() - target * 0.5, rect.center().y),
             act_size,
         );
-        let pen = tap(ui, pen_rect, Id::new(("neo-row-pen", self.id)));
-        let trash = tap(ui, trash_rect, Id::new(("neo-row-trash", self.id)));
+        let pen = tap(ui, pen_rect, Id::new(("neo-row-pen", self.id))).on_hover_text("重命名会话");
+        let trash =
+            tap(ui, trash_rect, Id::new(("neo-row-trash", self.id))).on_hover_text("删除会话");
         let idle = if self.active {
             p.label_secondary
         } else {
@@ -204,7 +206,7 @@ impl<'a> ListRow<'a> {
         let text_right_edge = pen_rect.left() - m.s(4.0);
         let title_rect = Rect::from_min_max(
             egui::pos2(rect.left() + m.s(10.0), rect.top() + m.s(4.0)),
-            egui::pos2(text_right_edge, rect.center().y + m.s(1.0)),
+            egui::pos2(text_right_edge, rect.center().y - m.s(2.0)),
         );
         let meta_rect = Rect::from_min_max(
             egui::pos2(rect.left() + m.s(10.0), rect.center().y - m.s(1.0)),
@@ -333,7 +335,12 @@ pub fn confirm_row(
     let shown = elide(ui.painter(), bar.question, &font, label_rect.width());
     text_left(ui.painter(), label_rect, &shown, font, p.label_primary);
 
-    let del = tap(ui, del_rect, Id::new(("neo-confirm-del", id)));
+    // 保留紧凑的视觉按钮，命中高度补足触控下限且不跨到相邻会话行。
+    let hit_rect = Rect::from_center_size(
+        del_rect.center(),
+        Vec2::new(m.hit_target(del_rect.width()), m.hit_target(del_rect.height())),
+    ).intersect(rect);
+    let del = tap(ui, hit_rect, Id::new(("neo-confirm-del", id)));
     ui.painter().squircle_filled(
         del_rect,
         m.radius_chip(),

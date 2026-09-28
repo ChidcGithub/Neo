@@ -89,7 +89,7 @@ fn attachment_area_height(skin: &Skin<'_>, state: &AppState) -> f32 {
 /// 当前提示条文案。
 fn notice_text(state: &AppState) -> &'static str {
     if state.plan_mode {
-        "Plan 模式 · 我会先列出步骤，经你确认后再执行"
+        "Plan 模式 · 只规划，不执行操作；关闭计划模式后再执行"
     } else if state.read_only {
         "只读模式 · 本次对话不会改动工作区文件"
     } else {
@@ -411,7 +411,7 @@ fn attachment_thumbnail(ctx: &egui::Context, url: &str) -> Option<egui::TextureH
 /// 工具栏行高：内容最高者（发送按钮）+ 上下内边距。
 fn toolbar_height(skin: &Skin<'_>) -> f32 {
     let m = skin.m();
-    m.btn_send() + m.s(2.0) + m.s(6.0)
+    m.hit_target(m.btn_send()) + m.s(8.0)
 }
 
 /// 绘制输入卡。
@@ -448,8 +448,6 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
     // ---- 卡片本体 ----
     let painter = ui.painter().clone();
 
-    let shadow = super::elevation_soft(skin);
-    painter.add(shadow.as_shape(rect, m.radius_card()));
     painter.squircle(rect, m.radius_card(), p.input_surface, card_stroke(skin));
 
     // 聚焦环：键盘焦点落在编辑区时，卡片外沿浮出一圈 accent 描边（0.1s 缓动，
@@ -458,11 +456,11 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
         ui.ctx().memory(|mem| mem.focused()) == Some(egui::Id::new(super::COMPOSER_ID));
     let focus_k = ease(ui, ui.id().with("focus-ring"), if focused { 1.0 } else { 0.0 });
     if focus_k > 0.0 {
-        let expand = m.s(1.5);
+        let expand = m.s(0.5);
         painter.squircle_stroked(
             rect.expand(expand),
             m.radius_card() + expand,
-            egui::Stroke::new(m.s(2.0), translucent(p.accent, focus_k)),
+            egui::Stroke::new(m.s(1.5), translucent(p.accent, focus_k)),
         );
     }
 
@@ -530,8 +528,7 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
     });
 
     // ---- 工具栏 ----
-    // 布局交给 egui_flex：左组（+ / Plan / 只读）— 弹性间隔 — 右组（模型 / 发送），
-    // 不再手推 x 游标。发送钮按上游规格是 34px 主按钮（Lg），其余控件 28px。
+    // 开关和模型使用 flex；发送钮独立固定在右侧，不参与内容自然宽测量。
     let d = skin.d();
     let row = Rect::from_min_max(
         egui::pos2(rect.left() + m.s(8.0), text_rect.bottom() + m.card_gap()),
@@ -550,9 +547,23 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
     let busy = state.generating || state.tool_open || state.tool_round;
     let can_send = state.can_submit();
 
-    super::at(ui, row, |ui| {
-        // 溢出即裁：内容比行宽时（极端窄窗 / 超长模型名）也别画出卡片右缘。
-        ui.shrink_clip_rect(row);
+    // 发送/停止独占右侧空间，模型名和左侧开关不能把它挤出卡片。
+    let send_w = m.hit_target(m.btn_send());
+    let send_center = egui::pos2(row.right() - send_w * 0.5, row.center().y);
+    let controls = Rect::from_min_max(
+        row.min,
+        egui::pos2((row.right() - send_w - m.toolbar_gap()).max(row.left()), row.bottom()),
+    );
+    let model_budget = (controls.width()
+        - m.s(28.0)
+        - Chip::width(ui.painter(), &d, "Plan", false)
+        - Chip::width(ui.painter(), &d, "只读", false)
+        - 4.0 * m.toolbar_gap())
+        .max(0.0);
+    let model = state.model_display();
+    let model_w = Chip::width(ui.painter(), &d, model, true).min(model_budget);
+    super::at(ui, controls, |ui| {
+        ui.shrink_clip_rect(controls);
         Flex::horizontal()
             .id_salt("neo-composer-toolbar")
             .align_items(FlexAlign::Center)
@@ -594,39 +605,155 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
                 // 弹性间隔把右组顶到行尾。
                 flex.grow();
 
-                // 右侧：模型选择器 + 发送/停止。
-                // 模型名会变：content_id 变了强制 flex 重测宽度。
-                let model = state.model_display();
-                let model_chip = flex.add_ui(item().content_id(egui::Id::new(model)), |ui| {
-                    Chip::new(model)
-                        .chevron(true)
-                        .id_salt("neo-composer-model")
-                        .show(ui, &d)
-                });
-                if model_chip.inner.clicked() {
-                    out.next_model = true;
-                }
-                // 生成中按钮变成"停止"（仍可点）；无可发内容时淡出强调色（不可点）。
-                let send_icon = if busy { Icon::Stop } else { Icon::ArrowUp };
-                let send = flex.add_ui(item(), |ui| {
-                    IconButton::new(send_icon)
-                        .accent()
-                        .size(Size::Lg)
-                        .enabled(busy || can_send)
-                        .id_salt("neo-composer-send")
-                        .show(ui, &d)
-                });
-                if send.inner.clicked() {
-                    if busy {
-                        out.stop = true;
-                    } else if can_send {
-                        out.send = true;
+                if model_w > m.chip_width(0.0, true) {
+                    let model_chip = flex.add_ui(
+                        item().content_id(egui::Id::new((model, model_w.to_bits()))),
+                        |ui| {
+                            let (rect, _) = ui.allocate_exact_size(
+                                Vec2::new(model_w, m.chip_h()),
+                                Sense::hover(),
+                            );
+                            // elide 的省略号兜底仍可能宽于剩余文本区，绘制必须限定在 chip 内。
+                            ui.shrink_clip_rect(rect);
+                            #[cfg(test)]
+                            ui.ctx().data_mut(|data| {
+                                data.insert_temp(egui::Id::new("neo-composer-model-probe"), (rect, ui.clip_rect()));
+                            });
+                            Chip::new(model)
+                                .chevron(true)
+                                .id_salt("neo-composer-model")
+                                .show_at(ui, &d, rect)
+                                .on_hover_text(state.model_id())
+                        },
+                    );
+                    if model_chip.inner.clicked() {
+                        out.next_model = true;
                     }
                 }
             });
     });
+    let send_icon = if busy { Icon::Stop } else { Icon::ArrowUp };
+    let send = IconButton::new(send_icon)
+        .accent()
+        .size(Size::Lg)
+        .enabled(busy || can_send)
+        .id_salt("neo-composer-send")
+        .show_at(ui, &d, send_center);
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(egui::Id::new("neo-composer-send-probe"), (send.rect, ui.clip_rect()));
+    });
+    if send.clicked() {
+        if busy {
+            out.stop = true;
+        } else if can_send {
+            out.send = true;
+        }
+    }
 
     out
+}
+
+#[cfg(test)]
+pub(super) mod ui_regression {
+    use super::*;
+
+    pub fn context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let proportional = fonts.families[&egui::FontFamily::Proportional].clone();
+        fonts.families.insert(neo_theme::fonts::bold(), proportional.clone());
+        fonts.families.insert(neo_theme::fonts::mono(), proportional);
+        ctx.set_fonts(fonts);
+        ctx
+    }
+
+    pub fn frame(
+        ctx: &egui::Context,
+        size: Vec2,
+        events: Vec<egui::Event>,
+        draw: impl FnMut(&mut Ui, &Skin<'_>),
+    ) -> egui::FullOutput {
+        frame_themed(ctx, size, events, neo_theme::ThemeMode::Light, draw)
+    }
+
+    pub fn frame_themed(
+        ctx: &egui::Context,
+        size: Vec2,
+        events: Vec<egui::Event>,
+        mode: neo_theme::ThemeMode,
+        mut draw: impl FnMut(&mut Ui, &Skin<'_>),
+    ) -> egui::FullOutput {
+        let theme = neo_theme::Theme::new(mode, 1080.0, neo_theme::Distance::Standard);
+        theme.apply(ctx);
+        let whale = crate::brand::WhaleMark::cached(ctx);
+        let mut output = ctx.run_ui(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events,
+            ..Default::default()
+        }, |ui| draw(ui, &Skin::new(theme, &whale)));
+        output.textures_delta.clear();
+        output
+    }
+
+    pub fn pointer(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed,
+            modifiers: egui::Modifiers::NONE,
+        }]
+    }
+
+    pub fn probe<T: Clone + Send + Sync + 'static>(ctx: &egui::Context, key: impl std::hash::Hash + std::fmt::Debug) -> T {
+        ctx.data(|data| data.get_temp::<T>(egui::Id::new(key)).unwrap())
+    }
+
+    #[test]
+    fn long_model_keeps_send_and_stop_visible_and_clickable() {
+        for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
+        let frame = |ctx: &egui::Context, size, events, draw: &mut dyn FnMut(&mut Ui, &Skin<'_>)| {
+            frame_themed(ctx, size, events, mode, draw)
+        };
+        for width in [240.0, 320.0, 480.0] {
+            for busy in 0..4 {
+                let ctx = context();
+                let mut state = AppState::default();
+                state.draft = "ready".into();
+                state.models = vec![crate::state::ModelDef::new("long-model-name-".repeat(80), "test", false)];
+                state.generating = busy == 1;
+                state.tool_open = busy == 2;
+                state.tool_round = busy == 3;
+                let mut outcome = Outcome::default();
+                let mut render = |ui: &mut Ui, skin: &Skin<'_>| {
+                    let rect = Rect::from_min_size(egui::pos2(8.0, 8.0),
+                        Vec2::new(width - 16.0, block_height(ui, skin, &state, width - 16.0, false)));
+                    outcome = draw(ui, skin, rect, &mut state, false);
+                };
+                for _ in 0..3 {
+                    frame(&ctx, Vec2::new(width, 400.0), vec![], &mut render);
+                }
+                let output = frame(&ctx, Vec2::new(width, 400.0), vec![], &mut render);
+                let (send, clip): (Rect, Rect) = probe(&ctx, "neo-composer-send-probe");
+                assert!(clip.contains_rect(send), "width={width}, {send:?}, {clip:?}");
+                assert!(send.right() <= width - 8.0);
+                if width == 480.0 {
+                    let (chip, chip_clip): (Rect, Rect) = probe(&ctx, "neo-composer-model-probe");
+                    assert!(chip.contains_rect(chip_clip));
+                    assert!(chip.right() < send.left(), "chip={chip:?}, send={send:?}");
+                    assert!(output.shapes.iter().any(|clipped| {
+                        if let egui::Shape::Text(text) = &clipped.shape {
+                            text.galley.job.text.starts_with("long-model")
+                                && chip.contains_rect(clipped.clip_rect)
+                        } else { false }
+                    }), "model text paint must remain clipped to its Chip::show_at rect");
+                }
+                frame(&ctx, Vec2::new(width, 400.0), pointer(send.center(), true), &mut render);
+                frame(&ctx, Vec2::new(width, 400.0), pointer(send.center(), false), &mut render);
+                assert_eq!(outcome.send, busy == 0, "width={width}, busy={busy}");
+                assert_eq!(outcome.stop, busy != 0, "width={width}, busy={busy}");
+            }
+        }
+        }
+    }
 }
 
 #[cfg(test)]

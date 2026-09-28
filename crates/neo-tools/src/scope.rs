@@ -6,6 +6,10 @@
 //!    挡住「工作区内放一个指向外面的符号链接」这种绕行。
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use crate::result::ToolError;
 
@@ -13,6 +17,7 @@ use crate::result::ToolError;
 #[derive(Clone, Debug)]
 pub struct Scope {
     root: PathBuf,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Scope {
@@ -26,7 +31,20 @@ impl Scope {
         });
         Self {
             root: normalize(&root),
+            cancel: None,
         }
+    }
+
+    /// 为本次调用绑定取消标记；克隆的 Scope 共享同一个标记。
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Acquire))
     }
 
     pub fn root(&self) -> &Path {
@@ -169,6 +187,20 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_is_optional_and_shared_by_clones() {
+        let original = scope();
+        assert!(!original.is_cancelled());
+        let token = Arc::new(AtomicBool::new(false));
+        let bound = original.clone().with_cancel(token.clone());
+        let cloned = bound.clone();
+        assert!(!cloned.is_cancelled());
+        token.store(true, Ordering::Release);
+        assert!(bound.is_cancelled());
+        assert!(cloned.is_cancelled());
+        assert!(!original.is_cancelled());
+    }
+
+    #[test]
     fn relative_paths_land_inside_root() {
         let s = scope();
         let p = s.resolve("src/main.rs").unwrap();
@@ -216,6 +248,7 @@ mod tests {
         );
         let unc = Scope {
             root: normalize(Path::new(r"\\server\share\workspace")),
+            cancel: None,
         };
         assert_eq!(
             unc.display(&unc.resolve(r"\\server\share\workspace\a.txt").unwrap()),

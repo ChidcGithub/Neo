@@ -41,6 +41,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GWLP_USERDATA, HCURSOR,
     HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE,
     SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WDA_EXCLUDEFROMCAPTURE, WM_APP,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_QUIT,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSEXW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
@@ -53,6 +54,24 @@ const PH_LISTEN: (f32, f32, f32) = (0.76, 0.85, 0.07);
 const RENDER_SCALE: f32 = 0.6;
 /// 线程消息：命令队列里有货，唤醒睡眠中的消息循环。
 const WM_NEO_CMD: u32 = WM_APP + 1;
+const START_TIMEOUT: Duration = Duration::from_secs(5);
+static ENGINE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+struct EngineLease(&'static AtomicBool);
+
+impl EngineLease {
+    fn acquire(flag: &'static AtomicBool) -> Result<Self, String> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self(flag))
+            .map_err(|_| "neo-overlay 线程仍在运行，本次不再启动".to_owned())
+    }
+}
+
+impl Drop for EngineLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// 发给窗口线程的命令。
 #[derive(Debug)]
@@ -62,8 +81,99 @@ enum Cmd {
     Shutdown,
 }
 
-/// 抓屏帧槽：抓屏线程放最新一帧，渲染线程每帧取走。
-type FrameSlot = Arc<Mutex<Option<Shot>>>;
+/// 采集门和帧槽共用短锁；锁绝不跨越系统抓屏或 GPU 操作。
+type FrameSlot = Arc<Mutex<CaptureState>>;
+
+#[derive(Default)]
+struct CaptureState {
+    enabled: bool,
+    generation: u64,
+    frame: Option<(DesktopBounds, Shot)>,
+}
+
+impl CaptureState {
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        self.invalidate();
+    }
+
+    /// 拓扑刷新也换代，但不能重新打开已关闭的采集门。
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.frame = None;
+    }
+
+    /// 取得许可即进入在途阶段。随后系统采集不可撤销，Hide 只阻止下一次
+    /// 许可并丢弃迟到结果；不能持锁等抓屏结束，否则 hide 会阻塞。
+    fn begin(&self) -> Option<u64> {
+        self.enabled.then_some(self.generation)
+    }
+
+    fn publish(&mut self, generation: u64, bounds: DesktopBounds, shot: Shot) {
+        if self.begin() == Some(generation) {
+            self.frame = Some((bounds, shot));
+        }
+    }
+
+    fn take(&mut self, bounds: DesktopBounds) -> Option<Shot> {
+        let (captured, shot) = self.frame.take()?;
+        (self.enabled && captured == bounds && (shot.width, shot.height) == bounds.size)
+            .then_some(shot)
+    }
+}
+
+#[derive(Default)]
+struct RippleState {
+    showing: bool,
+    fading: bool,
+}
+
+impl RippleState {
+    fn show(&mut self) {
+        self.showing = true;
+        self.fading = false;
+    }
+
+    fn hide(&mut self) {
+        self.fading = self.showing;
+    }
+
+    fn active(&self, have_cards: bool) -> bool {
+        self.showing || have_cards
+    }
+
+    fn finish_fade(&mut self, intensity: f32) -> bool {
+        if !fade_complete(self.fading, intensity) {
+            return false;
+        }
+        self.showing = false;
+        self.fading = false;
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DesktopBounds {
+    origin: (i32, i32),
+    size: (u32, u32),
+}
+
+impl DesktopBounds {
+    fn from_rect(rect: screen::Rect) -> Self {
+        Self {
+            origin: (rect.x, rect.y),
+            size: (rect.width.max(1) as u32, rect.height.max(1) as u32),
+        }
+    }
+
+    fn client_point(self, screen: (i32, i32)) -> (i32, i32) {
+        (screen.0 - self.origin.0, screen.1 - self.origin.1)
+    }
+}
+
+fn fade_complete(fading: bool, intensity: f32) -> bool {
+    fading && intensity < 0.02
+}
 
 /// 一张画进渲染层的卡片（替代过去的独立原生子窗口）。
 ///
@@ -128,6 +238,7 @@ pub struct OverlayHandle {
     level: Arc<AtomicU32>,
     visible: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    capture: FrameSlot,
     cards: CardSlot,
     thread: Option<JoinHandle<()>>,
 }
@@ -138,7 +249,8 @@ impl OverlayHandle {
         self.post(Cmd::Show);
     }
 
-    /// 隐藏跑马灯（淡出完成后暂停渲染，省电）。
+    /// 立即停止新采集，跑马灯用已有纹理淡出；卡片不受影响。
+    /// 已取得许可的在途采集无法回滚，其迟到结果会被丢弃。
     pub fn hide(&self) {
         self.post(Cmd::Hide);
     }
@@ -148,14 +260,22 @@ impl OverlayHandle {
         self.level.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
+    pub fn is_alive(&self) -> bool {
+        !self.stop.load(Ordering::Acquire)
+            && self.thread.as_ref().is_some_and(|thread| !thread.is_finished())
+    }
+
     pub fn is_visible(&self) -> bool {
-        self.visible.load(Ordering::Relaxed)
+        self.is_alive() && self.visible.load(Ordering::Relaxed)
     }
 
     /// 注册/更新/撤下一张卡片（`None` = 撤下）。窗口线程被唤醒后
     /// 下一帧生效：卡片出现会露面窗口、打开输入路由；最后一张撤下且
     /// 波纹已停时窗口回到隐藏睡眠。
     pub fn set_card(&self, id: u8, card: Option<Card>) {
+        if !self.is_alive() {
+            return;
+        }
         if let Ok(mut cards) = self.cards.lock() {
             match card {
                 Some(c) => {
@@ -167,26 +287,47 @@ impl OverlayHandle {
             }
         }
         // 唤醒隐藏中的消息循环（队列为空时 WM_NEO_CMD 也无妨：兜底排空而已）。
-        unsafe {
-            PostThreadMessageW(self.tid, WM_NEO_CMD, 0, 0);
+        self.wake_thread();
+    }
+
+    fn wake_thread(&self) {
+        if self.tid != 0 {
+            unsafe { PostThreadMessageW(self.tid, WM_NEO_CMD, 0, 0); }
         }
     }
 
-    /// 关停窗口线程并等待退出。
+    /// 立即关采集门并请求退出；不等待可能卡在驱动里的窗口线程。
     pub fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.visible.store(false, Ordering::Relaxed);
         self.post(Cmd::Shutdown);
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        self.tid = 0;
+        if let Some(thread) = self.thread.take() {
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
         }
+    }
+
+    fn await_ready(mut self, ready: Receiver<Result<u32, String>>, timeout: Duration) -> Result<Self, String> {
+        self.tid = ready.recv_timeout(timeout)
+            .map_err(|e| format!("neo-overlay 初始化未完成: {e}"))??;
+        Ok(self)
     }
 
     /// 投递命令并唤醒窗口线程（线程已退出时安静地丢弃）。
     fn post(&self, cmd: Cmd) {
-        if self.tx.send(cmd).is_ok() {
-            unsafe {
-                PostThreadMessageW(self.tid, WM_NEO_CMD, 0, 0);
-            }
+        // 许可变更与入队同序；窗口线程只处理动画，不能让积压的 Show
+        // 在 hide 返回后重新开门。此锁不等待在途抓屏或渲染。
+        let mut capture = self.capture.lock().unwrap_or_else(|p| p.into_inner());
+        capture.set_enabled(matches!(cmd, Cmd::Show) && self.is_alive());
+        let sent = self.tx.send(cmd).is_ok();
+        if !sent {
+            capture.set_enabled(false);
+        }
+        drop(capture);
+        if sent {
+            self.wake_thread();
         }
     }
 }
@@ -202,9 +343,11 @@ impl Drop for OverlayHandle {
 /// 窗口与 wgpu 初始化在窗口线程里同步完成，失败（无 DX12 / 建窗失败）
 /// 通过 `Err` 上报，调用方降级为无跑马灯/无层即可。
 pub fn start() -> Result<OverlayHandle, String> {
+    let lease = EngineLease::acquire(&ENGINE_RUNNING)?;
     let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
     let visible = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
+    let capture = Arc::new(Mutex::new(CaptureState::default()));
     let cards: CardSlot = Arc::new(Mutex::new(BTreeMap::new()));
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
     // 窗口线程初始化完成后回传线程 id（命令唤醒要靠它）。
@@ -213,24 +356,26 @@ pub fn start() -> Result<OverlayHandle, String> {
         let level = level.clone();
         let visible = visible.clone();
         let stop = stop.clone();
+        let capture = capture.clone();
         let cards = cards.clone();
         std::thread::Builder::new()
             .name("neo-overlay".into())
-            .spawn(move || run(ready_tx, cmd_rx, level, visible, stop, cards))
+            .spawn(move || {
+                let _lease = lease;
+                run(ready_tx, cmd_rx, level, visible, stop, capture, cards);
+            })
             .map_err(|e| format!("创建 neo-overlay 线程失败: {e}"))?
     };
-    let tid = ready_rx
-        .recv()
-        .map_err(|_| "neo-overlay 线程意外退出".to_string())??;
-    Ok(OverlayHandle {
+    OverlayHandle {
         tx: cmd_tx,
-        tid,
+        tid: 0,
         level,
         visible,
         stop,
+        capture,
         cards,
         thread: Some(thread),
-    })
+    }.await_ready(ready_rx, START_TIMEOUT)
 }
 
 /// 窗口线程主函数。
@@ -240,26 +385,24 @@ fn run(
     level: Arc<AtomicU32>,
     visible: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    slot: FrameSlot,
     cards: CardSlot,
 ) {
     // 无论正常退出还是 panic 展开（wgpu 的校验错误默认就是 panic），都要放
     // stop —— 否则抓屏线程跑到进程退出：迷你窗被永久压制、冻结的跑马灯残留
     // 在屏上、show()/hide() 全部落空且无人上报。
-    struct StopGuard(Arc<AtomicBool>);
+    struct StopGuard(Arc<AtomicBool>, FrameSlot);
     impl Drop for StopGuard {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Relaxed);
+            self.1.lock().unwrap_or_else(|p| p.into_inner()).set_enabled(false);
         }
     }
-    let _stop_guard = StopGuard(stop.clone());
+    let _stop_guard = StopGuard(stop.clone(), slot.clone());
 
-    // 波纹是否在跑（决定抓屏线程是否工作；卡片单独露面时不抓屏）。
-    let ripple_on = Arc::new(AtomicBool::new(false));
-    // 抓屏线程：波纹可见时 ~30fps 抓虚拟桌面，供 shader 折射采样。
-    let slot: FrameSlot = Arc::new(Mutex::new(None));
+    // 抓屏线程：只有采集门打开时才获取新许可；淡出和卡片不打开门。
     {
         let slot = slot.clone();
-        let ripple_on = ripple_on.clone();
         let stop = stop.clone();
         // spawn 失败（系统线程资源枯竭等）不必带崩窗口：slot 永远为空 →
         // desktop 保持 1x1 占位纹理 → render() 里 refr 自动为 0，
@@ -269,10 +412,11 @@ fn run(
             .spawn(move || {
                 screen::ensure_dpi_aware();
                 while !stop.load(Ordering::Relaxed) {
-                    if !ripple_on.load(Ordering::Relaxed) {
+                    let generation = slot.lock().ok().and_then(|s| s.begin());
+                    let Some(generation) = generation else {
                         std::thread::sleep(Duration::from_millis(80));
                         continue;
-                    }
+                    };
                     let rect = screen::virtual_screen();
                     // 静默抓帧：`capture()` 带「广播截屏信号 + 等迷你窗躲开 300ms」
                     // 的副作用，那是给「AI 应用户要求截屏」的；折射抓帧是 ~30fps 的
@@ -281,7 +425,7 @@ fn run(
                     // 本窗自带 WDA_EXCLUDEFROMCAPTURE，画面里本来就没有自己。
                     if let Ok(shot) = screen::capture_silent(rect) {
                         if let Ok(mut g) = slot.lock() {
-                            *g = Some(shot);
+                            g.publish(generation, DesktopBounds::from_rect(rect), shot);
                         }
                     }
                     std::thread::sleep(Duration::from_millis(33));
@@ -292,11 +436,11 @@ fn run(
     let tid = unsafe { GetCurrentThreadId() };
     match Gfx::new(slot, cards) {
         Ok(gfx) => {
-            if ready.send(Ok(tid)).is_err() {
+            if stop.load(Ordering::Acquire) || ready.send(Ok(tid)).is_err() {
                 stop.store(true, Ordering::Relaxed);
                 return;
             }
-            msg_loop(gfx, cmd_rx, level, visible, ripple_on, stop);
+            msg_loop(gfx, cmd_rx, level, visible, stop);
         }
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -312,32 +456,26 @@ fn msg_loop(
     cmd_rx: Receiver<Cmd>,
     level: Arc<AtomicU32>,
     visible: Arc<AtomicBool>,
-    ripple_on: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let hwnd = gfx.hwnd;
-    let mut ripple_showing = false; // 波纹相位目标是否亮着
-    let mut fading = false; // 波纹淡出中
+    let mut ripple = RippleState::default();
     let mut shown = false; // 窗口当前是否可见
     let mut shutdown = false;
-    while !shutdown {
+    while !shutdown && !stop.load(Ordering::Acquire) {
         // 先排空命令队列（PostThreadMessage 只负责唤醒，命令本体在 channel 里）
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::Show => {
-                    fading = false;
-                    ripple_showing = true;
-                    ripple_on.store(true, Ordering::Relaxed);
+                    gfx.wnd.display_dirty.store(true, Ordering::Relaxed);
+                    ripple.show();
                     gfx.tgt = PH_LISTEN;
                 }
                 Cmd::Hide => {
-                    if ripple_showing {
-                        // 目标相位归零，淡出完成后在渲染循环里真正收尾
-                        fading = true;
-                        gfx.tgt = PH_IDLE;
-                    } else {
-                        ripple_on.store(false, Ordering::Relaxed);
-                    }
+                    // 采集门已由调用线程同步关闭。这里只淡出已有桌面纹理，
+                    // 不因窗口仍在渲染或卡片可交互而重新采集。
+                    ripple.hide();
+                    gfx.tgt = PH_IDLE;
                 }
                 Cmd::Shutdown => shutdown = true,
             }
@@ -350,7 +488,7 @@ fn msg_loop(
         // 输入路由随卡片有无切换（改 WS_EX_TRANSPARENT 必须 FRAMECHANGED 才生效）。
         gfx.set_hit_testable(hwnd, have_cards);
 
-        if ripple_showing || have_cards {
+        if ripple.active(have_cards) {
             // 非阻塞泵消息：线程消息不需要分发，系统消息（含鼠标输入）要处理
             let mut msg = MSG::default();
             unsafe {
@@ -363,6 +501,10 @@ fn msg_loop(
                     DispatchMessageW(&msg);
                 }
             }
+            if !shown {
+                gfx.wnd.display_dirty.store(true, Ordering::Relaxed);
+            }
+            gfx.refresh_display(false);
             gfx.render(&level);
             // 露面时机：先离屏渲好一帧再 SW_SHOWNA —— 用户看到的第一个
             // 画面就是成品，新建窗口的黑帧在这套结构里不存在。
@@ -383,11 +525,9 @@ fn msg_loop(
                     );
                 }
             }
-            // 波纹淡出完成且没有卡片：真正隐藏窗口、停渲染、放掉陈旧桌面纹理
-            if fading && gfx.cur_i < 0.02 && !have_cards {
-                fading = false;
-                ripple_showing = false;
-                ripple_on.store(false, Ordering::Relaxed);
+            // 淡出只清理渲染状态；不能覆盖调用线程刚投递的下一轮 Show 许可。
+            if ripple.finish_fade(gfx.cur_i) {
+                gfx.cur_i = 0.0;
                 gfx.desktop = Gfx::placeholder_desktop(
                     &gfx.device,
                     &gfx.queue,
@@ -395,11 +535,13 @@ fn msg_loop(
                     &gfx.uniform_buf,
                     &gfx.sampler,
                 );
-                unsafe {
-                    ShowWindow(hwnd, SW_HIDE);
+                if !have_cards {
+                    unsafe {
+                        ShowWindow(hwnd, SW_HIDE);
+                    }
+                    shown = false;
+                    visible.store(false, Ordering::Relaxed);
                 }
-                shown = false;
-                visible.store(false, Ordering::Relaxed);
             }
         } else {
             if shown {
@@ -424,20 +566,13 @@ fn msg_loop(
         }
     }
     stop.store(true, Ordering::Relaxed);
-    unsafe {
-        // 取回 userdata 里的 Arc 所有权，随窗口一起释放。
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WndState;
-        if !ptr.is_null() {
-            drop(Arc::from_raw(ptr));
-        }
-        DestroyWindow(hwnd);
-    }
 }
 
 /// 窗口线程与窗口过程共享的状态（命中矩形 + 输入事件队列）。
 struct WndState {
-    /// 窗口左上角的虚拟屏坐标（可为负；本层窗口不移动不缩放）。
-    origin: (i32, i32),
+    /// 虚拟桌面物理边界；显示拓扑变化时与窗口一起更新。
+    bounds: Mutex<DesktopBounds>,
+    display_dirty: AtomicBool,
     /// 像素/点（f32 位模式）。物理像素 ↔ egui 点的换算系数。
     ppp: AtomicU32,
     /// 命中矩形（客户区物理像素 x,y,w,h）。
@@ -474,10 +609,14 @@ unsafe extern "system" fn overlay_wnd_proc(
     };
     let ppp = f32::from_bits(st.ppp.load(Ordering::Relaxed));
     match msg {
+        WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
+            st.display_dirty.store(true, Ordering::Relaxed);
+            return 0;
+        }
         WM_NCHITTEST => {
             // 屏幕坐标（符号 16 位对）→ 客户区
             let (sx, sy) = unpack_client(lparam);
-            let (cx, cy) = (sx - st.origin.0, sy - st.origin.1);
+            let (cx, cy) = st.bounds.lock().unwrap().client_point((sx, sy));
             let hit = st
                 .hit_rects
                 .lock()
@@ -635,6 +774,20 @@ struct Gfx {
     wnd: Arc<WndState>,
     /// 当前是否收鼠标（WS_EX_TRANSPARENT 是否已清掉）。
     hit_testable: bool,
+    display_checked: Instant,
+}
+
+impl Drop for Gfx {
+    fn drop(&mut self) {
+        unsafe {
+            let ptr = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *const WndState;
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+            DestroyWindow(self.hwnd);
+            if !ptr.is_null() {
+                drop(Arc::from_raw(ptr));
+            }
+        }
+    }
 }
 
 impl Gfx {
@@ -760,7 +913,8 @@ impl Gfx {
         // 窗口过程共享状态：origin = 窗口在虚拟屏的左上角（可为负），
         // ppp 取系统主屏 DPI（v1：卡片都锚在主屏；副屏异 DPI 备案）。
         let wnd = Arc::new(WndState {
-            origin: (rect.x, rect.y),
+            bounds: Mutex::new(DesktopBounds::from_rect(rect)),
+            display_dirty: AtomicBool::new(false),
             ppp: AtomicU32::new(((unsafe { GetDpiForSystem() } as f32) / 96.0).to_bits()),
             hit_rects: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
@@ -768,7 +922,7 @@ impl Gfx {
             inside: AtomicBool::new(false),
         });
         unsafe {
-            // 所有权随窗口生命周期；msg_loop 在 DestroyWindow 前 from_raw 回收。
+            // 所有权随窗口生命周期；Gfx::drop 在销毁窗口时回收。
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::into_raw(wnd.clone()) as _);
         }
         // 之后的初始化（surface/adapter/device…）任一步失败都要拆掉窗口，
@@ -993,6 +1147,7 @@ impl Gfx {
             egui_start: Instant::now(),
             wnd,
             hit_testable: false,
+            display_checked: Instant::now(),
         })
     }
 
@@ -1117,7 +1272,7 @@ impl Gfx {
         egui_wgpu::ScreenDescriptor,
     )> {
         let ppp = f32::from_bits(self.wnd.ppp.load(Ordering::Relaxed));
-        let (vx, vy) = self.wnd.origin;
+        let (vx, vy) = self.wnd.bounds.lock().unwrap().origin;
         let (ox, oy) = (vx as f32 / ppp, vy as f32 / ppp);
 
         let events = self
@@ -1314,9 +1469,52 @@ impl Gfx {
         );
     }
 
+    fn refresh_display(&mut self, force: bool) {
+        let dirty = self.wnd.display_dirty.swap(false, Ordering::Relaxed);
+        if !force && !dirty && self.display_checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.display_checked = Instant::now();
+        let bounds = DesktopBounds::from_rect(screen::virtual_screen());
+        let old = *self.wnd.bounds.lock().unwrap();
+        let ppp = screen::dpi_scale_at(0, 0).unwrap_or(1.0) as f32;
+        let old_ppp = f32::from_bits(self.wnd.ppp.load(Ordering::Relaxed));
+        if bounds != old || ppp != old_ppp || dirty {
+            *self.wnd.bounds.lock().unwrap() = bounds;
+            self.wnd.ppp.store(ppp.to_bits(), Ordering::Relaxed);
+            self.wnd.hit_rects.lock().unwrap().clear();
+            self.wnd.inside.store(false, Ordering::Relaxed);
+            *self.wnd.pointer.lock().unwrap() = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
+            let mut events = self.wnd.events.lock().unwrap();
+            events.clear();
+            events.push(egui::Event::PointerGone);
+            drop(events);
+            // SetWindowPos 会重入窗口过程，不能持有任何 WndState 锁。
+            unsafe {
+                SetWindowPos(self.hwnd, HWND_TOPMOST, bounds.origin.0, bounds.origin.1,
+                    bounds.size.0 as i32, bounds.size.1 as i32, SWP_NOACTIVATE);
+            }
+            self.slot.lock().unwrap().invalidate();
+            self.desktop = Self::placeholder_desktop(&self.device, &self.queue,
+                &self.bind_layout, &self.uniform_buf, &self.sampler);
+        }
+        if bounds.size != old.size || force {
+            self.config.width = bounds.size.0;
+            self.config.height = bounds.size.1;
+            self.surface.configure(&self.device, &self.config);
+        }
+        if bounds.size != old.size {
+            self.offscreen = Self::make_offscreen(&self.device,
+                &self.blit_pipeline.get_bind_group_layout(0), &self.sampler,
+                ((bounds.size.0 as f32) * RENDER_SCALE).max(1.0) as u32,
+                ((bounds.size.1 as f32) * RENDER_SCALE).max(1.0) as u32);
+        }
+    }
+
     fn render(&mut self, level: &AtomicU32) {
-        // 取最新抓屏帧
-        let shot = self.slot.lock().ok().and_then(|mut g| g.take());
+        // 只取当前许可下的帧；Hide 后保留已上传纹理淡出，不再接收迟到帧。
+        let current = *self.wnd.bounds.lock().unwrap();
+        let shot = self.slot.lock().ok().and_then(|mut g| g.take(current));
         if let Some(shot) = shot {
             self.upload_desktop(shot);
         }
@@ -1382,7 +1580,7 @@ impl Gfx {
                 return;
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
+                self.refresh_display(true);
                 return;
             }
             wgpu::CurrentSurfaceTexture::Validation => return,
@@ -1487,6 +1685,284 @@ impl Gfx {
             self.queue.submit(std::iter::once(enc.finish()));
         }
         self.queue.present(frame);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    fn fake_handle() -> (OverlayHandle, Receiver<Cmd>, Sender<()>, Receiver<()>) {
+        let (tx, rx) = channel();
+        let (release, wait) = channel();
+        let (done, finished) = channel();
+        let thread = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+            let _ = done.send(());
+        });
+        (OverlayHandle {
+            tx, tid: 0,
+            level: Arc::new(AtomicU32::new(0)),
+            visible: Arc::new(AtomicBool::new(true)),
+            stop: Arc::new(AtomicBool::new(false)),
+            capture: Arc::new(Mutex::new(CaptureState::default())),
+            cards: Arc::new(Mutex::new(BTreeMap::new())),
+            thread: Some(thread),
+        }, rx, release, finished)
+    }
+
+    #[test]
+    fn lifecycle_shutdown_and_drop_do_not_wait_for_stalled_thread() {
+        let (mut handle, commands, release, finished) = fake_handle();
+        assert!(handle.is_alive());
+        handle.show();
+        assert!(matches!(commands.try_recv(), Ok(Cmd::Show)));
+        let capture = handle.capture.clone();
+        let generation = capture.lock().unwrap().begin().unwrap();
+        let start = Instant::now();
+        handle.shutdown();
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(!handle.is_alive());
+        assert!(!handle.is_visible());
+        assert!(matches!(commands.try_recv(), Ok(Cmd::Shutdown)));
+        handle.show();
+        let mut state = capture.lock().unwrap();
+        state.publish(generation, bounds(), shot(1));
+        assert!(state.begin().is_none());
+        assert!(state.take(bounds()).is_none());
+        drop(state);
+        drop(handle);
+        assert!(finished.try_recv().is_err());
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_drop_closes_gate_without_waiting_for_worker() {
+        let (handle, _commands, release, finished) = fake_handle();
+        handle.show();
+        let capture = handle.capture.clone();
+        let stop = handle.stop.clone();
+        let start = Instant::now();
+        drop(handle);
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(stop.load(Ordering::Acquire));
+        assert!(capture.lock().unwrap().begin().is_none());
+        assert!(finished.try_recv().is_err());
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_ready_timeout_error_disconnect_and_success() {
+        for outcome in 0..4 {
+            let (handle, _commands, release, finished) = fake_handle();
+            let stop = handle.stop.clone();
+            let capture = handle.capture.clone();
+            capture.lock().unwrap().set_enabled(true);
+            let (ready, rx) = channel();
+            match outcome {
+                0 => {},
+                1 => ready.send(Err("fake initialization failure".into())).unwrap(),
+                2 => {},
+                _ => ready.send(Ok(0)).unwrap(),
+            }
+            let ready = if outcome == 2 { drop(ready); None } else { Some(ready) };
+            let start = Instant::now();
+            let result = handle.await_ready(rx, Duration::from_millis(10));
+            assert!(start.elapsed() < Duration::from_millis(500));
+            assert_eq!(result.is_ok(), outcome == 3);
+            if outcome != 3 {
+                assert!(stop.load(Ordering::Acquire));
+                assert!(capture.lock().unwrap().begin().is_none());
+                if let Some(ready) = ready {
+                    assert!(ready.send(Ok(0)).is_err());
+                }
+            }
+            drop(result);
+            release.send(()).unwrap();
+            finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+    }
+
+    #[test]
+    fn lifecycle_stalled_initialization_keeps_single_engine_lease() {
+        static RUNNING: AtomicBool = AtomicBool::new(false);
+        let lease = EngineLease::acquire(&RUNNING).unwrap();
+        let (release, wait) = channel();
+        let worker = std::thread::spawn(move || {
+            let _lease = lease;
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        });
+        for _ in 0..100 {
+            assert!(EngineLease::acquire(&RUNNING).is_err());
+        }
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(EngineLease::acquire(&RUNNING).is_ok());
+    }
+
+    #[test]
+    fn lifecycle_finished_thread_is_not_alive_even_without_stop_signal() {
+        let (mut handle, _commands, release, finished) = fake_handle();
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !handle.thread.as_ref().unwrap().is_finished() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!handle.stop.load(Ordering::Acquire));
+        assert!(!handle.is_alive());
+        assert!(!handle.is_visible());
+        handle.show();
+        assert!(handle.capture.lock().unwrap().begin().is_none());
+        handle.shutdown();
+    }
+
+    fn bounds() -> DesktopBounds {
+        DesktopBounds { origin: (0, 0), size: (2, 2) }
+    }
+
+    fn shot(value: u8) -> Shot {
+        Shot { width: 2, height: 2, rgba: vec![value; 16] }
+    }
+
+    #[test]
+    fn hide_stops_capture_before_fade_with_or_without_cards() {
+        for have_cards in [false, true] {
+            let mut capture = CaptureState::default();
+            let mut ripple = RippleState::default();
+            assert!(capture.begin().is_none());
+            assert_eq!(ripple.active(have_cards), have_cards);
+            capture.set_enabled(true);
+            ripple.show();
+            let in_flight = capture.begin().unwrap();
+            capture.publish(in_flight, bounds(), shot(1));
+            let frozen = capture.take(bounds()).unwrap();
+            capture.publish(in_flight, bounds(), shot(2));
+
+            capture.set_enabled(false);
+            ripple.hide();
+            assert!(ripple.active(have_cards));
+            assert!(!ripple.finish_fade(0.5));
+            assert!(capture.begin().is_none());
+            assert!(capture.take(bounds()).is_none());
+            // 在途系统调用不能撤销，但返回后不能再更新淡出画面。
+            capture.publish(in_flight, bounds(), shot(3));
+            assert!(capture.take(bounds()).is_none());
+            assert_eq!(frozen.rgba, vec![1; 16]);
+            for _ in 0..40 {
+                assert!(capture.begin().is_none());
+            }
+            assert!(ripple.finish_fade(0.01));
+            assert_eq!(ripple.active(have_cards), have_cards);
+            assert!(!ripple.finish_fade(0.0));
+            assert!(capture.begin().is_none());
+        }
+    }
+
+    #[test]
+    fn reshow_rejects_old_in_flight_and_queued_frames() {
+        let mut capture = CaptureState::default();
+        let mut ripple = RippleState::default();
+        capture.set_enabled(true);
+        ripple.show();
+        let old = capture.begin().unwrap();
+        capture.publish(old, bounds(), shot(1));
+        capture.set_enabled(false);
+        ripple.hide();
+        capture.set_enabled(true);
+        ripple.show();
+        let new = capture.begin().unwrap();
+        assert_ne!(old, new);
+        assert!(capture.take(bounds()).is_none());
+        capture.publish(old, bounds(), shot(2));
+        assert!(capture.take(bounds()).is_none());
+        capture.publish(new, bounds(), shot(3));
+        // 迟到旧帧也不能覆盖本轮已发布的新帧。
+        capture.publish(old, bounds(), shot(4));
+        assert_eq!(capture.take(bounds()).unwrap().rgba, vec![3; 16]);
+        assert!(!ripple.finish_fade(0.0));
+        assert!(ripple.active(false));
+    }
+
+    #[test]
+    fn queued_show_cannot_reopen_gate_after_hide() {
+        let mut capture = CaptureState::default();
+        let mut ripple = RippleState::default();
+        // 模拟窗口线程尚未排空命令时调用线程已连续 Show/Hide。
+        capture.set_enabled(true);
+        capture.set_enabled(false);
+        ripple.show();
+        assert!(capture.begin().is_none());
+        ripple.hide();
+        assert!(capture.begin().is_none());
+        // 淡出收尾也不得关掉已经投递的下一轮 Show 许可。
+        capture.set_enabled(true);
+        let new = capture.begin().unwrap();
+        assert!(ripple.finish_fade(0.0));
+        assert_eq!(capture.begin(), Some(new));
+        ripple.show();
+        assert!(ripple.active(false));
+    }
+
+    #[test]
+    fn repeated_hide_and_show_invalidate_previous_work() {
+        let mut capture = CaptureState::default();
+        let mut ripple = RippleState::default();
+        for _ in 0..2 {
+            capture.set_enabled(false);
+            ripple.hide();
+            assert!(!ripple.active(false));
+            assert!(!ripple.finish_fade(0.0));
+            assert!(capture.begin().is_none());
+        }
+        capture.set_enabled(true);
+        let old = capture.begin().unwrap();
+        capture.set_enabled(true);
+        capture.publish(old, bounds(), shot(1));
+        assert!(capture.take(bounds()).is_none());
+        let current = capture.begin().unwrap();
+        capture.publish(current, bounds(), shot(2));
+        assert!(capture.take(bounds()).is_some());
+    }
+
+    #[test]
+    fn topology_invalidation_rejects_in_flight_even_if_bounds_return() {
+        let mut capture = CaptureState::default();
+        capture.set_enabled(true);
+        let old = capture.begin().unwrap();
+        capture.invalidate();
+        capture.publish(old, bounds(), shot(1));
+        assert!(capture.take(bounds()).is_none());
+        let current = capture.begin().unwrap();
+        let shifted = DesktopBounds { origin: (-2, 0), ..bounds() };
+        capture.publish(current, shifted, shot(2));
+        assert!(capture.take(bounds()).is_none());
+        let mut wrong_size = shot(3);
+        wrong_size.width = 1;
+        capture.publish(current, bounds(), wrong_size);
+        assert!(capture.take(bounds()).is_none());
+        capture.publish(current, bounds(), shot(4));
+        assert!(capture.take(bounds()).is_some());
+        capture.set_enabled(false);
+        capture.invalidate();
+        assert!(capture.begin().is_none());
+        capture.publish(current, bounds(), shot(5));
+        assert!(capture.take(bounds()).is_none());
+    }
+
+    #[test]
+    fn topology_change_updates_negative_origin_and_size() {
+        let old = DesktopBounds::from_rect(screen::Rect { x: 0, y: 0, width: 1920, height: 1080 });
+        let new = DesktopBounds::from_rect(screen::Rect { x: -1280, y: -200, width: 3200, height: 1440 });
+        assert_ne!(old, new);
+        assert_eq!(new.size, (3200, 1440));
+        assert_eq!(new.client_point((50, 60)), (1330, 260));
+        let shifted = DesktopBounds { origin: (0, 0), ..new };
+        assert_ne!(shifted, new);
+        assert_eq!(shifted.size, new.size);
+        assert_eq!(DesktopBounds::from_rect(screen::Rect { x: 0, y: 0, width: 0, height: 0 }).size, (1, 1));
     }
 }
 

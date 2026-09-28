@@ -2,7 +2,7 @@
 //!
 //! 这是"AI 能动手"的那只手。三点约定：
 //!
-//! 1. **两种定位方式，`element_id` 优先**：先跑 `screen_elements` 拿到编号清单，
+//! 1. **两种定位方式，不可混用**：先跑 `screen_elements` 拿到快照和编号清单，
 //!    然后给 `element_id` 让它自动点元素中心 —— 比手算坐标准得多；
 //!    UIA 照不到的东西（游戏、自绘界面）才退回 `x/y` 直连。
 //! 2. **坐标是虚拟桌面的物理像素**，与 `screenshot` 同一套 ——
@@ -19,10 +19,11 @@ use crate::Scope;
 use super::screen::{self, Button};
 
 pub static PARAMS: &[Param] = &[
+    Param::opt_text("snapshot_id", "元素点击必填：与 element_id 同一结果返回的 snapshot_id；刷新或动作后旧快照失效。"),
     Param::opt_int(
         "element_id",
         "`screen_elements` 给出的元素编号 —— 点击该元素的**中心**。\
-         给了它就不用给 x/y（两者都给时以它为准）。",
+         必须同时给 snapshot_id；不可与 x/y 混用。",
         0,
         0,
         9999,
@@ -102,26 +103,31 @@ fn act(args: &Args) -> Result<Outcome, ToolError> {
         );
     }
 
-    // 定位：element_id 优先（离散引用比手算像素可靠），x/y 是直连兜底。
+    if has_id && (has_x || has_y) {
+        return Err(ToolError::bad_args("element_id 与 x/y 不可混用；歧义定位已拒绝"));
+    }
+    if !has_id && args.has("snapshot_id") {
+        return Err(ToolError::bad_args("snapshot_id 必须与 element_id 配对，不验证坐标模式"));
+    }
+    let _interaction = super::screen_uia::INTERACTION.lock().unwrap();
     let located_by;
     let (x, y) = if has_id {
         let id = args.opt_int("element_id")? as usize;
-        let Some(el) = super::screen_uia::cache_lookup(id) else {
-            return Err(
-                ToolError::bad_args(format!("编号 #{id} 查不到：缓存里没有它")).with_hint(
-                    "编号来自 `screen_elements` 的最近一次结果（5 分钟内有效）。\
-                     先重新跑一次 screen_elements，再用返回列表里的 id。",
-                ),
-            );
+        let snapshot = args.opt_str("snapshot_id")?;
+        let Some(el) = super::screen_uia::cache_consume(&snapshot, id) else {
+            return Err(ToolError::bad_args(format!("编号 #{id} 的 snapshot_id 缺失、陈旧或不匹配"))
+                .with_hint("重新运行 screen_elements，同时传入同一结果的 snapshot_id 和 element_id"));
         };
-        located_by = format!("element_id #{id}");
-        el.center()
+        // 已原子消费快照；无论验证/输入是否成功，都不能重试本次引用。
+        located_by = format!("validated element_id #{id}");
+        super::screen_uia::validate_target(&el)?
     } else {
         located_by = "x/y".to_owned();
         (args.opt_int("x")? as i32, args.opt_int("y")? as i32)
     };
 
     screen::ensure_dpi_aware();
+    super::screen_uia::cache_invalidate();
     screen::click(x, y, button, double)?;
 
     let what = if double { "双击" } else { "点击" };
@@ -136,7 +142,9 @@ fn act(args: &Args) -> Result<Outcome, ToolError> {
             "button": button.name(),
             "double": double,
             "dpi_scale": scale,
-            "next": "要确认点到哪儿了，用 `screenshot` 再看一眼屏幕",
+            "snapshot_invalidated": true,
+            "target_identity_verified": has_id,
+            "next": "旧元素快照已失效，请重新运行 screen_elements 或 screenshot 确认结果。坐标模式不验证目标身份；元素模式也不能消除核验与输入之间的竞态。",
         }),
     ))
 }
@@ -188,6 +196,16 @@ mod tests {
                 "实际：{}",
                 err.message
             );
+        }
+    }
+
+    #[test]
+    fn mixed_or_unpaired_references_fail_without_input() {
+        let tool = crate::find("click").unwrap();
+        for value in [json!({"element_id": 1, "x": 1, "y": 1}),
+            json!({"snapshot_id": "old", "x": 1, "y": 1}),
+            json!({"snapshot_id": "old", "element_id": 1})] {
+            assert!(act(&Args::new(tool, &value)).is_err());
         }
     }
 

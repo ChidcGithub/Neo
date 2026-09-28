@@ -11,7 +11,7 @@
 
 use egui::{Rect, Sense, Ui, Vec2};
 use neo_theme::fonts::LoadedFonts;
-use neo_ui::{field, FieldRow, Icon, IconButton, NavItem, Panel, Switch, TextField};
+use neo_ui::{FieldRow, Icon, IconButton, NavItem, Panel, Switch, TextField};
 
 use super::{at, section_label, segmented, text_left, Skin};
 use crate::state::{AppState, SettingsTab};
@@ -88,44 +88,53 @@ pub fn panel(
     let mut closed = false;
 
     // ---- 面板底：投影 + 卡片（组件库 Panel）----
-    let inner = Panel::new().paint(ui, &d, rect, m.s(24.0));
+    let inner = Panel::new().paint(ui, &d, rect, m.s(24.0).min(rect.width() * 0.05));
 
-    // 左导航 / 右内容，中间一道竖分隔线。
-    let nav_w = m.s(176.0);
-    let gap = m.s(24.0);
-    let nav_rect = Rect::from_min_size(inner.min, Vec2::new(nav_w, inner.height()));
-    let content_rect =
-        Rect::from_min_max(egui::pos2(nav_rect.right() + gap, inner.top()), inner.max);
-    ui.painter().vline(
-        nav_rect.right() + gap * 0.5,
-        inner.y_range(),
-        egui::Stroke::new(1.0, p.border_l1),
-    );
-
-    // ---- 左：标题 + 导航 ----
-    at(ui, nav_rect, |ui| {
-        ui.spacing_mut().item_spacing = Vec2::ZERO;
-        let (title_rect, _) =
-            ui.allocate_exact_size(Vec2::new(nav_w, m.s(32.0)), Sense::hover());
-        text_left(
-            ui.painter(),
-            title_rect,
-            "设置",
-            d.font_bold(d.t().label + m.s(6.0)),
-            p.label_primary,
-        );
-        ui.add_space(m.s(16.0));
-        for &(tab, name) in SettingsTab::ALL {
-            let resp = NavItem::new(name, nav_icon(tab))
-                .active(state.settings_tab == tab)
-                .id_salt(("settings-nav", name))
-                .show(ui, &d, nav_w);
-            if resp.clicked() {
-                state.settings_tab = tab;
-            }
-            ui.add_space(m.s(4.0));
-        }
-    });
+    // 窄窗把导航移到顶部，避免固定侧栏挤掉内容；宽窗导航独立滚动。
+    let compact = inner.width() < m.s(560.0);
+    let nav_w = m.s(152.0);
+    let gap = m.s(16.0);
+    let content_rect = if compact {
+        let nav_rect = Rect::from_min_size(inner.min, Vec2::new(inner.width(), m.s(42.0)));
+        at(ui, nav_rect, |ui| {
+            let nav = egui::ComboBox::from_id_salt("settings-compact-nav")
+                .selected_text(page_name(state.settings_tab))
+                .width((inner.width() - m.s(12.0)).max(0.0))
+                .show_ui(ui, |ui| {
+                    for &(tab, name) in SettingsTab::ALL {
+                        let item = ui.selectable_value(&mut state.settings_tab, tab, name);
+                        #[cfg(test)]
+                        if tab == SettingsTab::Logs {
+                            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("settings-log-item-probe"), (item.rect, ui.clip_rect())));
+                        }
+                        let _ = item;
+                    }
+                });
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("settings-nav-probe"), nav.response.rect));
+            let _ = nav;
+        });
+        Rect::from_min_max(egui::pos2(inner.left(), nav_rect.bottom()), inner.max)
+    } else {
+        let nav_rect = Rect::from_min_size(inner.min, Vec2::new(nav_w, inner.height()));
+        at(ui, nav_rect, |ui| {
+            ui.label(egui::RichText::new("设置").strong());
+            ui.add_space(m.s(16.0));
+            egui::ScrollArea::vertical().id_salt("settings-navigation").show(ui, |ui| {
+                for &(tab, name) in SettingsTab::ALL {
+                    if NavItem::new(name, nav_icon(tab))
+                        .active(state.settings_tab == tab)
+                        .id_salt(("settings-nav", name))
+                        .show(ui, &d, nav_w).clicked()
+                    {
+                        state.settings_tab = tab;
+                    }
+                    ui.add_space(m.s(4.0));
+                }
+            });
+        });
+        Rect::from_min_max(egui::pos2(nav_rect.right() + gap, inner.top()), inner.max)
+    };
 
     // ---- 右：页标题 + 描述 + 滚动内容 ----
     at(ui, content_rect, |ui| {
@@ -152,15 +161,15 @@ pub fn panel(
             closed = true;
         }
         ui.add_space(m.s(2.0));
-        let (desc_rect, _) = ui.allocate_exact_size(Vec2::new(cw, m.s(16.0)), Sense::hover());
-        text_left(
-            ui.painter(),
-            desc_rect,
-            page_desc(state.settings_tab),
-            skin.prop(skin.t().caption),
-            p.label_tertiary,
-        );
+        ui.add(egui::Label::new(egui::RichText::new(page_desc(state.settings_tab))
+            .font(skin.prop(skin.t().caption)).color(p.label_tertiary)).wrap());
         ui.add_space(m.s(14.0));
+        if state.preferences_unsaved {
+            ui.add(egui::Label::new(egui::RichText::new(
+                "设置尚未保存；安全限制仅对本次运行生效，重启可能恢复旧值。",
+            ).font(skin.prop(skin.t().caption)).color(p.error)).wrap());
+            ui.add_space(m.s(6.0));
+        }
 
         // 内容区滚动：行多也不顶破面板（小窗里调用方会把面板收窄）。
         // 滚动状态按页签分开：长页签滚到底切页签不该继承偏移。
@@ -170,13 +179,15 @@ pub fn panel(
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 // 给滚动条让位。
-                let w = (ui.available_width() - m.s(12.0)).max(0.0);
+                let w = (ui.available_width() - m.s(12.0)).max(1.0);
+                ui.set_max_width(w);
                 match state.settings_tab {
                     SettingsTab::General => general_tab(ui, skin, w, state),
                     SettingsTab::Appearance => appearance_tab(ui, skin, w, state),
                     SettingsTab::Display => display_tab(ui, skin, w, state, viewport_h),
                     SettingsTab::Model => model_tab(ui, skin, w, state),
                     SettingsTab::Memory => memory_tab(ui, skin, w, state),
+                    SettingsTab::Logs => super::logs::draw(ui, skin, w),
                     SettingsTab::About => about_tab(ui, skin, w, state, loaded),
                 }
             });
@@ -200,6 +211,7 @@ fn page_desc(tab: SettingsTab) -> &'static str {
         SettingsTab::Display => "观看距离与缩放链路",
         SettingsTab::Model => "接口、密钥与模型列表",
         SettingsTab::Memory => "AI 记住的事：查看、修改、导入导出",
+        SettingsTab::Logs => "本地诊断，不进入模型上下文",
         SettingsTab::About => "版本、存储与字体装配",
     }
 }
@@ -211,6 +223,7 @@ fn nav_icon(tab: SettingsTab) -> Icon {
         SettingsTab::Display => Icon::Board,
         SettingsTab::Model => Icon::Sparkle,
         SettingsTab::Memory => Icon::Checklist,
+        SettingsTab::Logs => Icon::Checklist,
         SettingsTab::About => Icon::Info,
     }
 }
@@ -221,12 +234,17 @@ fn nav_icon(tab: SettingsTab) -> Icon {
 
 /// 通用页：后台运行、启动即后台与语音唤醒三个开关。
 fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
+    let mut safe = state.classroom_safe;
+    switch_row(ui, skin, width, "课堂安全模式", "默认开启，限制后台采集和工具权限", &mut safe, "neo-set-safe");
+    state.set_classroom_safe(safe);
+    ui.add(egui::Label::new("这不是离线模式：普通问答和用户文件内容仍可发送给模型，联网读取仍可用。开启时暂停语音唤醒、课堂采集和桌面观察，禁止打开、写入、执行操作。").wrap());
+    row_divider(ui, skin, width);
     switch_row(
         ui,
         skin,
         width,
         "关闭时最小化到托盘",
-        "点关闭按钮后转入系统托盘继续运行，「Hi, Neo」唤醒会重新打开窗口",
+        "关闭后进入托盘，可从托盘菜单重新打开；安全模式下不监听唤醒词",
         &mut state.minimize_to_tray,
         "neo-set-tray",
     );
@@ -236,7 +254,7 @@ fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         skin,
         width,
         "启动时最小化到托盘",
-        "启动后不显示主界面，常驻后台等待「Hi, Neo」语音唤醒",
+        "仅在关闭安全模式且启用语音唤醒时生效",
         &mut state.start_in_tray,
         "neo-set-start-tray",
     );
@@ -246,7 +264,7 @@ fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         skin,
         width,
         "语音唤醒「Hi, Neo」",
-        "常驻监听唤醒词，唤醒后全屏跑马灯亮起，直接说出指令即可",
+        "安全模式下暂停；关闭安全模式后按此偏好监听唤醒词",
         &mut state.wake_enabled,
         "neo-set-wake",
     );
@@ -341,7 +359,7 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     section_label_row(ui, skin, width, "API 密钥");
     input_row(ui, skin, width, &mut state.api_key, true, "neo-api-key");
     ui.add_space(m.s(6.0));
-    hint_row(ui, skin, width, "仅保存在本机数据库，不会上传");
+    hint_row(ui, skin, width, "密钥仅在本机持久化；请求认证时会发送给所配置的接口，请核对地址后再刷新");
     ui.add_space(m.s(16.0));
 
     let name = if state.has_models() {
@@ -376,25 +394,24 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     // ---- 可选模型：来自模型商的 /models，内置表只是兜底 ----
     section_label_row(ui, skin, width, "可选模型");
     // 左：数量；右：刷新键。交给布局系统排，别手量宽度（Button 会自己算内边距）。
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(
             egui::RichText::new(if state.has_models() {
-                format!("{} 个可用 · 已保存到本机", state.models.len())
+                format!("{} 个可用", state.models.len())
             } else {
                 "还没有模型".to_owned()
             })
             .font(skin.prop(skin.t().label))
             .color(skin.p().label_secondary),
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if neo_ui::Button::new("从模型商刷新")
-                .elevated()
-                .show(ui, &skin.d())
-                .clicked()
-            {
-                state.start_model_fetch();
-            }
-        });
+        let refresh = if width < m.s(220.0) {
+            ui.add(egui::Button::new("从模型商刷新").wrap())
+        } else {
+            neo_ui::Button::new("从模型商刷新").elevated().show(ui, &skin.d())
+        };
+        if refresh.clicked() {
+            state.start_model_fetch();
+        }
     });
     ui.add_space(m.s(6.0));
     let hint = match (&state.model_fetch, &state.model_fetch_error) {
@@ -404,7 +421,7 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         }
         (None, Some(e)) => format!("上次刷新失败：{e}（仍在用上次拉到的列表）"),
         (None, None) if state.has_models() => {
-            "列表来自模型商，已保存到本机；每次启动会自动刷新".to_owned()
+            "列表来自模型商；启动（含安全模式）和编辑配置均不自动刷新，请核对后手动刷新".to_owned()
         }
         (None, None) if state.api_key.trim().is_empty() => {
             "先填上面的 API 密钥，再点「从模型商刷新」".to_owned()
@@ -463,11 +480,24 @@ fn about_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &AppState, loaded:
 
 /// 记忆页：AI 跨对话记住的事 —— 查看、行内编辑、删除、手动添加、导入导出。
 fn memory_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
+    memory_tab_with_edit(ui, skin, width, state, neo_tools::tools::memory::edit_memory);
+}
+
+fn memory_tab_with_edit(
+    ui: &mut Ui,
+    skin: &Skin<'_>,
+    width: f32,
+    state: &mut AppState,
+    mut edit: impl FnMut(u64, &str) -> Result<Option<neo_tools::tools::memory::Memory>, neo_tools::ToolError>,
+) {
     use neo_tools::tools::memory as mem;
 
     let d = skin.d();
     let p = skin.p();
     let m = skin.m();
+
+    let error_id = egui::Id::new("neo-memory-write-error");
+    let mut error = ui.ctx().data(|data| data.get_temp::<String>(error_id));
 
     section_label_row(ui, skin, width, "AI 记住的事");
 
@@ -492,21 +522,23 @@ fn memory_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     for item in &state.memories {
         let editing = matches!(&state.memory_editing, Some((id, _)) if *id == item.id);
         if editing {
-            // 编辑态：输入框 + 保存/取消，横向一行。
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(m.s(6.0), 0.0);
-                let input_w = (width - m.s(30.0) * 2.0 - m.s(12.0)).max(0.0);
+            // 窄屏让输入与操作分行，避免按钮挤出内容区。
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(m.s(6.0), m.s(6.0));
+                let input_w = if width < m.s(240.0) { width }
+                    else { (width - m.s(30.0) * 2.0 - m.s(12.0)).max(0.0) };
                 if let Some((_, draft)) = state.memory_editing.as_mut() {
                     TextField::new(draft)
                         .id_salt(("neo-mem-edit", item.id))
                         .show(ui, &d, input_w);
                 }
-                if IconButton::new(Icon::Check)
+                let save = IconButton::new(Icon::Check)
                     .ghost()
                     .id_salt(("neo-mem-save", item.id))
-                    .show(ui, &d)
-                    .clicked()
-                {
+                    .show(ui, &d);
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-memory-save-probe"), save.rect));
+                if save.clicked() {
                     act = Some(Act::Save);
                 }
                 if IconButton::new(Icon::Close)
@@ -584,20 +616,38 @@ fn memory_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     }
 
     match act {
-        Some(Act::Edit(id, content)) => state.memory_editing = Some((id, content)),
-        Some(Act::Delete(id)) => {
-            let _ = mem::forget_memory(&format!("#{id}"));
-            reload_memories(state);
+        Some(Act::Edit(id, content)) => {
+            if state.memory_editing.is_some() {
+                error = Some("请先保存或取消当前编辑，草稿已保留".to_owned());
+            } else {
+                state.memory_editing = Some((id, content));
+            }
         }
+        Some(Act::Delete(id)) => match mem::forget_memory(&format!("#{id}")) {
+            Ok(Some(_)) => {
+                error = None;
+                reload_memories(state);
+            }
+            Ok(None) => error = Some("删除失败：该记忆已不存在".to_owned()),
+            Err(e) => error = Some(format!("删除失败：{}", e.message)),
+        },
         Some(Act::Save) => {
-            // 清空文本 = 放弃保存（当成误触），删记忆走删除键。
-            if let Some((id, draft)) = state.memory_editing.take() {
+            if let Some((id, draft)) = &state.memory_editing {
                 let trimmed = draft.trim();
-                if !trimmed.is_empty() {
-                    let _ = mem::edit_memory(id, trimmed);
+                if trimmed.is_empty() {
+                    error = Some("记忆内容不能为空；如需删除请取消编辑后使用删除按钮".to_owned());
+                } else {
+                    match edit(*id, trimmed) {
+                        Ok(Some(_)) => {
+                            state.memory_editing = None;
+                            error = None;
+                            reload_memories(state);
+                        }
+                        Ok(None) => error = Some("保存失败：该记忆已不存在，草稿已保留".to_owned()),
+                        Err(e) => error = Some(format!("保存失败：{}（草稿已保留）", e.message)),
+                    }
                 }
             }
-            reload_memories(state);
         }
         Some(Act::Cancel) => state.memory_editing = None,
         None => {}
@@ -606,9 +656,10 @@ fn memory_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     // 添加与备份。
     ui.add_space(m.s(10.0));
     section_label_row(ui, skin, width, "添加与备份");
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(m.s(8.0), 0.0);
-        let input_w = (width - m.s(64.0) - m.s(8.0)).max(0.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(m.s(8.0), m.s(8.0));
+        let input_w = if width < m.s(240.0) { width }
+            else { (width - m.s(64.0) - m.s(8.0)).max(0.0) };
         input_row(ui, skin, input_w, &mut state.memory_draft, false, "neo-mem-new");
         if neo_ui::Button::new("记下")
             .elevated()
@@ -617,15 +668,30 @@ fn memory_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         {
             let content = state.memory_draft.trim().to_owned();
             if !content.is_empty() {
-                let _ = mem::add_memory(&content);
-                state.memory_draft.clear();
-                reload_memories(state);
+                match mem::add_memory(&content) {
+                    Ok(_) => {
+                        state.memory_draft.clear();
+                        error = None;
+                        reload_memories(state);
+                    }
+                    Err(e) => error = Some(format!("添加失败：{}（草稿已保留）", e.message)),
+                }
             }
         }
     });
+    if let Some(message) = &error {
+        ui.add(egui::Label::new(egui::RichText::new(message).color(p.error)).wrap());
+    }
+    ui.ctx().data_mut(|data| {
+        if let Some(message) = error {
+            data.insert_temp(error_id, message);
+        } else {
+            data.remove::<String>(error_id);
+        }
+    });
     ui.add_space(m.s(8.0));
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(m.s(8.0), 0.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(m.s(8.0), m.s(8.0));
         if neo_ui::Button::new("导入…")
             .ghost()
             .show(ui, &d)
@@ -648,6 +714,175 @@ fn memory_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         width,
         &format!("记忆保存在 {}", mem::memories_path().display()),
     );
+}
+
+#[cfg(test)]
+mod ui_regression {
+    use super::*;
+    use crate::ui::composer::ui_regression::{context, frame, pointer, probe};
+
+    #[test]
+    fn ui_safety_narrow_settings_log_navigation_is_reachable() {
+        for width in [320.0, 460.0] {
+            let ctx = context();
+            let loaded = neo_theme::fonts::install(&ctx);
+            let mut state = AppState::default();
+            let size = egui::vec2(width, 640.0);
+            let mut render = |ui: &mut Ui, skin: &Skin<'_>| {
+                panel(ui, skin, Rect::from_min_size(egui::pos2(8.0, 8.0), size - egui::vec2(16.0, 16.0)), &mut state, size.y, &loaded);
+            };
+            for _ in 0..2 { frame(&ctx, size, vec![], &mut render); }
+            let nav: Rect = probe(&ctx, "settings-nav-probe");
+            frame(&ctx, size, pointer(nav.center(), true), &mut render);
+            frame(&ctx, size, pointer(nav.center(), false), &mut render);
+            frame(&ctx, size, vec![], &mut render);
+            let (item, clip): (Rect, Rect) = probe(&ctx, "settings-log-item-probe");
+            assert!(clip.contains_rect(item));
+            assert!(Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(item));
+            frame(&ctx, size, pointer(item.center(), true), &mut render);
+            frame(&ctx, size, pointer(item.center(), false), &mut render);
+            let output = frame(&ctx, size, vec![], &mut render);
+            assert_eq!(state.settings_tab, SettingsTab::Logs);
+            assert!(!output.shapes.is_empty());
+        }
+    }
+
+    #[test]
+    fn narrow_scaled_settings_keep_warnings_and_scrolled_safety_text_readable() {
+        for width in [240.0, 320.0, 460.0] {
+            for scale in [0.85, 1.0, 1.75, 2.8] {
+                for dpi in [0.85, 1.0, 2.8] {
+                    let ctx = context();
+                    let theme = neo_theme::Theme::from_metrics(neo_theme::ThemeMode::Dark,
+                        neo_theme::Metrics::from_scale(scale));
+                    theme.apply(&ctx);
+                    let whale = crate::brand::WhaleMark::cached(&ctx);
+                    let skin = Skin::new(theme, &whale);
+                    let size = egui::vec2(width, 720.0);
+                    let mut state = AppState::default();
+                    state.preferences_unsaved = true;
+                    let mut seen = std::collections::BTreeSet::new();
+                    let mut expected = 0;
+                    for step in 0..45 {
+                        let mut input = egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                            time: Some(step as f64 / 10.0),
+                            ..Default::default()
+                        };
+                        input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(dpi);
+                        if step > 1 {
+                            input.events = vec![egui::Event::PointerMoved(egui::pos2(width * 0.5, 670.0)),
+                                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point,
+                                    delta: egui::vec2(0.0, -45.0), modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move }];
+                        }
+                        let mut output = ctx.run_ui(input, |ui| {
+                            panel(ui, &skin, Rect::from_min_size(egui::pos2(8.0, 8.0), size - egui::vec2(16.0, 16.0)),
+                                &mut state, size.y, &LoadedFonts::default());
+                        });
+                        output.textures_delta.clear();
+                        let mut warning_visible = false;
+                        for clipped in &output.shapes {
+                            if let egui::Shape::Text(text) = &clipped.shape {
+                                if text.galley.job.text.starts_with("设置尚未保存") {
+                                    let rect = Rect::from_min_size(text.pos, text.galley.size());
+                                    assert!(clipped.clip_rect.expand(1.0).contains_rect(rect), "warning {width}/{scale}/{dpi}: {rect:?}");
+                                    warning_visible = true;
+                                }
+                                if text.galley.job.text.starts_with("这不是离线模式") {
+                                    expected = text.galley.rows.len();
+                                    for (index, row) in text.galley.rows.iter().enumerate() {
+                                        let rect = row.rect().translate(text.pos.to_vec2());
+                                        assert!(rect.left() >= 0.0 && rect.right() <= width, "safety overflow {width}/{scale}/{dpi}");
+                                        if clipped.clip_rect.expand(1.0).contains_rect(rect) { seen.insert(index); }
+                                    }
+                                }
+                            }
+                        }
+                        assert!(warning_visible);
+                    }
+                    assert!(expected > 0);
+                    assert_eq!(seen.len(), expected, "all safety lines reachable {width}/{scale}/{dpi}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn model_credentials_hint_wraps_without_painting_the_key() {
+        for width in [240.0, 320.0, 460.0] {
+            for scale in [0.85, 1.0, 1.75, 2.8] {
+                let ctx = context();
+                let theme = neo_theme::Theme::from_metrics(neo_theme::ThemeMode::Light,
+                    neo_theme::Metrics::from_scale(scale));
+                theme.apply(&ctx);
+                let whale = crate::brand::WhaleMark::cached(&ctx);
+                let skin = Skin::new(theme, &whale);
+                let mut state = AppState::default();
+                state.api_key = "PRIVATE-KEY-NOT-FOR-DISPLAY".into();
+                let mut output = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 6000.0))),
+                    ..Default::default()
+                }, |ui| {
+                    ui.set_max_width(width - 16.0);
+                    model_tab(ui, &skin, width - 16.0, &mut state);
+                    assert!(ui.min_rect().width() <= width, "model overflow {width}/{scale}");
+                });
+                output.textures_delta.clear();
+                let mut found = false;
+                for clipped in &output.shapes {
+                    if let egui::Shape::Text(text) = &clipped.shape {
+                        assert!(!text.galley.job.text.contains(&state.api_key));
+                        if text.galley.job.text.starts_with("密钥仅在本机持久化") {
+                            found = true;
+                            assert!(!text.galley.elided);
+                            assert!(clipped.clip_rect.expand(1.0).contains_rect(Rect::from_min_size(text.pos, text.galley.size())));
+                        }
+                    }
+                }
+                assert!(found);
+                assert!(output.platform_output.commands.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_memory_save_keeps_draft_and_paints_error() {
+        for missing in [false, true] {
+            let ctx = context();
+            let mut state = AppState::default();
+            state.memories = vec![neo_tools::tools::memory::Memory {
+                id: 7, content: "original".into(), updated_ms: 0,
+            }];
+            state.memory_editing = Some((7, "  unsaved draft  ".into()));
+            let mut calls = 0;
+            let size = egui::vec2(640.0, 600.0);
+            let mut render = |ui: &mut Ui, skin: &Skin<'_>| {
+                memory_tab_with_edit(ui, skin, 580.0, &mut state, |id, draft| {
+                    calls += 1;
+                    assert_eq!(id, 7);
+                    assert_eq!(draft, "unsaved draft");
+                    if missing { Ok(None) } else { Err(neo_tools::ToolError::io("test write denied")) }
+                });
+            };
+            for _ in 0..2 { frame(&ctx, size, vec![], &mut render); }
+            let save: Rect = probe(&ctx, "neo-memory-save-probe");
+            frame(&ctx, size, pointer(save.center(), true), &mut render);
+            frame(&ctx, size, pointer(save.center(), false), &mut render);
+            let output = frame(&ctx, size, vec![], &mut render);
+            assert_eq!(calls, 1);
+            assert_eq!(state.memory_editing, Some((7, "  unsaved draft  ".into())));
+            assert_eq!(state.memories[0].content, "original");
+            let message: String = probe(&ctx, "neo-memory-write-error");
+            assert!(message.contains("草稿已保留"));
+            assert!(message.contains(if missing { "已不存在" } else { "test write denied" }));
+            assert!(output.shapes.iter().any(|clipped| {
+                if let egui::Shape::Text(text) = &clipped.shape {
+                    text.galley.job.text == message
+                        && clipped.clip_rect.contains_rect(Rect::from_min_size(text.pos, text.galley.size()))
+                } else { false }
+            }), "error label must be painted inside the visible clip");
+        }
+    }
 }
 
 /// 本地刚写完记忆文件：清掉 mtime 缓存强制重读
@@ -674,13 +909,17 @@ fn switch_row(
     let d = skin.d();
     let p = skin.p();
     let m = skin.m();
-    let h = m.s(52.0);
+    let sw = Switch::size(&d);
+    let tw = (width - sw.x - m.s(12.0)).max(1.0);
+    let title = ui.painter().layout(title.to_owned(), d.font_bold(d.t().label), p.label_primary, tw);
+    let desc = ui.painter().layout(desc.to_owned(), skin.prop(skin.t().caption), p.label_tertiary, width);
+    let title_h = title.size().y.max(sw.y);
+    let h = title_h + desc.size().y + m.s(18.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, h), Sense::hover());
 
     // 右侧开关：组件只负责画与报点击，取值翻转在这里做。
-    let sw = Switch::size(&d);
     let sw_rect = Rect::from_center_size(
-        egui::pos2(rect.right() - sw.x * 0.5, rect.center().y),
+        egui::pos2(rect.right() - sw.x * 0.5, rect.top() + m.s(6.0) + title_h * 0.5),
         sw,
     );
     if Switch::new(*on)
@@ -691,33 +930,8 @@ fn switch_row(
         *on = !*on;
     }
 
-    // 左侧文字（给开关让位）。
-    let tw = (sw_rect.left() - m.s(12.0) - rect.left()).max(0.0);
-    let title_rect = Rect::from_min_size(
-        rect.min + egui::vec2(0.0, m.s(7.0)),
-        Vec2::new(tw, m.s(20.0)),
-    );
-    text_left(
-        ui.painter(),
-        title_rect,
-        title,
-        d.font_bold(d.t().label),
-        p.label_primary,
-    );
-    let desc_rect = Rect::from_min_size(
-        rect.min + egui::vec2(0.0, m.s(29.0)),
-        Vec2::new(tw, m.s(16.0)),
-    );
-    // 描述单行直绘不换行：长文案（如「课堂总结」那条 ~56 字）会碾过
-    // 开关再被硬切成半个字 —— 超宽就 elide。
-    let desc = super::elide(ui.painter(), desc, &skin.prop(skin.t().caption), tw);
-    text_left(
-        ui.painter(),
-        desc_rect,
-        &desc,
-        skin.prop(skin.t().caption),
-        p.label_tertiary,
-    );
+    ui.painter().galley(rect.min + egui::vec2(0.0, m.s(6.0)), title, p.label_primary);
+    ui.painter().galley(rect.min + egui::vec2(0.0, title_h + m.s(12.0)), desc, p.label_tertiary);
 }
 
 /// 行间细分隔线。
@@ -753,9 +967,13 @@ fn input_row(ui: &mut Ui, skin: &Skin<'_>, width: f32, value: &mut String, secre
     tf.show(ui, &d, width);
 }
 
-/// 灰色提示行 —— 转发组件库。
+/// 安全与操作提示必须完整换行，不能依赖悬停才能读全。
 fn hint_row(ui: &mut Ui, skin: &Skin<'_>, width: f32, text: &str) {
-    field::hint_row(ui, &skin.d(), width, text);
+    ui.scope(|ui| {
+        ui.set_max_width(width);
+        ui.add(egui::Label::new(egui::RichText::new(text)
+            .font(skin.prop(skin.t().caption)).color(skin.p().label_caption)).wrap());
+    });
 }
 
 /// 一行键值对（左键、右值）—— [`neo_ui::FieldRow`]。

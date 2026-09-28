@@ -71,11 +71,18 @@ fn edit(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     }
 
     let path = scope.resolve(&raw)?;
-    let meta = std::fs::metadata(&path).map_err(|e| match e.kind() {
+    std::fs::metadata(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => ToolError::not_found(format!("文件不存在：{raw}"))
             .with_hint("本工具只改已存在的文件；新建请用 `write_file`"),
         _ => ToolError::io(format!("无法访问 {raw}：{e}")),
     })?;
+    let path = scope.verify_existing(&path)?;
+    let _disk = super::memory::lock_data_file_scoped(&path, Some(scope))?;
+    // 等锁期间路径可能已变化；不能拿旧路径的锁去修改新的链接目标。
+    if scope.verify_existing(&path)? != path {
+        return Err(ToolError::new(ErrorKind::Conflict, "等待期间文件路径已变化，请重新读取"));
+    }
+    let meta = std::fs::metadata(&path).map_err(|e| ToolError::io(format!("无法访问 {raw}：{e}")))?;
     if meta.len() > limits::READ_BYTES {
         return Err(ToolError::new(
             ErrorKind::TooLarge,
@@ -83,16 +90,15 @@ fn edit(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
         )
         .with_hint("先用 `read_file` 分段确认要改的片段，大文件改用 `bash` 处理"));
     }
-    let path = scope.verify_existing(&path)?;
 
-    let bytes = std::fs::read(&path).map_err(|e| ToolError::io(format!("读取 {raw} 失败：{e}")))?;
+    let bytes = super::read_file::read_bounded(&path, limits::READ_BYTES)?;
     let text = String::from_utf8(bytes).map_err(|_| {
         ToolError::new(ErrorKind::Unsupported, format!("{raw} 不是 UTF-8 文本"))
             .with_hint("二进制或非 UTF-8 文件请用 `bash` 处理")
     })?;
 
-    let hits: Vec<usize> = text.match_indices(&old).map(|(i, _)| i).collect();
-    if hits.is_empty() {
+    let hits = text.matches(&old).count();
+    if hits == 0 {
         let head: String = old.chars().take(60).collect();
         return Err(ToolError::not_found(format!(
             "在 {raw} 里找不到 `old_string`（首行：{head}）"
@@ -101,32 +107,37 @@ fn edit(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
             "先用 `read_file` 读一遍原文，确认缩进、全半角与换行都一致；不要凭记忆写 old_string",
         ));
     }
-    if hits.len() > 1 && !replace_all {
+    if hits > 1 && !replace_all {
         // 把命中所在的**行号**回给模型 —— 它据此加长上下文即可唯一定位。
-        let lines: Vec<usize> = hits
-            .iter()
-            .map(|i| text[..*i].bytes().filter(|b| *b == b'\n').count() + 1)
+        let lines: Vec<usize> = text.match_indices(&old)
+            .map(|(i, _)| text[..i].bytes().filter(|b| *b == b'\n').count() + 1)
             .take(20)
             .collect();
         return Err(ToolError::new(
             ErrorKind::NotUnique,
             format!(
                 "`old_string` 在 {raw} 里命中 {} 处（第 {:?} 行），无法确定改哪一处",
-                hits.len(),
+                hits,
                 lines
             ),
         )
         .with_hint("多带几行上下文让旧文本唯一；确定要全部替换时把 `replace_all` 设为 true"));
     }
 
-    let replacements = if replace_all { hits.len() } else { 1 };
+    let replacements = if replace_all { hits } else { 1 };
+    checked_replacement_len(text.len(), old.len(), new.len(), replacements, limits::WRITE_BYTES)?;
     let updated = if replace_all {
         text.replace(&old, &new)
     } else {
         text.replacen(&old, &new, 1)
     };
-    std::fs::write(&path, updated.as_bytes())
-        .map_err(|e| ToolError::io(format!("写回 {raw} 失败：{e}")))?;
+    if scope.is_cancelled() {
+        return Err(crate::cancelled_error());
+    }
+    if scope.verify_existing(&path)? != path {
+        return Err(ToolError::new(ErrorKind::Conflict, "编辑期间文件路径已变化，请重新读取"));
+    }
+    super::memory::atomic_write(&path, updated.as_bytes())?;
 
     let delta = updated.len() as i64 - text.len() as i64;
     Ok(Outcome::ok(
@@ -141,6 +152,103 @@ fn edit(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
             "new_preview": preview_text(&new),
         }),
     ))
+}
+
+fn checked_replacement_len(
+    text: usize,
+    old: usize,
+    new: usize,
+    count: usize,
+    limit: u64,
+) -> Result<usize, ToolError> {
+    let len = old.checked_mul(count)
+        .and_then(|removed| text.checked_sub(removed))
+        .and_then(|remaining| new.checked_mul(count).and_then(|added| remaining.checked_add(added)));
+    match len {
+        Some(len) if len as u64 <= limit => Ok(len),
+        _ => Err(ToolError::new(ErrorKind::TooLarge, "替换后的文件超过可写入上限")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edits_wait_for_other_writers_and_cancellation_prevents_commit() {
+        use std::sync::{atomic::{AtomicBool, Ordering}, Arc, mpsc};
+        use std::time::Duration;
+        let root = std::env::temp_dir().join(format!("neo-edit-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixture.txt");
+        std::fs::write(&path, "first second").unwrap();
+        let token = Arc::new(AtomicBool::new(false));
+        let scope = Scope::new(&root).with_cancel(token.clone());
+        for cancel in [false, true] {
+            let held = super::super::memory::lock_data_file(&path).unwrap();
+            std::thread::scope(|s| {
+                let (tx, rx) = mpsc::channel();
+                let scope = &scope;
+                s.spawn(move || {
+                    tx.send(crate::dispatch(scope, "edit_file", &json!({
+                        "path": "fixture.txt", "old_string": "first", "new_string": "edited"
+                    }))).unwrap();
+                });
+                assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+                if cancel {
+                    token.store(true, Ordering::Release);
+                    let out = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert_eq!(out.error.unwrap().kind, ErrorKind::NotAllowed);
+                    drop(held);
+                } else {
+                    std::fs::write(&path, "first other-update").unwrap();
+                    drop(held);
+                    assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().error.is_none());
+                }
+            });
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited other-update");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_target_stays_not_found_without_creating_lock() {
+        let root = std::env::temp_dir().join(format!("neo-edit-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let out = crate::dispatch(&Scope::new(&root), "edit_file", &json!({
+            "path": "missing.txt", "old_string": "old", "new_string": "new"
+        }));
+        assert_eq!(out.error.unwrap().kind, ErrorKind::NotFound);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expanded_edit_rejects_without_changing_file() {
+        let root = std::env::temp_dir().join(format!("neo-edit-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixture.txt");
+        std::fs::write(&path, "aa").unwrap();
+        let result = crate::dispatch(&Scope::new(&root), "edit_file", &json!({
+            "path": "fixture.txt", "old_string": "a",
+            "new_string": "x".repeat(limits::WRITE_BYTES as usize), "replace_all": true,
+        }));
+        let actual = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result.error.unwrap().kind, ErrorKind::TooLarge);
+        assert_eq!(actual, b"aa");
+    }
+
+    #[test]
+    fn replacement_size_is_checked_before_allocation() {
+        assert_eq!(checked_replacement_len(4, 1, 3, 4, 12).unwrap(), 12);
+        assert_eq!(checked_replacement_len(4, 1, 3, 4, 11).unwrap_err().kind, ErrorKind::TooLarge);
+        assert_eq!(checked_replacement_len(12, 3, 0, 4, 1).unwrap(), 0);
+        assert_eq!(checked_replacement_len(10, 1, 2, 1, 10).unwrap_err().kind, ErrorKind::TooLarge);
+        assert_eq!(checked_replacement_len(2, 1, usize::MAX, 2, u64::MAX).unwrap_err().kind, ErrorKind::TooLarge);
+        assert_eq!(checked_replacement_len(usize::MAX, 1, 2, 1, u64::MAX).unwrap_err().kind, ErrorKind::TooLarge);
+        assert_eq!(checked_replacement_len(6, "汉".len(), "文文".len(), 2, 12).unwrap(), 12);
+    }
 }
 
 /// 替换内容的短预览（单行、截断），只用于展示。

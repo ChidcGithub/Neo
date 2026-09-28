@@ -6,16 +6,16 @@
 //!
 //! **索引先行**是这个模块存在的核心理由：查「某天发生过什么」先读索引
 //! （小、恒定快），锁定日期后再翻当天文件 —— 逐日全文扫描会随天数线性变慢。
-//! 写速记时索引同锁同步更新，两边不可能脱节。
+//! 写速记时索引同锁更新；索引失败留下恢复标记，下次读取或追加时补齐。
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::classlog::today_key;
+use crate::classlog::{today_key, valid_date};
 use crate::result::ToolError;
-use crate::tools::memory::{memories_path, now_ms};
+use crate::tools::memory::{load_json, lock_data_file, memories_path, next_id, now_ms, save_json};
 
 /// 一条速记。内容约定一两句话（工具层限制 500 字符），时间由存储层盖章。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,28 +61,21 @@ pub fn index_path() -> PathBuf {
 
 /// 读某天全部速记；文件不存在或损坏返回空（损坏留档 `.bad`，与记忆文件同款）。
 pub fn load_day(date: &str) -> Vec<DailyNote> {
-    let _guard = FILE_LOCK.lock().unwrap();
-    load_notes_unlocked(&day_path(date))
+    if !valid_date(date) { return Vec::new(); }
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let Ok(_disk) = lock_data_file(&index_path()) else { return Vec::new() };
+    load_notes_unlocked(&day_path(date)).unwrap_or_default()
 }
 
 /// 读索引（日期升序，最近的在最后）。
 pub fn load_index() -> Vec<DailyIndexEntry> {
-    let _guard = FILE_LOCK.lock().unwrap();
-    let path = index_path();
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    match serde_json::from_str::<Vec<DailyIndexEntry>>(&raw) {
-        Ok(list) => list,
-        Err(e) => {
-            eprintln!("[neo] 每日记忆索引损坏（{e}），已留档为 index.json.bad");
-            let _ = std::fs::rename(&path, path.with_extension("json.bad"));
-            Vec::new()
-        }
-    }
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let Ok(_disk) = lock_data_file(&index_path()) else { return Vec::new() };
+    let _ = recover_index_unlocked();
+    load_index_unlocked().unwrap_or_default()
 }
 
-/// 往今天追加一条速记，并同步更新索引（同一把锁，索引与文件不会脱节）。
+/// 往今天追加一条速记；正文成功后索引故障由恢复标记补齐，不重复追加正文。
 pub fn append(content: &str) -> Result<DailyNote, ToolError> {
     let content = content.trim();
     if content.is_empty() {
@@ -95,47 +88,43 @@ pub fn append(content: &str) -> Result<DailyNote, ToolError> {
         )
         .with_hint("浓缩到一两句再记；长内容不属于每日记忆"));
     }
-    let _guard = FILE_LOCK.lock().unwrap();
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _disk = lock_data_file(&index_path())?;
+    recover_index_unlocked()?;
     let date = today_key();
     let path = day_path(&date);
-    let mut notes = load_notes_unlocked(&path);
+    let mut notes = load_notes_unlocked(&path)?;
     let note = DailyNote {
-        id: notes.iter().map(|n| n.id).max().unwrap_or(0) + 1,
+        id: next_id(notes.iter().map(|n| n.id))?,
         ts_ms: now_ms(),
         content: content.to_owned(),
     };
     notes.push(note.clone());
-    save_unlocked(&path, &notes)?;
-    update_index_unlocked(&date, &notes);
+    // 先留下恢复意图。正文提交后即算成功，避免索引失败诱发调用方重复追加。
+    save_json(&pending_index_path(), &Some(date))?;
+    save_json(&path, &notes)?;
+    let _ = recover_index_unlocked();
     Ok(note)
 }
 
-fn load_notes_unlocked(path: &std::path::Path) -> Vec<DailyNote> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    match serde_json::from_str::<Vec<DailyNote>>(&raw) {
-        Ok(list) => list,
-        Err(e) => {
-            eprintln!("[neo] 每日记忆文件损坏（{}：{e}），已留档 .bad", path.display());
-            let _ = std::fs::rename(path, path.with_extension("json.bad"));
-            Vec::new()
-        }
-    }
+fn load_notes_unlocked(path: &std::path::Path) -> Result<Vec<DailyNote>, ToolError> {
+    load_json(path)
 }
 
-/// 写回（先写临时文件再改名，写一半断电不会留半个 JSON）。
-fn save_unlocked(path: &std::path::Path, notes: &[DailyNote]) -> Result<(), ToolError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ToolError::io(format!("创建目录 {} 失败：{e}", parent.display())))?;
+fn pending_index_path() -> PathBuf {
+    daily_dir().join("index.pending.json")
+}
+
+fn recover_index_unlocked() -> Result<(), ToolError> {
+    let pending: Option<String> = load_json(&pending_index_path())?;
+    if let Some(date) = pending {
+        if !valid_date(&date) {
+            return Err(ToolError::io("待恢复索引日期无效"));
+        }
+        let notes = load_notes_unlocked(&day_path(&date))?;
+        update_index_unlocked(&date, &notes)?;
+        std::fs::remove_file(pending_index_path()).map_err(|e| ToolError::io(e.to_string()))?;
     }
-    let tmp = path.with_extension("json.tmp");
-    let body = serde_json::to_string_pretty(notes)
-        .map_err(|e| ToolError::io(format!("序列化每日记忆失败：{e}")))?;
-    std::fs::write(&tmp, body).map_err(|e| ToolError::io(format!("写 {} 失败：{e}", tmp.display())))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| ToolError::io(format!("落盘 {} 失败：{e}", path.display())))?;
     Ok(())
 }
 
@@ -151,21 +140,18 @@ fn gist_of(notes: &[DailyNote]) -> String {
         } else {
             format!("{gist}；{head}")
         };
-        if candidate.chars().count() > 80 {
-            gist = format!("{gist}…等 {} 条", notes.len());
-            return gist;
+        if candidate.chars().count() > 80 || (i + 1 >= 4 && notes.len() > 4) {
+            let suffix = format!("…等 {} 条", notes.len());
+            let keep = 80usize.saturating_sub(suffix.chars().count());
+            return candidate.chars().take(keep).collect::<String>() + &suffix;
         }
         gist = candidate;
-        if i + 1 >= 4 && notes.len() > 4 {
-            gist = format!("{gist}…等 {} 条", notes.len());
-            return gist;
-        }
     }
     gist
 }
 
-fn update_index_unlocked(date: &str, notes: &[DailyNote]) {
-    let mut index = load_index_unlocked();
+fn update_index_unlocked(date: &str, notes: &[DailyNote]) -> Result<(), ToolError> {
+    let mut index = load_index_unlocked()?;
     let gist = gist_of(notes);
     match index.iter_mut().find(|e| e.date == date) {
         Some(e) => e.gist = gist,
@@ -193,27 +179,11 @@ fn update_index_unlocked(date: &str, notes: &[DailyNote]) {
     if drop_n > 0 {
         index.drain(..drop_n);
     }
-    let path = index_path();
-    // 目录可能还没建（比如测试直接喂索引更新）：自己建，不依赖 append 先行。
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = path.with_extension("json.tmp");
-    let body = match serde_json::to_string_pretty(&index) {
-        Ok(b) => b,
-        Err(_) => return, // 序列化不会失败；真失败也不该拖垮速记本身
-    };
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    save_json(&index_path(), &index)
 }
 
-fn load_index_unlocked() -> Vec<DailyIndexEntry> {
-    let path = index_path();
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    serde_json::from_str::<Vec<DailyIndexEntry>>(&raw).unwrap_or_default()
+fn load_index_unlocked() -> Result<Vec<DailyIndexEntry>, ToolError> {
+    load_json(&index_path())
 }
 
 /// 当前本地时间「HH:MM」（速记回执里给模型确认用；Windows 取本地时区）。
@@ -284,6 +254,94 @@ mod tests {
     }
 
     #[test]
+    fn failed_index_write_is_recovered_without_duplicate_note() {
+        let _lock = crate::NEO_HOME_TEST_LOCK.lock().unwrap();
+        let (_g, dir) = temp_home("index-recovery");
+        std::fs::create_dir_all(index_path()).unwrap();
+        let saved = append("正文成功，索引失败").unwrap();
+        assert!(pending_index_path().exists());
+        assert_eq!(load_day(&today_key()).len(), 1);
+        assert!(append("恢复前不提交下一条").is_err());
+        std::fs::remove_dir(index_path()).unwrap();
+        let index = load_index();
+        assert_eq!(index.len(), 1);
+        assert!(index[0].gist.contains("正文成功"));
+        assert!(!pending_index_path().exists());
+        assert_eq!(load_day(&today_key())[0].id, saved.id);
+        append("下一条").unwrap();
+        assert_eq!(load_day(&today_key()).len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_index_preserves_history_and_pending_recovery() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::NEO_HOME_TEST_LOCK.lock().unwrap();
+        let (_g, dir) = temp_home("index-sharing");
+        let history = vec![DailyNote { id: 1, ts_ms: 0, content: "历史记录".into() }];
+        save_json(&day_path("2024-02-29"), &history).unwrap();
+        update_index_unlocked("2024-02-29", &history).unwrap();
+        let before = std::fs::read(index_path()).unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(index_path()).unwrap();
+        let note = append("正文已提交").unwrap();
+        let body = std::fs::read(day_path(&today_key())).unwrap();
+        assert!(pending_index_path().exists());
+        assert!(append("不可重复写入").is_err());
+        assert!(load_index().is_empty());
+        assert_eq!(std::fs::read(day_path(&today_key())).unwrap(), body);
+        drop(held);
+        assert_eq!(std::fs::read(index_path()).unwrap(), before);
+        for _ in 0..2 {
+            let index = load_index();
+            assert_eq!(index.len(), 2);
+            assert_eq!(index[0].date, "2024-02-29");
+            assert_eq!(index[0].gist, "历史记录");
+            assert_eq!(index[1].gist, "正文已提交");
+        }
+        assert!(!pending_index_path().exists());
+        let notes = load_day(&today_key());
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, note.id);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_body_and_pending_cleanup_recover_idempotently() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::NEO_HOME_TEST_LOCK.lock().unwrap();
+        let (_g, dir) = temp_home("commit-stages");
+        let first = append("原记录").unwrap();
+        let path = day_path(&today_key());
+        let before = std::fs::read(&path).unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        assert!(append("稍后重试").is_err());
+        assert!(pending_index_path().exists());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(held);
+        assert_eq!(load_index()[0].gist, "原记录");
+        assert!(!pending_index_path().exists());
+        assert_eq!(append("稍后重试").unwrap().id, first.id + 1);
+        let before = std::fs::read(&path).unwrap();
+        save_json(&pending_index_path(), &Some(today_key())).unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(pending_index_path()).unwrap();
+        for _ in 0..2 {
+            let index = load_index();
+            assert_eq!(index.len(), 1);
+            assert_eq!(index[0].gist, "原记录；稍后重试");
+            assert!(pending_index_path().exists());
+        }
+        assert!(append("清理失败时不追加").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(held);
+        assert_eq!(load_index().len(), 1);
+        assert!(!pending_index_path().exists());
+        assert_eq!(load_day(&today_key()).len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn append_rejects_empty_and_oversize() {
         let _lock = crate::NEO_HOME_TEST_LOCK.lock().unwrap();
         let (_g, _dir) = temp_home("reject");
@@ -305,6 +363,24 @@ mod tests {
     }
 
     #[test]
+    fn pending_index_recovery_uses_recorded_day_and_gist_stays_bounded() {
+        let _lock = crate::NEO_HOME_TEST_LOCK.lock().unwrap();
+        let (_g, dir) = temp_home("past-day");
+        let notes: Vec<_> = (1..=100).map(|id| DailyNote {
+            id, ts_ms: 0, content: "字".repeat(20),
+        }).collect();
+        assert!(gist_of(&notes).chars().count() <= 80);
+        save_json(&day_path("2024-02-29"), &notes).unwrap();
+        save_json(&pending_index_path(), &Some("2024-02-29")).unwrap();
+        let index = load_index();
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].date, "2024-02-29");
+        assert_eq!(load_day("2024-02-29").len(), 100);
+        assert!(load_day("../memories").is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn index_char_cap_drops_oldest_but_keeps_newest() {
         let _lock = crate::NEO_HOME_TEST_LOCK.lock().unwrap();
         let (_g, _dir) = temp_home("cap");
@@ -318,7 +394,7 @@ mod tests {
                     content: format!("第 {i} 条很长的记录内容，撑满单条 20 字符的上限"),
                 })
                 .collect();
-            update_index_unlocked(&date, &notes);
+            update_index_unlocked(&date, &notes).unwrap();
         }
         let index = load_index();
         let total: usize = index

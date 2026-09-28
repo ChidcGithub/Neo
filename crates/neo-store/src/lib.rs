@@ -508,6 +508,55 @@ mod tests {
     }
 
     #[test]
+    fn failed_delete_and_readonly_write_preserve_existing_data() {
+        let (store, dir) = temp_store("delete-rollback");
+        let id = store.create_session("保留").unwrap();
+        store.append_message(id, "user", "原消息", "", "").unwrap();
+        store.conn().execute_batch(
+            "CREATE TRIGGER reject_delete BEFORE DELETE ON sessions
+             BEGIN SELECT RAISE(FAIL, 'synthetic failure'); END;"
+        ).unwrap();
+        assert!(store.delete_session(id).is_err());
+        assert_eq!(store.messages(id).unwrap()[0].content, "原消息");
+        assert_eq!(store.sessions().unwrap().len(), 1);
+        store.conn().execute_batch("DROP TRIGGER reject_delete; PRAGMA query_only=ON;").unwrap();
+        assert!(store.append_message(id, "user", "失败", "", "").is_err());
+        assert_eq!(store.messages(id).unwrap().len(), 1);
+        store.conn().execute_batch("PRAGMA query_only=OFF;").unwrap();
+        store.append_message(id, "user", "重试", "", "").unwrap();
+        assert_eq!(store.messages(id).unwrap().len(), 2);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_connections_keep_all_messages_and_busy_failure_is_retryable() {
+        let (store, dir) = temp_store("concurrent");
+        let id = store.create_session("并发").unwrap();
+        let other = Store::open(&dir.join("neo.db")).unwrap();
+        std::thread::scope(|s| {
+            for store in [&store, &other] {
+                s.spawn(move || {
+                    for i in 0..20 {
+                        store.append_message(id, "user", &format!("记录{i}"), "", "").unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(store.messages(id).unwrap().len(), 40);
+        other.conn().busy_timeout(std::time::Duration::ZERO).unwrap();
+        store.conn().execute_batch("BEGIN IMMEDIATE;").unwrap();
+        assert!(other.append_message(id, "user", "被锁定", "", "").is_err());
+        store.conn().execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(store.messages(id).unwrap().len(), 40);
+        other.append_message(id, "user", "重试", "", "").unwrap();
+        assert_eq!(store.messages(id).unwrap().len(), 41);
+        drop(other);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn foreign_keys_are_enforced() {
         let (store, dir) = temp_store("fk");
         // 外键真的开着：给不存在的会话写消息必须报错，而不是产生孤儿消息。

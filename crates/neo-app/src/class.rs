@@ -43,8 +43,64 @@ const SETTLE_IDLE: Duration = Duration::from_secs(120);
 const SETTLE_MAX: Duration = Duration::from_secs(30 * 60);
 /// 进入最大化后稍等再截首屏（PPT 放映动画还在播，截早了是上一页）。
 const FIRST_SHOT_DELAY: Duration = Duration::from_millis(1200);
-/// 喂给打磨的转写文本上限（字符）：一节 40 分钟的课转写约一两万字，够了。
-const POLISH_TRANSCRIPT_CHARS: usize = 24_000;
+// 文本均按 UTF-8 字节计预算（比估算中文 token 更保守），截断只落在字符边界。
+const SEGMENT_BYTES: usize = 3_072;
+const NOTES_BYTES: usize = 24_576;
+const TRANSCRIPT_BYTES: usize = 73_728;
+const SUBJECT_BYTES: usize = 96;
+// 两类素材合计最多 96 KiB；按至少 32K 上下文保守分配：请求 12 KiB、
+// 返回 8 KiB，其余留给消息封装和单图。静默课堂关闭思考，不挤占返回预算。
+const REQUEST_BYTES: usize = 12_288;
+const REQUEST_NOTES_BYTES: usize = 4_096;
+const REQUEST_TRANSCRIPT_BYTES: usize = 6_144;
+const VISION_OUTPUT_BYTES: usize = 3_072;
+const SUMMARY_BYTES: usize = 8_192;
+const STREAM_BYTES: usize = 32_768;
+const STREAM_EVENTS: usize = 8_192;
+const IMAGE_EDGE: u32 = 1_280;
+const IMAGE_BYTES: usize = 2 * 1024 * 1024;
+// 展示、排队及打磨中的课共用四个槽；满时停止接新课，绝不覆盖失败结果。
+const SUMMARY_SLOTS: usize = 4;
+const LIMIT_NOTICE: &str = "\n（素材达到预算，已节选；优先保留近期内容）\n";
+const OUTPUT_NOTICE: &str = "\n（模型输出达到安全预算，已停止生成并保留节选）\n";
+const AUDIO_MISSING_NOTICE: &str = "部分课堂音频因缓冲过载或停止异常而缺失，转写可能不完整";
+
+fn prefix(text: &str, bytes: usize) -> &str {
+    let mut end = bytes.min(text.len());
+    while !text.is_char_boundary(end) { end -= 1; }
+    &text[..end]
+}
+
+fn suffix(text: &str, bytes: usize) -> &str {
+    let mut start = text.len().saturating_sub(bytes);
+    while !text.is_char_boundary(start) { start += 1; }
+    &text[start..]
+}
+
+fn bounded_text(text: &str, bytes: usize) -> String {
+    if text.len() <= bytes { return text.to_owned(); }
+    let room = bytes.saturating_sub(LIMIT_NOTICE.len());
+    // 单段保留开头的主题与较多的结尾，避免漏掉最近作业或结论。
+    format!("{}{}{}", prefix(text, room / 4), LIMIT_NOTICE, suffix(text, room - room / 4))
+}
+
+fn push_material(items: &mut Vec<String>, text: &str, budget: usize) {
+    if text.trim().is_empty() { return; }
+    items.push(bounded_text(text, SEGMENT_BYTES));
+    let mut bytes: usize = items.iter().map(|s| s.len() + 1).sum();
+    let mut removed = false;
+    while bytes + LIMIT_NOTICE.len() + 1 > budget && !items.is_empty() {
+        bytes -= items.remove(0).len() + 1;
+        removed = true;
+    }
+    if removed && items.first().is_none_or(|s| s != LIMIT_NOTICE) {
+        items.insert(0, LIMIT_NOTICE.to_owned());
+    }
+}
+
+fn class_warning(message: &'static str) {
+    crate::diagnostics::record(crate::diagnostics::Level::Warn, "class", message);
+}
 /// 视觉分析的总超时（connect_timeout 15s 之外的总闸）。
 const VISION_TIMEOUT: Duration = Duration::from_secs(90);
 /// 打磨的总超时（素材长，生成慢）。
@@ -53,6 +109,29 @@ const POLISH_TIMEOUT: Duration = Duration::from_secs(240);
 // ---------------------------------------------------------------------------
 // 事件与结构
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClassScope {
+    generation: u64,
+    session: u64,
+}
+
+struct ScopedEvent {
+    scope: ClassScope,
+    event: ClassEvent,
+}
+
+#[derive(Clone)]
+struct ClassSender {
+    tx: mpsc::Sender<ScopedEvent>,
+    scope: ClassScope,
+}
+
+impl ClassSender {
+    fn send(&self, event: ClassEvent) -> Result<(), mpsc::SendError<ScopedEvent>> {
+        self.tx.send(ScopedEvent { scope: self.scope, event })
+    }
+}
 
 /// 后台线程送回 UI 线程的事件。
 enum ClassEvent {
@@ -64,6 +143,8 @@ enum ClassEvent {
     Line(String),
     /// STT / 音频采集线程死亡（转写中断，其余照常）。
     SttDied(String),
+    /// 音频过载或停流超时；只传固定提示，不传音频或设备详情。
+    AudioMissing,
     /// 一次视觉分析完成（subject 只有首屏才有）。
     Vision { subject: Option<String>, note: String },
     /// 视觉分析失败（静默忽略，下一次触发再来）。
@@ -75,6 +156,7 @@ enum ClassEvent {
 }
 
 /// 一节课的进行中数据（Active / Settling 共享；打磨时随请求走、随结果回）。
+#[derive(Clone)]
 struct Session {
     started_ms: i64,
     subject: Option<String>,
@@ -96,12 +178,97 @@ impl Session {
     }
 }
 
-/// 打磨完成、等待弹窗展示的一节课。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveState {
+    Unsaved,
+    IndexFailed,
+    Saved,
+}
+
+/// 打磨完成不等于保存完成；失败素材随卡片保留，重试只执行尚未成功的阶段。
 pub struct ReadySummary {
     pub subject: String,
     pub summary: String,
     pub over_limit: bool,
+    /// 待保存结果创建时固定的目标日；落盘、索引和重试共用。
     pub date: String,
+    pub save_state: SaveState,
+    pub generated: bool,
+    pub close_blocked: bool,
+    pending_note: Option<neo_tools::classlog::NewClassNote>,
+    index_text: Option<String>,
+}
+
+impl ReadySummary {
+    fn new(session: Session, summary: String, generated: bool) -> Self {
+        let excerpted = session.screen_notes.iter().any(|s| s.contains(LIMIT_NOTICE) || s.contains(OUTPUT_NOTICE))
+            || session.transcript.iter().any(|s| s.contains(LIMIT_NOTICE))
+            || session.screen_notes.iter().map(|s| s.len() + 1).sum::<usize>() > REQUEST_NOTES_BYTES
+            || session.transcript.iter().map(|s| s.len() + 1).sum::<usize>() > REQUEST_TRANSCRIPT_BYTES;
+        let summary = if excerpted {
+            format!("{}{}", LIMIT_NOTICE, bounded_text(&summary, SUMMARY_BYTES - LIMIT_NOTICE.len()))
+        } else { bounded_text(&summary, SUMMARY_BYTES) };
+        let subject = bounded_text(session.subject.as_deref().unwrap_or("未知"), SUBJECT_BYTES);
+        let pending_note = Some(neo_tools::classlog::NewClassNote {
+            started_ms: session.started_ms,
+            subject: subject.clone(),
+            summary: summary.clone(),
+            screen_notes: session.screen_notes,
+            transcript: session.transcript,
+        });
+        Self {
+            subject, over_limit: summary.chars().count() > neo_tools::classlog::SUMMARY_LIMIT,
+            summary, date: neo_tools::classlog::today_key(), save_state: SaveState::Unsaved,
+            generated, close_blocked: false, pending_note, index_text: None,
+        }
+    }
+
+    fn retry(&mut self) {
+        self.retry_with(neo_tools::classlog::append_class_on, |text| {
+            neo_tools::tools::memory::add_memory(text).map(|_| ())
+        });
+    }
+
+    fn retry_with(
+        &mut self,
+        mut append: impl FnMut(&str, neo_tools::classlog::NewClassNote) -> Result<neo_tools::classlog::ClassNote, neo_tools::ToolError>,
+        mut index: impl FnMut(&str) -> Result<(), neo_tools::ToolError>,
+    ) {
+        if let Some(note) = &self.pending_note {
+            let attempt = neo_tools::classlog::NewClassNote {
+                started_ms: note.started_ms, subject: note.subject.clone(), summary: note.summary.clone(),
+                screen_notes: note.screen_notes.clone(), transcript: note.transcript.clone(),
+            };
+            match append(&self.date, attempt) {
+                Ok(saved) => {
+                    self.over_limit = saved.over_limit;
+                    let first_line: String = self.summary.lines()
+                        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                        .unwrap_or("").trim().chars().take(50).collect();
+                    self.index_text = Some(format!(
+                        "{} {}课：{}（完整总结见分记忆 class/{}.json，第 {} 节）",
+                        self.date, self.subject, first_line, self.date, saved.id
+                    ));
+                    self.pending_note = None;
+                    self.save_state = SaveState::IndexFailed;
+                }
+                Err(_) => {
+                    class_warning("课堂总结保存失败，结果保留待重试");
+                    return;
+                }
+            }
+        }
+        if let Some(text) = &self.index_text {
+            match index(text) {
+                Ok(()) => {
+                    self.index_text = None;
+                    self.save_state = SaveState::Saved;
+                    self.close_blocked = false;
+                }
+                Err(_) => class_warning("课堂总结已保存，记忆索引失败待重试"),
+            }
+        }
+    }
 }
 
 /// 状态机。
@@ -120,22 +287,31 @@ enum ClassPhase {
 /// 课堂总结控制器。app 持有一个实例，每帧 `tick`。
 pub struct ClassMonitor {
     phase: ClassPhase,
-    tx: mpsc::Sender<ClassEvent>,
-    rx: mpsc::Receiver<ClassEvent>,
+    tx: ClassSender,
+    rx: mpsc::Receiver<ScopedEvent>,
+    enabled: bool,
     /// watch 线程停止信号（功能开着 = Some）。
     watch_stop: Option<Arc<AtomicBool>>,
     /// STT 线程停止信号（Active 期间 = Some）。
     stt_stop: Option<Arc<AtomicBool>>,
-    /// 分析 worker 在飞标志（视觉与打磨共用，一次一个）。
+    /// 当前课的分析 worker 在飞标志（旧课打磨不阻塞新课）。
     analysis_in_flight: bool,
-    /// 跨课复用的 STT 引擎（模型约数百 MB，每节课全量重载 + 最大化抖动
-    /// 时新旧线程并存，低配教室机器会双倍占内存）。线程退出前 reset
-    /// 并放回；None = 没有可用缓存。
+    /// 跨课复用的 STT 引擎；worker 持锁直到 reset/归还完成，防止并行加载。
+    /// UI 只能 try_lock，不能等待重模型加载或尾音转写。
     stt_engine: Arc<std::sync::Mutex<Option<neo_stt::SttEngine>>>,
+    cache_enabled: Arc<AtomicBool>,
+    /// 只在功能关闭时撤销整代任务；正常下课及跨课打磨不置位。
+    cancelled: Arc<AtomicBool>,
+    stt_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// 已见到的键盘活动时间戳（沿检测）。
     seen_key_ms: u64,
     /// 打磨结果，等弹窗取走。
     ready: Option<ReadySummary>,
+    queued: std::collections::VecDeque<ReadySummary>,
+    polishing: Vec<ClassScope>,
+    // 有界备份让停用/安全模式切换无需等待 worker 也能保住已采集素材。
+    polishing_material: Vec<(ClassScope, Session)>,
+    paused_maximized: bool,
     /// 总结起止计数（开始打磨 +1、总结就绪 +1）：app 按差值点亮左上角红点。
     pub summary_pings: u64,
     /// 状态行（设置页显示「记录中…」之类）。
@@ -147,14 +323,22 @@ impl Default for ClassMonitor {
         let (tx, rx) = mpsc::channel();
         Self {
             phase: ClassPhase::Idle,
-            tx,
+            tx: ClassSender { tx, scope: ClassScope::default() },
             rx,
+            enabled: false,
             watch_stop: None,
             stt_stop: None,
             analysis_in_flight: false,
             stt_engine: Arc::new(std::sync::Mutex::new(None)),
+            cache_enabled: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            stt_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             seen_key_ms: 0,
             ready: None,
+            queued: Default::default(),
+            polishing: Vec::new(),
+            polishing_material: Vec::new(),
+            paused_maximized: false,
             summary_pings: 0,
             status: String::new(),
         }
@@ -170,11 +354,49 @@ impl ClassMonitor {
     /// 用户关掉弹窗：清掉待展示结果；只有状态机还在 Presenting 时才回 Idle
     ///（打磨与新课交叉时，phase 可能是进行中的 Active —— 弹窗照样要关得上）。
     pub fn dismiss(&mut self) {
-        self.ready = None;
-        if matches!(self.phase, ClassPhase::Presenting) {
+        if let Some(ready) = &mut self.ready {
+            if ready.save_state != SaveState::Saved {
+                // 关闭失败卡片只显示保留提示，不能隐式丢弃尚未保存/索引的内容。
+                ready.close_blocked = true;
+                return;
+            }
+        }
+        self.ready = self.queued.pop_front();
+        if self.ready.is_none() && matches!(self.phase, ClassPhase::Presenting) {
             self.phase = ClassPhase::Idle;
             self.status.clear();
         }
+    }
+
+    pub fn retry_save(&mut self) {
+        if let Some(ready) = &mut self.ready { ready.retry(); }
+    }
+
+    pub fn pending_saves(&self) -> usize {
+        self.ready.iter().chain(self.queued.iter())
+            .filter(|ready| ready.save_state != SaveState::Saved).count()
+    }
+
+    pub fn retry_all_saves(&mut self) -> bool {
+        for ready in self.ready.iter_mut().chain(self.queued.iter_mut()) {
+            ready.retry();
+        }
+        self.pending_saves() == 0
+    }
+
+    fn can_resume(&self) -> bool {
+        self.enabled && self.paused_maximized && self.summary_slots() < SUMMARY_SLOTS
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_pending_summaries(&mut self) {
+        for i in 0..SUMMARY_SLOTS {
+            self.publish_summary(ReadySummary::new(Session::new(), format!("result{i}"), true), true, false);
+        }
+    }
+
+    fn summary_slots(&self) -> usize {
+        usize::from(self.ready.is_some()) + self.queued.len() + self.polishing.len()
     }
 
     /// 一句话状态（设置页用；空闲返回 None）。
@@ -190,8 +412,19 @@ impl ClassMonitor {
     pub fn tick(&mut self, ctx: &egui::Context, state: &AppState, enabled: bool) {
         if !enabled {
             self.shutdown();
+            while let Ok(ev) = self.rx.try_recv() {
+                self.on_event(ev);
+            }
             return;
         }
+        if !self.enabled {
+            // 重新启用不能复活旧 worker，也不能等旧代尾音计数归零。
+            self.cancelled = Arc::new(AtomicBool::new(false));
+            self.cache_enabled = Arc::new(AtomicBool::new(true));
+            self.stt_pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        }
+        self.enabled = true;
+        self.cache_enabled.store(true, Ordering::Relaxed);
         if self.watch_stop.is_none() {
             // None = 还没起，或上次 spawn 失败 —— 每帧重试，失败日志在 watch 里。
             self.watch_stop = watch::start(self.tx.clone());
@@ -202,6 +435,11 @@ impl ClassMonitor {
         // 1) 收事件（drain，就地消化；phase 转移全在这里）。
         while let Ok(ev) = self.rx.try_recv() {
             self.on_event(ev);
+        }
+
+        // 满槽时保留最大化沿；释放槽位后不必让老师重新切一次课件。
+        if self.can_resume() {
+            self.on_event(ScopedEvent { scope: self.tx.scope, event: ClassEvent::Maximized });
         }
 
         // 2) 周期检查：先记账再落地 —— match 持有 phase 借用时调不了
@@ -239,7 +477,7 @@ impl ClassMonitor {
             ClassPhase::Settling(_, exited_at) => {
                 let due = watch::idle_duration() >= SETTLE_IDLE
                     || exited_at.elapsed() >= SETTLE_MAX;
-                if due && !self.analysis_in_flight {
+                if due && !self.analysis_in_flight && self.stt_pending.load(Ordering::Acquire) == 0 {
                     pending = Some(Pending::Polish);
                 }
             }
@@ -257,6 +495,20 @@ impl ClassMonitor {
                 }
             }
             Some(Pending::Polish) => {
+                // pending == 0 的 acquire 之后再排一次：最后一条 Line 可能在
+                // 本帧第一次 drain 与 worker 退出之间才入队。
+                while let Ok(ev) = self.rx.try_recv() {
+                    self.on_event(ev);
+                }
+                // drain 中可能发生「恢复 → 再退出」，重验新 worker 与静默期。
+                let ClassPhase::Settling(_, exited_at) = &self.phase else {
+                    return;
+                };
+                if self.analysis_in_flight || self.stt_pending.load(Ordering::Acquire) != 0
+                    || (watch::idle_duration() < SETTLE_IDLE && exited_at.elapsed() < SETTLE_MAX)
+                {
+                    return;
+                }
                 let old = std::mem::replace(&mut self.phase, ClassPhase::Polishing);
                 if let ClassPhase::Settling(session, _) = old {
                     self.spawn_polish(state, session);
@@ -268,19 +520,45 @@ impl ClassMonitor {
 
     /// 关掉所有后台活动（功能被关 / app 退出）。
     fn shutdown(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.cache_enabled.store(false, Ordering::Relaxed);
+        // 先收下已入队的素材/总结，不处理可能启动新采集的窗口沿。
+        while let Ok(ev) = self.rx.try_recv() {
+            if !matches!(&ev.event, ClassEvent::Maximized | ClassEvent::Unmaximized) {
+                self.on_event(ev);
+            }
+        }
+        let phase = std::mem::replace(&mut self.phase, ClassPhase::Idle);
+        if let ClassPhase::Active(session, _) | ClassPhase::Settling(session, _) = phase {
+            if !session.screen_notes.is_empty() || !session.transcript.is_empty() {
+                let summary = fallback_summary(&session, "课堂采集已停止");
+                self.publish_summary(ReadySummary::new(session, summary, false), true, true);
+            }
+        }
+        for (_, session) in std::mem::take(&mut self.polishing_material) {
+            let summary = fallback_summary(&session, "课堂整理已停止");
+            self.publish_summary(ReadySummary::new(session, summary, false), true, true);
+        }
+        if self.enabled {
+            self.enabled = false;
+            self.tx.scope.generation += 1;
+        }
         if let Some(stop) = self.watch_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
         self.stop_stt();
         self.phase = ClassPhase::Idle;
-        self.ready = None;
+        // 关闭功能会撤销迟到结果，但已经展示的失败结果仍可离线重试。
+        self.polishing.clear();
+        self.paused_maximized = false;
         self.status.clear();
-        // 在飞的 worker 可能已 panic（结果事件永远不会来）：标志留着会把
-        // 重新开启后的状态机卡死在「分析中」。清掉；迟到的旧事件本就只
-        // 落到 Idle 分支被忽略。
+        // 新一代独立记账，已撤销代际的迟到结果不再保存或展示。
         self.analysis_in_flight = false;
         // 缓存的 STT 引擎（数百 MB 模型）随功能关闭释放。
-        self.stt_engine.lock().unwrap().take();
+        // 加载/转写持有锁时绝不在 UI 等待；worker 退出时负责释放。
+        if let Ok(mut slot) = self.stt_engine.try_lock() {
+            slot.take();
+        }
     }
 
     fn stop_stt(&mut self) {
@@ -294,10 +572,33 @@ impl ClassMonitor {
     // 事件处理
     // ------------------------------------------------------------------
 
-    fn on_event(&mut self, ev: ClassEvent) {
-        match ev {
+    fn on_event(&mut self, ev: ScopedEvent) {
+        let current_generation = self.enabled && ev.scope.generation == self.tx.scope.generation;
+        let summary = matches!(&ev.event, ClassEvent::Polished { .. } | ClassEvent::PolishFailed { .. });
+        let watch = matches!(&ev.event, ClassEvent::Maximized | ClassEvent::Unmaximized);
+        if !current_generation || (!summary && !watch && ev.scope != self.tx.scope) {
+            return;
+        }
+        if summary {
+            let Some(index) = self.polishing.iter().position(|scope| *scope == ev.scope) else { return; };
+            self.polishing.remove(index);
+            self.polishing_material.retain(|(scope, _)| *scope != ev.scope);
+        }
+        if watch {
+            self.paused_maximized = false;
+        }
+        if matches!(&ev.event, ClassEvent::Maximized)
+            && matches!(self.phase, ClassPhase::Idle | ClassPhase::Polishing | ClassPhase::Presenting)
+            && self.summary_slots() >= SUMMARY_SLOTS
+        {
+            self.paused_maximized = true;
+            self.status = "课堂待处理结果已满，已暂停新课；请保存并关闭总结卡片".into();
+            return;
+        }
+        match ev.event {
             ClassEvent::Maximized => match &mut self.phase {
                 ClassPhase::Idle => {
+                    self.begin_session();
                     self.start_stt();
                     self.phase = ClassPhase::Active(
                         Session::new(),
@@ -325,6 +626,7 @@ impl ClassMonitor {
                 // Presenting 的弹窗继续挂着，与新课的记录互不干扰 ——
                 // 之前这里落入 `_ => {}`，弹窗不关则后续课程全部静默漏记。
                 ClassPhase::Polishing | ClassPhase::Presenting => {
+                    self.begin_session();
                     self.start_stt();
                     self.phase = ClassPhase::Active(
                         Session::new(),
@@ -349,16 +651,20 @@ impl ClassMonitor {
             ClassEvent::Line(text) => match &mut self.phase {
                 ClassPhase::Active(session, _) | ClassPhase::Settling(session, _) => {
                     if !text.trim().is_empty() {
-                        session.transcript.push(text);
+                        push_material(&mut session.transcript, &text, TRANSCRIPT_BYTES);
                     }
                 }
                 _ => {}
             },
-            ClassEvent::SttDied(e) => {
-                eprintln!("[neo-class] 转写线程退出：{e}");
+            ClassEvent::AudioMissing => {
+                class_warning(AUDIO_MISSING_NOTICE);
+                self.status = AUDIO_MISSING_NOTICE.into();
+            }
+            ClassEvent::SttDied(_e) => {
+                class_warning("课堂转写线程中断");
                 // 必须进状态行：只写 stderr 的话，用户以为整节课在录音，
                 // 实际转写早已中断 —— 课堂记录最怕「事后才发现没记上」。
-                self.status = format!("课堂转写已中断：{e}");
+                self.status = "课堂转写已中断，请检查麦克风和本地模型".into();
             }
             ClassEvent::Vision { subject, note } => {
                 self.analysis_in_flight = false;
@@ -366,11 +672,11 @@ impl ClassMonitor {
                     ClassPhase::Active(session, _) | ClassPhase::Settling(session, _) => {
                         if let Some(s) = subject {
                             if !s.is_empty() && s != "未知" && session.subject.is_none() {
-                                session.subject = Some(s);
+                                session.subject = Some(bounded_text(&s, SUBJECT_BYTES));
                             }
                         }
                         if !note.trim().is_empty() {
-                            session.screen_notes.push(note);
+                            push_material(&mut session.screen_notes, &note, NOTES_BYTES);
                         }
                     }
                     _ => {}
@@ -378,63 +684,62 @@ impl ClassMonitor {
             }
             ClassEvent::VisionFailed(e) => {
                 self.analysis_in_flight = false;
-                eprintln!("[neo-class] 视觉分析失败（跳过这次截图）：{e}");
+                class_warning("课堂视觉分析失败，本次截图已跳过");
+                if e.contains("预算") {
+                    if let ClassPhase::Active(session, _) | ClassPhase::Settling(session, _) = &mut self.phase {
+                        push_material(&mut session.screen_notes, OUTPUT_NOTICE, NOTES_BYTES);
+                    }
+                }
             }
             ClassEvent::Polished { summary, session } => {
-                self.analysis_in_flight = false;
-                self.finish(*session, summary);
+                let (publish, crossing) = self.complete_polish(ev.scope);
+                self.finish(*session, summary, publish, crossing, true);
             }
             ClassEvent::PolishFailed { error, session } => {
-                self.analysis_in_flight = false;
+                let (publish, crossing) = self.complete_polish(ev.scope);
                 let fallback = fallback_summary(&session, &error);
-                self.finish(*session, fallback);
+                class_warning("课堂总结生成失败，已使用有界素材节选");
+                self.finish(*session, fallback, publish, crossing, false);
             }
         }
     }
 
-    /// 打磨完成（或兜底）：落分记忆 + 总记忆索引 + 弹窗。
-    fn finish(&mut self, session: Session, summary: String) {
-        // 罕见交叉：打磨飞行期间又开了新课。此时**只存结果** —— 掐新课
-        // 的转写、把 phase 顶回 Presenting，都会毁掉正在进行中的记录。
-        let crossing = !matches!(self.phase, ClassPhase::Polishing);
-        if !crossing {
-            self.stop_stt();
+    fn begin_session(&mut self) {
+        self.tx.scope.session += 1;
+        self.analysis_in_flight = false;
+    }
+
+    fn complete_polish(&mut self, scope: ClassScope) -> (bool, bool) {
+        let publish = self.enabled && scope.generation == self.tx.scope.generation;
+        let current_session = publish && scope == self.tx.scope;
+        if current_session {
+            self.analysis_in_flight = false;
         }
-        let subject = session.subject.clone().unwrap_or_else(|| "未知".into());
-        let date = neo_tools::classlog::today_key();
-        let note = neo_tools::classlog::NewClassNote {
-            started_ms: session.started_ms,
-            subject: subject.clone(),
-            summary: summary.clone(),
-            screen_notes: session.screen_notes.clone(),
-            transcript: session.transcript.clone(),
-        };
-        let over_limit = match neo_tools::classlog::append_class(note) {
-            Ok(saved) => {
-                // 总记忆只留一句索引（分记忆不回读总记忆，单向引用）。
-                let first_line = summary
-                    .lines()
-                    .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
-                    .unwrap_or("")
-                    .trim();
-                let first_line: String = first_line.chars().take(50).collect();
-                let _ = neo_tools::tools::memory::add_memory(&format!(
-                    "{date} {subject}课：{first_line}（完整总结见分记忆 class/{date}.json）"
-                ));
-                saved.over_limit
-            }
-            Err(e) => {
-                // 落盘失败也要让人看到总结（内存里至少有）。
-                eprintln!("[neo-class] 分记忆落盘失败：{}", e.message);
-                summary.chars().count() > neo_tools::classlog::SUMMARY_LIMIT
-            }
-        };
-        self.ready = Some(ReadySummary {
-            subject,
-            summary,
-            over_limit,
-            date,
-        });
+        // 新课也可能已在 Polishing；不能只凭 phase 认领旧课结果。
+        let crossing = !current_session || !matches!(self.phase, ClassPhase::Polishing);
+        (publish, crossing)
+    }
+
+    /// 打磨完成（或兜底）：落分记忆 + 总记忆索引 + 弹窗。
+    fn finish(&mut self, session: Session, summary: String, publish: bool, crossing: bool, generated: bool) {
+        if !publish { return; }
+        // 交叉新课只存结果与发布弹窗，不改新课的转写及 phase。
+        if !crossing { self.stop_stt(); }
+        let mut ready = ReadySummary::new(session, summary, generated);
+        ready.retry();
+        self.publish_summary(ready, publish, crossing);
+    }
+
+    fn publish_summary(&mut self, ready: ReadySummary, publish: bool, crossing: bool) {
+        if !publish {
+            return;
+        }
+        if self.ready.is_none() {
+            self.ready = Some(ready);
+        } else {
+            // 新课开始前已经预留槽位，不允许失败卡片被后来结果覆盖。
+            self.queued.push_back(ready);
+        }
         self.summary_pings += 1; // 「总结完成」红点（交叉新课也算完成）
         if crossing {
             // 新课进行中：结果存进 ready 即可，弹窗会被用户看到；
@@ -456,9 +761,23 @@ impl ClassMonitor {
         let tx = self.tx.clone();
         let stop2 = stop.clone();
         let slot = self.stt_engine.clone();
+        let cache_enabled = self.cache_enabled.clone();
+        let cancelled = self.cancelled.clone();
+        let pending = self.stt_pending.clone();
+        pending.fetch_add(1, Ordering::Release);
+        let done = SttDone(pending);
         let spawned = std::thread::Builder::new()
             .name("neo-class-stt".into())
-            .spawn(move || stt_main(tx, stop2, slot));
+            .spawn(move || {
+                let _done = done;
+                // 在 pending 归零前上报异常，避免静默漏记；不捕获或记录语音内容。
+                let failed = tx.clone();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    stt_main(tx, stop2, slot, cache_enabled, cancelled);
+                })).is_err() {
+                    let _ = failed.send(ClassEvent::SttDied("转写线程异常中断".into()));
+                }
+            });
         match spawned {
             Ok(_) => self.stt_stop = Some(stop),
             Err(e) => {
@@ -478,13 +797,14 @@ impl ClassMonitor {
         };
         self.analysis_in_flight = true;
         let tx = self.tx.clone();
+        let cancelled = self.cancelled.clone();
         let spawned = std::thread::Builder::new()
             .name("neo-class-vision".into())
             .spawn(move || {
                 // worker panic（GDI 抓帧 / 编码 / 网络栈任何一处展开）时不会有
                 // 任何事件回传，analysis_in_flight 永久卡死状态机。guard 兜底。
                 struct VisionGuard {
-                    tx: mpsc::Sender<ClassEvent>,
+                    tx: ClassSender,
                     armed: bool,
                 }
                 impl Drop for VisionGuard {
@@ -500,16 +820,16 @@ impl ClassMonitor {
                     tx: tx.clone(),
                     armed: true,
                 };
-                let ev = run_vision(&cfg, first);
+                let ev = run_vision(&cfg, first, &cancelled);
                 let _ = tx.send(ev);
                 guard.armed = false;
             });
         match spawned {
             Ok(_) => true,
-            Err(e) => {
+            Err(_) => {
                 // 线程起不来：没有 worker 也就永远等不到结果事件，当场复位。
                 self.analysis_in_flight = false;
-                eprintln!("[neo-class] 视觉分析线程启动失败：{e}");
+                class_warning("课堂视觉分析线程启动失败");
                 false
             }
         }
@@ -517,6 +837,8 @@ impl ClassMonitor {
 
     /// 打磨收尾（调用方保证 !analysis_in_flight，且已把 phase 转到 Polishing）。
     fn spawn_polish(&mut self, state: &AppState, session: Session) {
+        self.polishing.push(self.tx.scope);
+        self.polishing_material.push((self.tx.scope, session.clone()));
         self.analysis_in_flight = true;
         self.status = "正在整理课堂总结…".into();
         self.summary_pings += 1; // 「开始总结」红点
@@ -532,6 +854,7 @@ impl ClassMonitor {
         // 失败路径还能取回来（这节课的素材不能丢得无声无息）。
         let slot = Arc::new(std::sync::Mutex::new(Some(session)));
         let slot2 = slot.clone();
+        let cancelled = self.cancelled.clone();
         let spawned = std::thread::Builder::new()
             .name("neo-class-polish".into())
             .spawn(move || {
@@ -539,7 +862,7 @@ impl ClassMonitor {
                 // 同 VisionGuard：panic 展开时用 Drop 补发失败事件，
                 // session 还在 guard 手里，素材不丢。
                 struct PolishGuard {
-                    tx: mpsc::Sender<ClassEvent>,
+                    tx: ClassSender,
                     session: Option<Session>,
                 }
                 impl Drop for PolishGuard {
@@ -557,7 +880,7 @@ impl ClassMonitor {
                     session: Some(session),
                 };
                 let result = match guard.session.as_ref() {
-                    Some(s) => run_polish(&cfg, s),
+                    Some(s) => run_polish(&cfg, s, &cancelled),
                     None => Err("内部错误：打磨会话丢失".into()),
                 };
                 // 取出即解除 guard（正常路径不重复发事件）。
@@ -591,7 +914,9 @@ impl Drop for ClassMonitor {
 /// 取 LLM 配置；未配置返回 None（静默任务不打扰用户）。
 fn llm_config(state: &AppState) -> Option<neo_llm::Config> {
     if state.can_call_real() {
-        Some(state.llm_config())
+        let mut cfg = state.llm_config();
+        cfg.thinking = neo_llm::Thinking::Off;
+        Some(cfg)
     } else {
         None
     }
@@ -604,40 +929,57 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 打磨失败的兜底总结：屏幕笔记全量 + 转写节选，素材不丢。
+/// 请求及兜底共用节选，不把网络原始错误或超长素材带进卡片。
+fn material_excerpt(session: &Session, notes: usize, transcript: usize) -> String {
+    format!("科目：{}\n\n【屏幕笔记】\n{}\n\n【讲课转写】\n{}",
+        bounded_text(session.subject.as_deref().unwrap_or("未知"), SUBJECT_BYTES),
+        bounded_text(&session.screen_notes.join("\n"), notes),
+        bounded_text(&session.transcript.join(" "), transcript))
+}
+
 fn fallback_summary(session: &Session, err: &str) -> String {
-    let mut s = format!("（自动总结失败：{err}。以下为原始记录，未整理）\n");
-    if let Some(sub) = &session.subject {
-        s.push_str(&format!("\n## 科目\n{sub}\n"));
-    }
-    if !session.screen_notes.is_empty() {
-        s.push_str("\n## 屏幕笔记\n");
-        for n in &session.screen_notes {
-            s.push_str(&format!("- {n}\n"));
-        }
-    }
-    if !session.transcript.is_empty() {
-        s.push_str("\n## 讲课转写（节选）\n");
-        let joined = session.transcript.join(" ");
-        let tail: String = joined.chars().take(6000).collect();
-        s.push_str(&tail);
-    }
-    s
+    let reason = if err.contains("预算") { "自动总结达到安全预算，已停止" } else { "自动总结失败" };
+    bounded_text(&format!("（{reason}。以下为原始记录节选，未整理）\n{}",
+        material_excerpt(session, 2_048, 4_096)), SUMMARY_BYTES)
 }
 
 // ---------------------------------------------------------------------------
 // STT 线程：AudioTap 采集 + SttEngine 连续转写
 // ---------------------------------------------------------------------------
 
+struct SttDone(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for SttDone {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 fn stt_main(
-    tx: mpsc::Sender<ClassEvent>,
+    tx: ClassSender,
     stop: Arc<AtomicBool>,
     engine_slot: Arc<std::sync::Mutex<Option<neo_stt::SttEngine>>>,
+    cache_enabled: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
 ) {
-    // 引擎跨课复用：每节课全量加载约数百 MB 模型；最大化抖动时旧线程
-    // 还在 flush、新线程又全量加载，两个实例并存会双倍占内存（低配
-    // 教室机器受不了）。回收的引擎已 reset，状态干净。
-    let cached = engine_slot.lock().unwrap().take();
+    // 租约覆盖加载、采集、flush 和归还全过程。只有后台 worker 等待，
+    // UI 关闭仅 try_lock；None 不再被误认成「别的 worker 没在用」。
+    let mut lease = loop {
+        if stop.load(Ordering::Relaxed) || cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        match engine_slot.try_lock() {
+            Ok(lease) => break lease,
+            Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    if stop.load(Ordering::Relaxed) || cancelled.load(Ordering::Acquire) {
+        return;
+    }
+    let cached = lease.take();
     let engine = match cached {
         Some(e) => e,
         None => match neo_stt::SttEngine::create(&neo_stt::SttConfig::default()) {
@@ -648,80 +990,168 @@ fn stt_main(
             }
         },
     };
-    let tap = match neo_wake::AudioTap::start() {
+    if stop.load(Ordering::Relaxed) || cancelled.load(Ordering::Acquire) {
+        if cache_enabled.load(Ordering::Relaxed) && !cancelled.load(Ordering::Acquire) {
+            *lease = Some(engine);
+        }
+        return;
+    }
+    let mut tap = match neo_wake::AudioTap::start_with_stop(stop.clone(), cancelled.clone()) {
         Ok(t) => t,
         Err(e) => {
             // 没用过的引擎放回去，下节课直接复用。
-            *engine_slot.lock().unwrap() = Some(engine);
-            let _ = tx.send(ClassEvent::SttDied(format!("打开麦克风失败：{e}")));
+            if cache_enabled.load(Ordering::Relaxed) && !cancelled.load(Ordering::Acquire) {
+                *lease = Some(engine);
+            }
+            if !stop.load(Ordering::Relaxed) && !cancelled.load(Ordering::Acquire) {
+                let _ = tx.send(ClassEvent::SttDied(format!("打开麦克风失败：{e}")));
+            }
             return;
         }
     };
     eprintln!("[neo-class] 课堂转写开始（{}）", tap.device());
 
-    // 收帧 → VAD 断句 → 成句即转写回传；stop 后 flush 尾音再退。
-    while !stop.load(Ordering::Relaxed) {
+    // 正常下课排空尾音；整代取消则不再启动下一次 VAD/转写。
+    let mut audio_warning_sent = false;
+    while !stop.load(Ordering::Relaxed) && !cancelled.load(Ordering::Acquire) {
+        report_missing_audio(tap.has_missing_audio(), &mut audio_warning_sent, &tx, &cancelled);
         let Some(frame) = tap.next_frame(Duration::from_millis(50)) else {
             // 超时空转是常态；但 tap 线程死了（设备拔出/流错误）会持续
             // None —— 不上报的话课堂录音会静默录进一片空白。
             if !tap.is_alive() {
-                let _ = tx.send(ClassEvent::SttDied(
-                    "麦克风连接中断（设备被拔出或被安全软件拦截），请重新开启课堂记录".into(),
-                ));
+                if !stop.load(Ordering::Relaxed) && !cancelled.load(Ordering::Acquire) {
+                    let _ = tx.send(ClassEvent::SttDied(
+                        "麦克风连接中断（设备被拔出或被安全软件拦截），请重新开启课堂记录".into(),
+                    ));
+                }
                 break;
             }
             continue;
         };
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
         engine.accept_waveform(&frame);
-        while let Some(seg) = engine.take_segment() {
-            if let Ok(text) = engine.transcribe(&seg) {
-                if !text.trim().is_empty() && tx.send(ClassEvent::Line(text)).is_err() {
+        transcribe_segments(&engine, &tx, &cancelled);
+    }
+    // 有界等待停流，再排空已入队音频；驱动卡住也不能阻塞收尾。
+    if !cancelled.load(Ordering::Acquire) {
+        let stopped = tap.stop_capture();
+        report_missing_audio(!stopped || tap.has_missing_audio(), &mut audio_warning_sent, &tx, &cancelled);
+    }
+    while !cancelled.load(Ordering::Acquire) {
+        let Some(frame) = tap.next_frame(Duration::ZERO) else { break };
+        engine.accept_waveform(&frame);
+        transcribe_segments(&engine, &tx, &cancelled);
+    }
+    if !cancelled.load(Ordering::Acquire) {
+        engine.flush();
+        transcribe_segments(&engine, &tx, &cancelled);
+    }
+    engine.reset();
+    if cache_enabled.load(Ordering::Relaxed) && !cancelled.load(Ordering::Acquire) {
+        *lease = Some(engine);
+    }
+    eprintln!("[neo-class] 课堂转写结束");
+}
+
+fn report_missing_audio(missing: bool, sent: &mut bool, tx: &ClassSender, cancelled: &AtomicBool) {
+    if missing && !*sent && !cancelled.load(Ordering::Acquire) {
+        let _ = tx.send(ClassEvent::AudioMissing);
+        *sent = true;
+    }
+}
+
+fn transcribe_segments(engine: &neo_stt::SttEngine, tx: &ClassSender, cancelled: &AtomicBool) {
+    while !cancelled.load(Ordering::Acquire) {
+        let Some(seg) = engine.take_segment() else { break };
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+        match engine.transcribe(&seg) {
+            Ok(text) => {
+                if cancelled.load(Ordering::Acquire)
+                    || tx.send(ClassEvent::Line(bounded_text(&text, SEGMENT_BYTES))).is_err() {
                     break;
                 }
             }
+            Err(_) => class_warning("课堂语音片段转写失败，本段已跳过"),
         }
     }
-    // 收尾：把没说完的尾音冲出来转掉（Settling 相位仍会收这些 Line）。
-    engine.flush();
-    while let Some(seg) = engine.take_segment() {
-        if let Ok(text) = engine.transcribe(&seg) {
-            let _ = tx.send(ClassEvent::Line(text));
-        }
-    }
-    engine.reset();
-    *engine_slot.lock().unwrap() = Some(engine);
-    eprintln!("[neo-class] 课堂转写结束");
 }
 
 // ---------------------------------------------------------------------------
 // 分析 worker：视觉分析 + 打磨（共用 neo_llm::start 静默流）
 // ---------------------------------------------------------------------------
 
-/// 消费一条静默流到结束，返回全文。Disconnected = 发送端收尾退出，
-/// 已累积的文本照用（Done 事件在极端时序下可能丢，文本不丢）。
-fn drain_stream(stream: &neo_llm::Stream, timeout: Duration) -> Result<String, String> {
+// 截屏、素材整理与流消费共用绝对截止，不因中间阶段或队列积压重置。
+fn check_job(cancelled: &AtomicBool, deadline: Instant) -> Result<(), String> {
+    if cancelled.load(Ordering::Acquire) {
+        Err("课堂任务已取消".into())
+    } else if Instant::now() >= deadline {
+        Err("模型响应超时".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn drain_stream(stream: &neo_llm::Stream, deadline: Instant, cancelled: &AtomicBool) -> Result<String, String> {
+    drain_limited(stream, deadline, cancelled, SUMMARY_BYTES)
+}
+
+fn drain_limited(stream: &neo_llm::Stream, deadline: Instant, cancelled: &AtomicBool, output_bytes: usize) -> Result<String, String> {
     let mut out = String::new();
-    let started = Instant::now();
+    let mut received = 0usize;
+    let mut events = 0usize;
     loop {
-        match stream.rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(neo_llm::Event::Delta { content, .. }) => out.push_str(&content),
-            Ok(neo_llm::Event::Done { .. }) => return Ok(out),
-            Ok(neo_llm::Event::Failed(e)) => return Err(e),
-            Ok(neo_llm::Event::ToolCall(_)) => {} // 静默轮不带工具，不会来
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if started.elapsed() > timeout {
+        if let Err(e) = check_job(cancelled, deadline) {
+            // 协作取消不回滚已上传内容，也不能立即中断阻塞中的 HTTP。
+            stream.cancel.store(true, Ordering::Relaxed);
+            return Err(e);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = stream.rx.recv_timeout(remaining.min(Duration::from_millis(200)));
+        if let Err(e) = check_job(cancelled, deadline) {
+            stream.cancel.store(true, Ordering::Relaxed);
+            return Err(e);
+        }
+        if event.is_ok() { events += 1; }
+        if events >= STREAM_EVENTS {
+            stream.cancel.store(true, Ordering::Relaxed);
+            return Err("模型流事件达到安全预算，已停止".into());
+        }
+        match event {
+            Ok(neo_llm::Event::Delta { content, reasoning }) => {
+                received = received.saturating_add(content.len()).saturating_add(reasoning.len());
+                let room = output_bytes.saturating_sub(OUTPUT_NOTICE.len()).saturating_sub(out.len());
+                out.push_str(prefix(&content, room));
+                if content.len() >= room || received >= STREAM_BYTES {
                     stream.cancel.store(true, Ordering::Relaxed);
-                    return Err("模型响应超时".into());
+                    if out.trim().is_empty() { return Err("模型流文本达到安全预算，已停止".into()); }
+                    out.push_str(OUTPUT_NOTICE);
+                    return Ok(out);
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(out),
+            Ok(neo_llm::Event::Done { .. }) => return Ok(out),
+            Ok(neo_llm::Event::Failed(_)) => return Err("模型请求失败".into()),
+            Ok(neo_llm::Event::ToolCall(_)) => {
+                stream.cancel.store(true, Ordering::Relaxed);
+                return Err("课堂静默请求收到意外工具调用，已停止".into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("模型响应中断（未收到完成标记）".into()),
         }
     }
 }
 
 /// 截一次全屏，送给视觉模型认科目 + 记笔记。
-fn run_vision(cfg: &neo_llm::Config, first: bool) -> ClassEvent {
+fn run_vision(cfg: &neo_llm::Config, first: bool, cancelled: &AtomicBool) -> ClassEvent {
     use base64::Engine as _;
+    let deadline = Instant::now() + VISION_TIMEOUT;
+    if let Err(e) = check_job(cancelled, deadline) {
+        return ClassEvent::VisionFailed(e);
+    }
     // 静默截图：不广播截屏信号（不触发闪光动画与迷你窗回避）——
     // 后台监听不该惊扰正在上课的屏幕。
     let shot =
@@ -730,13 +1160,24 @@ fn run_vision(cfg: &neo_llm::Config, first: bool) -> ClassEvent {
         Ok(s) => s,
         Err(e) => return ClassEvent::VisionFailed(format!("截屏失败：{}", e.message)),
     };
-    let png = match shot.to_png() {
-        Ok(p) => p,
-        Err(e) => return ClassEvent::VisionFailed(format!("编码截图失败：{}", e.message)),
+    if let Err(e) = check_job(cancelled, deadline) {
+        return ClassEvent::VisionFailed(e);
+    }
+    let Some(image) = image::RgbaImage::from_raw(shot.width, shot.height, shot.rgba) else {
+        return ClassEvent::VisionFailed("截图像素格式错误".into());
     };
+    // 沿用截图公开的 RGBA 接口，课堂只上传单张缩略 JPEG，不扩展通用截图 API。
+    let image = image::DynamicImage::ImageRgba8(image).thumbnail(IMAGE_EDGE, IMAGE_EDGE).to_rgb8();
+    let mut jpeg = Vec::new();
+    if image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 80).encode_image(&image).is_err() {
+        return ClassEvent::VisionFailed("截图编码失败".into());
+    }
+    if jpeg.len() > IMAGE_BYTES {
+        return ClassEvent::VisionFailed("截图达到上传预算，已跳过".into());
+    }
     let url = format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(png)
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(jpeg)
     );
     let prompt = if first {
         "这是一张课堂场景的屏幕截图（老师正在上课，屏幕上是课件或板书）。\n\
@@ -749,8 +1190,11 @@ fn run_vision(cfg: &neo_llm::Config, first: bool) -> ClassEvent {
          （每行一条，至多 5 条，每条一句话）。不要寒暄，不要写科目行。"
     };
     let msgs = vec![Msg::new(Role::User, prompt).with_image(url)];
+    if let Err(e) = check_job(cancelled, deadline) {
+        return ClassEvent::VisionFailed(e);
+    }
     let stream = neo_llm::start(cfg.clone(), msgs);
-    match drain_stream(&stream, VISION_TIMEOUT) {
+    match drain_limited(&stream, deadline, cancelled, VISION_OUTPUT_BYTES) {
         Err(e) => ClassEvent::VisionFailed(e),
         Ok(text) => {
             if first {
@@ -775,7 +1219,9 @@ fn run_vision(cfg: &neo_llm::Config, first: bool) -> ClassEvent {
 
 /// 把一节课的素材打磨成 ≤1500 字的课堂总结。
 /// 只借用 session：worker 持有所有权，panic 兜底时素材还能随失败事件送回。
-fn run_polish(cfg: &neo_llm::Config, session: &Session) -> Result<String, String> {
+fn run_polish(cfg: &neo_llm::Config, session: &Session, cancelled: &AtomicBool) -> Result<String, String> {
+    let deadline = Instant::now() + POLISH_TIMEOUT;
+    check_job(cancelled, deadline)?;
     let system = "你是课堂记录整理器。把一节中学课的「屏幕笔记」和「老师讲课的语音转写」\
         整理成一份课堂总结。\n要求：\n\
         - 中文，Markdown，面向学生课后复习\n\
@@ -783,24 +1229,532 @@ fn run_polish(cfg: &neo_llm::Config, session: &Session) -> Result<String, String
         - 全文 1500 字以内\n\
         - 转写来自语音识别，可能有同音错字，按学科常识纠正\n\
         - 不要编造素材里没有的内容；素材少就少写，诚实优先";
-    let mut user = format!(
-        "科目：{}\n\n【屏幕笔记】\n",
-        session.subject.as_deref().unwrap_or("未知")
-    );
-    for n in &session.screen_notes {
-        user.push_str(&format!("- {n}\n"));
+    let user = material_excerpt(session, REQUEST_NOTES_BYTES, REQUEST_TRANSCRIPT_BYTES);
+    if system.len() + user.len() > REQUEST_BYTES {
+        return Err("课堂请求达到安全预算，未发送".into());
     }
-    user.push_str("\n【讲课转写】\n");
-    let joined = session.transcript.join(" ");
-    let cut: String = joined.chars().take(POLISH_TRANSCRIPT_CHARS).collect();
-    user.push_str(&cut);
-
     let msgs = vec![Msg::new(Role::System, system), Msg::new(Role::User, user)];
+    check_job(cancelled, deadline)?;
     let stream = neo_llm::start(cfg.clone(), msgs);
-    match drain_stream(&stream, POLISH_TIMEOUT) {
+    match drain_limited(&stream, deadline, cancelled, SUMMARY_BYTES) {
         Ok(text) if !text.trim().is_empty() => Ok(text),
         Ok(_) => Err("模型返回了空总结".into()),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    fn active() -> ClassMonitor {
+        let mut m = ClassMonitor::default();
+        m.enabled = true;
+        m.tx.scope = ClassScope { generation: 2, session: 3 };
+        m.phase = ClassPhase::Active(Session::new(), None);
+        m.status = "new class".into();
+        m.analysis_in_flight = true;
+        m
+    }
+
+    #[test]
+    fn budgets_keep_utf8_recent_material_and_visible_notice() {
+        let mut session = Session::new();
+        for i in 0..300 {
+            let text = format!("主题{i}{}最近作业{i}", "中文😀".repeat(800));
+            push_material(&mut session.screen_notes, &text, NOTES_BYTES);
+            push_material(&mut session.transcript, &text, TRANSCRIPT_BYTES);
+        }
+        for (items, limit) in [(&session.screen_notes, NOTES_BYTES), (&session.transcript, TRANSCRIPT_BYTES)] {
+            assert!(items.iter().map(|s| s.len() + 1).sum::<usize>() <= limit);
+            assert!(items.iter().all(|s| s.len() <= SEGMENT_BYTES));
+            assert!(items.last().unwrap().contains("最近作业299"));
+            assert!(items.join("\n").contains(LIMIT_NOTICE));
+        }
+        let request = material_excerpt(&session, REQUEST_NOTES_BYTES, REQUEST_TRANSCRIPT_BYTES);
+        assert!(request.len() + 1_024 <= REQUEST_BYTES);
+        assert!(request.contains("最近作业299"));
+        assert!(fallback_summary(&session, "原始敏感错误").len() <= SUMMARY_BYTES);
+        assert!(!fallback_summary(&session, "原始敏感错误").contains("原始敏感错误"));
+        let ready = ReadySummary::new(session, "总结".repeat(10_000), true);
+        assert!(ready.summary.len() <= SUMMARY_BYTES);
+        assert!(ready.summary.contains(LIMIT_NOTICE));
+    }
+
+    #[test]
+    fn streams_stop_at_content_reasoning_and_event_budgets() {
+        for limit in [VISION_OUTPUT_BYTES, SUMMARY_BYTES] {
+            let (tx, rx) = mpsc::channel();
+            tx.send(neo_llm::Event::Delta { content: "中文😀".repeat(limit), reasoning: String::new() }).unwrap();
+            let stream = neo_llm::Stream::new_for_test(rx);
+            let text = drain_limited(&stream, Instant::now() + VISION_TIMEOUT, &AtomicBool::new(false), limit).unwrap();
+            assert!(text.len() <= limit);
+            assert!(text.contains(OUTPUT_NOTICE));
+            assert!(stream.cancel.load(Ordering::Relaxed));
+        }
+        for reasoning in [true, false] {
+            let (tx, rx) = mpsc::channel();
+            for _ in 0..if reasoning { 1 } else { STREAM_EVENTS } {
+                tx.send(neo_llm::Event::Delta { content: String::new(),
+                    reasoning: if reasoning { "x".repeat(STREAM_BYTES) } else { String::new() } }).unwrap();
+            }
+            let stream = neo_llm::Stream::new_for_test(rx);
+            assert!(drain_stream(&stream, Instant::now() + VISION_TIMEOUT, &AtomicBool::new(false)).unwrap_err().contains("预算"));
+            assert!(stream.cancel.load(Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn failures_are_retained_and_capacity_pauses_new_sessions() {
+        let mut m = active();
+        m.phase = ClassPhase::Presenting;
+        for i in 0..SUMMARY_SLOTS {
+            m.publish_summary(ReadySummary::new(Session::new(), format!("result{i}"), true), true, false);
+        }
+        m.dismiss();
+        assert_eq!(m.ready.as_ref().unwrap().summary, "result0");
+        assert!(m.ready.as_ref().unwrap().close_blocked);
+        for _ in 0..100 {
+            m.on_event(ScopedEvent { scope: m.tx.scope, event: ClassEvent::Maximized });
+        }
+        assert_eq!(m.summary_slots(), SUMMARY_SLOTS);
+        assert!(matches!(m.phase, ClassPhase::Presenting));
+        assert!(m.status.contains("已暂停"));
+        m.shutdown();
+        assert_eq!(m.summary_slots(), SUMMARY_SLOTS);
+        assert_eq!(m.ready.as_ref().unwrap().summary, "result0");
+        m.ready.as_mut().unwrap().save_state = SaveState::Saved;
+        m.dismiss();
+        assert_eq!(m.ready.as_ref().unwrap().summary, "result1");
+    }
+
+    #[test]
+    fn save_recovery_index_failure_and_duplicate_events_are_idempotent() {
+        // 本测试唯一的磁盘路径位于临时 NEO_HOME；只注入文件失败，不启动任何设备或网络。
+        struct HomeGuard { old: Option<std::ffi::OsString>, path: std::path::PathBuf }
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                match &self.old {
+                    Some(old) => std::env::set_var("NEO_HOME", old),
+                    None => std::env::remove_var("NEO_HOME"),
+                }
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+        let path = std::env::temp_dir().join(format!("neo-class-reliability-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&path).unwrap();
+        let _home = HomeGuard { old: std::env::var_os("NEO_HOME"), path: path.clone() };
+        std::env::set_var("NEO_HOME", &path);
+        let mut m = active();
+        m.phase = ClassPhase::Polishing;
+        m.polishing.push(m.tx.scope);
+        // 把 class 目录位置变成文件，真实 append 必须失败。
+        std::fs::write(path.join("class"), b"blocked").unwrap();
+        m.on_event(ScopedEvent { scope: m.tx.scope, event: ClassEvent::Polished {
+            summary: "离线测试总结".into(), session: Box::new(Session::new()),
+        }});
+        assert_eq!(m.ready.as_ref().unwrap().save_state, SaveState::Unsaved);
+        m.dismiss();
+        for _ in 0..3 { m.retry_save(); }
+        assert!(m.ready.as_ref().unwrap().pending_note.is_some());
+        assert_eq!(m.summary_slots(), 1);
+        std::fs::remove_file(path.join("class")).unwrap();
+        // 分记忆可恢复，但记忆文件被目录挡住：不得再次 append 已成功阶段。
+        std::fs::create_dir(path.join("memories.json")).unwrap();
+        m.retry_save();
+        let date = m.ready.as_ref().unwrap().date.clone();
+        assert_eq!(m.ready.as_ref().unwrap().save_state, SaveState::IndexFailed);
+        assert!(m.ready.as_ref().unwrap().pending_note.is_none());
+        for _ in 0..3 { m.retry_save(); }
+        assert_eq!(neo_tools::classlog::load_day(&date).len(), 1);
+        std::fs::remove_dir(path.join("memories.json")).unwrap();
+        m.retry_save();
+        assert_eq!(m.ready.as_ref().unwrap().save_state, SaveState::Saved);
+        for _ in 0..3 { m.retry_save(); }
+        m.ready.as_mut().unwrap().retry_with(|_, _| panic!("重复 append"), |_| panic!("重复 index"));
+        assert_eq!(neo_tools::classlog::load_day(&date).len(), 1);
+        let memory: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("memories.json")).unwrap()).unwrap();
+        assert_eq!(memory.as_array().unwrap().len(), 1);
+        m.dismiss();
+        // 已关闭卡片的同一结果重复投递，不能重新 append 或重新发布。
+        m.on_event(ScopedEvent { scope: m.tx.scope, event: ClassEvent::Polished {
+            summary: "迟到重复结果".into(), session: Box::new(Session::new()),
+        }});
+        assert!(m.ready.is_none());
+        assert_eq!(neo_tools::classlog::load_day(&date).len(), 1);
+        assert_eq!(m.summary_pings, 1);
+
+        // 模拟午夜在落盘前到来，提交后丢回执，再在次日重试；不改系统时钟。
+        let clock = std::cell::Cell::new("2026-12-31");
+        let mut first = ReadySummary::new(Session::new(), "跨日回执测试".into(), true);
+        first.date = clock.get().into();
+        let mut committed = None;
+        first.retry_with(|target, note| {
+            clock.set("2027-01-01");
+            assert_ne!(target, clock.get());
+            committed = Some(neo_tools::classlog::append_class_on(target, note).unwrap());
+            Err(neo_tools::ToolError::io("lost receipt"))
+        }, |_| panic!("must not index before receipt"));
+        assert_eq!(first.save_state, SaveState::Unsaved);
+        assert!(first.pending_note.is_some());
+        let committed = committed.unwrap();
+        let mut next = ReadySummary::new(Session::new(), "次日课堂测试".into(), true);
+        next.date = clock.get().into();
+        next.retry();
+        assert_eq!(next.save_state, SaveState::Saved);
+
+        // 回执恢复后只剩索引失败；反复重试不能把前日课堂写进次日文件。
+        first.retry_with(|target, note| {
+            assert_eq!(target, "2026-12-31");
+            let saved = neo_tools::classlog::append_class_on(target, note)?;
+            assert_eq!((saved.id, saved.ended_ms), (committed.id, committed.ended_ms));
+            Ok(saved)
+        }, |_| Err(neo_tools::ToolError::io("index blocked")));
+        assert_eq!(first.save_state, SaveState::IndexFailed);
+        for _ in 0..3 {
+            first.retry_with(|_, _| panic!("must not append after receipt"), |_| {
+                Err(neo_tools::ToolError::io("index blocked"))
+            });
+        }
+        first.retry_with(|_, _| panic!("must not append after receipt"), |text| {
+            assert!(text.contains(&format!("class/2026-12-31.json，第 {} 节", committed.id)));
+            neo_tools::tools::memory::add_memory(text).map(|_| ())
+        });
+        assert_eq!(first.save_state, SaveState::Saved);
+        first.retry_with(|_, _| panic!("duplicate append"), |_| panic!("duplicate index"));
+        assert_eq!(first.date, "2026-12-31");
+        for ready in [&first, &next] {
+            let day = neo_tools::classlog::load_day(&ready.date);
+            let matching: Vec<_> = day.iter().filter(|note| note.summary == ready.summary).collect();
+            assert_eq!(matching.len(), 1);
+            let other = if ready.date == first.date { &next } else { &first };
+            assert!(!day.iter().any(|note| note.summary == other.summary));
+        }
+        let memory: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("memories.json")).unwrap()).unwrap();
+        assert_eq!(memory.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn capacity_resume_is_cancelled_when_teaching_window_leaves() {
+        let mut m = active();
+        m.phase = ClassPhase::Presenting;
+        m.seed_pending_summaries();
+        m.on_event(ScopedEvent { scope: m.tx.scope, event: ClassEvent::Maximized });
+        assert!(!m.can_resume());
+        m.ready.as_mut().unwrap().save_state = SaveState::Saved;
+        m.dismiss();
+        assert!(m.can_resume());
+        m.on_event(ScopedEvent { scope: m.tx.scope, event: ClassEvent::Unmaximized });
+        assert!(!m.can_resume());
+    }
+
+    #[test]
+    fn disabling_retains_active_and_polishing_material_without_io() {
+        let mut m = active();
+        let old = ClassScope { generation: 2, session: 2 };
+        let mut session = Session::new();
+        session.transcript.push("old material".into());
+        m.polishing.push(old);
+        m.polishing_material.push((old, session));
+        m.tx.send(ClassEvent::Line("queued tail".into())).unwrap();
+        m.shutdown();
+        assert_eq!(m.pending_saves(), 2);
+        assert!(m.ready.as_ref().unwrap().summary.contains("queued tail"));
+        assert!(m.queued.front().unwrap().summary.contains("old material"));
+        m.shutdown();
+        assert_eq!(m.pending_saves(), 2);
+        m.enabled = true;
+        m.on_event(ScopedEvent { scope: old, event: ClassEvent::Polished {
+            summary: "late result".into(), session: Box::new(Session::new()),
+        }});
+        assert_eq!(m.pending_saves(), 2);
+        assert!(m.queued.front().unwrap().pending_note.is_some());
+    }
+
+    #[test]
+    fn save_and_index_retries_keep_each_cards_fixed_date() {
+        for date in ["2026-12-31", "2027-01-01"] {
+            let mut ready = ReadySummary::new(Session::new(), "summary".into(), true);
+            ready.date = date.into();
+            ready.retry_with(|target, _| {
+                assert_eq!(target, date);
+                Err(neo_tools::ToolError::io("blocked"))
+            }, |_| panic!("must not index unsaved note"));
+            assert_eq!(ready.save_state, SaveState::Unsaved);
+            ready.retry_with(|target, note| {
+                assert_eq!(target, date);
+                Ok(neo_tools::classlog::ClassNote {
+                    id: 7, started_ms: note.started_ms, ended_ms: now_ms(), subject: note.subject,
+                    summary: note.summary, over_limit: false, screen_notes: note.screen_notes,
+                    transcript: note.transcript,
+                })
+            }, |_| Err(neo_tools::ToolError::io("blocked")));
+            assert_eq!(ready.date, date);
+            assert_eq!(ready.save_state, SaveState::IndexFailed);
+            ready.retry_with(|_, _| panic!("must not append again"), |text| {
+                assert!(text.contains(&format!("class/{date}.json，第 7 节")));
+                Ok(())
+            });
+            assert_eq!(ready.date, date);
+            assert_eq!(ready.save_state, SaveState::Saved);
+        }
+    }
+
+    #[test]
+    fn stale_events_cannot_mutate_new_class() {
+        let mut m = active();
+        for scope in [ClassScope { generation: 1, session: 3 }, ClassScope { generation: 2, session: 2 }] {
+            for event in [ClassEvent::Line("old".into()),
+                ClassEvent::Vision { subject: Some("old".into()), note: "old".into() },
+                ClassEvent::VisionFailed("old".into()), ClassEvent::SttDied("old".into())] {
+                m.on_event(ScopedEvent { scope, event });
+            }
+        }
+        m.on_event(ScopedEvent { scope: ClassScope { generation: 1, session: 3 }, event: ClassEvent::Unmaximized });
+        assert!(m.analysis_in_flight);
+        assert_eq!(m.status, "new class");
+        let ClassPhase::Active(session, _) = &m.phase else { panic!("changed phase") };
+        assert!(session.transcript.is_empty());
+        assert!(session.screen_notes.is_empty());
+        assert!(session.subject.is_none());
+    }
+
+    #[test]
+    fn missing_audio_warning_is_once_scoped_and_cancel_safe() {
+        let mut m = active();
+        let mut sent = false;
+        report_missing_audio(false, &mut sent, &m.tx, &AtomicBool::new(false));
+        report_missing_audio(true, &mut sent, &m.tx, &AtomicBool::new(true));
+        assert!(!sent);
+        assert!(m.rx.try_recv().is_err());
+        report_missing_audio(true, &mut sent, &m.tx, &AtomicBool::new(false));
+        report_missing_audio(true, &mut sent, &m.tx, &AtomicBool::new(false));
+        let event = m.rx.try_recv().unwrap();
+        assert!(matches!(event.event, ClassEvent::AudioMissing));
+        assert!(m.rx.try_recv().is_err());
+        m.phase = ClassPhase::Settling(Session::new(), Instant::now());
+        m.on_event(event);
+        assert_eq!(m.status(), Some(AUDIO_MISSING_NOTICE));
+        assert!(matches!(m.phase, ClassPhase::Settling(..)));
+        m.status = "current".into();
+        for scope in [ClassScope { generation: 1, session: 3 }, ClassScope { generation: 2, session: 2 }] {
+            m.on_event(ScopedEvent { scope, event: ClassEvent::AudioMissing });
+        }
+        assert_eq!(m.status(), Some("current"));
+    }
+
+    #[test]
+    fn settling_accepts_current_tail() {
+        let mut m = active();
+        m.phase = ClassPhase::Settling(Session::new(), Instant::now());
+        m.on_event(ScopedEvent { scope: m.tx.scope, event: ClassEvent::Line("tail".into()) });
+        let ClassPhase::Settling(session, _) = &m.phase else { panic!("changed phase") };
+        assert_eq!(session.transcript, ["tail"]);
+    }
+
+    #[test]
+    fn closed_summary_does_not_publish_but_normal_crossing_does() {
+        let mut m = active();
+        let ready = || ReadySummary::new(Session::new(), "summary".into(), true);
+        m.publish_summary(ready(), false, false);
+        assert!(m.ready.is_none());
+        assert_eq!(m.summary_pings, 0);
+        assert!(m.analysis_in_flight);
+        m.publish_summary(ready(), true, true);
+        assert!(m.ready.is_some());
+        assert_eq!(m.summary_pings, 1);
+        assert!(matches!(m.phase, ClassPhase::Active(..)));
+        assert_eq!(m.status, "new class");
+    }
+
+    #[test]
+    fn old_polish_cannot_block_or_complete_new_session() {
+        let mut m = active();
+        m.phase = ClassPhase::Polishing;
+        let old = m.tx.scope;
+        m.begin_session();
+        assert!(!m.analysis_in_flight);
+        m.analysis_in_flight = true;
+        for phase in [ClassPhase::Active(Session::new(), None), ClassPhase::Polishing] {
+            m.phase = phase;
+            let (publish, crossing) = m.complete_polish(old);
+            assert!(publish && crossing);
+            assert!(m.analysis_in_flight);
+            let polishing = matches!(m.phase, ClassPhase::Polishing);
+            m.publish_summary(ReadySummary::new(Session::new(), "summary".into(), true), publish, crossing);
+            assert_eq!(matches!(m.phase, ClassPhase::Polishing), polishing);
+            assert_eq!(m.status, "new class");
+        }
+        assert_eq!(m.complete_polish(m.tx.scope), (true, false));
+        assert!(!m.analysis_in_flight);
+    }
+
+    #[test]
+    fn reopen_rejects_previous_generation_summary_bookkeeping() {
+        let mut m = active();
+        let old = m.tx.scope;
+        m.shutdown();
+        m.shutdown();
+        assert_eq!(m.tx.scope.generation, old.generation + 1);
+        m.enabled = true;
+        m.begin_session();
+        m.phase = ClassPhase::Polishing;
+        m.analysis_in_flight = true;
+        assert_eq!(m.complete_polish(old), (false, true));
+        assert!(m.analysis_in_flight);
+        assert!(m.ready.is_none());
+    }
+
+    #[test]
+    fn pending_stt_keeps_tail_visible_before_completion() {
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let done = SttDone(pending.clone());
+        let m = active();
+        m.tx.send(ClassEvent::Line("tail".into())).unwrap();
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        drop(done);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert!(matches!(m.rx.try_recv().unwrap().event, ClassEvent::Line(text) if text == "tail"));
+    }
+
+    #[test]
+    fn shutdown_never_waits_for_engine_lease() {
+        let mut m = active();
+        let slot = m.stt_engine.clone();
+        let _lease = slot.lock().unwrap();
+        m.shutdown();
+        assert!(!m.enabled);
+        assert_eq!(m.tx.scope.generation, 3);
+    }
+
+    #[test]
+    fn stopped_worker_does_not_load_or_open_microphone() {
+        let m = active();
+        stt_main(m.tx.clone(), Arc::new(AtomicBool::new(true)), m.stt_engine.clone(), m.cache_enabled.clone(), m.cancelled.clone());
+        assert!(m.rx.try_recv().is_err());
+        assert!(m.stt_engine.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn shutdown_cancels_workers_but_normal_stop_keeps_summary_enabled() {
+        let mut m = active();
+        let cancelled = m.cancelled.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        m.stt_stop = Some(stop.clone());
+        m.stop_stt();
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(!cancelled.load(Ordering::Acquire));
+        m.begin_session();
+        assert!(!cancelled.load(Ordering::Acquire));
+        m.shutdown();
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancelled_workers_skip_capture_network_and_locked_engine() {
+        let m = active();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let cfg = neo_llm::Config { base_url: String::new(), api_key: String::new(), model: String::new(), thinking: Default::default() };
+        assert!(matches!(run_vision(&cfg, true, &cancelled), ClassEvent::VisionFailed(_)));
+        assert!(run_polish(&cfg, &Session::new(), &cancelled).is_err());
+        let _lease = m.stt_engine.lock().unwrap();
+        stt_main(m.tx.clone(), Arc::new(AtomicBool::new(false)), m.stt_engine.clone(), m.cache_enabled.clone(), cancelled);
+        assert!(m.rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn waiting_stt_lease_observes_cancellation() {
+        let m = active();
+        let slot = m.stt_engine.clone();
+        let lease = slot.lock().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancelled.clone();
+        let worker_slot = slot.clone();
+        let tx = m.tx.clone();
+        let (done, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            stt_main(tx, Arc::new(AtomicBool::new(false)), worker_slot, Arc::new(AtomicBool::new(false)), worker_cancel);
+            let _ = done.send(());
+        });
+        cancelled.store(true, Ordering::Release);
+        let result = finished.recv_timeout(Duration::from_secs(1));
+        drop(lease);
+        worker.join().unwrap();
+        assert!(result.is_ok());
+        assert!(m.rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancelled_stream_rejects_queued_completion() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(neo_llm::Event::Done { tool_calls: false }).unwrap();
+        let stream = neo_llm::Stream::new_for_test(rx);
+        assert!(drain_stream(&stream, Instant::now() + VISION_TIMEOUT, &AtomicBool::new(true)).is_err());
+        assert!(stream.cancel.load(Ordering::Relaxed));
+        assert!(stream.rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn stream_cancellation_wakes_without_network_events() {
+        let (_tx, rx) = mpsc::channel();
+        let stream = neo_llm::Stream::new_for_test(rx);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel = cancelled.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            cancel.store(true, Ordering::Release);
+        });
+        assert!(drain_stream(&stream, Instant::now() + Duration::from_secs(2), &cancelled).unwrap_err().contains("取消"));
+        worker.join().unwrap();
+        assert!(stream.cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn stream_deadline_applies_to_queued_events() {
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..10_000 {
+            tx.send(neo_llm::Event::Delta { content: String::new(), reasoning: String::new() }).unwrap();
+        }
+        let stream = neo_llm::Stream::new_for_test(rx);
+        assert!(drain_stream(&stream, Instant::now(), &AtomicBool::new(false)).is_err());
+        assert!(stream.cancel.load(Ordering::Relaxed));
+        assert!(stream.rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn disconnected_stream_does_not_publish_truncated_summary() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(neo_llm::Event::Delta { content: "partial".into(), reasoning: String::new() }).unwrap();
+        drop(tx);
+        let stream = neo_llm::Stream::new_for_test(rx);
+        assert!(drain_stream(&stream, Instant::now() + VISION_TIMEOUT, &AtomicBool::new(false)).unwrap_err().contains("中断"));
+    }
+
+    #[test]
+    fn shutdown_discards_queued_success_and_fallback_before_persistence() {
+        let mut m = active();
+        let old = m.tx.clone();
+        m.shutdown();
+        old.send(ClassEvent::Polished { summary: "old".into(), session: Box::new(Session::new()) }).unwrap();
+        old.send(ClassEvent::PolishFailed { error: "old".into(), session: Box::new(Session::new()) }).unwrap();
+        // 模拟重新启用后才排到旧结果；on_event 必须在调用落盘路径前拒绝。
+        m.enabled = true;
+        while let Ok(event) = m.rx.try_recv() {
+            m.on_event(event);
+        }
+        assert!(m.ready.is_none());
+        assert_eq!(m.summary_pings, 0);
+        assert!(matches!(m.phase, ClassPhase::Idle));
+    }
+
+    #[test]
+    fn stream_normal_completion_keeps_text() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(neo_llm::Event::Delta { content: "ok".into(), reasoning: String::new() }).unwrap();
+        tx.send(neo_llm::Event::Done { tool_calls: false }).unwrap();
+        let stream = neo_llm::Stream::new_for_test(rx);
+        assert_eq!(drain_stream(&stream, Instant::now() + VISION_TIMEOUT, &AtomicBool::new(false)).unwrap(), "ok");
+        assert!(!stream.cancel.load(Ordering::Relaxed));
     }
 }
 
@@ -810,9 +1764,9 @@ fn run_polish(cfg: &neo_llm::Config, session: &Session) -> Result<String, String
 
 #[cfg(windows)]
 mod watch {
-    use super::{ClassEvent, Duration};
+    use super::{ClassEvent, ClassSender, Duration};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{mpsc, Arc};
+    use std::sync::Arc;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows_sys::Win32::System::SystemInformation::{GetTickCount, GetTickCount64};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
@@ -853,7 +1807,7 @@ mod watch {
 
     /// 启动监听线程；返回停止信号（置位即停）。spawn 失败返回 None ——
     /// 调用方（tick）下一帧会重试，别让「开关开着但什么都没在跑」静默发生。
-    pub fn start(tx: mpsc::Sender<ClassEvent>) -> Option<Arc<AtomicBool>> {
+    pub fn start(tx: ClassSender) -> Option<Arc<AtomicBool>> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         match std::thread::Builder::new()
@@ -868,7 +1822,10 @@ mod watch {
         }
     }
 
-    fn watch_main(tx: mpsc::Sender<ClassEvent>, stop: Arc<AtomicBool>) {
+    fn watch_main(tx: ClassSender, stop: Arc<AtomicBool>) {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         // 低级键盘钩子必须挂在有消息循环的线程上 —— 本线程边轮询边泵消息。
         // SAFETY: 回调是 'static 函数；线程退出前 Unhook。
         let hook = unsafe {
@@ -959,9 +1916,9 @@ mod watch {
 /// 非 Windows 只是编译保活：课堂监听为空壳（永不触发）。
 #[cfg(not(windows))]
 mod watch {
-    use super::{ClassEvent, Duration};
+    use super::Duration;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{mpsc, Arc};
+    use std::sync::Arc;
 
     pub fn last_key_ms() -> u64 {
         0
@@ -969,7 +1926,7 @@ mod watch {
     pub fn idle_duration() -> Duration {
         Duration::ZERO
     }
-    pub fn start(_tx: mpsc::Sender<ClassEvent>) -> Option<Arc<AtomicBool>> {
+    pub fn start(_tx: super::ClassSender) -> Option<Arc<AtomicBool>> {
         Some(Arc::new(AtomicBool::new(false)))
     }
 }

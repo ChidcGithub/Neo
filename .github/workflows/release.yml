@@ -3,33 +3,59 @@
 # 触发：推送 v* 标签，或手动 workflow_dispatch（版本号取自根 Cargo.toml）。
 # 版本号含 "-"（如 -rc...）时发布为 pre-release。
 #
-# 也监听 main 推送，但只跑到 cargo build 为止：
-# GitHub 缓存按 ref 隔离，工作流只能恢复「本 ref 或默认分支」的缓存 ——
-# 纯 tag 触发的工作流永远救不回自己在旧 tag 上存的缓存（每次都 No cache found）。
-# main 上跑一遍完整 build，tag 构建才能经 restore-keys 命中默认分支的缓存。
+# main / release/** 推送及面向 main 的 PR 仅编译检查与运行无外部副作用的定向测试。
+# 打包、模型下载及发布仅在 tag 或手动触发时执行，且必须先通过检查。
 
 name: Release
 
 on:
   push:
     tags: ["v*"]
+    branches: [main, "release/**"]
+  pull_request:
     branches: [main]
   workflow_dispatch:
 
-# 打包/发布步骤只在 tag（或手动触发）时跑；main 推送仅暖缓存。
+# 普通检查只读；写权限仅授予 tag / 手动发布任务。
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
-# main 上的暖缓存跑被新推送取代即可取消；tag 发布永不取消。
+# 分支检查被新推送取代即可取消；tag 发布永不取消。
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check all workspace targets
+        run: cargo check --locked --workspace --all-targets
+
+      # 仅运行纯逻辑/临时数据库测试；不运行真实截图、麦克风或 GUI 工具测试。
+      - name: Safe library tests
+        run: cargo test --locked -p neo-llm -p neo-store -p neo-theme -p neo-ui --lib -- --skip local_http_eof_and_normal_completion
+
+      - name: Tool policy tests
+        run: 'cargo test --locked -p neo-tools --lib policy::tests::'
+
   release:
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    needs: check
+    permissions:
+      contents: write
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -41,11 +67,11 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          if ($env:GITHUB_REF_TYPE -eq 'tag') {
-            $v = $env:GITHUB_REF_NAME -replace '^v', ''
-          } else {
-            $m = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"'
-            $v = $m.Matches.Groups[1].Value
+          $m = @(Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"')
+          if ($m.Count -ne 1) { throw "cannot determine workspace Cargo version" }
+          $v = $m[0].Matches.Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$v") {
+            throw "Tag '$env:GITHUB_REF_NAME' does not match Cargo version 'v$v'"
           }
           if (-not $v) { throw "cannot determine version" }
           "version=$v" >> $env:GITHUB_OUTPUT
@@ -61,9 +87,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release -p neo-app
+        run: cargo build --locked --release -p neo-app
 
-      # ---- 以下全部为打包/发布步骤：main 暖缓存跑不执行 ----
+      # ---- 以下全部为打包/发布步骤：分支推送及 PR 不执行 ----
 
       - name: Download STT models
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'

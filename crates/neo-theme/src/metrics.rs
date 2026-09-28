@@ -55,8 +55,8 @@ impl Distance {
 // Harness 基准常量（1x，单位：逻辑像素）
 // ---------------------------------------------------------------------------
 
-/// 输入卡圆角（`InputBar .card { border-radius: 22px }`）。
-pub const R_BASE_CARD: f32 = 22.0;
+/// 输入卡圆角：与面板共用克制的圆角尺度。
+pub const R_BASE_CARD: f32 = 16.0;
 /// chip / 下拉控件圆角（`.select { border-radius: 8px }`）。
 pub const R_BASE_CHIP: f32 = 8.0;
 /// workspace chip 圆角（`.workspace { border-radius: 16px }`）。
@@ -171,7 +171,7 @@ impl Metrics {
     }
 
     // ---- 圆角 ----
-    /// 输入卡圆角。22px 的「近方圆形」在放大后会显得太圆，因此上限锁定在 28。
+    /// 输入卡圆角随字号放大，上限锁定在 28，避免大屏上过度圆润。
     pub fn radius_card(&self) -> f32 {
         self.s(R_BASE_CARD).min(28.0)
     }
@@ -270,10 +270,10 @@ impl Metrics {
     }
     /// 侧栏导航项高度与圆角。
     pub fn nav_item_h(&self) -> f32 {
-        self.s(38.0)
+        self.hit_target(self.s(52.0))
     }
     pub fn nav_item_gap(&self) -> f32 {
-        self.s(2.0)
+        self.s(4.0)
     }
     /// 顶栏内边距。
     pub fn topbar_pad(&self) -> [f32; 4] {

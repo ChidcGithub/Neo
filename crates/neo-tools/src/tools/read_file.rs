@@ -51,6 +51,25 @@ pub fn run(scope: &Scope, args: &Args) -> Outcome {
     }
 }
 
+pub(crate) fn read_bounded(path: &std::path::Path, limit: u64) -> Result<Vec<u8>, ToolError> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| ToolError::io(e.to_string()))?;
+    let meta = file.metadata().map_err(|e| ToolError::io(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(ToolError::new(ErrorKind::Unsupported, "只支持普通文件"));
+    }
+    if meta.len() > limit {
+        return Err(ToolError::new(ErrorKind::TooLarge, "文件超过读取上限"));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)
+        .map_err(|e| ToolError::io(e.to_string()))?;
+    if bytes.len() as u64 > limit {
+        return Err(ToolError::new(ErrorKind::TooLarge, "文件读取期间超过上限"));
+    }
+    Ok(bytes)
+}
+
 fn read(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     let raw = args.require_str("path")?;
     let offset = args.opt_int("offset")? as usize;
@@ -93,7 +112,7 @@ fn read(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
         .with_hint("用 offset/limit 分段读，或用 `bash` 里的 grep/head 先定位"));
     }
 
-    let bytes = std::fs::read(&path).map_err(|e| ToolError::io(format!("读取 {raw} 失败：{e}")))?;
+    let bytes = read_bounded(&path, limits::READ_BYTES)?;
     let text = String::from_utf8(bytes).map_err(|_| {
         ToolError::new(ErrorKind::Unsupported, format!("{raw} 不是 UTF-8 文本")).with_hint(
             "DOC/DOCX、PPT/PPTX 或 GBK/UTF-16 文本请用 `read_document`；图片请用 `view_image`",
@@ -101,11 +120,10 @@ fn read(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     })?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
 
-    let total: Vec<&str> = text.lines().collect();
-    let lines_total = total.len();
+    let lines_total = text.lines().count();
     let start = offset.min(lines_total);
-    let end = (start + limit).min(lines_total);
-    let slice = &total[start..end];
+    let end = start.saturating_add(limit).min(lines_total);
+    let slice: Vec<&str> = text.lines().skip(start).take(end - start).collect();
     let content = slice.join("\n");
     let has_more = end < lines_total;
 
@@ -133,4 +151,25 @@ fn read(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
         format!("读取 {raw}（{lines_total} 行）")
     };
     Ok(Outcome::ok("read_file", summary, data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_limit_and_many_short_lines_remain_bounded() {
+        let root = std::env::temp_dir().join(format!("neo-read-bound-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("边界.txt");
+        std::fs::write(&path, b"1234").unwrap();
+        assert_eq!(read_bounded(&path, 4).unwrap(), b"1234");
+        assert_eq!(read_bounded(&path, 3).unwrap_err().kind, ErrorKind::TooLarge);
+        std::fs::write(&path, "\n".repeat(limits::READ_BYTES as usize)).unwrap();
+        let out = crate::dispatch(&Scope::new(&root), "read_file", &json!({"path": "边界.txt", "limit": 1}));
+        assert!(out.error.is_none());
+        assert_eq!(out.data["lines_returned"], 1);
+        assert_eq!(out.data["next_offset"], 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

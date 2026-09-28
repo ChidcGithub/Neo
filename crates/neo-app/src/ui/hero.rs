@@ -1,7 +1,7 @@
 //! 空态（hero）。
 //!
-//! 对应 Harness 的 `HeroShell`：整块垂直居中，一列内容 ——
-//! 鲸鱼标志 + 标题、workspace chip、输入卡。
+//! 单列欢迎区：整体垂直居中，标题、工作区与输入卡共享左基线。
+//! 标题按实际列宽换行，工作区路径截断而不挤出窄窗口。
 //!
 //! ```text
 //! .headline { gap: 10px; font-size: 26px; line-height: 32px; font-weight: 500 }
@@ -32,12 +32,17 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
     let card_w = m.card_max(area.width());
     let card_h = composer::block_height(ui, skin, state, card_w, true);
 
-    let headline_h = t.headline_lh;
-    let chip_h = m.s(28.0);
-    let gap = m.stack_gap();
-    // 标题与下方内容之间留开一点：它是这一列的「组标题」，
-    // 与 chip/输入卡的节奏区分开。
-    let head_gap = m.s(28.0);
+    let fish_w = t.fish;
+    let title = ui.painter().layout(
+        "今天想在课堂上做点什么？".to_owned(),
+        skin.bold(t.headline),
+        p.label_primary,
+        (card_w - fish_w - m.s(16.0)).max(1.0),
+    );
+    let headline_h = title.size().y.max(t.headline_lh);
+    let chip_h = m.hit_target(m.s(28.0));
+    let gap = m.s(8.0);
+    let head_gap = m.s(20.0);
 
     let fixed = headline_h + head_gap + chip_h + gap;
     // 卡片高 clamp 进剩余空间：长草稿 + 矮窗口（如四分屏）时文本区变矮
@@ -53,51 +58,19 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
         Vec2::new(card_w, total),
     );
 
-    // ---- 标题行：鲸鱼 + 文字 ----
-    let fish_w = t.fish;
+    // 标题、工作区与输入卡共用左基线；窄窗口按实际列宽换行。
     let fish_h = fish_w / skin.whale.aspect();
-    let title = "今天想在课堂上做点什么？";
-    let title_font = skin.bold(t.headline);
-    let title_w = ui
-        .painter()
-        .layout_no_wrap(title.to_owned(), title_font.clone(), p.label_primary)
-        .size()
-        .x;
-
-    let group_w = fish_w + m.s(10.0) + title_w;
-    let gx = area.center().x - group_w * 0.5;
+    let gx = col.left();
     let gy = col.top();
-
-    // 上游 `hero-fish-swim`：悬停在标志上时鲸鱼原地游动，1.6s 一循环，
-    // 幅度只有 1px 上下 —— 大屏上恰好是"它活着"而不是"它在晃"。
     let whale_rect = Rect::from_min_size(
-        egui::pos2(gx, gy + (headline_h - fish_h) * 0.5),
+        egui::pos2(gx, gy + (t.headline_lh - fish_h) * 0.5),
         Vec2::new(fish_w, fish_h),
     );
-    let swim_id = ui.id().with("neo-whale-swim");
-    let hit = super::hover_area(
-        ui,
-        whale_rect.expand(m.s(8.0)),
-        ui.id().with("neo-whale-hit"),
-    );
-    let swim = super::ease(ui, swim_id, if hit.hovered() { 1.0 } else { 0.0 });
-    if swim > 0.001 {
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(16));
-    }
-    let phase = (ui.ctx().time() * (std::f64::consts::TAU / 1.6)) as f32;
-    let bob = (phase.sin() * m.s(1.1)) * swim;
-    let drift = ((phase * 0.5).sin() * m.s(0.6)) * swim;
-    skin.whale.paint(
-        ui.painter(),
-        whale_rect.translate(egui::vec2(drift, bob)),
-        p.label_primary,
-    );
-    ui.painter().text(
-        egui::pos2(gx + fish_w + m.s(10.0), gy + headline_h * 0.5),
-        egui::Align2::LEFT_CENTER,
+    skin.whale
+        .paint(ui.painter(), whale_rect, p.label_secondary);
+    ui.painter().galley(
+        egui::pos2(gx + fish_w + m.s(16.0), gy),
         title,
-        title_font,
         p.label_primary,
     );
 
@@ -112,11 +85,12 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
         .x
         .min(m.s(280.0));
     // icon(16) + 间距(4) + 文字 + 间距(4) + chevron(10) + 两侧内边距(14+12)
-    let chip_w = m.s(14.0 + 16.0 + 4.0) + text_w + m.s(4.0 + 10.0 + 12.0);
-    let chip = Rect::from_min_size(
-        egui::pos2(col.left() + m.workspace_row_pad(), chip_top),
-        Vec2::new(chip_w, chip_h),
-    );
+    let chip_w = (m.s(14.0 + 16.0 + 4.0) + text_w + m.s(4.0 + 10.0 + 12.0)).min(card_w);
+    let chip = Rect::from_min_size(egui::pos2(col.left(), chip_top), Vec2::new(chip_w, chip_h));
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(egui::Id::new("neo-hero-workspace-probe"), chip);
+    });
     if workspace_chip(ui, skin, chip, state.workspace.as_deref()) {
         out.workspace_clicked = true;
     }
@@ -141,7 +115,7 @@ fn workspace_chip(ui: &Ui, skin: &Skin<'_>, rect: Rect, label: Option<&str>) -> 
     let painter = ui.painter();
 
     if st.hovered {
-        painter.squircle_filled(rect, m.radius_workspace(), p.hover);
+        painter.squircle_filled(rect, m.radius_chip(), p.hover);
     }
 
     let icon_r = Rect::from_center_size(
@@ -180,4 +154,66 @@ fn workspace_chip(ui: &Ui, skin: &Skin<'_>, rect: Rect, label: Option<&str>) -> 
     );
 
     resp.clicked()
+}
+
+#[cfg(test)]
+mod ui_regression {
+    use super::*;
+    use crate::ui::composer::ui_regression::{context, probe};
+
+    #[test]
+    fn welcome_column_wraps_and_keeps_workspace_and_send_inside_viewport() {
+        for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
+            for (width, height, scale) in [
+                (320.0, 600.0, 1.0),
+                (360.0, 640.0, 0.85),
+                (480.0, 720.0, 1.25),
+                (768.0, 1024.0, 1.6),
+                (1280.0, 720.0, 1.0),
+                (1920.0, 1080.0, 1.25),
+                (3840.0, 2160.0, 2.8),
+            ] {
+                let ctx = context();
+                let theme =
+                    neo_theme::Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
+                theme.apply(&ctx);
+                let whale = crate::brand::WhaleMark::cached(&ctx);
+                let skin = Skin::new(theme, &whale);
+                let area = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, height));
+                let mut state = AppState::default();
+                state.workspace = Some("long-workspace-path/".repeat(30));
+                for _ in 0..3 {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(area),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            draw(ui, &skin, area, &mut state);
+                        },
+                    );
+                    // 纯布局测试不上传 GPU；显式消费本帧纹理增量，遵守 egui 帧生命周期。
+                    output.textures_delta.clear();
+                    let mut found_title = false;
+                    for shape in output.shapes {
+                        if let egui::Shape::Text(text) = shape.shape {
+                            if text.galley.job.text == "今天想在课堂上做点什么？" {
+                                found_title = true;
+                                let bounds = Rect::from_min_size(text.pos, text.galley.size());
+                                assert!(area.contains_rect(bounds), "{mode:?} {width}: {bounds:?}");
+                            }
+                        }
+                    }
+                    assert!(found_title, "欢迎标题必须实际绘制");
+                }
+                let chip: Rect = probe(&ctx, "neo-hero-workspace-probe");
+                let (send, _): (Rect, Rect) = probe(&ctx, "neo-composer-send-probe");
+                assert!(area.contains_rect(chip));
+                assert!(area.contains_rect(send));
+                assert!(chip.bottom() < send.top());
+                // 矩形坐标相减会有亚像素舍入，容差不改变触控目标尺寸。
+                assert!(chip.height() + 0.01 >= skin.m().hit_target(0.0));
+            }
+        }
+    }
 }

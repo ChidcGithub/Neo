@@ -89,7 +89,6 @@ pub fn draw(
     // 顶栏右侧只留「新对话」：设置入口统一收在侧栏底部，顶栏不再重复一个。
     let d = skin.d();
     let m = skin.m();
-    let p = skin.p();
     let btn_d = m.s(30.0);
     let new_center = egui::pos2(header.right() - btn_d * 0.5, header.top() + m.s(16.0));
     if IconButton::new(Icon::Plus)
@@ -101,9 +100,7 @@ pub fn draw(
         out.new_session = true;
     }
 
-    // ---- 消息流 → 渐隐 → 输入卡 ----
-    // 绘制顺序有讲究：渐隐遮罩必须盖在消息流之上、输入卡之下，
-    // 否则会把卡片底边也一起糊掉。
+    // ---- 消息流与输入卡：用留白分隔，不遮盖最后一行内容 ----
     let card_w = m.card_max(body.width());
     let card_h = composer::block_height(ui, skin, state, card_w, false);
     let card_bottom_pad = m.s(14.0);
@@ -118,16 +115,6 @@ pub fn draw(
     let list_rect = Rect::from_min_max(body.min, egui::pos2(body.right(), card.top() - m.s(16.0)));
     if list_rect.height() > m.s(40.0) {
         draw_messages(ui, skin, list_rect, state);
-        // 消息被裁掉时不该出现生硬切边 —— 沉入背景。
-        let fade_h = m.s(52.0).min(list_rect.height() * 0.4);
-        super::bottom_fade(
-            ui.painter(),
-            Rect::from_min_max(
-                egui::pos2(list_rect.left(), list_rect.bottom() - fade_h),
-                egui::pos2(list_rect.right(), list_rect.bottom()),
-            ),
-            p.bg_base,
-        );
     }
 
     out.composer = composer::draw(ui, skin, card, state, false);
@@ -236,7 +223,7 @@ fn draw_one(
                     let (r, _) = ui.allocate_exact_size(Vec2::new(content_w, h), Sense::hover());
                     let bubble =
                         Rect::from_min_size(egui::pos2(r.right() - w, r.top()), Vec2::new(w, h));
-                    ui.painter().squircle_filled(bubble, m.s(16.0), p.bubble);
+                    ui.painter().squircle_filled(bubble, m.radius_card(), p.bubble);
                     ui.painter().galley(
                         egui::pos2(bubble.left() + m.s(16.0), bubble.top() + m.s(12.0)),
                         galley,
@@ -314,15 +301,14 @@ fn draw_reasoning(ui: &mut Ui, skin: &Skin<'_>, content_w: f32, text: &str) {
     let galley = wrap_text(ui.painter(), text.to_owned(), font, p.label_tertiary, text_w);
     let h = galley.size().y + m.s(16.0);
     let (r, _) = ui.allocate_exact_size(Vec2::new(content_w, h), Sense::hover());
-    // 圆头细条（3pt 宽、两端半圆）：比直角 vline 更精致，也呼应整套 squircle 语言。
-    // 45% 品牌色 —— 中性描边色在暗底下几乎隐形，竖条要「可见但不抢正文」。
-    let bar_w = m.s(3.0);
+    // 思考过程使用中性细线，与正文和工具状态的强调色区分。
+    let bar_w = m.s(2.0);
     let bar = Rect::from_min_max(
         egui::pos2(r.left(), r.top() + m.s(8.0)),
         egui::pos2(r.left() + bar_w, r.bottom() - m.s(8.0)),
     );
     ui.painter()
-        .squircle_filled(bar, bar_w * 0.5, super::translucent(p.accent, 0.45));
+        .squircle_filled(bar, bar_w * 0.5, p.border_l3);
     ui.painter().galley(
         egui::pos2(r.left() + pad_l, r.top() + m.s(8.0)),
         galley,
@@ -565,6 +551,75 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
             g,
             p.error,
         );
+    }
+}
+
+#[cfg(test)]
+mod ui_regression {
+    use super::*;
+    use crate::ui::composer::ui_regression::{context, frame_themed, probe};
+
+    #[test]
+    fn long_code_and_wide_table_stay_readable_inside_message_column() {
+        for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
+            for width in [320.0, 768.0, 1920.0] {
+                let ctx = context();
+                let code = format!("CODE_START{}CODE_END", "long_token_".repeat(50));
+                let table = format!("| {} |\n| {} |\n| {} |\n",
+                    (0..12).map(|i| format!("Header{i}")).collect::<Vec<_>>().join(" | "),
+                    vec!["---"; 12].join(" | "),
+                    (0..12).map(|i| format!("Cell{i} {}", "longword".repeat(10))).collect::<Vec<_>>().join(" | "));
+                let mut state = AppState::default();
+                state.messages.push(crate::state::ChatMessage::new(Role::Assistant,
+                    format!("```text\n{code}\n```\n\n{table}\n\nAFTER_TABLE")));
+                let size = Vec2::new(width, 1800.0);
+                let area = Rect::from_min_size(egui::pos2(8.0, 8.0), size - Vec2::splat(16.0));
+                let mut render = |ui: &mut Ui, skin: &Skin<'_>| draw_messages(ui, skin, area, &mut state);
+                for _ in 0..4 { frame_themed(&ctx, size, vec![], mode, &mut render); }
+                let output = frame_themed(&ctx, size, vec![], mode, &mut render);
+                let (viewport, content, _): (Rect, Vec2, Vec2) = probe(&ctx, "neo-test-thread-geometry");
+                assert!(content.x <= viewport.width() + 1.0, "width={width}: {content:?}, {viewport:?}");
+                let mut found_code = false;
+                let mut found_tail = false;
+                let mut cells = 0;
+                let mut table_pos = None;
+                for clipped in &output.shapes {
+                    if let egui::Shape::Text(text) = &clipped.shape {
+                        let source = &text.galley.job.text;
+                        if source.contains("CODE_START") {
+                            found_code = true;
+                            assert!(source.contains("CODE_END"), "代码不能丢失尾部");
+                            assert!(text.galley.rows.len() > 1, "长代码应按消息列换行");
+                            assert!(text.pos.x + text.galley.size().x <= viewport.right() + 1.0);
+                        }
+                        if source.starts_with("Cell") {
+                            cells += 1;
+                            let visible = clipped.clip_rect.intersect(Rect::from_min_size(text.pos, text.galley.size()));
+                            if visible.is_positive() { table_pos = Some(visible.center()); }
+                            assert!(clipped.clip_rect.right() <= viewport.right() + 1.0);
+                            assert!(clipped.clip_rect.left() >= viewport.left() - 1.0);
+                        }
+                        if source == "AFTER_TABLE" { found_tail = true; }
+                    }
+                }
+                assert!(found_code && found_tail && cells > 0, "代码、表格及后续正文都必须绘制");
+                // 横向滚到表尾，最后一列必须能真正进入局部裁剪区。
+                for _ in 0..8 {
+                    frame_themed(&ctx, size, vec![egui::Event::PointerMoved(table_pos.unwrap()),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point, delta: Vec2::new(-2000.0, 0.0),
+                            phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE,
+                        }], mode, &mut render);
+                }
+                let output = frame_themed(&ctx, size, vec![], mode, &mut render);
+                assert!(output.shapes.iter().any(|clipped| {
+                    if let egui::Shape::Text(text) = &clipped.shape {
+                        text.galley.job.text.starts_with("Cell11")
+                            && clipped.clip_rect.expand(1.0).contains_rect(Rect::from_min_size(text.pos, text.galley.size()))
+                    } else { false }
+                }), "width={width}: 最后一列必须能横向滚动至完整可见");
+            }
+        }
     }
 }
 

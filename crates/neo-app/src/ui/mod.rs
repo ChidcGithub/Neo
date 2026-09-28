@@ -19,6 +19,7 @@ pub mod composer;
 pub mod confirmwin;
 pub mod conversation;
 pub mod hero;
+pub mod logs;
 pub mod markdown;
 pub mod math;
 pub mod miniwin;
@@ -94,7 +95,7 @@ impl<'a> Skin<'a> {
 
 // ---- 组件库转发：让页面 `use crate::ui::…` 一处拿到常用接口 ----
 
-pub use neo_ui::{at, bottom_fade, ease, elide, hover_area, inset, tap, text_left, translucent, State};
+pub use neo_ui::{at, ease, elide, inset, tap, text_left, translucent, State};
 
 /// 区块小标题（`Design` → `Skin` 包装）。
 pub fn section_label(painter: &egui::Painter, skin: &Skin<'_>, rect: egui::Rect, label: &str) {
@@ -103,10 +104,6 @@ pub fn section_label(painter: &egui::Painter, skin: &Skin<'_>, rect: egui::Rect,
 /// 1px 分隔线（`Design` → `Skin` 包装）。
 pub fn divider(painter: &egui::Painter, skin: &Skin<'_>, rect: egui::Rect) {
     neo_ui::divider(painter, &skin.design, rect);
-}
-/// 卡片投影（`Design` → `Skin` 包装）。
-pub fn elevation_soft(skin: &Skin<'_>) -> egui::epaint::Shadow {
-    neo_ui::elevation_soft(&skin.design)
 }
 /// 分段控件（`Design` → `Skin` 包装）。
 pub fn segmented(

@@ -94,18 +94,17 @@ impl<'a> TextField<'a> {
         let resp = at(ui, inner, |ui| {
             let edit = egui::TextEdit::singleline(self.value)
                 .id(edit_id)
-                .frame(egui::Frame::NONE)
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(
+                    0,
+                    ((h - d.t().body * 1.4) * 0.5) as i8,
+                )))
                 .font(font.clone())
                 .text_color(if self.enabled {
                     p.label_primary
                 } else {
                     crate::base::translucent(p.label_primary, 0.5)
                 })
-                .desired_width(inner.width())
-                .margin(egui::Margin::symmetric(
-                    0,
-                    ((h - d.t().body * 1.4) * 0.5) as i8,
-                ));
+                .desired_width(inner.width());
             let edit = if self.secret {
                 edit.password(true)
             } else {
@@ -135,13 +134,9 @@ impl<'a> TextField<'a> {
         // 占位符：空且未聚焦时给一句提示。
         if self.value.is_empty() && !focus {
             if let Some(hint) = self.hint {
-                text_left(
-                    ui.painter(),
-                    inset(rect, text_left_pad, 0.0, m.s(10.0), 0.0),
-                    hint,
-                    d.font(d.t().body),
-                    d.c().placeholder,
-                );
+                let font = d.font(d.t().body);
+                let shown = crate::base::elide(ui.painter(), hint, &font, inner.width());
+                text_left(ui.painter(), inner, &shown, font, p.label_caption);
             }
         }
         resp

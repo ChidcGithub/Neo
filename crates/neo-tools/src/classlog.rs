@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::result::ToolError;
-use crate::tools::memory::{memories_path, now_ms};
+use crate::tools::memory::{load_json, lock_data_file, memories_path, next_id, now_ms, save_json};
 
 /// 总结的目标字数上限：超过只是提醒（`over_limit`），不强制截断。
 pub const SUMMARY_LIMIT: usize = 1500;
@@ -59,6 +59,25 @@ pub fn class_path(date: &str) -> PathBuf {
     class_dir().join(format!("{date}.json"))
 }
 
+pub(crate) fn valid_date(date: &str) -> bool {
+    let b = date.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-'
+        || !b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()) {
+        return false;
+    }
+    let year: u32 = date[..4].parse().unwrap();
+    let month: u32 = date[5..7].parse().unwrap();
+    let day: u32 = date[8..].parse().unwrap();
+    let days = match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return false,
+    };
+    year > 0 && day > 0 && day <= days
+}
+
 /// 当天日期串（本地时区，`YYYY-MM-DD`）。
 #[cfg(windows)]
 pub fn today_key() -> String {
@@ -96,43 +115,40 @@ static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// 读某一天的分记忆；文件不存在返回空，损坏文件改名 `.bad` 留档。
 pub fn load_day(date: &str) -> Vec<ClassNote> {
-    let _guard = FILE_LOCK.lock().unwrap();
-    let path = class_path(date);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
+    if !valid_date(date) {
         return Vec::new();
-    };
-    match serde_json::from_str::<Vec<ClassNote>>(&raw) {
-        Ok(list) => list,
-        Err(e) => {
-            eprintln!("[neo] 分记忆文件损坏（{e}），已留档：{}", path.display());
-            let _ = std::fs::rename(&path, path.with_extension("json.bad"));
-            Vec::new()
-        }
     }
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = class_path(date);
+    let Ok(_disk) = lock_data_file(&path) else { return Vec::new() };
+    load_json(&path).unwrap_or_default()
 }
 
 /// 追加一节课到当天文件，返回分配好 id 的完整条目。
 pub fn append_class(note: NewClassNote) -> Result<ClassNote, ToolError> {
-    let _guard = FILE_LOCK.lock().unwrap();
-    let date = today_key();
-    let path = class_path(&date);
-    let mut list = {
-        // 不存在 = 当天第一节课；坏了就留档重建（与 load_day 同款处理）。
-        match std::fs::read_to_string(&path) {
-            Err(_) => Vec::new(),
-            Ok(raw) => match serde_json::from_str::<Vec<ClassNote>>(&raw) {
-                Ok(list) => list,
-                Err(e) => {
-                    eprintln!("[neo] 分记忆文件损坏（{e}），已留档：{}", path.display());
-                    let _ = std::fs::rename(&path, path.with_extension("json.bad"));
-                    Vec::new()
-                }
-            },
-        }
-    };
+    append_class_on(&today_key(), note)
+}
+
+/// 追加到固定目标日；调用方重试时必须复用同一日期，不能重新取当天日期。
+pub fn append_class_on(date: &str, note: NewClassNote) -> Result<ClassNote, ToolError> {
+    if !valid_date(date) {
+        return Err(ToolError::bad_args("课堂日期必须是有效的 YYYY-MM-DD"));
+    }
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = class_path(date);
+    let _disk = lock_data_file(&path)?;
+    let mut list: Vec<ClassNote> = load_json(&path)?;
+    // 同一次收课回执丢失后重试不产生第二份；同起点但不同内容仍可保存。
+    if let Some(saved) = list.iter().find(|saved| {
+        saved.started_ms == note.started_ms && saved.subject == note.subject
+            && saved.summary == note.summary && saved.screen_notes == note.screen_notes
+            && saved.transcript == note.transcript
+    }) {
+        return Ok(saved.clone());
+    }
     let chars = note.summary.chars().count();
     let full = ClassNote {
-        id: list.iter().map(|c| c.id).max().unwrap_or(0) + 1,
+        id: next_id(list.iter().map(|c| c.id))?,
         started_ms: note.started_ms,
         ended_ms: now_ms(),
         subject: note.subject,
@@ -142,18 +158,7 @@ pub fn append_class(note: NewClassNote) -> Result<ClassNote, ToolError> {
         transcript: note.transcript,
     };
     list.push(full.clone());
-    // 原子写：先 tmp 再改名，写一半断电不留半个 JSON。
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ToolError::io(format!("创建目录 {} 失败：{e}", parent.display())))?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let body = serde_json::to_string_pretty(&list)
-        .map_err(|e| ToolError::io(format!("序列化分记忆失败：{e}")))?;
-    std::fs::write(&tmp, body)
-        .map_err(|e| ToolError::io(format!("写 {} 失败：{e}", tmp.display())))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| ToolError::io(format!("落盘 {} 失败：{e}", path.display())))?;
+    save_json(&path, &list)?;
     Ok(full)
 }
 
@@ -179,6 +184,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn date_boundaries_are_validated_before_path_use() {
+        for date in ["2024-02-29", "2000-02-29", "2026-12-31", "2027-01-01"] {
+            assert!(valid_date(date));
+        }
+        for date in ["1900-02-29", "2026-02-29", "2026-04-31", "2026-00-01", "2026-01-00", "../memories", "C:\\outside", "２０２６-01-01"] {
+            assert!(!valid_date(date));
+            assert!(load_day(date).is_empty());
+            assert_eq!(append_class_on(date, fixture("invalid date")).unwrap_err().kind,
+                crate::result::ErrorKind::BadArguments);
+        }
+    }
+
     fn fixture(content: &str) -> NewClassNote {
         NewClassNote {
             started_ms: 1_790_000_000_000,
@@ -195,10 +213,28 @@ mod tests {
     fn append_roundtrip_and_corruption_handling() {
         let _lock = crate::NEO_HOME_TEST_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("neo-classlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let _g = EnvGuard::set(&dir);
 
-        // 同一天写两节课，id 递增、落在同一个当天文件里。
+        // 模拟跨年两日：即使第二日已有记录，第一日的回执丢失重试仍命中原条目。
+        let first_date = "2026-12-31";
+        let next_date = "2027-01-01";
+        let first = append_class_on(first_date, fixture("跨日总结")).unwrap();
+        let next = append_class_on(next_date, fixture("次日总结")).unwrap();
+        let retry = append_class_on(first_date, fixture("跨日总结")).unwrap();
+        assert_eq!((retry.id, retry.ended_ms), (first.id, first.ended_ms));
+        assert_eq!(load_day(first_date).len(), 1);
+        let next_day = load_day(next_date);
+        assert_eq!(next_day.len(), 1);
+        assert_eq!(next_day[0].summary, next.summary);
+        assert!(class_path(first_date).is_file());
+        assert!(class_path(next_date).is_file());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // 便利 API 仍保存到当天；固定日期测试不依赖实际系统日期。
         let a = append_class(fixture("诱导公式")).unwrap();
+        let retry = append_class(fixture("诱导公式")).unwrap();
+        assert_eq!((retry.id, retry.ended_ms), (a.id, a.ended_ms));
         let b = append_class(fixture("图象变换")).unwrap();
         assert_eq!(b.id, a.id + 1);
 

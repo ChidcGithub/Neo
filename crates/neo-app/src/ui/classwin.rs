@@ -17,18 +17,29 @@ use neo_theme::{SquirclePaint, Theme};
 use neo_ui::{Icon, IconButton};
 
 use crate::brand::WhaleMark;
-use crate::class::ClassMonitor;
+use crate::class::{ClassMonitor, SaveState};
 use crate::ui::{Skin, markdown, text_left};
 
 use super::miniwin::OFFSCREEN;
 
-/// 滑入时长（秒）：从屏幕顶外滑到目标位。
+/// 滑入时长（秒）。
 const SLIDE_SECS: f32 = 0.35;
 /// 动画帧节拍（回调自驱 60fps）。
 const POLL: Duration = Duration::from_millis(16);
 
 fn viewport_id() -> ViewportId {
     ViewportId::from_hash_of("neo-classwin")
+}
+
+fn save_status(generated: bool, state: SaveState, close_blocked: bool) -> String {
+    let generation = if generated { "总结已生成" } else { "未完成自动整理，已保留素材节选" };
+    let saved = match state {
+        SaveState::Unsaved => "尚未保存，仅在内存中；请重试保存，退出前会再次检查",
+        SaveState::IndexFailed => "总结已保存；记忆索引失败，请重试",
+        SaveState::Saved => "总结及记忆索引已保存",
+    };
+    let retained = if close_blocked { "；已保留卡片，未关闭" } else { "" };
+    format!("{generation} · {saved}{retained}")
 }
 
 /// 课堂总结弹窗的运行时状态，挂在 `NeoApp` 上，每帧由 [`ClassWin::tick`] 驱动。
@@ -38,6 +49,7 @@ pub struct ClassWin {
     open: bool,
     /// 回调里点「关闭」置位，tick 里落到 `ClassMonitor::dismiss`。
     close_wanted: Arc<AtomicBool>,
+    retry_wanted: Arc<AtomicBool>,
     /// 滑入起点（打开沿置位，回调读完动画进度）。
     open_since: Arc<Mutex<Option<Instant>>>,
     /// 渲染层卡片的共享矩形（滑入动画由绘制闭包逐帧改写）。
@@ -68,6 +80,9 @@ impl ClassWin {
         overlay: Option<&neo_overlay::OverlayHandle>,
     ) {
         // 1. 关闭回传先行：dismiss 后 presenting 转 None，本轮即走关闭沿。
+        if self.retry_wanted.swap(false, Ordering::Relaxed) {
+            monitor.retry_save();
+        }
         if self.close_wanted.swap(false, Ordering::Relaxed) {
             monitor.dismiss();
         }
@@ -83,8 +98,9 @@ impl ClassWin {
         let target = rect.min;
 
         // 3. 内容快照（两条路径共用）。
-        let snapshot: Option<(String, String, bool, String)> = monitor.presenting().map(|r| {
-            (r.subject.clone(), r.summary.clone(), r.over_limit, r.date.clone())
+        let snapshot = monitor.presenting().map(|r| {
+            (r.subject.clone(), r.summary.clone(), r.over_limit, r.date.clone(),
+                save_status(r.generated, r.save_state, r.close_blocked), r.save_state != SaveState::Saved)
         });
 
         // 4a. 渲染层：卡片注册；滑入动画由绘制闭包在层内 vsync 自驱
@@ -97,13 +113,14 @@ impl ClassWin {
                     *self.open_since.lock().unwrap() = Some(Instant::now());
                 }
                 let close_wanted = Arc::clone(&self.close_wanted);
+                let retry_wanted = Arc::clone(&self.retry_wanted);
                 let open_since = Arc::clone(&self.open_since);
                 let rect_slot = Arc::clone(&self.layer_rect);
                 let card = neo_overlay::Card {
                     rect: Arc::clone(&self.layer_rect),
                     interactive: true,
                     draw: Box::new(move |ui| {
-                        let Some((subject, summary, over_limit, date)) = &snapshot else {
+                        let Some((subject, summary, over_limit, date, status, retry)) = &snapshot else {
                             return;
                         };
                         // 渲染层的 egui 上下文不管主题：同步一次（幂等、便宜）。
@@ -118,9 +135,9 @@ impl ClassWin {
                         }
                         drop(since);
 
-                        let whale = WhaleMark::load(ui.ctx());
+                        let whale = WhaleMark::cached(ui.ctx());
                         let skin = Skin::new(theme, &whale);
-                        if paint(ui, &skin, subject, summary, *over_limit, date) {
+                        if paint(ui, &skin, subject, summary, *over_limit, date, status, *retry, &retry_wanted) {
                             close_wanted.store(true, Ordering::Relaxed);
                         }
                     }),
@@ -157,6 +174,7 @@ impl ClassWin {
 
         // 5. 每帧注册（防回收 + 内容增量）。
         let close_wanted = Arc::clone(&self.close_wanted);
+        let retry_wanted = Arc::clone(&self.retry_wanted);
         let open_since = Arc::clone(&self.open_since);
         ctx.show_viewport_deferred(
             viewport_id(),
@@ -173,7 +191,7 @@ impl ClassWin {
                 .with_inner_size(if open { size } else { Vec2::new(1.0, 1.0) })
                 .with_position(if open { target } else { OFFSCREEN }),
             move |ui, _class| {
-                let Some((subject, summary, over_limit, date)) = &snapshot else {
+                let Some((subject, summary, over_limit, date, status, retry)) = &snapshot else {
                     return;
                 };
                 // 滑入：从顶外到目标位，ease-out；动画期间自驱 60fps。
@@ -192,9 +210,9 @@ impl ClassWin {
                 }
                 drop(since);
 
-                let whale = WhaleMark::load(ui.ctx());
+                let whale = WhaleMark::cached(ui.ctx());
                 let skin = Skin::new(theme, &whale);
-                if paint(ui, &skin, subject, summary, *over_limit, date) {
+                if paint(ui, &skin, subject, summary, *over_limit, date, status, *retry, &retry_wanted) {
                     close_wanted.store(true, Ordering::Relaxed);
                 }
             },
@@ -210,6 +228,9 @@ fn paint(
     summary: &str,
     over_limit: bool,
     date: &str,
+    status: &str,
+    retry: bool,
+    retry_wanted: &AtomicBool,
 ) -> bool {
     let d = skin.d();
     let p = skin.p();
@@ -265,7 +286,7 @@ fn paint(
         text_left(
             ui.painter(),
             warn_rect,
-            "总结超过 1500 字，未强制截断",
+            "总结超过建议的 1500 字（仍受安全预算限制）",
             skin.prop(skin.t().caption),
             p.label_tertiary,
         );
@@ -291,6 +312,11 @@ fn paint(
         .id_salt("neo-classwin-body")
         .auto_shrink([false, false])
         .show(&mut body_ui, |ui| {
+            ui.label(egui::RichText::new(status).color(if retry { p.error } else { p.label_tertiary }));
+            if retry && ui.button("重试保存 / 索引").clicked() {
+                retry_wanted.store(true, Ordering::Relaxed);
+            }
+            ui.separator();
             markdown::render(ui, skin, summary, false);
         });
 
@@ -345,5 +371,41 @@ impl ClassDot {
             })
         });
         layer.set_card(neo_overlay::card_id::DOT, card);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_close_keeps_card_and_renders_explicit_retention() {
+        let ctx = Context::default();
+        neo_theme::fonts::install(&ctx);
+        let theme = Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard);
+        theme.apply(&ctx);
+        let whale = WhaleMark::load(&ctx);
+        let skin = Skin::new(theme, &whale);
+        let mut monitor = ClassMonitor::default();
+        monitor.seed_pending_summaries();
+        monitor.dismiss();
+        let ready = monitor.presenting().unwrap();
+        assert!(ready.close_blocked);
+        assert_eq!(monitor.pending_saves(), 4);
+        for state in [SaveState::Unsaved, SaveState::IndexFailed] {
+            let status = save_status(true, state, ready.close_blocked);
+            let mut output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(640.0, 460.0))),
+                ..Default::default()
+            }, |ui| {
+                paint(ui, &skin, "数学", "保留正文", false, "2026-09-28", &status, true, &AtomicBool::new(false));
+            });
+            output.textures_delta.clear();
+            for needle in ["已保留卡片，未关闭", "重试保存 / 索引"] {
+                assert!(output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains(needle))
+                }), "缺少可见提示：{needle}");
+            }
+        }
     }
 }

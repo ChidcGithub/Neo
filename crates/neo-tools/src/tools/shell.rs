@@ -340,6 +340,9 @@ pub fn exec(
 
     let host = resolve(kind)?;
     let shown_cwd = scope.display(&cwd);
+    if scope.is_cancelled() {
+        return Err(crate::cancelled_error());
+    }
 
     if background {
         let child =
@@ -365,54 +368,12 @@ pub fn exec(
     }
 
     let started = Instant::now();
-    let mut child =
-        spawn(kind, &host, &cwd, &command, true).map_err(|e| spawn_error(kind, &host, &e))?;
-
-    // 输出由两个线程收，主线程只盯超时 —— 免得"进程写满管道 → 双方互等"这种死锁。
-    let out_handle = child.stdout.take().map(drain);
-    let err_handle = child.stderr.take().map(drain);
-
-    let deadline = Duration::from_millis(timeout_ms);
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) => {
-                if started.elapsed() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    timed_out = true;
-                    break None;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => return Err(ToolError::io(format!("等待命令结束失败：{e}"))),
-        }
-    };
-
-    let stdout = out_handle
-        .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
-    let stderr = err_handle
-        .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
+    let mut cmd = shell_command(kind, &host, &cwd, &command, true);
+    let captured = run_foreground(&mut cmd, scope, Duration::from_millis(timeout_ms))?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
-
-    if timed_out {
-        let secs = timeout_ms as f64 / 1000.0;
-        return Err(ToolError::new(
-            ErrorKind::Timeout,
-            format!("命令在 {secs:.0} 秒内没有结束，已终止"),
-        )
-        .with_hint(
-            "拆小命令、缩短范围（如限制目录/文件数），或提高 timeout_ms（上限 1800000 = 30 分钟）；\
-             若是长驻进程（服务、监听），改用 `background: true`",
-        ));
-    }
-
-    let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-    let (stdout, out_cut) = clip(&stdout);
-    let (stderr, err_cut) = clip(&stderr);
+    let exit_code = captured.status.code().unwrap_or(-1);
+    let (stdout, out_cut) = clip(&captured.stdout);
+    let (stderr, err_cut) = clip(&captured.stderr);
 
     let head: String = command.chars().take(60).collect();
     let summary = if exit_code == 0 {
@@ -458,6 +419,16 @@ fn spawn(
     command: &str,
     capture: bool,
 ) -> std::io::Result<Child> {
+    shell_command(kind, host, cwd, command, capture).spawn()
+}
+
+fn shell_command(
+    kind: ShellKind,
+    host: &Host,
+    cwd: &Path,
+    command: &str,
+    capture: bool,
+) -> Command {
     let io = if capture {
         Stdio::piped()
     } else {
@@ -500,8 +471,8 @@ fn spawn(
             Stdio::piped()
         } else {
             Stdio::null()
-        })
-        .spawn()
+        });
+    cmd
 }
 
 /// PowerShell 的命令前置：钉住输出编码、静音进度条、错误即终止。
@@ -532,24 +503,367 @@ fn spawn_error(kind: ShellKind, host: &Host, e: &std::io::Error) -> ToolError {
     ))
 }
 
-/// 后台读干一个管道，最多留 [`limits::OUTPUT_BYTES`]，其余继续读但丢弃。
-fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut kept: Vec<u8> = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            match r.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if kept.len() < limits::OUTPUT_BYTES {
-                        let room = limits::OUTPUT_BYTES - kept.len();
-                        kept.extend_from_slice(&buf[..n.min(room)]);
-                    }
-                }
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+
+struct Captured {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// 前台所有退出路径都收回所属进程树。后台调用不进入此生命周期。
+struct Foreground {
+    child: Child,
+    tree: process_tree::Tree,
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        let _ = self.tree.terminate();
+        let _ = self.child.kill();
+        let deadline = Instant::now() + CLEANUP_TIMEOUT;
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+}
+
+fn run_foreground(
+    cmd: &mut Command,
+    scope: &Scope,
+    timeout: Duration,
+) -> Result<Captured, ToolError> {
+    if scope.is_cancelled() {
+        return Err(crate::cancelled_error());
+    }
+    let started = Instant::now();
+    let mut process = process_tree::spawn(cmd)
+        .map_err(|e| ToolError::io(format!("无法安全启动前台命令：{e}")))?;
+    let mut out = process.child.stdout.take();
+    let mut err = process.child.stderr.take();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut status = None;
+    let mut cleanup_deadline = None;
+    loop {
+        if scope.is_cancelled() {
+            return Err(crate::cancelled_error());
+        }
+        if started.elapsed() >= timeout {
+            return Err(ToolError::new(
+                ErrorKind::Timeout,
+                "前台命令超时，正在收回所属进程树；已发生的操作不会回滚",
+            )
+            .with_hint("拆小命令或提高 timeout_ms；长驻进程请显式使用 background: true"));
+        }
+        if status.is_none() {
+            status = process
+                .child
+                .try_wait()
+                .map_err(|e| ToolError::io(format!("等待命令结束失败：{e}")))?;
+            if status.is_some() {
+                // 父 shell 退出不代表继承输出管道的后代退出。
+                process
+                    .tree
+                    .terminate()
+                    .map_err(|e| ToolError::io(format!("终止前台进程树失败：{e}")))?;
+                cleanup_deadline = Some(Instant::now() + CLEANUP_TIMEOUT);
             }
         }
-        kept
-    })
+        drain_ready(&mut out, &mut stdout)
+            .and_then(|()| drain_ready(&mut err, &mut stderr))
+            .map_err(|e| ToolError::io(format!("收集命令输出失败：{e}")))?;
+        if let Some(status) = status {
+            if out.is_none() && err.is_none() {
+                return Ok(Captured {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            if cleanup_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(ToolError::new(
+                    ErrorKind::Timeout,
+                    "命令已退出，但输出管道未在清理期限内关闭；已停止收集输出",
+                ));
+            }
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// 每轮限定读取量，避免持续大量输出饿死取消/超时检查。不创建可能永久阻塞的读线程。
+fn drain_ready<R: Read + process_tree::Pipe>(
+    pipe: &mut Option<R>,
+    kept: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    for _ in 0..32 {
+        let Some(reader) = pipe.as_mut() else { break };
+        let Some(available) = process_tree::readable(reader)? else {
+            break;
+        };
+        if available == 0 {
+            *pipe = None;
+            break;
+        }
+        let mut buf = [0u8; 8192];
+        let count = available.min(buf.len());
+        match reader.read(&mut buf[..count]) {
+            Ok(0) => {
+                *pipe = None;
+                break;
+            }
+            Ok(n) => {
+                let room = limits::OUTPUT_BYTES.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..n.min(room)]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+mod process_tree {
+    use super::*;
+    use std::io;
+    use std::os::windows::{io::AsRawHandle, process::CommandExt};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_BROKEN_PIPE, HANDLE, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+                THREADENTRY32,
+            },
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+            Pipes::PeekNamedPipe,
+            Threading::{
+                OpenThread, ResumeThread, CREATE_NO_WINDOW, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
+            },
+        },
+    };
+
+    struct Handle(HANDLE);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+    pub struct Tree(Handle);
+    impl Tree {
+        pub fn terminate(&self) -> io::Result<()> {
+            if unsafe { TerminateJobObject(self.0 .0, 1) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn new_tree() -> io::Result<Tree> {
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let tree = Tree(Handle(raw));
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                raw,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of_val(&info) as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(tree)
+    }
+
+    pub fn spawn(cmd: &mut Command) -> io::Result<Foreground> {
+        spawn_in_tree(cmd, new_tree()?)
+    }
+
+    fn spawn_in_tree(cmd: &mut Command, tree: Tree) -> io::Result<Foreground> {
+        // 不使用 BREAKAWAY：允许嵌套在宿主 Job 内；不兼容的宿主 Job 必须失败关闭。
+        // 主线程挂起后先 assign，绝不让用户脚本在未受保护的窗口内执行。
+        cmd.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
+        let child = cmd.spawn()?;
+        let process = Foreground { child, tree };
+        if unsafe { AssignProcessToJobObject(process.tree.0 .0, process.child.as_raw_handle()) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        resume(&process.child)?;
+        Ok(process)
+    }
+
+    #[cfg(test)]
+    pub(super) fn spawn_with_failing_assignment(cmd: &mut Command) -> io::Result<Foreground> {
+        use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        let tree = new_tree()?;
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // 把活动进程数限制为 0，使 assign 确定失败；用户脚本仍处于挂起状态。
+        info.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        info.BasicLimitInformation.ActiveProcessLimit = 0;
+        if unsafe {
+            SetInformationJobObject(
+                tree.0 .0,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of_val(&info) as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        spawn_in_tree(cmd, tree)
+    }
+
+    fn resume(child: &Child) -> io::Result<()> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = Handle(snapshot);
+        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of_val(&entry) as u32;
+        let mut found = unsafe { Thread32First(snapshot.0, &mut entry) };
+        while found != 0 {
+            if entry.th32OwnerProcessID == child.id() {
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if thread.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let thread = Handle(thread);
+                if unsafe { ResumeThread(thread.0) } == u32::MAX {
+                    return Err(io::Error::last_os_error());
+                }
+                return Ok(());
+            }
+            found = unsafe { Thread32Next(snapshot.0, &mut entry) };
+        }
+        Err(io::Error::other("未找到挂起的 shell 主线程"))
+    }
+
+    pub trait Pipe: AsRawHandle {}
+    impl<T: AsRawHandle> Pipe for T {}
+    pub fn readable(pipe: &impl Pipe) -> io::Result<Option<usize>> {
+        let mut available = 0;
+        if unsafe {
+            PeekNamedPipe(
+                pipe.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            let e = io::Error::last_os_error();
+            return if e.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                Ok(Some(0))
+            } else {
+                Err(e)
+            };
+        }
+        Ok((available > 0).then_some(available as usize))
+    }
+}
+
+#[cfg(unix)]
+mod process_tree {
+    use super::*;
+    use std::io;
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+        fn poll(fds: *mut PollFd, count: Nfds, timeout: i32) -> i32;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    type Nfds = std::ffi::c_ulong;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    type Nfds = u32;
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    pub struct Tree(i32, std::cell::Cell<bool>);
+    impl Tree {
+        pub fn terminate(&self) -> io::Result<()> {
+            if self.1.replace(true) {
+                return Ok(());
+            }
+            // 独立进程组，绝不向宿主或其它调用的进程组发信号。
+            if unsafe { kill(-self.0, 9) } == 0 {
+                return Ok(());
+            }
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(3) {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
+    pub fn spawn(cmd: &mut Command) -> io::Result<Foreground> {
+        let child = cmd.process_group(0).spawn()?;
+        let tree = Tree(child.id() as i32, std::cell::Cell::new(false));
+        Ok(Foreground { child, tree })
+    }
+    pub trait Pipe: AsRawFd {}
+    impl<T: AsRawFd> Pipe for T {}
+    pub fn readable(pipe: &impl Pipe) -> io::Result<Option<usize>> {
+        let mut fd = PollFd {
+            fd: pipe.as_raw_fd(),
+            events: 1,
+            revents: 0,
+        };
+        let ready = unsafe { poll(&mut fd, 1, 0) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((ready > 0).then_some(8192))
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+mod process_tree {
+    use super::*;
+    use std::io;
+    pub struct Tree;
+    impl Tree {
+        pub fn terminate(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    pub fn spawn(_: &mut Command) -> io::Result<Foreground> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "本平台不支持受保护的前台进程树",
+        ))
+    }
+    pub trait Pipe {}
+    impl<T> Pipe for T {}
+    pub fn readable(_: &impl Pipe) -> io::Result<Option<usize>> {
+        Ok(Some(0))
+    }
 }
 
 /// 字节 → 文本，超限截断并标记。
@@ -590,6 +904,303 @@ pub fn argv_debug(argv: &[OsString]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 仅重启本测试程序：不运行桌面、录音、网络工具，也不依赖本机 shell 安装。
+    fn helper(mode: &str, dir: &Path) -> Command {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "tools::shell::tests::lifecycle_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("NEO_LIFECYCLE_CHILD", mode)
+        .env("NEO_LIFECYCLE_DIR", dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        cmd
+    }
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "neo-shell-lifecycle-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    #[ignore = "仅由隔离生命周期回归作为短进程启动"]
+    fn lifecycle_child() {
+        let Ok(mode) = std::env::var("NEO_LIFECYCLE_CHILD") else {
+            return;
+        };
+        let dir = PathBuf::from(std::env::var_os("NEO_LIFECYCLE_DIR").unwrap());
+        match mode.as_str() {
+            "output" => {
+                println!("captured-stdout");
+                eprintln!("captured-stderr");
+                print!("{}", "x".repeat(limits::OUTPUT_BYTES * 2));
+            }
+            "nested" => {
+                let captured = run_foreground(
+                    &mut helper("output", &dir),
+                    &Scope::new(&dir),
+                    Duration::from_secs(5),
+                )
+                .unwrap();
+                assert!(captured.status.success());
+                println!("nested-job-ok");
+            }
+            "leaf" => {
+                std::fs::write(dir.join("ready"), b"ready").unwrap();
+                std::thread::sleep(Duration::from_millis(1800));
+                let _ = std::fs::write(dir.join("escaped"), b"must not survive foreground");
+            }
+            "tree" | "parent-exits" => {
+                let child = helper("leaf", &dir)
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap();
+                drop(child);
+                if mode == "tree" {
+                    std::thread::sleep(Duration::from_secs(4));
+                }
+            }
+            _ => panic!("unknown helper mode"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_collects_both_streams_and_caps_output() {
+        let dir = TempDir::new();
+        let captured = run_foreground(
+            &mut helper("output", &dir.0),
+            &Scope::new(&dir.0),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(captured.status.success());
+        assert_eq!(captured.stdout.len(), limits::OUTPUT_BYTES);
+        assert!(String::from_utf8_lossy(&captured.stdout).contains("captured-stdout"));
+        assert!(String::from_utf8_lossy(&captured.stderr).contains("captured-stderr"));
+    }
+
+    #[test]
+    fn lifecycle_timeout_kills_descendants_with_inherited_pipes() {
+        let dir = TempDir::new();
+        let started = Instant::now();
+        let result = run_foreground(
+            &mut helper("tree", &dir.0),
+            &Scope::new(&dir.0),
+            Duration::from_millis(700),
+        );
+        assert_eq!(result.err().unwrap().kind, ErrorKind::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(dir.0.join("ready").exists(), "后代必须确实启动");
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(!dir.0.join("escaped").exists());
+    }
+
+    #[test]
+    fn lifecycle_cancellation_kills_running_tree() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let dir = TempDir::new();
+        let token = Arc::new(AtomicBool::new(false));
+        let scope = Scope::new(&dir.0).with_cancel(token.clone());
+        let path = dir.0.clone();
+        let cancel = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !path.join("ready").exists() && Instant::now() < deadline {
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            token.store(true, Ordering::Release);
+        });
+        let result = run_foreground(&mut helper("tree", &dir.0), &scope, Duration::from_secs(5));
+        cancel.join().unwrap();
+        let error = result.err().unwrap();
+        assert_eq!(error.kind, ErrorKind::NotAllowed);
+        assert!(error.message.contains("取消"));
+        assert!(dir.0.join("ready").exists());
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(!dir.0.join("escaped").exists());
+    }
+
+    #[test]
+    fn lifecycle_parent_exit_does_not_wait_for_pipe_holding_descendant() {
+        let dir = TempDir::new();
+        let started = Instant::now();
+        let result = run_foreground(
+            &mut helper("parent-exits", &dir.0),
+            &Scope::new(&dir.0),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(result.status.success());
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(!dir.0.join("escaped").exists());
+    }
+
+    #[test]
+    fn lifecycle_precancel_and_spawn_failure_do_not_execute() {
+        let dir = TempDir::new();
+        let scope = Scope::new(&dir.0).with_cancel(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(true),
+        ));
+        assert_eq!(
+            run_foreground(&mut helper("leaf", &dir.0), &scope, Duration::from_secs(5))
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::NotAllowed
+        );
+        assert!(!dir.0.join("ready").exists());
+        let mut missing = Command::new(dir.0.join("nonexistent-shell"));
+        assert_eq!(
+            run_foreground(&mut missing, &Scope::new(&dir.0), Duration::from_secs(5))
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::Io
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lifecycle_job_assignment_failure_never_runs_user_command() {
+        let dir = TempDir::new();
+        let started = Instant::now();
+        assert!(process_tree::spawn_with_failing_assignment(&mut helper("leaf", &dir.0)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!dir.0.join("ready").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lifecycle_nested_job_is_compatible_with_external_job() {
+        let dir = TempDir::new();
+        let captured = run_foreground(
+            &mut helper("nested", &dir.0),
+            &Scope::new(&dir.0),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(
+            captured.status.success(),
+            "{}",
+            String::from_utf8_lossy(&captured.stderr)
+        );
+        assert!(String::from_utf8_lossy(&captured.stdout).contains("nested-job-ok"));
+    }
+
+    #[test]
+    fn lifecycle_timeout_does_not_kill_unrelated_process() {
+        let unrelated = TempDir::new();
+        let mut child = helper("leaf", &unrelated.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let dir = TempDir::new();
+        let result = run_foreground(
+            &mut helper("tree", &dir.0),
+            &Scope::new(&dir.0),
+            Duration::from_millis(100),
+        );
+        assert_eq!(result.err().unwrap().kind, ErrorKind::Timeout);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let status = child.try_wait().unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(status.is_some_and(|status| status.success()));
+        assert!(unrelated.0.join("escaped").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lifecycle_powershell_dispatch_captures_output_and_times_out() {
+        let dir = TempDir::new();
+        let scope = Scope::new(&dir.0);
+        let outcome = crate::dispatch(
+            &scope,
+            "powershell",
+            &json!({
+                "command": "[Console]::WriteLine('foreground-ok'); [Console]::Error.WriteLine('stderr-ok')",
+                "timeout_ms": 5000
+            }),
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.data["exit_code"], 0, "{}", outcome.data);
+        assert!(outcome.data["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("foreground-ok"));
+        assert!(outcome.data["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("stderr-ok"));
+        let started = Instant::now();
+        let outcome = crate::dispatch(
+            &scope,
+            "powershell",
+            &json!({
+                "command": "Start-Sleep -Seconds 4", "timeout_ms": 300
+            }),
+        );
+        assert_eq!(outcome.error.unwrap().kind, ErrorKind::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lifecycle_explicit_background_survives_token_cancellation() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let dir = TempDir::new();
+        let token = Arc::new(AtomicBool::new(false));
+        let scope = Scope::new(&dir.0).with_cancel(token.clone());
+        let outcome = crate::dispatch(
+            &scope,
+            "powershell",
+            &json!({
+                "command": "Start-Sleep -Milliseconds 400; [IO.File]::WriteAllText((Join-Path (Get-Location) 'background.txt'), 'done')",
+                "background": true
+            }),
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.data["background"], true);
+        token.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.0.join("background.txt").exists() && Instant::now() < deadline {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert!(dir.0.join("background.txt").exists());
+    }
 
     #[test]
     fn powershell_wrap_fixes_upstream_problems() {

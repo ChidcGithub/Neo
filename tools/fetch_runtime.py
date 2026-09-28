@@ -40,6 +40,8 @@ import json
 import os
 import shutil
 import sys
+import stat
+import time
 import tempfile
 import urllib.error
 import urllib.request
@@ -63,33 +65,90 @@ FALLBACK_ASSET = "MinGit-2.55.0.5-64-bit.zip"
 
 # 37 MB 在国内链路上可能要走一会儿 —— 别用默认的短超时。
 SOCKET_TIMEOUT = 300
+MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
+MAX_API_BYTES = 8 * 1024 * 1024
+MAX_EXTRACT_BYTES = 1024 * 1024 * 1024
+MAX_ZIP_MEMBERS = 50000
+DOWNLOAD_DEADLINE = 900
+
+
+def check_local_path(path: str) -> None:
+    # 拒绝路径任一级重解析点，避免缓存命中或目录替换触及外部目录。
+    current = os.path.abspath(path)
+    while True:
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise ValueError(f"不允许重解析路径：{current}")
+        parent = os.path.dirname(current)
+        if parent == current:
+            return
+        current = parent
+
+
+def extract_runtime(archive: zipfile.ZipFile, stage: str) -> None:
+    members = archive.infolist()
+    if len(members) > MAX_ZIP_MEMBERS or sum(i.file_size for i in members) > MAX_EXTRACT_BYTES:
+        raise ValueError("压缩包超过解压预算")
+    seen = set()
+    for info in members:
+        parts = info.filename.replace("\\", "/").removesuffix("/").split("/")
+        mode = (info.external_attr >> 16) & 0o170000
+        key = "/".join(parts).casefold()
+        # zipfile 在 Windows 会把非法字符替换为下划线；必须在替换前拒绝，避免覆盖别名。
+        if (info.orig_filename != info.filename
+                or not parts or any(not p or p in (".", "..") or any(c in p for c in ':<>|"?*') or p.endswith((".", " "))
+                                    or any(ord(c) < 32 for c in p)
+                                    or p.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in "123456789¹²³"), *(f"LPT{i}" for i in "123456789¹²³")}
+                                    for p in parts)
+                or key in seen or mode not in (0, stat.S_IFREG, stat.S_IFDIR)
+                or info.external_attr & 0x400 or info.flag_bits & 1):
+            raise ValueError(f"不安全的压缩包路径或属性：{info.filename}")
+        seen.add(key)
+    # 只使用受预算约束的内置解压，不调用外部解压器。
+    archive.extractall(stage)
 
 
 def fetch_bytes(url: str, timeout: int = SOCKET_TIMEOUT) -> bytes:
     req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+        data = resp.read(MAX_API_BYTES + 1)
+        if len(data) > MAX_API_BYTES:
+            raise ValueError("API 响应超过预算")
+        return data
 
 
 def pick_asset(version: str | None) -> tuple[str, str, str]:
-    """问出（tag, 资产名, 官方地址）。问不到就退回已知版本。"""
+    """问出（tag, 资产名, 官方地址）；显式版本绝不降级到其他版本。"""
+    requested = "v" + version.removeprefix("v") if version else None
     url = f"https://api.github.com/repos/{REPO}/releases"
-    url = url if version is None else f"{url}/tags/v{version}"
+    url = url if requested is None else f"{url}/tags/{requested}"
     try:
         data = json.loads(fetch_bytes(url, timeout=60))
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
-        print(f"问 GitHub API 失败（{e}）；退回已知版本 {FALLBACK_VERSION}")
+        if requested and requested != FALLBACK_VERSION:
+            raise SystemExit(f"无法查询指定版本 {requested}：{e}；未更改现有运行时") from e
+        print(f"问 GitHub API 失败（{e}）；使用已知版本 {FALLBACK_VERSION}")
         data = None
 
     if data is None:
+        if requested and requested != FALLBACK_VERSION:
+            raise SystemExit(f"指定版本 {requested} 无可用元数据")
         return (
             FALLBACK_VERSION,
             FALLBACK_ASSET,
             MIRRORS["github"].format(repo=REPO, tag=FALLBACK_VERSION, asset=FALLBACK_ASSET),
         )
     if isinstance(data, list):  # /releases 返回数组，可能含预发布
-        data = next((r for r in data if not r.get("prerelease")), data[0])
-    tag = data["tag_name"]
+        data = next((r for r in data if not r.get("prerelease")), None)
+    if not isinstance(data, dict) or not isinstance(data.get("assets"), list):
+        raise SystemExit("GitHub API 未返回有效 release")
+    tag = data.get("tag_name")
+    if not isinstance(tag, str) or (requested and tag != requested):
+        raise SystemExit(f"release 版本不匹配：请求 {requested}，返回 {tag}")
     for a in data["assets"]:
         name = a["name"]
         # 排除 busybox 变体：它没有完整的 usr/bin，观感差别大
@@ -111,17 +170,22 @@ def download(tag: str, asset: str, only: str | None, tmp: str) -> str:
         url = MIRRORS[name].format(repo=REPO, tag=tag, asset=asset)
         print(f"尝试 {name}：{url}")
         try:
+            started = time.monotonic()
             req = urllib.request.Request(url, headers=UA)
             with urllib.request.urlopen(req, timeout=SOCKET_TIMEOUT) as resp:
                 total = int(resp.headers.get("Content-Length") or 0)
+                if total < 0 or total > MAX_DOWNLOAD_BYTES:
+                    raise ValueError("下载超过预算或长度无效")
                 got = 0
                 with open(tmp, "wb") as f:
                     while True:
                         chunk = resp.read(262144)
                         if not chunk:
                             break
-                        f.write(chunk)
                         got += len(chunk)
+                        if got > MAX_DOWNLOAD_BYTES or time.monotonic() - started > DOWNLOAD_DEADLINE:
+                            raise OSError("下载超过大小或时间预算")
+                        f.write(chunk)
                         if total:
                             pct = got * 100 // total
                             print(
@@ -133,7 +197,7 @@ def download(tag: str, asset: str, only: str | None, tmp: str) -> str:
             if total and got != total:
                 raise OSError(f"只收到 {got} 字节，期望 {total} 字节")
             return name
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
             print(f"  {name} 失败：{e}")
             errors.append(f"{name}: {e}")
     raise SystemExit("所有镜像都失败了：\n  " + "\n  ".join(errors))
@@ -146,45 +210,101 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="已存在也重下")
     args = ap.parse_args()
 
-    bash = os.path.join(DEST, "bin", "bash.exe")
-    if os.path.exists(bash) and not args.force:
+    try:
+        for rel in ("", "bin/bash.exe", "usr/bin/bash.exe", ".neo-version"):
+            check_local_path(os.path.join(DEST, rel))
+    except (OSError, ValueError) as e:
+        print(f"运行时路径无效：{e}", file=sys.stderr)
+        return 1
+    bash = find_bash(DEST)
+    cached_tag = None
+    try:
+        with open(os.path.join(DEST, ".neo-version"), encoding="utf-8") as f:
+            cached_tag = f.read(256).strip()
+    except (OSError, UnicodeError):
+        pass
+    requested = "v" + args.version.removeprefix("v") if args.version else None
+    if bash and not args.force and (requested is None or requested == cached_tag):
         print(f"已存在：{bash}")
         return 0
 
     tag, asset, official = pick_asset(args.version)
     print(f"版本 {tag}，资产 {asset}\n官方地址：{official}")
-
-    with tempfile.TemporaryDirectory() as td:
-        zip_path = os.path.join(td, asset)
-        used = download(tag, asset, args.mirror, zip_path)
-        print(f"下载完成（源：{used}）")
-
-        if os.path.isdir(DEST):
-            shutil.rmtree(DEST)
-        os.makedirs(DEST, exist_ok=True)
-        with zipfile.ZipFile(zip_path) as z:
-            z.extractall(DEST)
-
-    # 有些发行版的 zip 里多一层目录，拍平它
-    entries = os.listdir(DEST)
-    if len(entries) == 1 and os.path.isdir(os.path.join(DEST, entries[0])):
-        inner = os.path.join(DEST, entries[0])
-        for item in os.listdir(inner):
-            shutil.move(os.path.join(inner, item), os.path.join(DEST, item))
-        os.rmdir(inner)
-
-    bash = ensure_bash_named(DEST)
-    if bash is None:
-        print("解包后没找到可用的 shell，请检查目录结构", file=sys.stderr)
+    parent = os.path.dirname(DEST)
+    os.makedirs(parent, exist_ok=True)
+    lock = os.path.join(parent, ".gitbash-install.lock")
+    try:
+        lock_fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise SystemExit(f"另一个安装正在进行或上次被强制终止，请检查 {lock}")
+    try:
+        with tempfile.TemporaryDirectory(prefix=".gitbash-stage-", dir=parent) as td:
+            zip_path = os.path.join(td, "runtime.zip")
+            used = download(tag, asset, args.mirror, zip_path)
+            print(f"下载完成（源：{used}）")
+            stage = os.path.join(td, "payload")
+            os.mkdir(stage)
+            with zipfile.ZipFile(zip_path) as z:
+                extract_runtime(z, stage)
+            entries = os.listdir(stage)
+            if len(entries) == 1 and os.path.isdir(os.path.join(stage, entries[0])):
+                inner = os.path.join(stage, entries[0])
+                # usr 本身是有效根目录中的一部分，不应拍平。
+                if entries[0] not in ("usr", "bin", "mingw64", "cmd"):
+                    for item in os.listdir(inner):
+                        shutil.move(os.path.join(inner, item), os.path.join(stage, item))
+                    os.rmdir(inner)
+            bash = ensure_bash_named(stage)
+            version = smoke_test(bash) if bash else None
+            if version is None:
+                print("暂存运行时验证失败，现有运行时未更改", file=sys.stderr)
+                return 1
+            with open(os.path.join(stage, ".neo-version"), "w", encoding="utf-8") as f:
+                f.write(tag)
+            replace_runtime(stage, DEST)
+            print(f"完成：{find_bash(DEST)}\n  {version}")
+        return 0
+    except (OSError, ValueError, zipfile.BadZipFile) as e:
+        print(f"运行时安装失败：{e}", file=sys.stderr)
         return 1
+    finally:
+        os.close(lock_fd)
+        os.unlink(lock)
 
-    # 真实冒烟：**跑一次**，确认它自己报的是 GNU bash（比查文件存不存在靠谱）
-    version = smoke_test(bash)
-    if version is None:
-        print(f"警告：{bash} 起不来，运行时可能不完整", file=sys.stderr)
-        return 1
-    print(f"完成：{bash}\n  {version}")
-    return 0
+
+def replace_runtime(stage: str, dest: str) -> None:
+    # 网络下载和验证可能耗时数分钟，不能沿用下载前的路径检查。
+    check_local_path(stage)
+    check_local_path(dest)
+    backup = tempfile.mkdtemp(prefix=".gitbash-backup-", dir=os.path.dirname(dest))
+    os.rmdir(backup)
+    moved = False
+    try:
+        if os.path.lexists(dest):
+            os.replace(dest, backup)
+            moved = True
+        os.replace(stage, dest)
+    except BaseException:
+        if moved:
+            # 不删除备份；恢复失败时仍保留完整旧版本，并明确报告位置。
+            try:
+                os.replace(backup, dest)
+            except OSError as rollback_error:
+                raise RuntimeError(f"回滚失败；完整旧运行时保存在 {backup}") from rollback_error
+        raise
+    if moved:
+        try:
+            shutil.rmtree(backup)
+        except OSError:
+            print(f"新版本已安装；旧备份暂无法清理：{backup}", file=sys.stderr)
+
+
+def find_bash(root: str) -> str | None:
+    for rel in ("bin/bash.exe", "usr/bin/bash.exe"):
+        path = os.path.join(root, *rel.split("/"))
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def ensure_bash_named(root: str) -> str | None:
@@ -200,10 +320,9 @@ def ensure_bash_named(root: str) -> str | None:
 
     返回 bash.exe 的路径。
     """
-    for rel in ("usr/bin/bash.exe", "bin/bash.exe"):
-        p = os.path.join(root, *rel.split("/"))
-        if os.path.exists(p):
-            return p
+    existing = find_bash(root)
+    if existing:
+        return existing
     src = os.path.join(root, "usr", "bin", "sh.exe")
     if not os.path.exists(src):
         return None
@@ -222,22 +341,34 @@ def smoke_test(bash: str) -> str | None:
     """跑一次，验证 bash 本体与随包的核心 Unix 工具都能被 PATH 找到。"""
     import subprocess
 
-    env = os.environ.copy()
-    env["PATH"] = os.path.dirname(bash) + os.pathsep + env.get("PATH", "")
+    # 禁止继承导出的 Bash 函数、SHELLOPTS 和 DLL/启动脚本注入变量。
+    env = {k: v for k, v in os.environ.items()
+           if k.upper() in {"SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "TEMP", "TMP"}}
+    bindir = os.path.dirname(bash)
+    root = os.path.dirname(bindir)
+    if os.path.basename(root).lower() == "usr":
+        root = os.path.dirname(root)
+    env["PATH"] = os.pathsep.join((bindir, os.path.join(root, "usr", "bin"),
+                                  os.path.join(root, "mingw64", "bin")))
     try:
+        check_local_path(bash)
         out = subprocess.run(
             [
                 bash,
+                "--noprofile",
+                "--norc",
                 "-c",
-                "echo $BASH_VERSION; set -o | grep -E '^posix'; "
-                "command -v ls >/dev/null && command -v grep >/dev/null && command -v sed >/dev/null",
+                "test -n \"$BASH_VERSION\" && ! shopt -qo posix && "
+                "command -v ls >/dev/null && command -v grep >/dev/null && "
+                "command -v sed >/dev/null && printf '%s\\n' \"$BASH_VERSION\"",
             ],
             capture_output=True,
             text=True,
             timeout=30,
             env=env,
+            cwd=root,
         )
-    except (OSError, subprocess.SubprocessError) as e:
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
         print(f"  冒烟失败：{e}", file=sys.stderr)
         return None
     if out.returncode != 0:

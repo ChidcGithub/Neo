@@ -52,6 +52,8 @@ pub enum Decision {
 /// 当前策略。由 UI 的开关映射而来。
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
+    /// 课堂安全模式：禁止桌面观察和所有有副作用的工具。
+    pub classroom_safe: bool,
     /// 输入卡的「只读」开关：打开后写与执行一律拒绝。
     pub read_only: bool,
     /// 用户显式信任本会话（"全部允许"）。默认关。
@@ -72,6 +74,7 @@ const PARAM_ESCALATION: &[(&str, &str, Risk)] = &[
 impl Default for Policy {
     fn default() -> Self {
         Self {
+            classroom_safe: false,
             read_only: false,
             auto_approve: false,
             allow_open: true,
@@ -111,6 +114,12 @@ impl Policy {
                     && args.get(*param).and_then(Value::as_bool).unwrap_or(false)
             })
             .map_or(tool.risk, |(_, _, r)| *r);
+        if self.classroom_safe
+            && (risk != Risk::Read
+                || matches!(tool.name, "screenshot" | "screen_elements" | "screen_element_search"))
+        {
+            return Decision::Deny("课堂安全模式禁止桌面观察、打开程序、写入和执行；请用户明确关闭安全模式后重试".to_owned());
+        }
         match risk {
             Risk::Read => Decision::Allow,
             Risk::Open => {
@@ -135,6 +144,23 @@ impl Policy {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn safety_classroom_denies_desktop_and_side_effects_even_when_trusted() {
+        assert!(!Policy::default().classroom_safe);
+        let policy = Policy { classroom_safe: true, auto_approve: true, ..Policy::default() };
+        for tool in crate::tools::REGISTRY {
+            let decision = policy.decide(tool, &json!({}));
+            if tool.risk != Risk::Read || matches!(tool.name, "screenshot" | "screen_elements" | "screen_element_search") {
+                assert!(matches!(decision, Decision::Deny(_)), "{}", tool.name);
+            } else {
+                assert_eq!(decision, Decision::Allow, "{}", tool.name);
+            }
+        }
+        let web = crate::find("web_search").unwrap();
+        assert!(matches!(policy.decide(web, &json!({"query":"test", "open_browser":true})), Decision::Deny(_)));
+        assert_eq!(policy.decide(web, &json!({"query":"test", "open_browser":false})), Decision::Allow);
+    }
 
     #[test]
     fn read_tools_never_ask() {

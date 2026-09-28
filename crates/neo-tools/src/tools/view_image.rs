@@ -1,10 +1,7 @@
 //! `view_image` —— 查看图片。
 //!
-//! 边界：**不解码像素、不做识别**。它回答"这是张什么图、多大、能不能给模型看"。
-//! 真要"看图说话"，靠的是把 `data_url` 交给多模态模型，而不是在这里做图像处理。
-//!
-//! 尺寸解析是读文件头的：PNG 的 IHDR、JPEG 的 SOFn、GIF 的逻辑屏幕描述符、
-//! BMP 的 DIB 头、WEBP 的三种容器。只为报元数据去拖一个解码库不划算。
+//! 元数据查询只读文件头；附图时有界解码并转换为 PNG/JPEG。
+//! 仅发送首帧，必要时等比缩小，原文件不变；识别由多模态模型完成。
 
 use super::base64_lite::encode as b64;
 use serde_json::json;
@@ -69,7 +66,7 @@ fn view(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
         .with_hint("先缩小图片再查看，或只用 `bash` 的 file 命令看格式"));
     }
 
-    let bytes = std::fs::read(&path).map_err(|e| ToolError::io(format!("读取 {raw} 失败：{e}")))?;
+    let bytes = super::read_file::read_bounded(&path, limits::IMAGE_BYTES)?;
     let Some(img) = sniff(&bytes) else {
         return Err(ToolError::new(
             ErrorKind::Unsupported,
@@ -82,6 +79,7 @@ fn view(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     let mut data = json!({
         "path": shown,
         "format": img.format,
+        "mime": img.mime,
         "width": img.width,
         "height": img.height,
         "bytes": meta.len(),
@@ -108,11 +106,66 @@ fn view(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
         data,
     );
     if include_data {
-        let url = format!("data:{};base64,{}", img.mime, b64(&bytes));
+        if img.width == 0 || img.height == 0 || img.width > 8192 || img.height > 8192
+            || u64::from(img.width) * u64::from(img.height) > 16_000_000 {
+            return Err(ToolError::new(ErrorKind::TooLarge, "图片尺寸未知或超过 8192 边长 / 1600 万像素上限"));
+        }
+        let url = model_image(&bytes, true)
+            .map_err(|e| ToolError::new(ErrorKind::Unsupported, e))?;
+        outcome.data["image_note"] = json!("仅发送首帧，最长边1536；原文件和上面的原始尺寸不变。");
         outcome = outcome.with_image(url);
     }
 
     Ok(outcome)
+}
+
+/// 有界转换供工具与应用回灌共用。桌面图传 false，绝不改变坐标尺度。
+pub fn model_image(bytes: &[u8], resize: bool) -> Result<String, String> {
+    use std::io::Cursor;
+    if bytes.len() > 32 * 1024 * 1024 {
+        return Err("图片编码体积超过32 MiB".into());
+    }
+    let reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()
+        .map_err(|e| format!("无法识别图片：{e}"))?;
+    let format = reader.format().ok_or("无法识别图片格式")?;
+    if !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg
+        | image::ImageFormat::Gif | image::ImageFormat::Bmp | image::ImageFormat::WebP) {
+        return Err("仅支持 PNG/JPEG/GIF/BMP/WebP".into());
+    }
+    let (width, height) = reader.into_dimensions().map_err(|e| format!("图片尺寸损坏：{e}"))?;
+    let (side, pixels) = if resize { (8192, 16_000_000) } else { (4096, 8_000_000) };
+    if width == 0 || height == 0 || width > side || height > side
+        || u64::from(width) * u64::from(height) > pixels {
+        return Err(format!("图片超过{side}边长或{pixels}像素；桌面截图请缩小区域"));
+    }
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(side);
+    limits.max_image_height = Some(side);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let mut decoded = reader.decode().map_err(|e| format!("图片解码失败：{e}"))?;
+    if resize && (width > 1536 || height > 1536) {
+        decoded = decoded.thumbnail(1536, 1536);
+    } else if !resize && matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg)
+        && bytes.len() <= 4 * 1024 * 1024 {
+        let mime = if format == image::ImageFormat::Png { "image/png" } else { "image/jpeg" };
+        return Ok(format!("data:{mime};base64,{}", b64(bytes)));
+    }
+    let mut encoded = Cursor::new(Vec::new());
+    decoded.write_to(&mut encoded, image::ImageFormat::Png)
+        .map_err(|e| format!("图片转换失败：{e}"))?;
+    let mut mime = "image/png";
+    if encoded.get_ref().len() > 4 * 1024 * 1024 {
+        encoded = Cursor::new(Vec::new());
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 85)
+            .encode_image(&decoded.to_rgb8()).map_err(|e| format!("图片转换失败：{e}"))?;
+        mime = "image/jpeg";
+    }
+    if encoded.get_ref().len() > 4 * 1024 * 1024 {
+        return Err("图片转换后仍超过4 MiB，请缩小图片区域".into());
+    }
+    Ok(format!("data:{mime};base64,{}", b64(encoded.get_ref())))
 }
 
 struct ImageInfo {
@@ -152,8 +205,8 @@ fn sniff(b: &[u8]) -> Option<ImageInfo> {
             format: "bmp",
             mime: "image/bmp",
             width: le32(18),
-            // 高位为 1 表示自顶向下存储；取绝对值语义即低 16 位可读，这里直接取无符号。
-            height: le32(22),
+            // Windows DIB 的负高度表示自顶向下存储。
+            height: (le32(22) as i32).unsigned_abs(),
         });
     }
     // WEBP：RIFF 容器，三种子格式尺寸位置不同。
@@ -220,6 +273,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_image_formats_dimensions_and_corruption() {
+        use base64::Engine;
+        for format in [image::ImageFormat::Png, image::ImageFormat::Jpeg,
+            image::ImageFormat::Bmp, image::ImageFormat::Gif, image::ImageFormat::WebP] {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(2, 3).write_to(&mut bytes, format).unwrap();
+            let url = model_image(bytes.get_ref(), true).unwrap();
+            assert!(url.starts_with("data:image/png;base64,") || url.starts_with("data:image/jpeg;base64,"));
+            let data = base64::engine::general_purpose::STANDARD.decode(url.split_once(',').unwrap().1).unwrap();
+            let image = image::load_from_memory(&data).unwrap();
+            assert_eq!((image.width(), image.height()), (2, 3));
+        }
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(4100, 2).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        assert!(model_image(bytes.get_ref(), false).is_err());
+        let url = model_image(bytes.get_ref(), true).unwrap();
+        let data = base64::engine::general_purpose::STANDARD.decode(url.split_once(',').unwrap().1).unwrap();
+        assert_eq!(image::load_from_memory(&data).unwrap().width(), 1536);
+        assert!(model_image(&bytes.get_ref()[..24], true).is_err());
+    }
+
+    #[test]
     fn sniffs_png_header() {
         let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
         png.extend_from_slice(&[0, 0, 0, 13]);
@@ -229,6 +304,33 @@ mod tests {
         png.extend_from_slice(&[8, 6, 0, 0, 0]);
         let info = sniff(&png).unwrap();
         assert_eq!((info.format, info.width, info.height), ("png", 1920, 1080));
+    }
+
+    #[test]
+    fn top_down_bmp_has_positive_height() {
+        let mut bmp = vec![0; 54];
+        bmp[..2].copy_from_slice(b"BM");
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&320i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&(-240i32).to_le_bytes());
+        let info = sniff(&bmp).unwrap();
+        assert_eq!((info.width, info.height), (320, 240));
+    }
+
+    #[test]
+    fn oversized_pixel_header_is_not_attached() {
+        let root = std::env::temp_dir().join(format!("neo-image-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut png = vec![0x89, b'P', b'N', b'G', 13, 10, 26, 10];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&5000u32.to_be_bytes());
+        png.extend_from_slice(&5000u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        std::fs::write(root.join("超大.png"), png).unwrap();
+        let out = crate::dispatch(&Scope::new(&root), "view_image", &json!({"path": "超大.png", "include_data": true}));
+        assert_eq!(out.error.unwrap().kind, ErrorKind::TooLarge);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
