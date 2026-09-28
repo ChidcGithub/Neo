@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import unittest
 
+from tools.check_release import CRT_NAMES
+
 
 SOURCE = Path(__file__).with_name("installer.nsi").read_text(encoding="utf-8")
 
@@ -32,16 +34,23 @@ class NsModel:
         self.messages = []
         self.aborted = False
         self.attributes = {}
+        self.native_machine = 0x8664
+        self.os_version = (10, 0, 19041)
+        self.process_result = "0"
 
     def value(self, token):
         token = token.strip('"')
         return re.sub(r'\$(?:[A-Za-z][A-Za-z0-9]*|[0-9])', lambda m: str(self.variables.get(m[0], "")), token)
 
     def lines(self, name):
-        marker = f"Function {name}\n"
-        if marker not in SOURCE:
-            marker = f"Function ${{PREFIX}}{name}\n"
-        body = SOURCE.split(marker, 1)[1].split("FunctionEnd", 1)[0]
+        marker = f'Section "{name}"\n'
+        if marker in SOURCE:
+            body = SOURCE.split(marker, 1)[1].split("SectionEnd", 1)[0]
+        else:
+            marker = f"Function {name}\n"
+            if marker not in SOURCE:
+                marker = f"Function ${{PREFIX}}{name.removeprefix('un.')}\n"
+            body = SOURCE.split(marker, 1)[1].split("FunctionEnd", 1)[0]
         def expand(match):
             macro, path, flag, filename = shlex.split(match[0], posix=False)[1:]
             text = SOURCE.split(f"!macro {macro} PATH FLAG NAME\n", 1)[1].split("!macroend", 1)[0]
@@ -112,7 +121,17 @@ class NsModel:
                 self.variables[args[1]] = "" if parent == path else parent
             elif op == "System::Call":
                 api = " ".join(args)
-                if "GetFileAttributesW" in api:
+                if "IsWow64Process2" in api:
+                    self.variables["$0"] = "0" if "arch-api" in self.faults else "1"
+                    self.variables["$2"] = str(self.native_machine)
+                elif api.startswith("'*(i 276"):
+                    self.variables["$0"] = "0" if "allocate" in self.faults else "100"
+                elif "RtlGetVersion" in api:
+                    self.variables["$4"] = "-1" if "version-api" in self.faults else "0"
+                elif api.startswith("'*$0(i,"):
+                    for register, value in zip(("$1", "$2", "$3"), self.os_version):
+                        self.variables[register] = str(value)
+                elif "GetFileAttributesW" in api:
                     path = self.variables["$0"]
                     attrs, err = self.attributes.get(path, (0 if path in self.files else -1, 2))
                     self.variables["$1"] = str(attrs)
@@ -127,6 +146,12 @@ class NsModel:
                     self.variables["$0"] = "10"
                 elif "RegCloseKey" not in api:
                     raise AssertionError(api)
+            elif op == "System::Free":
+                self.calls.append("free")
+            elif op == "SetErrorLevel":
+                self.variables["exit_code"] = v(args[0])
+            elif op == "nsExec::ExecToStack" and "powershell.exe" in " ".join(args):
+                self.stack.extend(["output", self.process_result])
             elif op == "nsExec::ExecToStack":
                 command = " ".join(args)
                 action = "export" if ' export ' in command else "import"
@@ -306,6 +331,68 @@ class InstallerTests(unittest.TestCase):
                 m.execute("CheckInstallPath")
                 self.assertEqual(not m.error, allowed)
 
+    def test_native_architecture_not_emulated_x64(self):
+        for machine, allowed in [(0x8664, True), (0xAA64, False), (0x14C, False), (0, False)]:
+            with self.subTest(machine=machine):
+                m = NsModel()
+                m.native_machine = machine
+                m.execute("CheckPlatform")
+                self.assertEqual(not m.aborted, allowed)
+                if not allowed:
+                    self.assertIn("原生 x64", m.messages[0])
+                    self.assertEqual(m.variables["exit_code"], "2")
+
+    def test_real_version_boundary_and_detection_failures(self):
+        for version, allowed in [((6, 3, 9600), False), ((6, 3, 99999), False),
+                                 ((11, 0, 1), True), ((10, 0, 18363), False),
+                                 ((10, 0, 19040), False), ((10, 0, 19041), True),
+                                 ((10, 0, 19045), True), ((10, 0, 22000), True)]:
+            with self.subTest(version=version):
+                m = NsModel()
+                m.os_version = version
+                m.execute("CheckPlatform")
+                self.assertEqual(not m.aborted, allowed)
+                self.assertIn("free", m.calls)
+        for fault in ("arch-api", "version-api", "allocate"):
+            m = NsModel([fault])
+            m.execute("CheckPlatform")
+            self.assertTrue(m.aborted)
+            self.assertIn("无法可靠确认", m.messages[0])
+
+    def test_platform_api_layout_and_calling_convention(self):
+        body = SOURCE.split("Function CheckPlatform\n", 1)[1].split("FunctionEnd", 1)[0]
+        self.assertIn("IsWow64Process2(p -1, *i r1 r1, *i r2 r2) i .r0", body)
+        self.assertIn("IntOp $2 $2 & 0xffff", body)
+        self.assertIn('*(i 276, i 0, i 0, i 0, i 0, &w128 "") p .r0', body)
+        self.assertIn("RtlGetVersion(p r0) i .r4", body)
+        self.assertIn("*$0(i, i .r1, i .r2, i .r3)", body)
+        self.assertNotRegex(body, r"\?\s*c")
+        self.assertLess(body.index("System::Free $0"), body.index("StrCmp $4 0"))
+
+    def test_platform_gate_is_install_only_and_before_payload(self):
+        install_init = SOURCE.split("Function .onInit\n", 1)[1].split("FunctionEnd", 1)[0]
+        uninstall_init = SOURCE.split("Function un.onInit\n", 1)[1].split("FunctionEnd", 1)[0]
+        self.assertIn("Call CheckPlatform", install_init)
+        self.assertIn("Call AcquireLock", install_init)
+        self.assertNotIn("CheckPlatform", uninstall_init)
+        self.assertIn("Call un.AcquireLock", uninstall_init)
+        self.assertLess(SOURCE.index("Call CheckPlatform"), SOURCE.index('File /r "dist'))
+
+    def test_process_gate_distinguishes_running_failure_timeout_and_start_error(self):
+        for result, message in [("0", None), ("10", "正在运行"), ("20", "无法枚举进程"),
+                                ("timeout", "超时"), ("error", "无法启动进程检查"),
+                                ("1", "返回异常")]:
+            with self.subTest(result=result):
+                m = NsModel()
+                m.process_result = result
+                m.execute("CheckRunning")
+                self.assertEqual(m.error, result != "0")
+                self.assertEqual(m.stack, [])
+                if message:
+                    self.assertIn(message, m.messages[0])
+                else:
+                    self.assertFalse(m.messages)
+
     @unittest.skipUnless(os.name == "nt", "PowerShell requires Windows")
     def test_actual_process_gate_with_mock_processes(self):
         command = re.search(r'-Command "(try .*?)"\'', SOURCE).group(1)
@@ -328,6 +415,76 @@ class InstallerTests(unittest.TestCase):
         self.assertLess(body.index("Call un.CheckInstallPath"), body.index("Delete "))
         self.assertNotIn("RMDir /r", body)
         self.assertLess(body.index("DeleteRegKey"), body.index('Delete "$INSTDIR\\uninstall.exe"'))
+
+    def test_crt_whitelist_is_installed_and_uninstalled_without_unknown_files(self):
+        self.assertIn('File /r "dist\\neo\\*.*"', SOURCE)
+        body = SOURCE.split('Section "Uninstall"', 1)[1]
+        deleted_dlls = re.findall(r'Delete "\$INSTDIR\\([^"\\]+\.dll)"', body)
+        self.assertEqual(set(deleted_dlls), set(CRT_NAMES))
+        m = NsModel()
+        known = ["neo.exe", "uninstall.exe", *CRT_NAMES]
+        unknown = ["custom.dll", "msvcp140_custom.dll", "assets\\custom.dll", "runtime\\custom.txt"]
+        for name in known + unknown:
+            m.files[m.value("$INSTDIR") + "\\" + name] = name.encode()
+        m.registry = {"DisplayVersion": "old"}
+        m.execute("Uninstall")
+        self.assertFalse(m.aborted)
+        self.assertIsNone(m.registry)
+        self.assertEqual(m.files, {m.value("$INSTDIR") + "\\" + name: name.encode() for name in unknown})
+
+    def test_crt_delete_failure_preserves_uninstaller_and_registration(self):
+        for name in CRT_NAMES:
+            with self.subTest(name=name):
+                m = NsModel()
+                path = m.value("$INSTDIR") + "\\" + name
+                uninstaller = m.value(r"$INSTDIR\uninstall.exe")
+                m.files.update({path: b"locked CRT", uninstaller: b"uninstaller"})
+                m.registry = {"DisplayVersion": "old"}
+                m.faults.add(("delete", path))
+                m.execute("Uninstall")
+                self.assertTrue(m.aborted)
+                self.assertEqual(m.files[path], b"locked CRT")
+                self.assertIn(uninstaller, m.files)
+                self.assertEqual(m.registry, {"DisplayVersion": "old"})
+
+    def test_crt_transaction_rollback_restores_all_old_dlls_and_unknown_files(self):
+        for previous in (False, True):
+            for blocked in (None, r"C:\Programs\Neo", r"C:\Programs\backup"):
+                with self.subTest(previous=previous, blocked=blocked):
+                    m = NsModel()
+                    m.variables.update({"$Published": "1", "$OldMoved": str(int(previous))})
+                    old = {}
+                    for name in [*CRT_NAMES, "custom.dll", "assets\\custom.txt"]:
+                        m.files[m.value("$INSTDIR") + "\\" + name] = b"new"
+                        if previous:
+                            path = m.value("$BackupDir") + "\\" + name
+                            old[path] = b"old: " + name.encode()
+                    m.files.update(old)
+                    if blocked:
+                        m.faults.add(("rename", blocked))
+                    m.execute("InstallAbort")
+                    if previous:
+                        for path, content in old.items():
+                            restored = path if blocked else path.replace(m.value("$BackupDir"), m.value("$INSTDIR"), 1)
+                            self.assertEqual(m.files[restored], content)
+                    elif blocked != m.value("$INSTDIR"):
+                        self.assertFalse(m.files)
+                    before = dict(m.files)
+                    m.execute("InstallAbort")
+                    self.assertEqual(m.files, before)
+
+    def test_release_uses_explicit_x64_output_and_formal_assets(self):
+        root = Path(__file__).resolve().parent.parent
+        workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        self.assertIn("cargo build --locked --release -p neo-app --target x86_64-pc-windows-msvc", workflow)
+        self.assertIn(r"Copy-Item target\x86_64-pc-windows-msvc\release\neo.exe", workflow)
+        self.assertNotIn(r"Copy-Item target\release\neo.exe", workflow)
+        self.assertIn(r'Copy-Item -Recurse crates\neo-wake\assets "$pkg\assets"', workflow)
+        self.assertNotIn("wake-training", workflow)
+        self.assertLess(workflow.index("python tools/check_release.py"), workflow.index("- name: Zip portable package"))
+        wake = (root / "crates/neo-wake/src/lib.rs").read_text(encoding="utf-8")
+        self.assertIn("安装资源缺失：hi_neo.onnx", wake)
+        self.assertNotIn("请先跑 wake-training", wake)
 
     def test_isolated_nsis_compile(self):
         compiler = shutil.which("makensis")

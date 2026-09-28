@@ -105,9 +105,7 @@ impl ConfirmWin {
         let pending = state.awaiting_tool();
         let open = pending.is_some();
         let m = theme.metrics;
-        let monitor = ctx
-            .input(|i| i.viewport().monitor_size)
-            .unwrap_or(Vec2::new(1920.0, 1080.0));
+        let monitor = super::miniwin::screen_geometry(ctx, overlay.is_some()).monitor;
         let size = Vec2::new(m.s(560.0), m.s(420.0))
             .min(monitor - egui::vec2(m.s(32.0), m.s(32.0)))
             .max(egui::vec2(m.s(280.0), m.s(180.0)));

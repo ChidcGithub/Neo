@@ -59,6 +59,121 @@ fn viewport_id() -> ViewportId {
     ViewportId::from_hash_of("neo-miniwin")
 }
 
+/// overlay 的点是全局物理坐标 / 主屏 DPI；不能减虚拟桌面原点，
+/// 原点平移由 overlay 自己完成。deferred 视口仍使用自己的原有坐标系。
+#[derive(Clone, Copy)]
+pub(crate) struct ScreenGeometry {
+    pub monitor: Vec2,
+    ppp: f32,
+}
+
+impl ScreenGeometry {
+    fn from_physical(size: Vec2, ppp: f32) -> Self {
+        Self { monitor: size / ppp, ppp }
+    }
+
+    fn point(self, physical: Pos2) -> Pos2 {
+        physical / self.ppp
+    }
+
+    fn rect(self, physical: neo_tools::tools::screen::Rect, origin: Pos2) -> Rect {
+        Rect::from_min_size(
+            self.point(Pos2::new(physical.x as f32, physical.y as f32) - origin.to_vec2()),
+            Vec2::new(physical.width as f32, physical.height as f32) / self.ppp,
+        )
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+fn primary_geometry() -> ScreenGeometry {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    let _dpi = neo_tools::tools::screen::physical_pixels().ok();
+    let ppp = neo_tools::tools::screen::dpi_scale_at(0, 0).unwrap_or(1.0) as f32;
+    let size = unsafe {
+        Vec2::new(GetSystemMetrics(SM_CXSCREEN) as f32, GetSystemMetrics(SM_CYSCREEN) as f32)
+    };
+    ScreenGeometry::from_physical(size, ppp)
+}
+
+#[cfg(any(not(windows), test))]
+fn primary_geometry() -> ScreenGeometry {
+    ScreenGeometry::from_physical(Vec2::new(1920.0, 1080.0), 1.0)
+}
+
+pub(crate) fn screen_geometry(ctx: &Context, using_overlay: bool) -> ScreenGeometry {
+    if using_overlay {
+        primary_geometry()
+    } else {
+        ctx.input(|i| ScreenGeometry {
+            monitor: i.viewport().monitor_size.unwrap_or(Vec2::new(1920.0, 1080.0)),
+            ppp: i.viewport().native_pixels_per_point.unwrap_or(1.0),
+        })
+    }
+}
+
+/// fallback 的屏幕点只属于 child；跨视口传递的命中区一律存全局物理像素。
+#[derive(Clone, Copy)]
+struct FallbackGeometry {
+    screen: ScreenGeometry,
+    position: Pos2,
+    physical_rects: [Rect; 4],
+}
+
+impl FallbackGeometry {
+    fn new(
+        screen: ScreenGeometry,
+        position: Pos2,
+        size: Vec2,
+        home: Pos2,
+        away: Pos2,
+        actual: Option<Rect>,
+    ) -> Self {
+        let requested = Rect::from_min_size(position, size);
+        Self {
+            screen,
+            position,
+            physical_rects: [
+                actual.unwrap_or(requested),
+                requested,
+                Rect::from_min_size(home, size),
+                Rect::from_min_size(away, size),
+            ].map(|r| r * screen.ppp),
+        }
+    }
+
+    fn screen(ctx: &Context) -> ScreenGeometry {
+        let zoom = ctx.zoom_factor();
+        ctx.input(|i| i.raw.viewports.get(&viewport_id()).and_then(|v| {
+            Some(ScreenGeometry {
+                monitor: v.monitor_size?,
+                ppp: v.native_pixels_per_point? * zoom,
+            })
+        })).or_else(|| {
+            ctx.data(|d| d.get_temp::<Self>(Id::new("neo-miniwin-pos")))
+                .map(|cached| cached.screen)
+        }).unwrap_or_else(|| {
+            let primary = primary_geometry();
+            ScreenGeometry { monitor: primary.monitor / zoom, ppp: primary.ppp * zoom }
+        })
+    }
+
+    fn contains(self, physical: Pos2) -> bool {
+        self.physical_rects.iter().any(|r| r.contains(physical))
+    }
+
+    fn store(self, ctx: &Context) {
+        let id = Id::new("neo-miniwin-pos");
+        let last = ctx.data(|d| d.get_temp::<Self>(id));
+        // 相同点坐标在 DPI / egui zoom 变化后不是同一个物理位置，必须重发。
+        let moved = last.is_none_or(|last|
+            last.position != self.position || last.screen.ppp != self.screen.ppp);
+        ctx.data_mut(|d| d.insert_temp(id, self));
+        if moved {
+            ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(self.position));
+        }
+    }
+}
+
 /// 缓出三次方：避让与淡入共用这条「先快后慢」的曲线。
 fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
@@ -566,6 +681,7 @@ fn paint_border_beam(
 pub struct MiniWin {
     /// 上一帧是否已发 `Visible(true)`（显隐改由显式命令驱动，沿检测用）。
     shown: bool,
+    using_overlay: bool,
     /// 已见到的截屏时间戳（变了 = AI 又截了一次屏）。
     shot_seen: u64,
     /// 截屏隐藏的截止时刻。
@@ -596,6 +712,19 @@ pub struct MiniWin {
 }
 
 impl MiniWin {
+    fn switch_backend(&mut self, ctx: &Context, using_overlay: bool) {
+        if self.using_overlay != using_overlay {
+            self.using_overlay = using_overlay;
+            self.shown = false;
+            self.legacy_sent = Vec2::ZERO;
+            *self.layer_rect.lock().unwrap() = [0.0; 4];
+            ctx.data_mut(|d| { d.remove::<FallbackGeometry>(Id::new("neo-miniwin-pos")); });
+            if using_overlay {
+                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Close);
+            }
+        }
+    }
+
     /// 视口 builder：尺寸按显隐给（休眠 1x1），patch 自己收成增量命令。
     ///
     /// 两个反直觉处：
@@ -632,6 +761,15 @@ impl MiniWin {
         classwin_rect: Option<Rect>,
         overlay: Option<&neo_overlay::OverlayHandle>,
     ) {
+        let overlay = overlay.filter(|layer| layer.is_alive());
+        self.switch_backend(ctx, overlay.is_some());
+        let geometry = if overlay.is_some() {
+            primary_geometry()
+        } else {
+            FallbackGeometry::screen(ctx)
+        };
+        // classwin_rect 仍由调用者按 screen_geometry 的坐标约定传入。
+        let class_geometry = screen_geometry(ctx, overlay.is_some());
         // 1. 截屏信号：时间戳一变就进入短暂隐藏；隐藏结束后播淡入。
         let shot_at = neo_tools::tools::screen::SCREENSHOT_AT.load(Ordering::Relaxed);
         if shot_at != self.shot_seen {
@@ -680,16 +818,13 @@ impl MiniWin {
         let open = hidden_to_tray && (busy || lingering || (fading && !faded)) && !shot_hiding;
 
         // 3. 全局输入（由视口回调单点采样转发，见 LMB_EDGE_MS 注释）：
-        //    逻辑坐标光标 + 左键按下沿。沿带 250ms 窗口并记消费，托盘态
+        //    全局物理光标 + 左键按下沿。沿带 250ms 窗口并记消费，托盘态
         //    ~10fps 的 tick 不会漏掉两次 tick 之间的快速点按。
-        let ppp = ctx
-            .input(|i| i.viewport().native_pixels_per_point)
-            .unwrap_or(1.0);
         let cursor = CURSOR
             .lock()
             .ok()
             .and_then(|g| *g)
-            .map(|(physical, _)| Pos2::new(physical.x / ppp, physical.y / ppp));
+            .map(|(physical, _)| physical);
         let edge_ms = LMB_EDGE_MS.load(Ordering::Relaxed);
         let lmb_edge = edge_ms != 0
             && edge_ms != self.lmb_edge_consumed
@@ -702,9 +837,7 @@ impl MiniWin {
         //    paint 量到的内容高（上一帧）+ 边距，钳制后由回调朝它做缓动。
         //    打断弹窗打开时用固定大窗（模态需要稳定的落点）。
         let m = theme.metrics;
-        let monitor = ctx
-            .input(|i| i.viewport().monitor_size)
-            .unwrap_or(Vec2::new(1920.0, 1080.0));
+        let monitor = geometry.monitor;
         let (width, target_h) = if self.interrupt_open {
             (m.s(380.0), m.s(280.0))
         } else {
@@ -731,23 +864,23 @@ impl MiniWin {
             && used_mouse_or_keyboard(state)
             && !synthetic_click_recent()
         {
-            let on_miniwin = cursor.is_some_and(|c| {
-                // 实时位置优先（避让动画途中窗体不在任何一个静止端点上）：
-                // 渲染层模式读共享矩形，旧视口模式读回调写进 ctx.data 的位置。
-                let live = if overlay.is_some() {
+            let on_miniwin = cursor.is_some_and(|physical| {
+                if overlay.is_some() {
+                    let c = geometry.point(physical);
                     let r = *self.layer_rect.lock().unwrap();
-                    Some(Rect::from_min_size(Pos2::new(r[0], r[1]), Vec2::new(r[2], r[3])))
+                    Rect::from_min_size(Pos2::new(r[0], r[1]), Vec2::new(r[2], r[3])).contains(c)
+                        || Rect::from_min_size(home, size).contains(c)
+                        || Rect::from_min_size(away, size).contains(c)
                 } else {
-                    ctx.data(|d| d.get_temp::<Pos2>(Id::new("neo-miniwin-pos")))
-                        .map(|pos| Rect::from_min_size(pos, size))
-                };
-                live.is_some_and(|r| r.contains(c))
-                    || Rect::from_min_size(home, size).contains(c)
-                    || Rect::from_min_size(away, size).contains(c)
+                    // 缓存自带 child 的实测/动画/端点物理矩形，不再拼 root 的尺寸。
+                    ctx.data(|d| d.get_temp::<FallbackGeometry>(Id::new("neo-miniwin-pos")))
+                        .unwrap_or_else(|| FallbackGeometry::new(geometry, home, size, home, away, None))
+                        .contains(physical)
+                }
             });
             let on_classwin = cursor
                 .zip(classwin_rect)
-                .is_some_and(|(c, r)| r.contains(c));
+                .is_some_and(|(c, r)| r.contains(class_geometry.point(c)));
             if !on_miniwin && !on_classwin {
                 self.interrupt_open = true;
                 self.interrupt_result.store(0, Ordering::Relaxed);
@@ -841,7 +974,6 @@ impl MiniWin {
                         let home =
                             Pos2::new((monitor.x - size.x - margin).max(margin), margin);
                         let away = Pos2::new(margin, margin);
-                        let ppp = ctx.pixels_per_point();
                         let cursor = {
                             // 采样顺带刷新槽位（层内 vsync 单点采样，tick 的
                             // 沿检测靠它喂 —— 见 LMB_EDGE_MS 注释）。
@@ -850,7 +982,7 @@ impl MiniWin {
                                 .lock()
                                 .ok()
                                 .and_then(|g| *g)
-                                .map(|(p, _)| Pos2::new(p.x / ppp, p.y / ppp))
+                                .map(|(p, _)| geometry.point(p))
                         };
                         let dodge = !snap.interrupt_open
                             && cursor
@@ -896,6 +1028,7 @@ impl MiniWin {
         //    露面，`is_viewport_or_descendant_visible` 反向强制主窗跑真 pass，
         //    内容快照的增量更新随之恢复（但被托盘节流到 10fps，只够刷文字）。
         if open != self.shown {
+            ctx.data_mut(|d| { d.remove::<FallbackGeometry>(Id::new("neo-miniwin-pos")); });
             if open {
                 // 先落位再恢复尺寸，免得在屏幕内从 1x1 长大被瞥见；
                 // 每次露面都重新提到顶层，盖过同屏后到的其它 topmost 窗口。
@@ -961,14 +1094,13 @@ impl MiniWin {
                 let m = snapshot.theme.metrics;
                 let size = Vec2::new(snapshot.width, snapshot.target_h);
                 let margin = m.s(16.0);
-                let monitor = ctx
-                    .input(|i| i.viewport().monitor_size)
-                    .unwrap_or(Vec2::new(1920.0, 1080.0));
-                let home = Pos2::new((monitor.x - size.x - margin).max(margin), margin);
+                let geometry = ScreenGeometry {
+                    monitor: ctx.input(|i| i.viewport().monitor_size)
+                        .unwrap_or(snapshot.monitor),
+                    ppp: ctx.pixels_per_point(),
+                };
+                let home = Pos2::new((geometry.monitor.x - size.x - margin).max(margin), margin);
                 let away = Pos2::new(margin, margin);
-                let ppp = ctx
-                    .input(|i| i.viewport().native_pixels_per_point)
-                    .unwrap_or(1.0);
                 let cursor = {
                     // 采样顺带刷新槽位（60fps 单点，tick 的沿检测靠它喂）。
                     poll_global_input();
@@ -976,7 +1108,7 @@ impl MiniWin {
                         .lock()
                         .ok()
                         .and_then(|g| *g)
-                        .map(|(p, _)| Pos2::new(p.x / ppp, p.y / ppp))
+                        .map(|(p, _)| geometry.point(p))
                 };
                 let dodge = !snapshot.interrupt_open
                     && cursor.is_some_and(|c| Rect::from_min_size(home, size).contains(c));
@@ -987,14 +1119,10 @@ impl MiniWin {
                 );
                 let mut pos = home + (away - home) * ease_out_cubic(t);
                 pos.y -= m.s(10.0) * ease_out_cubic(fade_out);
-                // 位置没变就不发：每条命令都是一次 SetWindowPos + DWM 重合成，
-                // 静止时每帧白调是纯开销。
-                let pos_id = Id::new("neo-miniwin-pos");
-                let last = ctx.data_mut(|d| d.get_temp::<Pos2>(pos_id));
-                if last != Some(pos) {
-                    ctx.data_mut(|d| d.insert_temp(pos_id, pos));
-                    ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(pos));
-                }
+                // inner_rect 是屏幕点坐标（不是 ui.max_rect 的本地坐标）；
+                // 同时保留实测与待应用位置，覆盖窗口移动命令生效前后的点击。
+                let actual = ctx.input(|i| i.viewport().inner_rect);
+                FallbackGeometry::new(geometry, pos, size, home, away, actual).store(&ctx);
                 paint(ui, &snapshot, &result, fade, &measure);
                 // 本视口自驱 60fps：流光 / 避让 / 淡入淡出全靠它。
                 ctx.request_repaint_after(POLL);
@@ -1012,6 +1140,177 @@ impl MiniWin {
 #[cfg(test)]
 mod beam_tests {
     use super::*;
+
+    fn fallback_input(root_scale: f32, child_scale: f32) -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        let root = input.viewports.get_mut(&ViewportId::ROOT).unwrap();
+        root.native_pixels_per_point = Some(root_scale);
+        root.monitor_size = Some(Vec2::new(2560.0, 1440.0) / root_scale);
+        input.viewports.insert(viewport_id(), egui::ViewportInfo {
+            native_pixels_per_point: Some(child_scale),
+            monitor_size: Some(Vec2::new(1920.0, 1080.0) / child_scale),
+            ..Default::default()
+        });
+        input
+    }
+
+    #[test]
+    fn fallback_mixed_dpi_hits_child_physical_rects_not_root_points() {
+        for (root_scale, child_scale) in [(1.5, 1.0), (1.0, 1.5)] {
+            let ctx = Context::default();
+            ctx.begin_pass(fallback_input(root_scale, child_scale));
+            let screen = FallbackGeometry::screen(&ctx);
+            assert_eq!(screen.ppp, child_scale);
+            assert_eq!(screen.monitor, Vec2::new(1920.0, 1080.0) / child_scale);
+            let size = Vec2::new(340.0, 96.0);
+            let home = Pos2::new(screen.monitor.x - size.x - 16.0, 16.0);
+            let away = Pos2::new(16.0, 16.0);
+            let pos = home + (away - home) * 0.4;
+            let actual = Rect::from_min_size(Pos2::new(-1100.0, -180.0), size);
+            FallbackGeometry::new(screen, pos, size, home, away, Some(actual)).store(&ctx);
+            let cached = ctx.data(|d| d.get_temp::<FallbackGeometry>(Id::new("neo-miniwin-pos"))).unwrap();
+            for rect in [Rect::from_min_size(home, size), Rect::from_min_size(away, size),
+                Rect::from_min_size(pos, size), actual] {
+                for point in [rect.center(), rect.min + Vec2::splat(1.0), rect.max - Vec2::splat(1.0)] {
+                    let physical = point * child_scale;
+                    assert!(cached.contains(physical));
+                    assert!(rect.contains(screen.point(physical)));
+                }
+            }
+            let home_click = (home + size * 0.5) * child_scale;
+            // 旧代码把主窗 DPI 用在 child 的 home/live 上，两种比例都会漏命中。
+            assert!(!Rect::from_min_size(home, size).contains(home_click / root_scale));
+            assert!(!cached.contains(Pos2::new(-10.0, -10.0)));
+            assert!(!cached.contains(Pos2::new(3000.0, 2000.0)));
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn fallback_scale_and_size_changes_refresh_cache_and_position_commands() {
+        let ctx = Context::default();
+        ctx.set_embed_viewports(false);
+        let pos = Pos2::new(-1200.0, -200.0);
+        let size = Vec2::new(340.0, 96.0);
+        for (scale, height, expect_move) in [(1.0, 96.0, true), (1.0, 160.0, false),
+            (1.5, 160.0, true), (1.5, 96.0, false), (1.0, 96.0, true)] {
+            ctx.begin_pass(fallback_input(2.0, scale));
+            ctx.show_viewport_deferred(viewport_id(), ViewportBuilder::default(), |_, _| {});
+            let screen = FallbackGeometry::screen(&ctx);
+            let size = Vec2::new(size.x, height);
+            FallbackGeometry::new(screen, pos, size, pos, pos, None).store(&ctx);
+            let cached = ctx.data(|d| d.get_temp::<FallbackGeometry>(Id::new("neo-miniwin-pos"))).unwrap();
+            assert_eq!(cached.physical_rects[1], Rect::from_min_size(pos * scale, size * scale));
+            assert!(cached.contains((pos + size * 0.5) * scale));
+            assert!(!cached.contains((pos + size + Vec2::splat(1.0)) * scale));
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+            let moved = output.viewport_output.get(&viewport_id()).is_some_and(|v|
+                v.commands.iter().any(|c| matches!(c, ViewportCommand::OuterPosition(p) if *p == pos)));
+            assert_eq!(moved, expect_move);
+        }
+        // egui zoom 也属于完整 ppp，不能只记录系统 DPI。
+        ctx.set_zoom_factor(1.25);
+        let mut input = fallback_input(1.0, 1.5);
+        input.viewports.get_mut(&viewport_id()).unwrap().monitor_size = Some(Vec2::new(1920.0, 1080.0) / 1.875);
+        ctx.begin_pass(input);
+        ctx.show_viewport_deferred(viewport_id(), ViewportBuilder::default(), |_, _| {});
+        let screen = FallbackGeometry::screen(&ctx);
+        assert_eq!(screen.ppp, 1.875);
+        FallbackGeometry::new(screen, pos, size, pos, pos, None).store(&ctx);
+        assert!(ctx.data(|d| d.get_temp::<FallbackGeometry>(Id::new("neo-miniwin-pos")))
+            .unwrap().contains((pos + size * 0.5) * 1.875));
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+        assert!(output.viewport_output[&viewport_id()].commands.iter()
+            .any(|c| matches!(c, ViewportCommand::OuterPosition(p) if *p == pos)));
+    }
+
+    #[test]
+    fn fallback_missing_child_uses_cached_or_primary_geometry_never_root() {
+        let ctx = Context::default();
+        let mut input = fallback_input(1.5, 1.0);
+        input.viewports.remove(&viewport_id());
+        ctx.begin_pass(input);
+        let screen = FallbackGeometry::screen(&ctx);
+        assert_eq!(screen.ppp, 1.0);
+        assert_eq!(screen.monitor, Vec2::new(1920.0, 1080.0));
+        let child = ScreenGeometry::from_physical(Vec2::new(1920.0, 1080.0), 1.25);
+        FallbackGeometry::new(child, Pos2::new(100.0, 20.0), Vec2::new(340.0, 96.0),
+            Pos2::new(100.0, 20.0), Pos2::new(16.0, 16.0), None).store(&ctx);
+        assert_eq!(FallbackGeometry::screen(&ctx).ppp, 1.25);
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn mixed_dpi_overlay_geometry_and_class_click_use_primary_scale_once() {
+        let theme = Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard);
+        for (primary_scale, secondary_scale) in [(1.0, 1.5), (1.5, 1.0)] {
+            let primary = ScreenGeometry::from_physical(Vec2::new(1920.0, 1080.0), primary_scale);
+            let secondary = ScreenGeometry::from_physical(Vec2::new(2560.0, 1440.0), secondary_scale);
+            let class = super::super::classwin::ClassWin::target_rect(theme, primary.monitor);
+            let physical_click = class.center() * primary_scale;
+            assert!(class.contains(primary.point(physical_click)));
+            assert_eq!(primary.point(physical_click), class.center());
+            assert_ne!(primary.point(physical_click), secondary.point(physical_click));
+            let home = Pos2::new(primary.monitor.x - 356.0, 16.0);
+            let card = Rect::from_min_size(home, Vec2::new(340.0, 96.0));
+            assert!(card.contains(primary.point(card.center() * primary_scale)));
+            assert_eq!(primary.monitor * primary_scale, Vec2::new(1920.0, 1080.0));
+        }
+    }
+
+    #[test]
+    fn flash_negative_origin_is_global_for_overlay_local_for_fallback() {
+        let physical = neo_tools::tools::screen::Rect { x: -1200, y: -150, width: 600, height: 300 };
+        let origin = Pos2::new(-1500.0, -300.0);
+        for scale in [1.0, 1.5] {
+            let geometry = ScreenGeometry::from_physical(Vec2::new(1920.0, 1080.0), scale);
+            let overlay = geometry.rect(physical, Pos2::ZERO);
+            let fallback = geometry.rect(physical, origin);
+            assert_eq!(overlay.min, Pos2::new(-1200.0, -150.0) / scale);
+            assert_eq!(fallback.min, Pos2::new(300.0, 150.0) / scale);
+            assert_eq!(overlay.size(), Vec2::new(600.0, 300.0) / scale);
+            assert_eq!(fallback.translate(geometry.point(origin).to_vec2()), overlay);
+        }
+    }
+
+    #[test]
+    fn backend_switch_resets_positions_but_preserves_local_beam_cache() {
+        let ctx = Context::default();
+        let mut input = egui::RawInput::default();
+        let root = input.viewports.get_mut(&ViewportId::ROOT).unwrap();
+        root.native_pixels_per_point = Some(1.5);
+        root.monitor_size = Some(Vec2::new(1700.0, 960.0));
+        ctx.begin_pass(input);
+        let fallback = screen_geometry(&ctx, false);
+        let overlay = screen_geometry(&ctx, true);
+        assert_eq!(fallback.monitor, Vec2::new(1700.0, 960.0));
+        assert_eq!(fallback.point(Pos2::new(150.0, 300.0)), Pos2::new(100.0, 200.0));
+        assert_eq!(overlay.monitor, Vec2::new(1920.0, 1080.0));
+        assert_eq!(overlay.point(Pos2::new(150.0, 300.0)), Pos2::new(150.0, 300.0));
+        let mut win = MiniWin::default();
+        let key = BeamKey::new(Vec2::new(340.0, 96.0), 18.0);
+        let mut cache = BeamGeometry::default();
+        assert!(cache.ensure(key));
+        for using_overlay in [true, false, true] {
+            win.shown = true;
+            win.legacy_sent = key.size;
+            *win.layer_rect.lock().unwrap() = [100.0, 20.0, 340.0, 96.0];
+            FallbackGeometry::new(fallback, Pos2::new(100.0, 20.0), key.size,
+                Pos2::new(100.0, 20.0), Pos2::new(16.0, 16.0), None).store(&ctx);
+            win.switch_backend(&ctx, using_overlay);
+            assert!(!win.shown);
+            assert_eq!(win.legacy_sent, Vec2::ZERO);
+            assert_eq!(*win.layer_rect.lock().unwrap(), [0.0; 4]);
+            assert!(ctx.data(|d| d.get_temp::<FallbackGeometry>(Id::new("neo-miniwin-pos"))).is_none());
+            assert!(!cache.ensure(key));
+        }
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+    }
 
     #[test]
     fn beam_cache_invalidates_only_geometry_inputs() {
@@ -1135,6 +1434,7 @@ pub struct ShotFlash {
     flashing_since: Option<Instant>,
     /// 上一帧是否在闪（沿检测用）。
     shown: bool,
+    using_overlay: bool,
 }
 
 impl ShotFlash {
@@ -1142,6 +1442,15 @@ impl ShotFlash {
     pub fn tick(&mut self, ctx: &Context, overlay: Option<&neo_overlay::OverlayHandle>) {
         use neo_tools::tools::screen;
 
+        let overlay = overlay.filter(|layer| layer.is_alive());
+        if self.using_overlay != overlay.is_some() {
+            self.using_overlay = overlay.is_some();
+            self.shown = false;
+            if self.using_overlay {
+                ctx.send_viewport_cmd_to(flash_viewport_id(), ViewportCommand::Close);
+            }
+        }
+        let geometry = screen_geometry(ctx, overlay.is_some());
         // 1. 截屏信号：时间戳一变就锁定区域并排程闪光。
         let shot_at = screen::SCREENSHOT_AT.load(Ordering::Relaxed);
         if shot_at != self.shot_seen {
@@ -1163,27 +1472,18 @@ impl ShotFlash {
         }
         let on = self.flashing_since.is_some();
 
-        // 2. 几何：虚拟屏物理像素 → 点（多屏时原点可为负）。
-        let ppp = ctx
-            .input(|i| i.viewport().native_pixels_per_point)
-            .unwrap_or(1.0);
+        // 2. 物理矩形只换算一次；overlay 使用全局点，fallback 绘制时才减原点。
         let vs = screen::virtual_screen();
-        let vs_size = Vec2::new(
-            (vs.width as f32 / ppp).max(1.0),
-            (vs.height as f32 / ppp).max(1.0),
-        );
-        let origin = Pos2::new(vs.x as f32 / ppp, vs.y as f32 / ppp);
+        let desktop = geometry.rect(vs, Pos2::ZERO);
+        let vs_size = desktop.size().max(Vec2::splat(1.0));
+        let origin = desktop.min;
 
         // 3a. 渲染层：闪光是一张 passive 卡（只画不收点击），区域即卡矩形。
         if let Some(layer) = overlay {
             if on {
                 let region = self.region.unwrap_or(vs);
-                let rect = [
-                    region.x as f32 / ppp,
-                    region.y as f32 / ppp,
-                    region.width as f32 / ppp,
-                    region.height as f32 / ppp,
-                ];
+                let rect = geometry.rect(region, Pos2::ZERO);
+                let rect = [rect.min.x, rect.min.y, rect.width(), rect.height()];
                 let t0 = self.flashing_since.unwrap_or_else(Instant::now);
                 let card = neo_overlay::Card::passive(rect, move |ui| {
                     let r = ui.max_rect();
@@ -1227,16 +1527,7 @@ impl ShotFlash {
         let frame = if on {
             let region = self.region.unwrap_or(vs);
             Some((
-                Rect::from_min_size(
-                    Pos2::new(
-                        (region.x - vs.x) as f32 / ppp,
-                        (region.y - vs.y) as f32 / ppp,
-                    ),
-                    Vec2::new(
-                        region.width as f32 / ppp,
-                        region.height as f32 / ppp,
-                    ),
-                ),
+                geometry.rect(region, Pos2::new(vs.x as f32, vs.y as f32)),
                 self.flashing_since.unwrap_or_else(Instant::now),
             ))
         } else {

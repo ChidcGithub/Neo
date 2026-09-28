@@ -300,7 +300,7 @@ pub struct WakeEngine {
 
 impl WakeEngine {
     /// 启动后台采集 + 推理线程，返回事件接收端。
-    /// hi_neo.onnx 尚未训练出来时也会正常返回，错误通过 WakeEvent::Error 上报。
+    /// 安装资源缺失时也会正常返回，错误通过 WakeEvent::Error 上报。
     pub fn start(config: WakeConfig) -> (Self, mpsc::Receiver<WakeEvent>) {
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -638,12 +638,12 @@ fn init_ort(dir: &Path) -> Result<(), String> {
 fn load_models(dir: &Path) -> Result<Models, String> {
     for name in ["melspectrogram.onnx", "embedding_model.onnx"] {
         if !dir.join(name).is_file() {
-            return Err(format!("missing {}", dir.join(name).display()));
+            return Err(format!("安装资源缺失：{}。请使用完整的正式发行包重新安装 Neo。", dir.join(name).display()));
         }
     }
     let classifier_path = dir.join("hi_neo.onnx");
     if !classifier_path.is_file() {
-        return Err("hi_neo.onnx 尚未训练，请先跑 wake-training 管线".into());
+        return Err("安装资源缺失：hi_neo.onnx。请使用完整的正式发行包重新安装 Neo。".into());
     }
     init_ort(dir)?;
     let build = |path: &Path| -> Result<Session, String> {

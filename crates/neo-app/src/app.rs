@@ -42,6 +42,17 @@ thread_local! {
         const { std::cell::Cell::new(neo_llm::start_with_tools) };
 }
 
+/// 只记录固定类别，不把驱动/系统返回的路径或原始详情写入日志。
+fn overlay_failure_summary(reason: &str) -> &'static str {
+    if reason.contains("RegisterClassExW") || reason.contains("CreateWindowExW") {
+        "覆盖层初始化失败（原生窗口）；已切换独立窗口，听写不可用"
+    } else if reason.contains("线程") || reason.contains("初始化未完成") {
+        "覆盖层初始化失败（线程启动或等待）；已切换独立窗口，听写不可用"
+    } else {
+        "覆盖层初始化失败（渲染设备或其他初始化阶段）；已切换独立窗口，听写不可用"
+    }
+}
+
 /// 主题重建的输入指纹。
 type Fingerprint = (ThemeMode, Distance, i32);
 
@@ -355,7 +366,14 @@ impl NeoApp {
             // 失败（无 DX12 / 建窗失败）降级为无跑马灯，不拖垮主程序。
             match neo_overlay::start() {
                 Ok(h) => self.overlay = Some(h),
-                Err(_) => record(Level::Error, "overlay", "覆盖层初始化失败"),
+                Err(reason) => {
+                    record(Level::Error, "overlay", overlay_failure_summary(&reason));
+                    self.pending_toasts.push((
+                        neo_ui::ToastKind::Warning,
+                        "覆盖层不可用，提示已改用独立窗口；语音唤醒将打开输入框，不启动听写".into(),
+                        std::time::Instant::now() + std::time::Duration::from_secs(8),
+                    ));
+                },
             }
         }
     }
@@ -1480,9 +1498,7 @@ impl NeoApp {
         // 迷你窗：主窗藏起 + AI 在忙时贴屏幕角落（对话速览 / 截屏回避 / 打断确认）。
         // 打断判定要排除课堂总结弹窗的矩形：点它的「关闭」不是「打断 AI」。
         let classwin_rect = if self.class.presenting().is_some() {
-            let monitor = ctx
-                .input(|i| i.viewport().monitor_size)
-                .unwrap_or(egui::Vec2::new(1920.0, 1080.0));
+            let monitor = ui::miniwin::screen_geometry(&ctx, self.overlay_alive()).monitor;
             Some(ui::classwin::ClassWin::target_rect(self.theme, monitor))
         } else {
             None
@@ -2719,6 +2735,20 @@ mod restore_tests {
         assert!(matches!(rx.try_recv(), Ok(super::SttCmd::Reset(6))));
         assert!(wake_tx.send(neo_wake::WakeEvent::Audio { epoch: 0, frame: vec![] }).is_err());
         assert!(!super::current_dictation(app.dictating, app.dictation_epoch, 5));
+    }
+
+    #[test]
+    fn safety_overlay_failure_summary_never_exposes_system_details() {
+        for (reason, category) in [
+            ("CreateWindowExW 失败 secret-path", "原生窗口"),
+            ("创建 neo-overlay 线程失败: secret-path", "线程启动或等待"),
+            ("GPU adapter secret-path", "渲染设备或其他初始化阶段"),
+        ] {
+            let summary = super::overlay_failure_summary(reason);
+            assert!(summary.contains(category));
+            assert!(summary.contains("独立窗口"));
+            assert!(!summary.contains("secret-path"));
+        }
     }
 
     #[test]

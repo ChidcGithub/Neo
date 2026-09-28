@@ -39,10 +39,28 @@ mod notify;
 mod state;
 mod ui;
 
+fn window_limits(supported: &eframe::wgpu::Limits) -> eframe::wgpu::Limits {
+    // 不把 eframe 默认的 8192 变成硬件门槛；保留设备可用的完整 2D
+    // 尺寸范围，供最大化、跨屏拖动及辅助视口使用。
+    let mut limits = eframe::wgpu::Limits::default().or_worse_values_from(supported);
+    limits.max_texture_dimension_2d = supported.max_texture_dimension_2d;
+    limits
+}
+
 fn main() -> eframe::Result {
     // 窗口图标与托盘图标共用同一张鲸鱼位图（品牌蓝、方形内接居中）。
     let (rgba, width, height) = brand::whale_rgba(64);
+    let mut wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    wgpu_setup.device_descriptor = std::sync::Arc::new(|adapter| eframe::wgpu::DeviceDescriptor {
+        label: Some("Neo window device"),
+        required_limits: window_limits(&adapter.limits()),
+        ..Default::default()
+    });
     let options = eframe::NativeOptions {
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: wgpu_setup.into(),
+            ..Default::default()
+        },
         viewport: egui::ViewportBuilder::default()
             .with_title("Neo — 教室大屏 AI 助手")
             .with_inner_size([1600.0, 1000.0])
@@ -77,4 +95,23 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod graphics_tests {
+    use super::*;
+
+    #[test]
+    fn window_limits_follow_adapter_without_8192_requirement() {
+        for max_dimension in [4096, 8192, 16384] {
+            let supported = eframe::wgpu::Limits {
+                max_texture_dimension_2d: max_dimension,
+                ..eframe::wgpu::Limits::downlevel_defaults()
+            };
+            let requested = window_limits(&supported);
+            assert!(requested.check_limits(&supported));
+            assert_eq!(requested.max_texture_dimension_2d, max_dimension);
+            assert!(requested.max_texture_dimension_2d >= 3840);
+        }
+    }
 }

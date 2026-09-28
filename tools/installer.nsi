@@ -116,7 +116,20 @@ Function ${PREFIX}CheckRunning
   Pop $0
   Pop $1
   StrCmp $0 "0" running_ok
-  MessageBox MB_OK|MB_ICONSTOP "请完全退出 Neo 后重试。无法确认进程已退出时，安装不会继续。"
+  StrCmp $0 "10" running_found
+  StrCmp $0 "20" running_enumeration_failed
+  StrCmp $0 "timeout" running_timeout
+  MessageBox MB_OK|MB_ICONSTOP "无法启动进程检查（PowerShell 不可用或返回异常）。为保护现有安装，本次操作已停止。"
+  Goto running_failed
+running_found:
+  MessageBox MB_OK|MB_ICONSTOP "Neo 正在运行，请完全退出 Neo 后重试。"
+  Goto running_failed
+running_enumeration_failed:
+  MessageBox MB_OK|MB_ICONSTOP "无法枚举进程，不能确认 Neo 已退出。请检查系统权限或安全软件后重试；本次操作已停止。"
+  Goto running_failed
+running_timeout:
+  MessageBox MB_OK|MB_ICONSTOP "进程检查超时（15 秒），不能确认 Neo 已退出。本次操作已停止，请稍后重试。"
+running_failed:
   SetErrors
   Return
 running_ok:
@@ -201,8 +214,44 @@ FunctionEnd
 !insertmacro InitTransaction ""
 !insertmacro InitTransaction "un."
 
+Function CheckPlatform
+  ; IsWow64Process2 的 nativeMachine 不受 x86/x64 仿真影响；RunningX64 会误放 ARM64。
+  StrCpy $0 0
+  StrCpy $1 0
+  StrCpy $2 0
+  System::Call 'kernel32::IsWow64Process2(p -1, *i r1 r1, *i r2 r2) i .r0'
+  StrCmp $0 1 0 platform_unknown
+  IntOp $2 $2 & 0xffff
+  IntCmp $2 0x8664 platform_version platform_arch platform_arch
+platform_version:
+  ; RtlGetVersion 不受兼容性 manifest / GetVersionEx 版本虚拟化影响。
+  System::Call '*(i 276, i 0, i 0, i 0, i 0, &w128 "") p .r0'
+  StrCmp $0 0 platform_unknown
+  StrCpy $4 -1
+  System::Call 'ntdll::RtlGetVersion(p r0) i .r4'
+  System::Call '*$0(i, i .r1, i .r2, i .r3)'
+  System::Free $0
+  StrCmp $4 0 0 platform_unknown
+  IntCmp $1 10 platform_build platform_old platform_supported
+platform_build:
+  IntCmp $3 19041 platform_supported platform_old platform_supported
+platform_arch:
+  MessageBox MB_OK|MB_ICONSTOP "Neo 仅支持原生 x64（AMD64）Windows，不支持 32 位 Windows 或 ARM64 仿真。安装尚未解包。"
+  Goto platform_abort
+platform_old:
+  MessageBox MB_OK|MB_ICONSTOP "Neo 需要 Windows 10 2004（系统内部版本 19041）或更新的 Windows。请先升级系统；安装尚未解包。"
+  Goto platform_abort
+platform_unknown:
+  MessageBox MB_OK|MB_ICONSTOP "无法可靠确认系统版本或原生架构。Neo 需要 Windows 10 2004（19041）及以上的原生 x64 系统；为安全起见已停止安装。"
+platform_abort:
+  SetErrorLevel 2
+  Abort
+platform_supported:
+FunctionEnd
+
 Function .onInit
   Call AcquireLock
+  Call CheckPlatform
 FunctionEnd
 
 Function un.onInit
@@ -478,6 +527,16 @@ Section "Uninstall"
   Delete "$INSTDIR\neo.ico"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\LICENSE"
+  ; 与 check_release.py 的 CRT_NAMES 对齐；不使用 *.dll，保留未知用户文件。
+  Delete "$INSTDIR\vcruntime140.dll"
+  Delete "$INSTDIR\vcruntime140_1.dll"
+  Delete "$INSTDIR\vcruntime140_threads.dll"
+  Delete "$INSTDIR\msvcp140.dll"
+  Delete "$INSTDIR\msvcp140_1.dll"
+  Delete "$INSTDIR\msvcp140_2.dll"
+  Delete "$INSTDIR\msvcp140_atomic_wait.dll"
+  Delete "$INSTDIR\msvcp140_codecvt_ids.dll"
+  Delete "$INSTDIR\concrt140.dll"
   IfErrors uninstall_failed
   ; 注册项删除失败时保留卸载器，以便用户修复权限后重试。
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Neo"

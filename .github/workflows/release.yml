@@ -22,6 +22,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+  PYTHONUTF8: "1"
 
 # 分支检查被新推送取代即可取消；tag 发布永不取消。
 concurrency:
@@ -36,13 +38,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
+        run: rustup toolchain install stable --profile minimal --no-self-update --target x86_64-pc-windows-msvc
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x64-msvc
 
       - name: Check all workspace targets
-        run: cargo check --locked --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
 
       # 仅运行纯逻辑/临时数据库测试；不运行真实截图、麦克风或 GUI 工具测试。
       - name: Safe library tests
@@ -50,6 +54,24 @@ jobs:
 
       - name: Tool policy tests
         run: 'cargo test --locked -p neo-tools --lib policy::tests::'
+
+      - name: Overlay compatibility tests (no desktop capture)
+        run: 'cargo test --locked -p neo-overlay --lib regression_tests:: --target x86_64-pc-windows-msvc'
+
+      - name: App overlay fallback tests (no GUI or audio)
+        shell: pwsh
+        run: |
+          cargo test --locked -p neo-app --bin neo graphics_tests:: --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo safety_overlay_loss_reopens_fallback_and_invalidates_old_answer --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo toast_overlay_loss_keeps_deadline_and_registers_passive_fallback_each_frame --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo backend_switch_resets_positions_but_preserves_local_beam_cache --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Installer and release checks (isolated, never install)
+        run: python -m unittest tools.test_installer tools.test_check_release -v
 
   release:
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
@@ -81,13 +103,15 @@ jobs:
           echo "version=$v prerelease=$pre"
 
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
+        run: rustup toolchain install stable --profile minimal --no-self-update --target x86_64-pc-windows-msvc
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x64-msvc
 
       - name: Build
-        run: cargo build --locked --release -p neo-app
+        run: cargo build --locked --release -p neo-app --target x86_64-pc-windows-msvc
 
       # ---- 以下全部为打包/发布步骤：分支推送及 PR 不执行 ----
 
@@ -114,13 +138,30 @@ jobs:
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $pkg = "dist\neo"
-          New-Item -ItemType Directory -Force $pkg | Out-Null
-          Copy-Item target\release\neo.exe $pkg\
+          if (Test-Path $pkg) { throw "Package directory must be clean: $pkg" }
+          New-Item -ItemType Directory $pkg | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\neo.exe $pkg\
           Copy-Item -Recurse crates\neo-wake\assets "$pkg\assets"
           Copy-Item -Recurse assets-stt "$pkg\assets-stt"
           Copy-Item -Recurse runtime "$pkg\runtime"
           Copy-Item README.md, LICENSE $pkg\ -ErrorAction SilentlyContinue
+
+      # 只从已授权 VS 的 Redist 目录收集真实导入依赖，不使用 System32 或执行 vc_redist。
+      # app-local CRT 安全更新需要随 Neo 重新发布；UCRT/API sets 由 Win10 自带。
+      - name: Audit packaged PE imports and collect app-local MSVC CRT
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Licensed Visual Studio C++ tools not found' }
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin -or -not $crt) { throw 'MSVC dumpbin or licensed x64 CRT redistributables missing; no system DLL fallback' }
+          python tools/check_release.py --package dist/neo --dumpbin "$($dumpbin.FullName)" --redist-dir "$($crt.FullName)"
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged PE / CRT audit failed' }
 
       - name: Zip portable package
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'

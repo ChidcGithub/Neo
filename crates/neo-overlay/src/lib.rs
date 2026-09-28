@@ -33,6 +33,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -167,16 +169,66 @@ struct DesktopBounds {
 }
 
 impl DesktopBounds {
-    fn from_rect(rect: screen::Rect) -> Self {
-        Self {
-            origin: (rect.x, rect.y),
-            size: (rect.width.max(1) as u32, rect.height.max(1) as u32),
+    fn from_rect(rect: screen::Rect) -> Result<Self, String> {
+        if rect.width <= 0 || rect.height <= 0 {
+            return Err(format!("无效虚拟桌面尺寸: {}x{}", rect.width, rect.height));
         }
+        Ok(Self {
+            origin: (rect.x, rect.y),
+            size: (rect.width as u32, rect.height as u32),
+        })
     }
 
     fn client_point(self, screen: (i32, i32)) -> (i32, i32) {
         (screen.0 - self.origin.0, screen.1 - self.origin.1)
     }
+}
+
+fn validate_dimensions(size: (u32, u32), max_dimension: u32) -> Result<(), String> {
+    let (width, height) = size;
+    if width == 0 || height == 0 || width > max_dimension || height > max_dimension {
+        return Err(format!("overlay 尺寸 {width}x{height} 超出有效范围 1..={max_dimension}"));
+    }
+    Ok(())
+}
+
+fn overlay_limits(supported: &wgpu::Limits, size: (u32, u32)) -> Result<wgpu::Limits, String> {
+    validate_dimensions(size, supported.max_texture_dimension_2d)?;
+    let mut limits = wgpu::Limits::downlevel_defaults().using_alignment(supported.clone());
+    // 预留适配器实际支持的 2D 范围，让正常热插拔不受初始桌面尺寸限制。
+    limits.max_texture_dimension_2d = supported.max_texture_dimension_2d;
+    if !limits.check_limits(supported) {
+        return Err("适配器不满足 overlay 渲染所需 limits".into());
+    }
+    Ok(limits)
+}
+
+fn transparent_alpha(modes: &[wgpu::CompositeAlphaMode]) -> Result<wgpu::CompositeAlphaMode, String> {
+    // shader 和 egui 都输出预乘 alpha；PostMultiplied 不能直接替代。
+    modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+        .then_some(wgpu::CompositeAlphaMode::PreMultiplied)
+        .ok_or_else(|| "overlay surface 不支持预乘透明合成".into())
+}
+
+fn supports_capture_exclusion(version: Option<(u32, u32, u32)>) -> bool {
+    version.is_some_and(|version| version >= (10, 0, 19041))
+}
+
+fn windows_version() -> Option<(u32, u32, u32)> {
+    let mut info = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    // RtlGetVersion 不受应用兼容 manifest 的版本谎报影响；查询失败即禁采。
+    (unsafe { RtlGetVersion(&mut info) } >= 0)
+        .then_some((info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber))
+}
+
+fn valid_upload(size: (u32, u32), len: usize, max_dimension: u32) -> bool {
+    validate_dimensions(size, max_dimension).is_ok()
+        && size.0.checked_mul(4).is_some()
+        && (size.0 as usize).checked_mul(size.1 as usize)
+            .and_then(|pixels| pixels.checked_mul(4)) == Some(len)
 }
 
 fn capture_rest(elapsed: Duration) -> Duration {
@@ -423,9 +475,8 @@ fn run(
     slot: FrameSlot,
     cards: CardSlot,
 ) {
-    // 无论正常退出还是 panic 展开（wgpu 的校验错误默认就是 panic），都要放
-    // stop —— 否则抓屏线程跑到进程退出：迷你窗被永久压制、冻结的跑马灯残留
-    // 在屏上、show()/hide() 全部落空且无人上报。
+    // 正常退出/初始化失败都关闭采集；release panic=abort 不会运行析构，
+    // 因此尺寸与能力必须在 GPU 调用前校验，不能靠展开或 catch_unwind 保护。
     struct StopGuard(Arc<AtomicBool>, FrameSlot);
     impl Drop for StopGuard {
         fn drop(&mut self) {
@@ -459,9 +510,11 @@ fn run(
                     // 后台循环，走它会压死迷你窗、把折射帧率拖到 ~3fps、还会在听写
                     // 结束后凭空闪一次全屏白框（信号被反复续期后的假反馈）。
                     // 本窗自带 WDA_EXCLUDEFROMCAPTURE，画面里本来就没有自己。
-                    if let Ok(shot) = screen::capture_silent(rect) {
-                        if let Ok(mut g) = slot.lock() {
-                            g.publish(generation, DesktopBounds::from_rect(rect), shot);
+                    if let Ok(bounds) = DesktopBounds::from_rect(rect) {
+                        if let Ok(shot) = screen::capture_silent(rect) {
+                            if let Ok(mut g) = slot.lock() {
+                                g.publish(generation, bounds, shot);
+                            }
                         }
                     }
                     std::thread::sleep(capture_rest(started.elapsed()));
@@ -543,8 +596,10 @@ fn msg_loop(
             if !shown {
                 gfx.wnd.display_dirty.store(true, Ordering::Relaxed);
             }
-            gfx.refresh_display(false);
-            gfx.render(&level);
+            if let Err(error) = gfx.refresh_display(false).and_then(|()| gfx.render(&level)) {
+                eprintln!("neo-overlay 已停止，交回辅助窗口 fallback: {error}");
+                break;
+            }
             // 露面时机：先离屏渲好一帧再 SW_SHOWNA —— 用户看到的第一个
             // 画面就是成品，新建窗口的黑帧在这套结构里不存在。
             if !shown {
@@ -604,7 +659,9 @@ fn msg_loop(
             }
         }
     }
-    stop.store(true, Ordering::Relaxed);
+    stop.store(true, Ordering::Release);
+    visible.store(false, Ordering::Relaxed);
+    gfx.slot.lock().unwrap_or_else(|p| p.into_inner()).set_enabled(false);
 }
 
 /// 窗口线程与窗口过程共享的状态（命中矩形 + 输入事件队列）。
@@ -909,8 +966,8 @@ impl Gfx {
     fn new(slot: FrameSlot, cards: CardSlot) -> Result<Self, String> {
         screen::ensure_dpi_aware();
         let rect = screen::virtual_screen();
-        let width = rect.width.max(1) as u32;
-        let height = rect.height.max(1) as u32;
+        let bounds = DesktopBounds::from_rect(rect)?;
+        let (width, height) = bounds.size;
 
         // 覆盖整个虚拟桌面（可多显示器、原点可为负）的全屏无边框置顶窗口。
         // WS_EX_TRANSPARENT = 鼠标穿透；WS_EX_NOACTIVATE = 永不抢焦点；
@@ -956,7 +1013,7 @@ impl Gfx {
         // 窗口过程共享状态：origin = 窗口在虚拟屏的左上角（可为负），
         // ppp 取系统主屏 DPI（v1：卡片都锚在主屏；副屏异 DPI 备案）。
         let wnd = Arc::new(WndState {
-            bounds: Mutex::new(DesktopBounds::from_rect(rect)),
+            bounds: Mutex::new(bounds),
             display_dirty: AtomicBool::new(false),
             ppp: AtomicU32::new(((unsafe { GetDpiForSystem() } as f32) / 96.0).to_bits()),
             hit_rects: Mutex::new(Vec::new()),
@@ -985,10 +1042,10 @@ impl Gfx {
         }
         let hwnd_guard = HwndGuard(hwnd);
         // 让窗口对截屏不可见（抓屏线程才能拍到干净的桌面做折射）。
-        // WDA_EXCLUDEFROMCAPTURE 需 Win10 2004+；低版本或远程会话等场景下
-        // 返回 FALSE。失败后抓屏会拍到跑马灯自己，折射形成反馈循环 ——
-        // 记下来，整轮禁用折射（只画光环），比"越转越亮"体面得多。
-        let exclude_ok = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } != 0;
+        // 旧系统可能成功返回却仅按 WDA_MONITOR 处理（抓屏黑块），不能只看 BOOL。
+        // 版本未知/低于 19041 或 API 失败时，只画光环，不给抓屏线程许可。
+        let exclude_ok = supports_capture_exclusion(windows_version())
+            && unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } != 0;
         slot.lock().unwrap().set_exclude_ok(exclude_ok);
 
         // 强制 DX12 + DirectComposition 交换链（否则窗口不支持透明）
@@ -1023,9 +1080,13 @@ impl Gfx {
             apply_limit_buckets: false,
         }))
         .map_err(|e| e.to_string())?;
+        let required_limits = overlay_limits(&adapter.limits(), bounds.size)?;
         let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .map_err(|e| e.to_string())?;
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                required_limits,
+                ..Default::default()
+            })).map_err(|e| e.to_string())?;
+        validate_dimensions(bounds.size, device.limits().max_texture_dimension_2d)?;
 
         // 交换链配置：BGRA + 预乘 alpha
         let caps = surface.get_capabilities(&adapter);
@@ -1034,19 +1095,13 @@ impl Gfx {
             .iter()
             .copied()
             .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
-            .unwrap_or(caps.formats[0]);
-        let alpha_mode = if caps
-            .alpha_modes
-            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
-        {
-            wgpu::CompositeAlphaMode::PreMultiplied
-        } else {
-            caps.alpha_modes[0]
-        };
+            .or_else(|| caps.formats.first().copied())
+            .ok_or("overlay surface 没有可用格式")?;
+        let alpha_mode = transparent_alpha(&caps.alpha_modes)?;
         let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
             wgpu::PresentMode::Fifo
         } else {
-            caps.present_modes[0]
+            *caps.present_modes.first().ok_or("overlay surface 没有可用呈现模式")?
         };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1150,7 +1205,7 @@ impl Gfx {
             &sampler,
             ((config.width as f32) * RENDER_SCALE).max(1.0) as u32,
             ((config.height as f32) * RENDER_SCALE).max(1.0) as u32,
-        );
+        )?;
 
         // 内嵌 egui：独立上下文 + 中文字体装配（卡片 UI 用它绘制）。
         let egui_ctx = egui::Context::default();
@@ -1201,7 +1256,8 @@ impl Gfx {
         sampler: &wgpu::Sampler,
         w: u32,
         h: u32,
-    ) -> Offscreen {
+    ) -> Result<Offscreen, String> {
+        validate_dimensions((w, h), device.limits().max_texture_dimension_2d)?;
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("overlay-offscreen"),
             size: wgpu::Extent3d {
@@ -1231,13 +1287,13 @@ impl Gfx {
                 },
             ],
         });
-        Offscreen {
+        Ok(Offscreen {
             _tex: tex,
             view,
             blit_bind,
             w,
             h,
-        }
+        })
     }
 
     fn make_bind_group(
@@ -1458,7 +1514,8 @@ impl Gfx {
             return;
         }
         // 跨线程来的数据，长度不符时 write_texture 会直接 panic —— 宁可丢帧。
-        if shot.rgba.len() != shot.width as usize * shot.height as usize * 4 {
+        if !valid_upload((shot.width, shot.height), shot.rgba.len(),
+            self.device.limits().max_texture_dimension_2d) {
             return;
         }
         if shot.width != self.desktop.w || shot.height != self.desktop.h {
@@ -1512,13 +1569,15 @@ impl Gfx {
         );
     }
 
-    fn refresh_display(&mut self, force: bool) {
+    fn refresh_display(&mut self, force: bool) -> Result<(), String> {
         let dirty = self.wnd.display_dirty.swap(false, Ordering::Relaxed);
         if !force && !dirty && self.display_checked.elapsed() < Duration::from_secs(1) {
-            return;
+            return Ok(());
         }
         self.display_checked = Instant::now();
-        let bounds = DesktopBounds::from_rect(screen::virtual_screen());
+        // 必须在移动窗口、修改 config 或分配纹理之前拦住无效/超限拓扑。
+        let bounds = DesktopBounds::from_rect(screen::virtual_screen())?;
+        validate_dimensions(bounds.size, self.device.limits().max_texture_dimension_2d)?;
         let old = *self.wnd.bounds.lock().unwrap();
         let ppp = screen::dpi_scale_at(0, 0).unwrap_or(1.0) as f32;
         let old_ppp = f32::from_bits(self.wnd.ppp.load(Ordering::Relaxed));
@@ -1550,11 +1609,12 @@ impl Gfx {
             self.offscreen = Self::make_offscreen(&self.device,
                 &self.blit_pipeline.get_bind_group_layout(0), &self.sampler,
                 ((bounds.size.0 as f32) * RENDER_SCALE).max(1.0) as u32,
-                ((bounds.size.1 as f32) * RENDER_SCALE).max(1.0) as u32);
+                ((bounds.size.1 as f32) * RENDER_SCALE).max(1.0) as u32)?;
         }
+        Ok(())
     }
 
-    fn render(&mut self, level: &AtomicU32) {
+    fn render(&mut self, level: &AtomicU32) -> Result<(), String> {
         // 只取当前许可下的帧；Hide 后保留已上传纹理淡出，不再接收迟到帧。
         let current = *self.wnd.bounds.lock().unwrap();
         let shot = self.slot.lock().ok().and_then(|mut g| g.take(current));
@@ -1590,7 +1650,7 @@ impl Gfx {
         let draw_ripple = self.cur_i > 0.004 || self.tgt.0 > 0.0;
         let egui = self.egui_frame();
         if !draw_ripple && egui.is_none() {
-            return; // 无事可画（正常不会走到：active 前提是波纹或卡片在）
+            return Ok(()); // 无事可画（正常不会走到：active 前提是波纹或卡片在）
         }
 
         if draw_ripple {
@@ -1620,13 +1680,12 @@ impl Gfx {
                 // 锁屏 / UAC 安全桌面期间拿不到 surface：直接 return 会让消息
                 // 循环在活跃分支里 100% 空转一个核。睡 50ms 降频等系统回来。
                 std::thread::sleep(Duration::from_millis(50));
-                return;
+                return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.refresh_display(true);
-                return;
+                return self.refresh_display(true);
             }
-            wgpu::CurrentSurfaceTexture::Validation => return,
+            wgpu::CurrentSurfaceTexture::Validation => return Err("overlay surface 校验失败".into()),
         };
         let view = frame.texture.create_view(&Default::default());
         let mut enc = self
@@ -1728,12 +1787,76 @@ impl Gfx {
             self.queue.submit(std::iter::once(enc.finish()));
         }
         self.queue.present(frame);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    #[test]
+    fn dimensions_request_adapter_capacity_and_reject_insufficient_limits() {
+        let supported = wgpu::Limits { max_texture_dimension_2d: 16384, ..wgpu::Limits::default() };
+        let requested = overlay_limits(&supported, (11520, 2160)).unwrap();
+        assert_eq!(requested.max_texture_dimension_2d, 16384);
+        assert!(requested.check_limits(&supported));
+        let limited = wgpu::Limits { max_texture_dimension_2d: 4096, ..supported.clone() };
+        assert!(overlay_limits(&limited, (3840, 2160)).is_ok());
+        assert!(overlay_limits(&limited, (11520, 2160)).is_err());
+        let insufficient = wgpu::Limits { max_bind_groups: 0, ..supported };
+        assert!(overlay_limits(&insufficient, (1920, 1080)).is_err());
+    }
+
+    #[test]
+    fn dimensions_hotplug_checks_device_limit_before_reconfiguration() {
+        let supported = wgpu::Limits { max_texture_dimension_2d: 16384, ..wgpu::Limits::default() };
+        let device = overlay_limits(&supported, (1920, 1080)).unwrap();
+        for size in [(11520, 2160), (16384, 2160), (2160, 16384)] {
+            assert!(validate_dimensions(size, device.max_texture_dimension_2d).is_ok());
+        }
+        for size in [(16385, 2160), (2160, 16385), (0, 2160), (1920, 0)] {
+            assert!(validate_dimensions(size, device.max_texture_dimension_2d).is_err());
+        }
+        for (width, height) in [(0, 1080), (1920, 0), (-1, 1080), (1920, -1)] {
+            assert!(DesktopBounds::from_rect(screen::Rect { x: -1920, y: 0, width, height }).is_err());
+        }
+    }
+
+    #[test]
+    fn dimensions_upload_rejects_zero_oversize_and_malformed_frames() {
+        assert!(valid_upload((11520, 2160), 11520 * 2160 * 4, 16384));
+        assert!(!valid_upload((11520, 2160), 11520 * 2160 * 4, 8192));
+        assert!(!valid_upload((0, 0), 0, 16384));
+        assert!(!valid_upload((2, 2), 15, 16384));
+        assert!(!valid_upload((u32::MAX, u32::MAX), 0, u32::MAX));
+    }
+
+    #[test]
+    fn capture_exclusion_requires_19041_and_successful_affinity() {
+        for (version, supported) in [
+            (None, false), (Some((6, 3, 9600)), false),
+            (Some((10, 0, 19040)), false), (Some((10, 0, 19041)), true),
+            (Some((10, 0, 19045)), true), (Some((10, 0, 22000)), true),
+        ] {
+            assert_eq!(supports_capture_exclusion(version), supported);
+            for affinity_ok in [false, true] {
+                let mut state = CaptureState::default();
+                state.set_enabled(true);
+                state.set_exclude_ok(supports_capture_exclusion(version) && affinity_ok);
+                assert_eq!(state.begin().is_some(), supported && affinity_ok);
+            }
+        }
+    }
+
+    #[test]
+    fn transparency_never_falls_back_to_opaque_or_wrong_alpha_convention() {
+        use wgpu::CompositeAlphaMode::*;
+        for modes in [vec![], vec![Opaque], vec![Auto, Inherit], vec![PostMultiplied]] {
+            assert!(transparent_alpha(&modes).is_err());
+        }
+        assert_eq!(transparent_alpha(&[Opaque, PreMultiplied]).unwrap(), PreMultiplied);
+    }
 
     fn safe_capture() -> CaptureState {
         let mut state = CaptureState::default();
@@ -2185,15 +2308,15 @@ mod regression_tests {
 
     #[test]
     fn topology_change_updates_negative_origin_and_size() {
-        let old = DesktopBounds::from_rect(screen::Rect { x: 0, y: 0, width: 1920, height: 1080 });
-        let new = DesktopBounds::from_rect(screen::Rect { x: -1280, y: -200, width: 3200, height: 1440 });
+        let old = DesktopBounds::from_rect(screen::Rect { x: 0, y: 0, width: 1920, height: 1080 }).unwrap();
+        let new = DesktopBounds::from_rect(screen::Rect { x: -1280, y: -200, width: 3200, height: 1440 }).unwrap();
         assert_ne!(old, new);
         assert_eq!(new.size, (3200, 1440));
         assert_eq!(new.client_point((50, 60)), (1330, 260));
         let shifted = DesktopBounds { origin: (0, 0), ..new };
         assert_ne!(shifted, new);
         assert_eq!(shifted.size, new.size);
-        assert_eq!(DesktopBounds::from_rect(screen::Rect { x: 0, y: 0, width: 0, height: 0 }).size, (1, 1));
+        assert!(DesktopBounds::from_rect(screen::Rect { x: 0, y: 0, width: 0, height: 0 }).is_err());
     }
 }
 

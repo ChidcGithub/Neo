@@ -47,6 +47,7 @@ fn save_status(generated: bool, state: SaveState, close_blocked: bool) -> String
 pub struct ClassWin {
     /// 上一帧是否开着（沿检测用）。
     open: bool,
+    using_overlay: bool,
     /// 回调里点「关闭」置位，tick 里落到 `ClassMonitor::dismiss`。
     close_wanted: Arc<AtomicBool>,
     retry_wanted: Arc<AtomicBool>,
@@ -79,6 +80,14 @@ impl ClassWin {
         theme: Theme,
         overlay: Option<&neo_overlay::OverlayHandle>,
     ) {
+        let overlay = overlay.filter(|layer| layer.is_alive());
+        if self.using_overlay != overlay.is_some() {
+            self.using_overlay = overlay.is_some();
+            self.open = false;
+            if self.using_overlay {
+                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Close);
+            }
+        }
         // 1. 关闭回传先行：dismiss 后 presenting 转 None，本轮即走关闭沿。
         if self.retry_wanted.swap(false, Ordering::Relaxed) {
             monitor.retry_save();
@@ -91,8 +100,7 @@ impl ClassWin {
         // 2. 位置：屏幕上方居中。
         let rect = Self::target_rect(
             theme,
-            ctx.input(|i| i.viewport().monitor_size)
-                .unwrap_or(Vec2::new(1920.0, 1080.0)),
+            super::miniwin::screen_geometry(ctx, overlay.is_some()).monitor,
         );
         let size = rect.size();
         let target = rect.min;
