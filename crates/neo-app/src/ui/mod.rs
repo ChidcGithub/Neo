@@ -26,6 +26,8 @@ pub mod miniwin;
 pub mod settings;
 pub mod sidebar;
 pub mod tools;
+pub mod toastwin;
+pub mod waketest;
 
 use neo_theme::Theme;
 use neo_ui::Design;

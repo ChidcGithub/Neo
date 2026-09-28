@@ -44,6 +44,8 @@ pub struct MessageRow {
     pub meta: String,
     /// 附件 JSON；图片数据随附件保存，空附件为 `[]`。
     pub attachments: String,
+    pub tool_calls: String,
+    pub tool_call_id: String,
 }
 
 pub type Result<T> = std::result::Result<T, rusqlite::Error>;
@@ -89,6 +91,18 @@ impl Store {
             ) {
                 if !e.to_string().contains("duplicate column") {
                     return Err(e);
+                }
+            }
+        }
+        for (name, default) in [("tool_calls", "[]"), ("tool_call_id", "")] {
+            let columns = conn.prepare("PRAGMA table_info(messages)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>>>()?;
+            if !columns.iter().any(|column| column == name) {
+                if let Err(error) = conn.execute(&format!(
+                    "ALTER TABLE messages ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'"
+                ), []) {
+                    if !error.to_string().contains("duplicate column") { return Err(error); }
                 }
             }
         }
@@ -167,7 +181,7 @@ impl Store {
     pub fn messages(&self, session_id: i64) -> Result<Vec<MessageRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(
-            "SELECT role, content, reasoning, meta, attachments FROM messages \
+            "SELECT role, content, reasoning, meta, attachments, tool_calls, tool_call_id FROM messages \
              WHERE session_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt
@@ -178,6 +192,8 @@ impl Store {
                     reasoning: r.get(2)?,
                     meta: r.get(3)?,
                     attachments: r.get(4)?,
+                    tool_calls: r.get(5)?,
+                    tool_call_id: r.get(6)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -206,13 +222,29 @@ impl Store {
         meta: &str,
         attachments: &str,
     ) -> Result<i64> {
+        self.append_message_with_protocol(session_id, role, content, reasoning, meta, attachments, "[]", "")
+    }
+
+    /// 原文与工具协议同事务保存，避免重开后丢失配对结果。
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_message_with_protocol(
+        &self,
+        session_id: i64,
+        role: &str,
+        content: &str,
+        reasoning: &str,
+        meta: &str,
+        attachments: &str,
+        tool_calls: &str,
+        tool_call_id: &str,
+    ) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let timestamp = now();
         tx.execute(
-            "INSERT INTO messages (session_id, role, content, reasoning, meta, attachments, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![session_id, role, content, reasoning, meta, attachments, timestamp],
+            "INSERT INTO messages (session_id, role, content, reasoning, meta, attachments, created_at, tool_calls, tool_call_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![session_id, role, content, reasoning, meta, attachments, timestamp, tool_calls, tool_call_id],
         )?;
         let message_id = tx.last_insert_rowid();
         tx.execute(
@@ -221,6 +253,22 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(message_id)
+    }
+
+    /// 检查点只允许覆盖已持久化消息；原消息不被删除。
+    pub fn save_checkpoint(&self, session: i64, covered: usize, data: &str) -> Result<()> {
+        let conn = self.conn();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM messages WHERE session_id=?1", [session], |r| r.get(0))?;
+        if covered == 0 || covered > count as usize {
+            return Err(rusqlite::Error::InvalidParameterName("checkpoint boundary".into()).into());
+        }
+        conn.execute("INSERT INTO context_checkpoints(session_id,covered,data) VALUES(?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET covered=excluded.covered,data=excluded.data", params![session, covered as i64, data])?;
+        Ok(())
+    }
+
+    pub fn checkpoint(&self, session: i64) -> Result<Option<(usize, String)>> {
+        let conn = self.conn();
+        Ok(conn.query_row("SELECT covered,data FROM context_checkpoints WHERE session_id=?1 AND covered>0 AND covered<=(SELECT COUNT(*) FROM messages WHERE session_id=?1)", [session], |r| Ok((r.get::<_, i64>(0)? as usize, r.get(1)?))).optional()?)
     }
 
     /// 读取设置；不存在返回 `None`。
@@ -277,6 +325,11 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_ms DESC);
 
+CREATE TABLE IF NOT EXISTS context_checkpoints (
+    session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    covered INTEGER NOT NULL,
+    data TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -311,6 +364,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::open(&dir.join("neo.db")).expect("打开测试库");
         (store, dir)
+    }
+
+    #[test]
+    fn checkpoint_boundary_reopen_and_delete() {
+        let (store, dir) = temp_store("checkpoint");
+        let id = store.create_session("摘要").unwrap();
+        assert!(store.save_checkpoint(id, 1, "summary").is_err());
+        store.append_message(id, "user", "原文", "", "").unwrap();
+        assert!(store.save_checkpoint(id, 0, "summary").is_err());
+        store.save_checkpoint(id, 1, "summary").unwrap();
+        drop(store);
+        let store = Store::open(&dir.join("neo.db")).unwrap();
+        assert_eq!(store.checkpoint(id).unwrap(), Some((1, "summary".into())));
+        assert_eq!(store.messages(id).unwrap()[0].content, "原文");
+        store.delete_session(id).unwrap();
+        assert!(store.checkpoint(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn checkpoint_boundary_uses_session_position_and_failed_update_keeps_previous() {
+        let (store, dir) = temp_store("checkpoint-position");
+        let id = store.create_session("摘要会话").unwrap();
+        let other = store.create_session("其他会话").unwrap();
+        store.append_message(other, "user", "其他记录", "", "").unwrap();
+        store.append_message(id, "user", "首条原意", "", "").unwrap();
+        store.append_message(other, "assistant", "交错记录", "", "").unwrap();
+        store.append_message(id, "assistant", "历史回答", "", "").unwrap();
+        store.save_checkpoint(id, 2, "previous").unwrap();
+        assert!(store.save_checkpoint(id, 3, "invalid").is_err());
+        assert_eq!(store.checkpoint(id).unwrap(), Some((2, "previous".into())));
+        store.append_message(id, "user", "最近意图", "", "").unwrap();
+        store.conn().execute_batch("CREATE TRIGGER reject_checkpoint BEFORE UPDATE ON context_checkpoints BEGIN SELECT RAISE(ABORT, 'test'); END;").unwrap();
+        assert!(store.save_checkpoint(id, 3, "failed").is_err());
+        drop(store);
+        let store = Store::open(&dir.join("neo.db")).unwrap();
+        assert_eq!(store.checkpoint(id).unwrap(), Some((2, "previous".into())));
+        let rows = store.messages(id).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].content, "首条原意");
+        assert_eq!(rows[2].content, "最近意图");
+        assert!(store.checkpoint(other).unwrap().is_none());
     }
 
     #[test]
@@ -378,6 +472,23 @@ mod tests {
         assert_eq!(messages[0].reasoning, "思考");
         assert_eq!(messages[0].meta, "元信息");
         assert_eq!(messages[0].attachments, attachments);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tool_protocol_survives_reopen() {
+        let (store, dir) = temp_store("tool-protocol");
+        let id = store.create_session("工具协议").unwrap();
+        let calls = r#"[{"id":"call-1","name":"read_file","arguments":"{ \"path\": \"a.txt\" }"}]"#;
+        store.append_message_with_protocol(id, "assistant", "读取", "思考", "", "[]", calls, "").unwrap();
+        store.append_message_with_protocol(id, "tool", r#"{"ok":true,"data":{"content":"原文"}}"#, "", "read_file", "[]", "[]", "call-1").unwrap();
+        drop(store);
+        let store = Store::open(&dir.join("neo.db")).unwrap();
+        let rows = store.messages(id).unwrap();
+        assert_eq!(rows[0].tool_calls, calls);
+        assert_eq!(rows[1].tool_call_id, "call-1");
+        assert!(rows[1].content.contains("原文"));
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

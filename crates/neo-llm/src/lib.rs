@@ -154,7 +154,7 @@ impl Thinking {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     /// 形如 `https://api.deepseek.com`，**不带**路径与末尾斜杠。
     pub base_url: String,
@@ -164,6 +164,8 @@ pub struct Config {
     pub model: String,
     /// 思考模式档位。默认「不表态」。
     pub thinking: Thinking,
+    /// 本地保守估算上限；应按接口实际能力调整。
+    pub context_tokens: usize,
 }
 
 impl Config {
@@ -174,6 +176,7 @@ impl Config {
             api_key: api_key.into(),
             model: "deepseek-chat".to_owned(),
             thinking: Thinking::default(),
+            context_tokens: CONTEXT_TOKENS,
         }
     }
 
@@ -206,7 +209,7 @@ impl Role {
 }
 
 /// 模型请求的一次工具调用（已聚合）。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     /// 协议要求的调用 id，回灌结果时用它配对。
     pub id: String,
@@ -374,8 +377,16 @@ impl Msg {
     }
 }
 
-/// 固定以 32K 为目标，不因模型名称猜测更大的上下文。
-pub const CONTEXT_TOKENS: usize = 32 * 1024;
+/// 默认一百万；不是供应商能力承诺，不按模型名称猜测。
+pub const CONTEXT_TOKENS: usize = 1_000_000;
+pub const MIN_CONTEXT_TOKENS: usize = 8192;
+pub const MAX_CONTEXT_TOKENS: usize = 4_000_000;
+
+pub fn restored_context_tokens(value: Option<&str>) -> usize {
+    value.and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| (MIN_CONTEXT_TOKENS..=MAX_CONTEXT_TOKENS).contains(n))
+        .unwrap_or(CONTEXT_TOKENS)
+}
 pub const OUTPUT_TOKENS: usize = 4096;
 const MIN_OUTPUT_TOKENS: usize = 1024;
 const PROTOCOL_TOKENS: usize = 1024;
@@ -392,6 +403,10 @@ pub fn estimate_text_tokens(text: &str) -> usize {
 }
 
 impl Msg {
+    pub fn is_rejected(&self) -> bool {
+        self.budget_error.is_some()
+    }
+
     /// 保留错误而非把超限用户意图替换成可发送的短文本。
     pub fn rejected(reason: impl Into<String>) -> Self {
         let mut msg = Self::new(Role::User, "");
@@ -553,8 +568,8 @@ fn message_tokens(msg: &Msg, reasoning: bool) -> Result<usize, String> {
     Ok(tokens)
 }
 
-/// 仅删除最旧完整用户轮次；system 与最新用户轮次（含所有工具块）不可删除。
-/// 消息、JSON 参数及推理均不截断。供所有 start 入口共同使用。
+/// 校验完整上下文与工具配对；超限明确拒绝，不静默删除消息。
+/// 摘要由调用方独立生成，所有 start 入口共享此预算检查。
 pub fn budget_messages(
     config: &Config,
     messages: &mut Vec<Msg>,
@@ -565,71 +580,15 @@ pub fn budget_messages(
             return Err(e.clone());
         }
     }
-    let schema_bytes = serialized_size(&tools, CONTEXT_TOKENS * 2)?;
-    // schema 按序列化 UTF-8 字节估算，至少预留 4K，防止工具协议额外开销。
-    // 最新完整工具链优先于输出长度；实际发送也采用同一有界输出额度。
-    let fixed = MIN_OUTPUT_TOKENS + PROTOCOL_TOKENS + TOOL_RESERVE.max(schema_bytes);
-    let available = CONTEXT_TOKENS
-        .checked_sub(fixed)
-        .ok_or("工具声明超过 32K 上下文预算，尚未发送")?;
-    let keep_reasoning = !tools.is_empty() && config.thinking != Thinking::Off;
-    let mut system = 0usize;
-    for msg in messages.iter().filter(|m| m.role == Role::System) {
-        system = system.saturating_add(message_tokens(msg, keep_reasoning)?);
+    let used = context_usage(config, messages, tools)?;
+    if used > config.context_tokens {
+        return Err(format!("上下文超过配置的 {} 预算（已预留工具和输出），尚未发送；请压缩历史或减少最新输入/附件", config.context_tokens));
     }
-    let latest = messages
-        .iter()
-        .rposition(|m| m.role == Role::User)
-        .unwrap_or_else(|| {
-            messages
-                .iter()
-                .position(|m| m.role != Role::System)
-                .unwrap_or(messages.len())
-        });
-    let mut used = system;
-    let mut images = messages
-        .iter()
-        .filter(|m| m.role == Role::System)
-        .map(|m| m.images.len())
-        .sum::<usize>();
-    for msg in messages[latest..].iter().filter(|m| m.role != Role::System) {
-        used = used.saturating_add(message_tokens(msg, keep_reasoning)?);
-        images = images.saturating_add(msg.images.len());
+    if messages.iter().map(|m| m.images.len()).sum::<usize>() > MAX_IMAGES {
+        return Err("上下文图片超过 4 张，尚未发送；请压缩历史或减少图片".into());
     }
-    if used > available || images > MAX_IMAGES {
-        return Err("系统提示或最近一轮超过 32K 上下文预算（已预留工具和输出），尚未发送；请减少输入/附件或新建对话".into());
-    }
-    let mut start = latest;
-    while start > 0 {
-        let Some(previous) = messages[..start].iter().rposition(|m| m.role == Role::User) else {
-            break;
-        };
-        let mut next = used;
-        let mut count = images;
-        let mut valid = true;
-        for msg in messages[previous..start]
-            .iter()
-            .filter(|m| m.role != Role::System)
-        {
-            match message_tokens(msg, keep_reasoning) {
-                Ok(n) => next = next.saturating_add(n),
-                Err(_) => {
-                    valid = false;
-                    break;
-                }
-            }
-            count = count.saturating_add(msg.images.len());
-        }
-        if !valid || next > available || count > MAX_IMAGES {
-            break;
-        }
-        start = previous;
-        used = next;
-        images = count;
-    }
-    // 先验证候选窗口，失败时保持原输入不变。
     let mut pending = std::collections::HashSet::new();
-    for (_, msg) in messages.iter().enumerate().filter(|(i, m)| *i >= start || m.role == Role::System) {
+    for msg in messages.iter() {
         if msg.role == Role::Tool {
             if !msg.tool_calls.is_empty()
                 || !msg
@@ -656,13 +615,16 @@ pub fn budget_messages(
     if !pending.is_empty() {
         return Err("工具调用缺少完整结果，尚未发送".into());
     }
-    let mut index = 0;
-    messages.retain(|m| {
-        let keep = index >= start || m.role == Role::System;
-        index += 1;
-        keep
-    });
     Ok(())
+}
+
+pub fn context_usage(config: &Config, messages: &[Msg], tools: &[serde_json::Value]) -> Result<usize, String> {
+    let schema = serialized_size(&tools, MAX_REQUEST_BYTES)?;
+    let fixed = MIN_OUTPUT_TOKENS + PROTOCOL_TOKENS + TOOL_RESERVE.max(schema);
+    messages.iter().try_fold(fixed, |sum, msg| {
+        message_tokens(msg, !tools.is_empty() && config.thinking != Thinking::Off)
+            .map(|n| sum.saturating_add(n))
+    })
 }
 
 /// 流式过程中回报的事件。
@@ -997,11 +959,11 @@ fn build_wire<'a>(
 ) -> WireRequest<'a> {
     let has_tools = !tools.is_empty();
     let keep_reasoning = has_tools && config.thinking != Thinking::Off;
-    let schema = serialized_size(&tools, CONTEXT_TOKENS * 2).unwrap_or(CONTEXT_TOKENS);
+    let schema = serialized_size(&tools, MAX_REQUEST_BYTES).unwrap_or(config.context_tokens);
     let input = messages.iter().try_fold(0usize, |sum, msg| {
         message_tokens(msg, keep_reasoning).map(|n| sum.saturating_add(n))
-    }).unwrap_or(CONTEXT_TOKENS);
-    let max_tokens = CONTEXT_TOKENS
+    }).unwrap_or(config.context_tokens);
+    let max_tokens = config.context_tokens
         .saturating_sub(PROTOCOL_TOKENS + TOOL_RESERVE.max(schema))
         .saturating_sub(input)
         .clamp(MIN_OUTPUT_TOKENS, OUTPUT_TOKENS);
@@ -1466,8 +1428,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn context_multiround_output_reserve_matches_wire_and_stays_bounded() {
+    fn context_configuration_restore_and_million_default() {
+        assert_eq!(Config::deepseek("k").context_tokens, 1_000_000);
+        for value in [None, Some("invalid"), Some("0"), Some("4000001")] {
+            assert_eq!(restored_context_tokens(value), 1_000_000);
+        }
+        assert_eq!(restored_context_tokens(Some("32768")), 32768);
         let cfg = Config::deepseek("k");
+        let mut messages = vec![Msg::new(Role::User, "x".repeat(100_000))];
+        budget_messages(&cfg, &mut messages, &[]).unwrap();
+        assert_eq!(build_wire(&cfg, &messages, vec![]).max_tokens, OUTPUT_TOKENS);
+        let smaller = Config { context_tokens: 32 * 1024, ..cfg };
+        assert!(budget_messages(&smaller, &mut messages, &[]).is_err());
+        assert_eq!(messages[0].content.len(), 100_000);
+    }
+
+    #[test]
+    fn context_compaction_input_keeps_previous_summary_and_every_history_record() {
+        let cfg = Config { context_tokens: 32 * 1024, ..Config::deepseek("k") };
+        let history = serde_json::json!([
+            {"previous_summary": "此前目标与约束"},
+            {"role": "user", "content": "原始用户目标"},
+            {"role": "assistant", "content": "x".repeat(20_000)},
+            {"role": "tool", "content": "旧工具结果"}
+        ]).to_string();
+        let mut messages = vec![Msg::new(Role::System, "只总结历史"), Msg::new(Role::User, history.clone())];
+        budget_messages(&cfg, &mut messages, &[]).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, history);
+        assert_eq!(request_body(&cfg, &messages, vec![])["messages"][1]["content"], history);
+        messages.push(Msg::new(Role::User, "y".repeat(20_000)));
+        let before = request_body(&cfg, &messages, vec![]);
+        assert!(budget_messages(&cfg, &mut messages, &[]).is_err());
+        assert_eq!(request_body(&cfg, &messages, vec![]), before);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].content, history);
+    }
+
+    #[test]
+    fn context_multiround_output_reserve_matches_wire_and_stays_bounded() {
+        const CONTEXT_TOKENS: usize = 32 * 1024;
+        let cfg = Config { context_tokens: CONTEXT_TOKENS, ..Config::deepseek("k") };
         let tools = neo_tools::tool_declarations();
         let mut messages = vec![Msg::new(Role::System, "s".repeat(2000)), Msg::new(Role::User, "original intent")];
         for round in 0..4 {
@@ -1541,24 +1542,21 @@ mod tests {
             Msg::assistant_with_tools("", vec![call]).with_reasoning("完整推理"),
             Msg::tool_result("c", "{\"ok\":true}"),
         ];
-        budget_messages(
-            &Config::deepseek("k"),
-            &mut messages,
-            &[serde_json::json!({})],
-        )
-        .unwrap();
-        assert_eq!(messages.len(), 4);
+        let cfg = Config { context_tokens: 32 * 1024, ..Config::deepseek("k") };
+        assert!(budget_messages(&cfg, &mut messages, &[serde_json::json!({})]).is_err());
+        assert_eq!(messages.len(), 7, "超限不能冒充摘要而删除旧轮");
         assert_eq!(messages[0].content, "system");
-        assert_eq!(messages[1].content, "最新意图");
-        assert_eq!(messages[2].reasoning.as_deref(), Some("完整推理"));
-        assert_eq!(messages[3].content, "{\"ok\":true}");
+        assert_eq!(messages[1].content, "旧".repeat(9000));
+        assert_eq!(messages[4].content, "最新意图");
+        assert_eq!(messages[5].reasoning.as_deref(), Some("完整推理"));
+        assert_eq!(messages[6].content, "{\"ok\":true}");
     }
 
     #[test]
     fn context_rejects_large_latest_system_schema_and_unpaired_tools() {
         assert_eq!(estimate_text_tokens("中文"), 6);
         assert_eq!(estimate_text_tokens("abcd"), 4);
-        let cfg = Config::deepseek("k");
+        let cfg = Config { context_tokens: 32 * 1024, ..Config::deepseek("k") };
         for mut messages in [
             vec![Msg::new(Role::User, "中文".repeat(10_000))],
             vec![
@@ -1672,6 +1670,7 @@ mod tests {
             base_url: format!("http://{}", listener.local_addr().unwrap()),
             ..Config::deepseek("test")
         };
+        let cfg = Config { context_tokens: 32 * 1024, ..cfg };
         let stream = start(cfg, vec![Msg::new(Role::User, "字".repeat(100_000))]);
         assert!(matches!(
             stream.rx.recv_timeout(Duration::from_secs(3)).unwrap(),

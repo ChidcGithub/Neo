@@ -5,7 +5,7 @@
 //! 混淆或没有标记的秘密，不能把任意输入变成安全日志。
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 pub const MAX_ENTRIES: usize = 1_000;
@@ -67,8 +67,8 @@ pub struct Stats {
 
 #[derive(Clone, Debug)]
 pub struct Snapshot {
-    /// 按最后一次出现时间排列；不保留原始未脱敏文本。
-    pub entries: Vec<Entry>,
+    /// 按最后一次出现时间排列；不保留原始未脱敏文本。未变更的快照共享条目。
+    pub entries: Arc<Vec<Entry>>,
     /// 全部计数均从最近一次 clear 开始。
     pub stats: Stats,
     pub max_entries: usize,
@@ -82,6 +82,7 @@ struct Buffer {
     max_entries: usize,
     max_bytes: usize,
     max_entry_bytes: usize,
+    cached_snapshot: Option<Snapshot>,
 }
 
 impl Buffer {
@@ -92,10 +93,13 @@ impl Buffer {
             max_entries,
             max_bytes,
             max_entry_bytes,
+            cached_snapshot: None,
         }
     }
 
     fn push(&mut self, level: Level, component: &str, message: &str, now: u64) {
+        // 聚合、截断或直接丢弃也会改变计数，所有记录路径都必须失效。
+        self.cached_snapshot = None;
         self.stats.received = self.stats.received.saturating_add(1);
         let (component, component_cut) =
             sanitize(component, MAX_COMPONENT_BYTES.min(self.max_entry_bytes));
@@ -143,17 +147,18 @@ impl Buffer {
         self.entries.push_back(entry);
     }
 
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            entries: self.entries.iter().cloned().collect(),
+    fn snapshot(&mut self) -> Snapshot {
+        self.cached_snapshot.get_or_insert_with(|| Snapshot {
+            entries: Arc::new(self.entries.iter().cloned().collect()),
             stats: self.stats,
             max_entries: self.max_entries,
             max_bytes: self.max_bytes,
             max_entry_bytes: self.max_entry_bytes,
-        }
+        }).clone()
     }
 
     fn clear(&mut self) {
+        self.cached_snapshot = None;
         self.entries.clear();
         self.stats = Stats::default();
     }
@@ -196,7 +201,7 @@ pub fn record(level: Level, component: &str, message: &str) {
     logger().record(level, component, message);
 }
 
-/// 复制有界的脱敏视图，调用返回后不持锁，UI/剪贴板不会阻塞记录锁。
+/// 获取共享的有界脱敏视图；仅变更后首次读取复制条目，UI/剪贴板不持记录锁。
 pub fn snapshot() -> Snapshot {
     logger().lock().snapshot()
 }
@@ -285,6 +290,93 @@ fn clip(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn unchanged_thousand_entry_snapshots_avoid_repeated_string_copies() {
+        let mut buffer = Buffer::new(MAX_ENTRIES, MAX_BYTES, MAX_ENTRY_BYTES);
+        for index in 0..MAX_ENTRIES {
+            buffer.push(Level::Info, "test", &format!("安全事件 {index}"), index as u64);
+        }
+        let view = buffer.snapshot();
+        assert_eq!(view.entries.len(), MAX_ENTRIES);
+        assert!(view.entries.iter().zip(&buffer.entries).all(|(copy, original)| {
+            copy.component.as_ptr() != original.component.as_ptr()
+                && copy.message.as_ptr() != original.message.as_ptr()
+        }));
+        for repeats in [4, 60] {
+            let mut legacy_copies = 0;
+            let mut cached_copies = 0;
+            let mut rebuilt = 0;
+            for _ in 0..repeats {
+                // 与优化前相同的 collect/cloned 路径，活跃分配地址不可重用。
+                let legacy: Vec<_> = buffer.entries.iter().cloned().collect();
+                legacy_copies += legacy.iter().zip(&buffer.entries).map(|(a, b)| {
+                    usize::from(a.component.as_ptr() != b.component.as_ptr())
+                        + usize::from(a.message.as_ptr() != b.message.as_ptr())
+                }).sum::<usize>();
+                let next = buffer.snapshot();
+                rebuilt += usize::from(!Arc::ptr_eq(&view.entries, &next.entries));
+                cached_copies += next.entries.iter().zip(view.entries.iter()).map(|(a, b)| {
+                    usize::from(a.component.as_ptr() != b.component.as_ptr())
+                        + usize::from(a.message.as_ptr() != b.message.as_ptr())
+                }).sum::<usize>();
+            }
+            assert_eq!(legacy_copies, repeats * MAX_ENTRIES * 2);
+            assert_eq!((cached_copies, rebuilt), (0, 0));
+            println!("1000项，预热后{repeats}次读取：旧路径Box字符串复制={legacy_copies}，缓存复制={cached_copies}，缓存重建={rebuilt}");
+        }
+    }
+
+    #[test]
+    fn record_merge_eviction_and_clear_refresh_only_the_latest_snapshot() {
+        let logger = Logger {
+            started: Instant::now(),
+            buffer: Mutex::new(Buffer::new(1, 100, 40)),
+        };
+        let empty = logger.lock().snapshot();
+        logger.record(Level::Info, "test", "first");
+        let first = logger.lock().snapshot();
+        assert!(!Arc::ptr_eq(&empty.entries, &first.entries));
+        let old = Arc::downgrade(&first.entries);
+        logger.record(Level::Info, "test", "first");
+        let merged = logger.lock().snapshot();
+        assert!(!Arc::ptr_eq(&first.entries, &merged.entries));
+        assert_eq!(first.entries[0].occurrences, 1);
+        assert_eq!(merged.entries[0].occurrences, 2);
+        assert_eq!(merged.stats.merged, 1);
+        assert!(merged.entries[0].last_ms >= first.entries[0].last_ms);
+        drop(first);
+        assert!(old.upgrade().is_none(), "缓存不能累积历史快照");
+        logger.record(Level::Error, "test", "second");
+        let evicted = logger.lock().snapshot();
+        assert!(!Arc::ptr_eq(&merged.entries, &evicted.entries));
+        assert_eq!(evicted.stats.dropped, 2);
+        assert_eq!(&*evicted.entries[0].message, "second");
+        logger.lock().clear();
+        let cleared = logger.lock().snapshot();
+        assert!(!Arc::ptr_eq(&evicted.entries, &cleared.entries));
+        assert!(cleared.entries.is_empty());
+        assert_eq!(cleared.stats, Stats::default());
+        assert!(Arc::ptr_eq(&cleared.entries, &logger.lock().snapshot().entries));
+        logger.record(Level::Info, "test", "new");
+        assert_eq!(logger.lock().snapshot().stats.received, 1);
+    }
+
+    #[test]
+    fn dropped_and_truncated_records_invalidate_even_without_new_entries() {
+        for (count, bytes) in [(0, 100), (3, 1)] {
+            let mut buffer = Buffer::new(count, bytes, 20);
+            let before = buffer.snapshot();
+            buffer.push(Level::Warn, "test", &"长".repeat(100), 1);
+            let after = buffer.snapshot();
+            assert!(!Arc::ptr_eq(&before.entries, &after.entries));
+            assert!(after.entries.is_empty());
+            assert_eq!(after.stats.received, 1);
+            assert_eq!(after.stats.dropped, 1);
+            assert_eq!(after.stats.truncated, 1);
+            assert_eq!(before.stats, Stats::default());
+        }
+    }
 
     #[test]
     fn count_and_byte_limits_evict_oldest() {

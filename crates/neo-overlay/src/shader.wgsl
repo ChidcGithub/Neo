@@ -255,10 +255,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var alpha = glow * 0.42;
     if (u.refr > 0.5 && thick > 0.003) {
         // 色散：RGB 各用不同折射系数（蓝偏折最大），物理彩边
-        var refr_rgb: vec3<f32>;
-        refr_rgb.r = sample_rough(uv0 + off_uv * 0.90, rough_r, jr).r;
-        refr_rgb.g = sample_rough(uv0 + off_uv * 1.00, rough_r, jr).g;
-        refr_rgb.b = sample_rough(uv0 + off_uv * 1.10, rough_r, jr).b;
+        var refr_rgb = vec3<f32>(0.0);
+        // 薄裙 vis=0 时桌面项严格为零：省掉 15 次纹理采样，仍保留棱线高光。
+        if (vis > 0.0) {
+            refr_rgb.r = sample_rough(uv0 + off_uv * 0.90, rough_r, jr).r;
+            refr_rgb.g = sample_rough(uv0 + off_uv * 1.00, rough_r, jr).g;
+            refr_rgb.b = sample_rough(uv0 + off_uv * 1.10, rough_r, jr).b;
+        }
         // 扭曲桌面为主体（乘 vis：薄裙区不折射），被流光轻微渗色；
         // 菲涅尔处轻微压暗折射（能量守恒感）；棱线高光染一点同色
         let spec_col = mix(vec3<f32>(1.0, 1.0, 1.0), band_col, 0.30);

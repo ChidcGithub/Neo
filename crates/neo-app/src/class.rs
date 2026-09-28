@@ -1654,7 +1654,7 @@ mod regression_tests {
     fn cancelled_workers_skip_capture_network_and_locked_engine() {
         let m = active();
         let cancelled = Arc::new(AtomicBool::new(true));
-        let cfg = neo_llm::Config { base_url: String::new(), api_key: String::new(), model: String::new(), thinking: Default::default() };
+        let cfg = neo_llm::Config { base_url: String::new(), api_key: String::new(), model: String::new(), thinking: Default::default(), context_tokens: neo_llm::CONTEXT_TOKENS };
         assert!(matches!(run_vision(&cfg, true, &cancelled), ClassEvent::VisionFailed(_)));
         assert!(run_polish(&cfg, &Session::new(), &cancelled).is_err());
         let _lease = m.stt_engine.lock().unwrap();

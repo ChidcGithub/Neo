@@ -13,7 +13,7 @@ use egui::{Rect, Sense, Ui, Vec2};
 use neo_theme::fonts::LoadedFonts;
 use neo_ui::{FieldRow, Icon, IconButton, NavItem, Panel, Switch, TextField};
 
-use super::{at, section_label, segmented, text_left, Skin};
+use super::{at, segmented, Skin};
 use crate::state::{AppState, SettingsTab};
 
 /// 面板尺寸。内容区带滚动，尺寸固定；调用方负责按视口收窄。
@@ -141,16 +141,17 @@ pub fn panel(
         ui.spacing_mut().item_spacing = Vec2::ZERO;
         let cw = content_rect.width();
 
-        // 页标题行（右端是关闭钮）。
-        let (title_rect, _) = ui.allocate_exact_size(Vec2::new(cw, m.s(28.0)), Sense::hover());
-        text_left(
-            ui.painter(),
-            title_rect,
-            page_name(state.settings_tab),
+        // 标题按实际字高布局，并为关闭按钮单独留出点击区。
+        let close_d = m.s(30.0);
+        let title = ui.painter().layout(
+            page_name(state.settings_tab).to_owned(),
             d.font_bold(d.t().label + m.s(4.0)),
             p.label_primary,
+            (cw - close_d - m.s(12.0)).max(1.0),
         );
-        let close_d = m.s(24.0);
+        let (title_rect, _) = ui.allocate_exact_size(
+            Vec2::new(cw, title.size().y.max(close_d)), Sense::hover());
+        ui.painter().galley(title_rect.min, title, p.label_primary);
         let close_center = egui::pos2(title_rect.right() - close_d * 0.5, title_rect.center().y);
         if IconButton::new(Icon::Close)
             .ghost()
@@ -160,16 +161,16 @@ pub fn panel(
         {
             closed = true;
         }
-        ui.add_space(m.s(2.0));
-        ui.add(egui::Label::new(egui::RichText::new(page_desc(state.settings_tab))
-            .font(skin.prop(skin.t().caption)).color(p.label_tertiary)).wrap());
-        ui.add_space(m.s(14.0));
-        if state.preferences_unsaved {
-            ui.add(egui::Label::new(egui::RichText::new(
-                "设置尚未保存；安全限制仅对本次运行生效，重启可能恢复旧值。",
-            ).font(skin.prop(skin.t().caption)).color(p.error)).wrap());
-            ui.add_space(m.s(6.0));
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("settings-title-probe"),
+            (title_rect, Rect::from_center_size(close_center, Vec2::splat(close_d)))));
+        ui.add_space(m.s(8.0));
+        // 低矮窗口把说明和完整错误放入同一滚动区，不让固定头部吃掉正文。
+        let scroll_intro = content_rect.height() < m.s(360.0);
+        if !scroll_intro {
+            page_intro(ui, skin, state);
         }
+        row_divider(ui, skin, cw);
 
         // 内容区滚动：行多也不顶破面板（小窗里调用方会把面板收窄）。
         // 滚动状态按页签分开：长页签滚到底切页签不该继承偏移。
@@ -181,8 +182,15 @@ pub fn panel(
                 // 给滚动条让位。
                 let w = (ui.available_width() - m.s(12.0)).max(1.0);
                 ui.set_max_width(w);
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("settings-body-probe"), ui.clip_rect()));
+                if scroll_intro {
+                    page_intro(ui, skin, state);
+                }
+                ui.add_space(m.s(8.0));
                 match state.settings_tab {
                     SettingsTab::General => general_tab(ui, skin, w, state),
+                    SettingsTab::WakeTest => super::waketest::draw(ui, skin, w, state),
                     SettingsTab::Appearance => appearance_tab(ui, skin, w, state),
                     SettingsTab::Display => display_tab(ui, skin, w, state, viewport_h),
                     SettingsTab::Model => model_tab(ui, skin, w, state),
@@ -196,6 +204,18 @@ pub fn panel(
     closed
 }
 
+fn page_intro(ui: &mut Ui, skin: &Skin<'_>, state: &AppState) {
+    ui.add(egui::Label::new(egui::RichText::new(page_desc(state.settings_tab))
+        .font(skin.prop(skin.t().caption)).color(skin.p().label_tertiary)).wrap());
+    ui.add_space(skin.m().s(10.0));
+    if state.preferences_unsaved {
+        ui.add(egui::Label::new(egui::RichText::new(
+            "设置尚未保存；安全限制仅对本次运行生效，重启可能恢复旧值。",
+        ).font(skin.prop(skin.t().caption)).color(skin.p().error)).wrap());
+        ui.add_space(skin.m().s(10.0));
+    }
+}
+
 fn page_name(tab: SettingsTab) -> &'static str {
     SettingsTab::ALL
         .iter()
@@ -207,6 +227,7 @@ fn page_name(tab: SettingsTab) -> &'static str {
 fn page_desc(tab: SettingsTab) -> &'static str {
     match tab {
         SettingsTab::General => "后台运行与语音唤醒",
+        SettingsTab::WakeTest => "本机观测麦克风与唤醒词，不听写、不发送",
         SettingsTab::Appearance => "主题与回复展示",
         SettingsTab::Display => "观看距离与缩放链路",
         SettingsTab::Model => "接口、密钥与模型列表",
@@ -219,6 +240,7 @@ fn page_desc(tab: SettingsTab) -> &'static str {
 fn nav_icon(tab: SettingsTab) -> Icon {
     match tab {
         SettingsTab::General => Icon::Cog,
+        SettingsTab::WakeTest => Icon::Info,
         SettingsTab::Appearance => Icon::Sun,
         SettingsTab::Display => Icon::Board,
         SettingsTab::Model => Icon::Sparkle,
@@ -234,11 +256,13 @@ fn nav_icon(tab: SettingsTab) -> Icon {
 
 /// 通用页：后台运行、启动即后台与语音唤醒三个开关。
 fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
+    section_label_row(ui, skin, width, "安全与权限");
     let mut safe = state.classroom_safe;
     switch_row(ui, skin, width, "课堂安全模式", "默认开启，限制后台采集和工具权限", &mut safe, "neo-set-safe");
     state.set_classroom_safe(safe);
     ui.add(egui::Label::new("这不是离线模式：普通问答和用户文件内容仍可发送给模型，联网读取仍可用。开启时暂停语音唤醒、课堂采集和桌面观察，禁止打开、写入、执行操作。").wrap());
     row_divider(ui, skin, width);
+    section_label_row(ui, skin, width, "窗口与后台");
     switch_row(
         ui,
         skin,
@@ -259,6 +283,7 @@ fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         "neo-set-start-tray",
     );
     row_divider(ui, skin, width);
+    section_label_row(ui, skin, width, "语音与课堂");
     switch_row(
         ui,
         skin,
@@ -291,7 +316,7 @@ fn appearance_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState
         neo_theme::ThemeMode::Dark => 0,
         neo_theme::ThemeMode::Light => 1,
     };
-    if let Some(sel) = segmented(ui, skin, width, &["暗色", "亮色"], idx) {
+    if let Some(sel) = choice_row(ui, skin, width, &["暗色", "亮色"], idx, "settings-theme") {
         state.theme_mode = if sel == 0 {
             neo_theme::ThemeMode::Dark
         } else {
@@ -325,7 +350,7 @@ fn display_tab(
         neo_theme::Distance::Classroom => 1,
         neo_theme::Distance::Auditorium => 2,
     };
-    if let Some(sel) = segmented(ui, skin, width, &["近距", "教室", "远距"], idx) {
+    if let Some(sel) = choice_row(ui, skin, width, &["近距", "教室", "远距"], idx, "settings-distance") {
         state.distance = match sel {
             0 => neo_theme::Distance::Standard,
             1 => neo_theme::Distance::Classroom,
@@ -362,6 +387,8 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     hint_row(ui, skin, width, "密钥仅在本机持久化；请求认证时会发送给所配置的接口，请核对地址后再刷新");
     ui.add_space(m.s(16.0));
 
+    row_divider(ui, skin, width);
+    section_label_row(ui, skin, width, "模型与推理");
     let name = if state.has_models() {
         format!("{}（{}）", state.model_display(), state.model_id())
     } else {
@@ -377,6 +404,13 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     hint_row(ui, skin, width, switch_hint);
     ui.add_space(m.s(16.0));
 
+    section_label_row(ui, skin, width, "上下文预算（估算 token）");
+    ui.add(egui::DragValue::new(&mut state.context_tokens)
+        .range(neo_llm::MIN_CONTEXT_TOKENS..=neo_llm::MAX_CONTEXT_TOKENS).speed(1024.0));
+    hint_row(ui, skin, width, "默认 1,000,000，请依接口与模型实际能力调整；含输出和工具预留。接近预算时后台摘要，原记录保留；摘要失败不会静默丢弃历史。");
+    hint_row(ui, skin, width, "每个用户任务最多执行 500 次工具调用（含错误、拒绝与询问），跨续轮和历史压缩累计。");
+    ui.add_space(m.s(16.0));
+
     // ---- 思考强度：对应请求体顶层的 thinking / reasoning_effort ----
     section_label_row(ui, skin, width, "思考强度");
     let labels: Vec<&str> = neo_llm::Thinking::ALL.iter().map(|t| t.label()).collect();
@@ -384,7 +418,7 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         .iter()
         .position(|t| *t == state.thinking)
         .unwrap_or(0);
-    if let Some(i) = segmented(ui, skin, width, &labels, sel) {
+    if let Some(i) = choice_row(ui, skin, width, &labels, sel, "settings-thinking") {
         state.thinking = neo_llm::Thinking::ALL[i];
     }
     ui.add_space(m.s(6.0));
@@ -392,6 +426,7 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     ui.add_space(m.s(16.0));
 
     // ---- 可选模型：来自模型商的 /models，内置表只是兜底 ----
+    row_divider(ui, skin, width);
     section_label_row(ui, skin, width, "可选模型");
     // 左：数量；右：刷新键。交给布局系统排，别手量宽度（Button 会自己算内边距）。
     ui.horizontal_wrapped(|ui| {
@@ -763,7 +798,9 @@ mod ui_regression {
                     state.preferences_unsaved = true;
                     let mut seen = std::collections::BTreeSet::new();
                     let mut expected = 0;
-                    for step in 0..45 {
+                    let mut warning_seen = std::collections::BTreeSet::new();
+                    let mut warning_rows = 0;
+                    for step in 0..65 {
                         let mut input = egui::RawInput {
                             screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
                             time: Some(step as f64 / 10.0),
@@ -780,13 +817,16 @@ mod ui_regression {
                                 &mut state, size.y, &LoadedFonts::default());
                         });
                         output.textures_delta.clear();
-                        let mut warning_visible = false;
                         for clipped in &output.shapes {
                             if let egui::Shape::Text(text) = &clipped.shape {
                                 if text.galley.job.text.starts_with("设置尚未保存") {
-                                    let rect = Rect::from_min_size(text.pos, text.galley.size());
-                                    assert!(clipped.clip_rect.expand(1.0).contains_rect(rect), "warning {width}/{scale}/{dpi}: {rect:?}");
-                                    warning_visible = true;
+                                    warning_rows = text.galley.rows.len();
+                                    assert!(!text.galley.elided);
+                                    for (index, row) in text.galley.rows.iter().enumerate() {
+                                        let rect = row.rect().translate(text.pos.to_vec2());
+                                        assert!(rect.left() >= 0.0 && rect.right() <= width);
+                                        if clipped.clip_rect.expand(1.0).contains_rect(rect) { warning_seen.insert(index); }
+                                    }
                                 }
                                 if text.galley.job.text.starts_with("这不是离线模式") {
                                     expected = text.galley.rows.len();
@@ -798,8 +838,9 @@ mod ui_regression {
                                 }
                             }
                         }
-                        assert!(warning_visible);
                     }
+                    assert!(warning_rows > 0);
+                    assert_eq!(warning_seen.len(), warning_rows, "all warning lines reachable {width}/{scale}/{dpi}");
                     assert!(expected > 0);
                     assert_eq!(seen.len(), expected, "all safety lines reachable {width}/{scale}/{dpi}");
                 }
@@ -842,6 +883,218 @@ mod ui_regression {
                 assert!(found);
                 assert!(output.platform_output.commands.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn five_thinking_choices_wrap_without_overlap_and_all_click() {
+        for width in [200.0, 320.0, 720.0, 1200.0] {
+            for scale in [0.85, 1.0, 1.75, 2.8] {
+                let ctx = context();
+                neo_theme::fonts::install(&ctx);
+                let theme = neo_theme::Theme::from_metrics(neo_theme::ThemeMode::Light,
+                    neo_theme::Metrics::from_scale(scale));
+                theme.apply(&ctx);
+                let whale = crate::brand::WhaleMark::cached(&ctx);
+                let skin = Skin::new(theme, &whale);
+                let labels: Vec<&str> = neo_llm::Thinking::ALL.iter().map(|t| t.label()).collect();
+                let mut selected = 0;
+                let mut draw = |events| {
+                    let mut output = ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 1600.0))),
+                        events, ..Default::default()
+                    }, |ui| {
+                        ui.set_max_width(width - 16.0);
+                        if let Some(i) = choice_row(ui, &skin, width - 16.0, &labels, selected, "test-thinking") {
+                            selected = i;
+                        }
+                    });
+                    output.textures_delta.clear();
+                    output
+                };
+                draw(vec![]);
+                let output = draw(vec![]);
+                let rects: Vec<Rect> = (0..labels.len()).map(|i| probe(&ctx, ("test-thinking", i))).collect();
+                for (i, rect) in rects.iter().enumerate() {
+                    assert!(rect.left() >= 0.0 && rect.right() <= width, "choice overflow {width}/{scale}");
+                    for other in &rects[i + 1..] { assert!(!rect.shrink(0.1).intersects(other.shrink(0.1)), "targets overlap {width}/{scale}: {rect:?}, {other:?}"); }
+                }
+                for clipped in &output.shapes {
+                    if let egui::Shape::Text(text) = &clipped.shape {
+                        if labels.contains(&text.galley.text()) {
+                            let i = labels.iter().position(|label| *label == text.galley.text()).unwrap();
+                            assert!(!text.galley.elided);
+                            assert!(rects[i].expand(1.0).contains_rect(Rect::from_min_size(text.pos, text.galley.size())),
+                                "label crosses its target {width}/{scale}");
+                        }
+                    }
+                }
+                drop(draw);
+                for (i, rect) in rects.iter().enumerate() {
+                    for pressed in [true, false] {
+                        let mut output = ctx.run_ui(egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 1600.0))),
+                            events: pointer(rect.center(), pressed), ..Default::default()
+                        }, |ui| {
+                            ui.set_max_width(width - 16.0);
+                            if let Some(index) = choice_row(ui, &skin, width - 16.0, &labels, selected, "test-thinking") { selected = index; }
+                        });
+                        output.textures_delta.clear();
+                    }
+                    assert_eq!(selected, i, "choice not operable {width}/{scale}/{i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_values_and_section_titles_use_real_wrapped_height() {
+        for width in [200.0, 320.0, 720.0] {
+            for scale in [1.0, 1.75, 2.8] {
+                let ctx = context();
+                let theme = neo_theme::Theme::from_metrics(neo_theme::ThemeMode::Dark,
+                    neo_theme::Metrics::from_scale(scale));
+                theme.apply(&ctx);
+                let whale = crate::brand::WhaleMark::cached(&ctx);
+                let skin = Skin::new(theme, &whale);
+                let values = ["provider/model-long-name-".repeat(8),
+                    "D:\\School\\Neo\\very-long-database-path\\".repeat(6),
+                    "VeryLongFontFamilyNameWithoutBreaks".repeat(8)];
+                let mut output = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 12000.0))),
+                    ..Default::default()
+                }, |ui| {
+                    ui.set_max_width(width - 16.0);
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    section_label_row(ui, &skin, width - 16.0, "上下文预算（估算 token）");
+                    for (key, value) in ["当前模型", "数据库", "字体"].iter().zip(&values) {
+                        kv_row(ui, &skin, width - 16.0, key, value);
+                    }
+                    assert!(ui.min_rect().width() <= width);
+                });
+                output.textures_delta.clear();
+                let mut bottom = 0.0;
+                let mut found = 0;
+                for clipped in &output.shapes {
+                    if let egui::Shape::Text(text) = &clipped.shape {
+                        let rect = Rect::from_min_size(text.pos, text.galley.size());
+                        assert!(!text.galley.elided);
+                        assert!(clipped.clip_rect.expand(1.0).contains_rect(rect));
+                        assert!(rect.top() >= bottom - 1.0, "rows overlap {width}/{scale}");
+                        bottom = rect.bottom();
+                        if values.contains(&text.galley.job.text) { found += 1; }
+                    }
+                }
+                assert_eq!(found, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn long_page_title_reserves_clickable_close_target() {
+        for width in [240.0, 320.0, 720.0] {
+            for scale in [1.0, 1.75, 2.8] {
+                let ctx = context();
+                let loaded = neo_theme::fonts::install(&ctx);
+                let theme = neo_theme::Theme::from_metrics(neo_theme::ThemeMode::Light,
+                    neo_theme::Metrics::from_scale(scale));
+                theme.apply(&ctx);
+                let whale = crate::brand::WhaleMark::cached(&ctx);
+                let skin = Skin::new(theme, &whale);
+                let size = egui::vec2(width, 420.0);
+                let mut state = AppState::default();
+                state.settings_tab = SettingsTab::WakeTest;
+                state.preferences_unsaved = true;
+                let mut closed = false;
+                let mut render = |events| {
+                    let mut output = ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        events, ..Default::default()
+                    }, |ui| {
+                        closed = panel(ui, &skin, Rect::from_min_size(egui::pos2(8.0, 8.0), size - egui::vec2(16.0, 16.0)),
+                            &mut state, size.y, &loaded);
+                    });
+                    output.textures_delta.clear();
+                    output
+                };
+                render(vec![]);
+                let output = render(vec![]);
+                let (title, close): (Rect, Rect) = probe(&ctx, "settings-title-probe");
+                assert!(title.contains_rect(close));
+                let mut found = false;
+                for clipped in &output.shapes {
+                    if let egui::Shape::Text(text) = &clipped.shape {
+                        let rect = Rect::from_min_size(text.pos, text.galley.size());
+                        if text.galley.text() == "麦克风测试" && rect.intersects(title) {
+                            assert!(rect.right() < close.left());
+                            assert!(title.expand(1.0).contains_rect(rect));
+                            found = true;
+                        }
+                    }
+                }
+                assert!(found);
+                render(pointer(close.center(), true));
+                render(pointer(close.center(), false));
+                drop(render);
+                assert!(closed, "close not operable {width}/{scale}");
+            }
+        }
+    }
+
+    #[test]
+    fn low_height_large_scale_keeps_body_scrollable_and_close_clear() {
+        for (width, height, scale) in [(240.0, 360.0, 2.8), (320.0, 360.0, 2.8), (720.0, 300.0, 1.75), (1000.0, 320.0, 1.0)] {
+            let ctx = context();
+            let theme = neo_theme::Theme::from_metrics(neo_theme::ThemeMode::Dark,
+                neo_theme::Metrics::from_scale(scale));
+            theme.apply(&ctx);
+            let whale = crate::brand::WhaleMark::cached(&ctx);
+            let skin = Skin::new(theme, &whale);
+            let size = egui::vec2(width, height);
+            let mut state = AppState::default();
+            state.preferences_unsaved = true;
+            state.settings_tab = SettingsTab::About;
+            state.db_path = Some("D:\\School\\database-long-path\\".repeat(8));
+            let mut seen = std::collections::BTreeSet::new();
+            let mut warning_rows = 0;
+            let mut database_seen = false;
+            for step in 0..140 {
+                let events = if step < 2 { vec![] } else {
+                    vec![egui::Event::PointerMoved(egui::pos2(width * 0.6, height - 50.0)),
+                        egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -20.0), modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move }]
+                };
+                let mut output = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(step as f64 * 0.1), events, ..Default::default()
+                }, |ui| {
+                    panel(ui, &skin, Rect::from_min_size(egui::pos2(8.0, 8.0), size - egui::vec2(16.0, 16.0)),
+                        &mut state, height, &LoadedFonts::default());
+                });
+                output.textures_delta.clear();
+                let body: Rect = probe(&ctx, "settings-body-probe");
+                assert!(body.height() >= skin.t().caption * 1.5, "body starved {width}/{height}/{scale}: {body:?}");
+                let (title, close): (Rect, Rect) = probe(&ctx, "settings-title-probe");
+                assert!(Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(close));
+                for clipped in &output.shapes {
+                    if let egui::Shape::Text(text) = &clipped.shape {
+                        let rect = Rect::from_min_size(text.pos, text.galley.size());
+                        if text.galley.text() == page_name(SettingsTab::About) && rect.intersects(title) {
+                            assert!(rect.right() < close.left());
+                        }
+                        if text.galley.text().starts_with("设置尚未保存") {
+                            warning_rows = text.galley.rows.len();
+                            for (i, row) in text.galley.rows.iter().enumerate() {
+                                if clipped.clip_rect.contains_rect(row.rect().translate(text.pos.to_vec2())) { seen.insert(i); }
+                            }
+                        }
+                        if text.galley.text() == "数据库" && clipped.clip_rect.contains_rect(rect) { database_seen = true; }
+                    }
+                }
+            }
+            assert!(warning_rows > 0);
+            assert_eq!(seen.len(), warning_rows);
+            assert!(database_seen, "body unreachable {width}/{height}/{scale}");
         }
     }
 
@@ -947,12 +1200,50 @@ fn row_divider(ui: &mut Ui, skin: &Skin<'_>, width: f32) {
     ui.add_space(m.s(2.0));
 }
 
-/// 小标题行。
-fn section_label_row(ui: &mut Ui, skin: &Skin<'_>, width: f32, label: &str) {
+/// 小标题随字体实际高度换行，避免放大后与下一行相撞。
+pub(super) fn section_label_row(ui: &mut Ui, skin: &Skin<'_>, width: f32, label: &str) {
+    let galley = ui.painter().layout(label.to_owned(), skin.d().font_bold(skin.t().caption),
+        skin.p().label_secondary, width.max(1.0));
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, galley.size().y), Sense::hover());
+    ui.painter().galley(rect.min, galley, skin.p().label_secondary);
+    ui.add_space(skin.m().s(8.0));
+}
+
+/// 能放下才均分；否则改为可换行的独立选项，不缩小字体或隐藏选项。
+fn choice_row(ui: &mut Ui, skin: &Skin<'_>, width: f32, labels: &[&str], selected: usize, salt: &str) -> Option<usize> {
+    let d = skin.d();
     let m = skin.m();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, m.s(18.0)), Sense::hover());
-    section_label(ui.painter(), skin, rect, label);
-    ui.add_space(m.s(6.0));
+    let widest = labels.iter().flat_map(|label| [d.font(d.t().caption), d.font_bold(d.t().caption)]
+        .map(|font| ui.painter().layout_no_wrap((*label).to_owned(), font, skin.p().label_primary).size().x))
+        .fold(0.0_f32, f32::max);
+    if width >= (widest + m.s(20.0)) * labels.len() as f32 + m.s(4.0) {
+        let top = ui.cursor().top();
+        let result = ui.push_id(salt, |ui| segmented(ui, skin, width, labels, selected)).inner;
+        #[cfg(test)]
+        for i in 0..labels.len() {
+            let segment_w = (width - m.s(4.0)) / labels.len() as f32;
+            let rect = Rect::from_min_size(egui::pos2(ui.min_rect().left() + m.s(2.0) + segment_w * i as f32, top + m.s(2.0)),
+                Vec2::new(segment_w, m.s(28.0)));
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new((salt, i)), rect));
+        }
+        let _ = top;
+        result
+    } else {
+        let mut result = None;
+        ui.push_id(salt, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::splat(m.s(6.0));
+                for (i, label) in labels.iter().enumerate() {
+                    let response = ui.add(egui::Button::new(egui::RichText::new(*label)
+                        .font(d.font(d.t().caption))).selected(i == selected).wrap());
+                    #[cfg(test)]
+                    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new((salt, i)), response.rect));
+                    if response.clicked() { result = Some(i); }
+                }
+            });
+        });
+        result
+    }
 }
 
 /// 单行输入框 —— [`neo_ui::TextField`]：容器、聚焦环、密码掩码都由组件库负责。
@@ -976,7 +1267,25 @@ fn hint_row(ui: &mut Ui, skin: &Skin<'_>, width: f32, text: &str) {
     });
 }
 
-/// 一行键值对（左键、右值）—— [`neo_ui::FieldRow`]。
-fn kv_row(ui: &mut Ui, skin: &Skin<'_>, width: f32, key: &str, value: &str) {
-    FieldRow::new(key, value).show(ui, &skin.d(), width);
+/// 短值保留紧凑对齐；长值改为标签在上、全文在下，触屏也能读全。
+pub(super) fn kv_row(ui: &mut Ui, skin: &Skin<'_>, width: f32, key: &str, value: &str) {
+    let d = skin.d();
+    let key_size = ui.painter().layout_no_wrap(key.to_owned(), d.font(d.t().caption), skin.p().label_caption).size();
+    let value_size = ui.painter().layout_no_wrap(value.to_owned(), d.font_mono(d.t().caption), skin.p().label_secondary).size();
+    if !value.contains(['\r', '\n']) && key_size.x <= width * 0.4
+        && key_size.x + skin.m().s(16.0) + value_size.x <= width
+        && key_size.y.max(value_size.y) <= FieldRow::height(&d)
+    {
+        FieldRow::new(key, value).show(ui, &d, width);
+    } else {
+        ui.scope(|ui| {
+            ui.set_max_width(width);
+            ui.add(egui::Label::new(egui::RichText::new(key)
+                .font(d.font(d.t().caption)).color(skin.p().label_caption)).wrap());
+            ui.add_space(skin.m().s(4.0));
+            ui.add(egui::Label::new(egui::RichText::new(value)
+                .font(d.font_mono(d.t().caption)).color(skin.p().label_secondary)).wrap());
+            ui.add_space(skin.m().s(10.0));
+        });
+    }
 }

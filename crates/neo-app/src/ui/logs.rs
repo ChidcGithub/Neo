@@ -1,6 +1,7 @@
 //! 本地诊断页：只读取脱敏日志，不依赖 AppState，不把日志送入模型上下文。
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{RichText, Ui};
@@ -9,12 +10,20 @@ use neo_ui::{Button, Segmented, TextField};
 use super::Skin;
 use crate::diagnostics::{self, Entry, Level, Snapshot};
 
-/// 仅为界面交互保存状态，不持有日志副本；默认自动跟随最新条目。
+/// 保存交互状态及当前筛选索引，共享一份有界脱敏快照；默认自动跟随。
 #[derive(Clone)]
 pub struct LogViewState {
     pub level: Option<Level>,
     pub keyword: String,
     pub follow: bool,
+    filtered: Option<Arc<FilteredEntries>>,
+}
+
+struct FilteredEntries {
+    entries: Arc<Vec<Entry>>,
+    level: Option<Level>,
+    keyword: String,
+    indices: Vec<usize>,
 }
 
 impl Default for LogViewState {
@@ -23,6 +32,7 @@ impl Default for LogViewState {
             level: None,
             keyword: String::new(),
             follow: true,
+            filtered: None,
         }
     }
 }
@@ -39,6 +49,29 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, width: f32) {
 }
 
 impl LogViewState {
+    fn filtered_entries(&mut self, view: &Snapshot) -> Arc<FilteredEntries> {
+        let keyword = self.keyword.trim();
+        if let Some(cached) = &self.filtered {
+            if Arc::ptr_eq(&cached.entries, &view.entries)
+                && cached.level == self.level
+                && cached.keyword == keyword
+            {
+                return Arc::clone(cached);
+            }
+        }
+        let lower = keyword.to_lowercase();
+        let filtered = Arc::new(FilteredEntries {
+            entries: Arc::clone(&view.entries),
+            level: self.level,
+            keyword: keyword.to_owned(),
+            indices: view.entries.iter().enumerate()
+                .filter_map(|(index, entry)| matches_filter(entry, self.level, &lower).then_some(index))
+                .collect(),
+        });
+        self.filtered = Some(Arc::clone(&filtered));
+        filtered
+    }
+
     /// 也可由调用方自行保存独立 LogViewState，并直接调用此方法。
     pub fn draw(&mut self, ui: &mut Ui, skin: &Skin<'_>, width: f32) {
         let view = diagnostics::snapshot();
@@ -113,12 +146,11 @@ impl LogViewState {
                 }
                 copy = action("复制筛选结果", "neo-logs-copy");
             });
-            let keyword = self.keyword.trim().to_lowercase();
-            let entries: Vec<_> = view.entries.iter()
-                .filter(|entry| matches_filter(entry, self.level, &keyword)).collect();
+            let filtered = self.filtered_entries(&view);
+            let entries = &filtered.indices;
             if copy {
                 // 只复制当前快照中匹配的脱敏条目，不复制输入条件或原始错误。
-                ui.ctx().copy_text(export(&entries));
+                ui.ctx().copy_text(export(entries.iter().map(|&index| &view.entries[index])));
             }
             ui.add(egui::Label::new(RichText::new(format!(
                 "显示 {} / {} 条 · 文本 {} / {} KiB · 上限 {} 条、单条 {} 字节\n收到 {} 次 · 聚合重复 {} 次 · 容量丢弃 {} 次 · 截断 {} 次（自清空起）",
@@ -143,7 +175,7 @@ impl LogViewState {
                     "没有匹配当前筛选条件的日志。"
                 }).font(skin.prop(skin.t().body)).color(p.label_secondary)).wrap());
             } else {
-                let scroll = self.draw_entries(ui, skin, width, &entries, resume_follow);
+                let scroll = self.draw_entries(ui, skin, width, &filtered, resume_follow);
                 // egui 在用户滚离底部后解除吸附，按钮也必须同步为可恢复状态。
                 if self.follow && scroll.state.offset.y + scroll.inner_rect.height() + 1.0 < scroll.content_size.y {
                     self.follow = false;
@@ -160,9 +192,10 @@ impl LogViewState {
         ui: &mut Ui,
         skin: &Skin<'_>,
         width: f32,
-        entries: &[&Entry],
+        filtered: &FilteredEntries,
         resume_follow: bool,
     ) -> egui::scroll_area::ScrollAreaOutput<usize> {
+        let entries = &filtered.indices;
         let font = skin.prop(skin.t().caption);
         let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
         let mut scroll = egui::ScrollArea::vertical()
@@ -181,7 +214,7 @@ impl LogViewState {
             ui.set_max_width((width - skin.m().s(12.0)).min(ui.available_width()).max(1.0));
             let count = rows.len();
             for row in rows {
-                let entry = entries[row];
+                let entry = &filtered.entries[entries[row]];
                 let color = match entry.level {
                     Level::Error => skin.p().error,
                     Level::Warn => skin.p().warn,
@@ -218,7 +251,7 @@ fn format_entry(entry: &Entry) -> String {
     )
 }
 
-fn export(entries: &[&Entry]) -> String {
+fn export<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
     let mut text = String::new();
     for entry in entries {
         let _ = writeln!(text, "{}", format_entry(entry));
@@ -233,7 +266,7 @@ mod tests {
 
     fn sample() -> Snapshot {
         Snapshot {
-            entries: vec![
+            entries: Arc::new(vec![
                 Entry {
                     level: Level::Error,
                     component: "Tool".into(),
@@ -250,7 +283,7 @@ mod tests {
                     last_ms: 3,
                     occurrences: 1,
                 },
-            ],
+            ]),
             stats: Stats {
                 received: 10,
                 merged: 2,
@@ -265,6 +298,59 @@ mod tests {
     }
 
     #[test]
+    fn filter_cache_reuses_indices_and_refreshes_for_conditions_and_snapshot() {
+        let mut view = sample();
+        view.entries = Arc::new((0..MAX_ENTRIES).map(|index| Entry {
+            level: if index % 2 == 0 { Level::Info } else { Level::Error },
+            component: "Tool".into(), message: format!("安全事件 {index}").into_boxed_str(),
+            first_ms: index as u64, last_ms: index as u64, occurrences: 1,
+        }).collect());
+        let mut state = LogViewState { keyword: "安全事件".into(), ..Default::default() };
+        let first = state.filtered_entries(&view);
+        assert_eq!(first.indices.len(), MAX_ENTRIES);
+        let mut legacy_matches = 0;
+        let mut rebuilt = 0;
+        for _ in 0..60 {
+            let keyword = state.keyword.trim().to_lowercase();
+            let legacy: Vec<_> = view.entries.iter().filter(|entry| {
+                legacy_matches += 1;
+                matches_filter(entry, state.level, &keyword)
+            }).collect();
+            assert_eq!(legacy.len(), first.indices.len());
+            // egui get_temp 也会克隆状态：索引与日志文本都应继续共享。
+            state = state.clone();
+            let next = state.filtered_entries(&view.clone());
+            rebuilt += usize::from(!Arc::ptr_eq(&first, &next));
+        }
+        assert_eq!(legacy_matches, 60 * MAX_ENTRIES);
+        assert_eq!(rebuilt, 0);
+        println!("1000项，预热后60次筛选：旧路径匹配次数={legacy_matches}，缓存索引重建={rebuilt}");
+        state.level = Some(Level::Error);
+        let errors = state.filtered_entries(&view);
+        assert!(!Arc::ptr_eq(&first, &errors));
+        assert_eq!(errors.indices.len(), 500);
+        state.keyword = " TOOL ".into();
+        let by_component = state.filtered_entries(&view);
+        assert!(!Arc::ptr_eq(&errors, &by_component));
+        assert_eq!(by_component.indices, errors.indices);
+        state.keyword = "missing".into();
+        assert!(state.filtered_entries(&view).indices.is_empty());
+        state.keyword.clear();
+        let old = Arc::downgrade(&state.filtered_entries(&view));
+        let mut changed = view.clone();
+        Arc::make_mut(&mut changed.entries)[1].occurrences = 9;
+        let updated = state.filtered_entries(&changed);
+        assert!(old.upgrade().is_none(), "仅保留当前筛选而非历史结果");
+        assert_eq!(updated.entries[1].occurrences, 9);
+        assert!(export(updated.indices.iter().map(|&index| &updated.entries[index])).contains("×9"));
+        changed.entries = Arc::new(Vec::new());
+        changed.stats = Stats::default();
+        let cleared = state.filtered_entries(&changed);
+        assert!(cleared.indices.is_empty());
+        assert!(!Arc::ptr_eq(&updated, &cleared));
+    }
+
+    #[test]
     fn filters_and_copy_use_only_visible_safe_entries() {
         let view = sample();
         assert!(matches_filter(&view.entries[0], Some(Level::Error), "tool"));
@@ -276,10 +362,10 @@ mod tests {
             .iter()
             .filter(|entry| matches_filter(entry, Some(Level::Info), ""))
             .collect();
-        let copied = export(&entries);
+        let copied = export(entries);
         assert!(copied.contains("[已脱敏]"));
         assert!(!copied.contains("timeout"));
-        assert!(export(&[]).is_empty());
+        assert!(export([]).is_empty());
     }
 
     #[test]
@@ -298,6 +384,7 @@ mod tests {
         for entry in entries.iter_mut().take(120) {
             entry.message = "安全概括".repeat(150).into_boxed_str();
         }
+        let entries = Arc::new(entries);
         let mut state = LogViewState { follow: false, ..Default::default() };
         let render = |state: &LogViewState, count: usize, resume: bool| {
             let mut scroll = None;
@@ -305,7 +392,10 @@ mod tests {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(240.0, 700.0))),
                 ..Default::default()
             }, |ui| {
-                let visible: Vec<_> = entries[..count].iter().collect();
+                let visible = FilteredEntries {
+                    entries: Arc::clone(&entries), level: None, keyword: String::new(),
+                    indices: (0..count).collect(),
+                };
                 scroll = Some(state.draw_entries(ui, &skin, 224.0, &visible, resume));
                 assert!(ui.min_rect().width() <= 240.0);
             });
@@ -334,15 +424,20 @@ mod tests {
         let ctx = context();
         let size = egui::vec2(460.0, 900.0);
         let mut view = sample();
-        view.entries = (0..MAX_ENTRIES).map(|index| Entry {
+        view.entries = Arc::new((0..MAX_ENTRIES).map(|index| Entry {
             level: if index % 2 == 0 { Level::Info } else { Level::Error },
             component: "safe-test".into(), message: format!("安全事件 {index}").into_boxed_str(),
             first_ms: index as u64, last_ms: index as u64, occurrences: 1,
-        }).collect();
+        }).collect());
         let mut state = LogViewState::default();
         let render = |state: &mut LogViewState, events| frame(&ctx, size, events,
             |ui, skin| state.draw_snapshot(ui, skin, 444.0, view.clone()));
         for _ in 0..3 { render(&mut state, vec![]); }
+        let cached = state.filtered.clone().unwrap();
+        for _ in 0..60 {
+            render(&mut state, vec![]);
+            assert!(Arc::ptr_eq(&cached, state.filtered.as_ref().unwrap()));
+        }
         let (bottom, rect, content, count): (f32, egui::Rect, f32, usize) = probe(&ctx, "neo-logs-scroll-probe");
         assert!(state.follow && bottom > 0.0 && count < 40);
         assert!((bottom + rect.height() - content).abs() < 1.0);
@@ -370,7 +465,7 @@ mod tests {
             if let egui::OutputCommand::CopyText(text) = command { Some(text) } else { None }
         }).expect("copy action must produce only a clipboard command");
         let filtered: Vec<_> = view.entries.iter().filter(|entry| entry.level == Level::Error).collect();
-        assert_eq!(copied, &export(&filtered));
+        assert_eq!(copied, &export(filtered));
         assert_eq!(copied.lines().count(), 500);
         assert!(!state.follow);
     }

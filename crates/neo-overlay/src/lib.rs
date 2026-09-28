@@ -16,7 +16,7 @@
 //! - `WS_EX_NOACTIVATE` + `SW_SHOWNA` 永不抢焦点；卡片全是纯鼠标交互，无需键盘
 //! - 窗口每次露面（含卡片首次出现）都先离屏渲好一帧再 `SW_SHOWNA` ——
 //!   用户看到的第一个画面就是成品，没有黑帧
-//! - 抓屏线程 ~30fps 把桌面帧喂给渲染线程，shader 做边缘折射采样
+//! - 抓屏线程最多 20fps 把桌面帧喂给渲染线程，光带动画仍随交换链 vsync
 //! - 控制命令走 mpsc + `PostThreadMessageW` 唤醒（消息循环在隐藏时整块睡眠）
 //! - 视觉为 VCC edgeglow v2 移植：0.6x 离屏渲染光环 + 线性放大 blit 上屏（低频内容几乎无损，省 ~65% GPU）
 
@@ -55,6 +55,8 @@ const RENDER_SCALE: f32 = 0.6;
 /// 线程消息：命令队列里有货，唤醒睡眠中的消息循环。
 const WM_NEO_CMD: u32 = WM_APP + 1;
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+/// 桌面纹理独立限频；不降低光带、淡出或卡片输入的显示帧率。
+const CAPTURE_INTERVAL: Duration = Duration::from_millis(50);
 static ENGINE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 struct EngineLease(&'static AtomicBool);
@@ -87,6 +89,7 @@ type FrameSlot = Arc<Mutex<CaptureState>>;
 #[derive(Default)]
 struct CaptureState {
     enabled: bool,
+    exclude_ok: bool,
     generation: u64,
     frame: Option<(DesktopBounds, Shot)>,
 }
@@ -94,6 +97,11 @@ struct CaptureState {
 impl CaptureState {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+        self.invalidate();
+    }
+
+    fn set_exclude_ok(&mut self, exclude_ok: bool) {
+        self.exclude_ok = exclude_ok;
         self.invalidate();
     }
 
@@ -106,7 +114,7 @@ impl CaptureState {
     /// 取得许可即进入在途阶段。随后系统采集不可撤销，Hide 只阻止下一次
     /// 许可并丢弃迟到结果；不能持锁等抓屏结束，否则 hide 会阻塞。
     fn begin(&self) -> Option<u64> {
-        self.enabled.then_some(self.generation)
+        (self.enabled && self.exclude_ok).then_some(self.generation)
     }
 
     fn publish(&mut self, generation: u64, bounds: DesktopBounds, shot: Shot) {
@@ -117,7 +125,7 @@ impl CaptureState {
 
     fn take(&mut self, bounds: DesktopBounds) -> Option<Shot> {
         let (captured, shot) = self.frame.take()?;
-        (self.enabled && captured == bounds && (shot.width, shot.height) == bounds.size)
+        (self.begin().is_some() && captured == bounds && (shot.width, shot.height) == bounds.size)
             .then_some(shot)
     }
 }
@@ -171,6 +179,11 @@ impl DesktopBounds {
     }
 }
 
+fn capture_rest(elapsed: Duration) -> Duration {
+    // 慢采集也留出原来的休息时间，不追赶欠帧、不因限频优化反而增加工作量。
+    CAPTURE_INTERVAL.saturating_sub(elapsed).max(Duration::from_millis(33))
+}
+
 fn fade_complete(fading: bool, intensity: f32) -> bool {
     fading && intensity < 0.02
 }
@@ -212,6 +225,14 @@ impl Card {
     }
 }
 
+fn card_area(id: u8, pos: egui::Pos2, interactive: bool) -> egui::Area {
+    egui::Area::new(egui::Id::new(("neo-layer-card", id)))
+        .fixed_pos(pos)
+        .movable(false)
+        .interactable(interactive)
+        .sense(if interactive { egui::Sense::click() } else { egui::Sense::hover() })
+}
+
 /// 卡片槽：应用线程每帧按需覆写，渲染线程每帧读最新。
 /// BTreeMap 让同 id 覆盖天然幂等、遍历顺序稳定。
 type CardSlot = Arc<Mutex<BTreeMap<u8, Card>>>;
@@ -228,6 +249,8 @@ pub mod card_id {
     pub const FLASH: u8 = 4;
     /// 总结起止红点（classwin::ClassDot）。
     pub const DOT: u8 = 5;
+    /// 独立轻提示（toastwin）。
+    pub const TOAST: u8 = 6;
 }
 
 /// 跑马灯控制柄，跨线程安全。Drop 时自动关停窗口线程。
@@ -241,6 +264,8 @@ pub struct OverlayHandle {
     capture: FrameSlot,
     cards: CardSlot,
     thread: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    wake_count: Option<AtomicU32>,
 }
 
 impl OverlayHandle {
@@ -276,21 +301,29 @@ impl OverlayHandle {
         if !self.is_alive() {
             return;
         }
-        if let Ok(mut cards) = self.cards.lock() {
+        let changed = if let Ok(mut cards) = self.cards.lock() {
             match card {
                 Some(c) => {
                     cards.insert(id, c);
+                    true
                 }
-                None => {
-                    cards.remove(&id);
-                }
+                None => cards.remove(&id).is_some(),
             }
+        } else {
+            false
+        };
+        // 锁已释放；最后一张撤下也要唤醒，让窗口隐藏并恢复穿透。
+        if changed {
+            self.wake_thread();
         }
-        // 唤醒隐藏中的消息循环（队列为空时 WM_NEO_CMD 也无妨：兜底排空而已）。
-        self.wake_thread();
     }
 
     fn wake_thread(&self) {
+        #[cfg(test)]
+        if let Some(count) = &self.wake_count {
+            count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if self.tid != 0 {
             unsafe { PostThreadMessageW(self.tid, WM_NEO_CMD, 0, 0); }
         }
@@ -375,6 +408,8 @@ pub fn start() -> Result<OverlayHandle, String> {
         capture,
         cards,
         thread: Some(thread),
+        #[cfg(test)]
+        wake_count: None,
     }.await_ready(ready_rx, START_TIMEOUT)
 }
 
@@ -417,9 +452,10 @@ fn run(
                         std::thread::sleep(Duration::from_millis(80));
                         continue;
                     };
+                    let started = Instant::now();
                     let rect = screen::virtual_screen();
                     // 静默抓帧：`capture()` 带「广播截屏信号 + 等迷你窗躲开 300ms」
-                    // 的副作用，那是给「AI 应用户要求截屏」的；折射抓帧是 ~30fps 的
+                    // 的副作用，那是给「AI 应用户要求截屏」的；折射抓帧是最多 20fps 的
                     // 后台循环，走它会压死迷你窗、把折射帧率拖到 ~3fps、还会在听写
                     // 结束后凭空闪一次全屏白框（信号被反复续期后的假反馈）。
                     // 本窗自带 WDA_EXCLUDEFROMCAPTURE，画面里本来就没有自己。
@@ -428,7 +464,7 @@ fn run(
                             g.publish(generation, DesktopBounds::from_rect(rect), shot);
                         }
                     }
-                    std::thread::sleep(Duration::from_millis(33));
+                    std::thread::sleep(capture_rest(started.elapsed()));
                 }
             });
     }
@@ -486,7 +522,10 @@ fn msg_loop(
 
         let have_cards = gfx.has_cards();
         // 输入路由随卡片有无切换（改 WS_EX_TRANSPARENT 必须 FRAMECHANGED 才生效）。
-        gfx.set_hit_testable(hwnd, have_cards);
+        let interactive = gfx.cards.lock()
+            .map(|cards| cards.values().any(|card| card.interactive))
+            .unwrap_or(false);
+        gfx.set_hit_testable(hwnd, interactive);
 
         if ripple.active(have_cards) {
             // 非阻塞泵消息：线程消息不需要分发，系统消息（含鼠标输入）要处理
@@ -794,6 +833,10 @@ impl Gfx {
     /// 透镜渲染管线与绑定布局（输出 0.6x 离屏 Rgba8Unorm）。
     /// 抽成独立函数：离屏测试不建窗口/surface，只验证 shader 的折射行为。
     fn lens_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+        Self::lens_pipeline_source(device, include_str!("shader.wgsl"))
+    }
+
+    fn lens_pipeline_source(device: &wgpu::Device, source: &str) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("overlay-bgl"),
             entries: &[
@@ -828,7 +871,7 @@ impl Gfx {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("overlay-shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("overlay-pl"),
@@ -946,6 +989,7 @@ impl Gfx {
         // 返回 FALSE。失败后抓屏会拍到跑马灯自己，折射形成反馈循环 ——
         // 记下来，整轮禁用折射（只画光环），比"越转越亮"体面得多。
         let exclude_ok = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } != 0;
+        slot.lock().unwrap().set_exclude_ok(exclude_ok);
 
         // 强制 DX12 + DirectComposition 交换链（否则窗口不支持透明）
         let desc = wgpu::InstanceDescriptor {
@@ -1316,8 +1360,7 @@ impl Gfx {
             for (id, card) in cards.iter_mut() {
                 let [x, y, w, h] = *card.rect.lock().unwrap_or_else(|p| p.into_inner());
                 let pos = egui::pos2(x - ox, y - oy);
-                egui::Area::new(egui::Id::new(("neo-layer-card", *id)))
-                    .fixed_pos(pos)
+                card_area(*id, pos, card.interactive)
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
                         ui.set_width(w);
@@ -1692,6 +1735,48 @@ impl Gfx {
 mod regression_tests {
     use super::*;
 
+    fn safe_capture() -> CaptureState {
+        let mut state = CaptureState::default();
+        state.set_exclude_ok(true);
+        state
+    }
+
+    #[test]
+    fn capture_safety_blocks_work_even_after_show_and_topology_changes() {
+        let mut state = CaptureState::default();
+        for _ in 0..100 {
+            state.set_enabled(true);
+            state.invalidate();
+            assert!(state.begin().is_none());
+        }
+        state.set_exclude_ok(true);
+        let old = state.begin().unwrap();
+        state.publish(old, bounds(), shot(1));
+        state.set_exclude_ok(false);
+        state.publish(old, bounds(), shot(2));
+        assert!(state.take(bounds()).is_none());
+        state.set_enabled(false);
+        state.set_exclude_ok(true);
+        assert!(state.begin().is_none(), "安全许可不能覆盖 Hide");
+        state.set_enabled(true);
+        state.publish(old, bounds(), shot(3));
+        assert!(state.take(bounds()).is_none());
+    }
+
+    #[test]
+    fn capture_cadence_is_at_most_twenty_hz_without_catch_up() {
+        for millis in [0, 5, 17, 33, 50, 100, 1000] {
+            let elapsed = Duration::from_millis(millis);
+            let cycle = elapsed + capture_rest(elapsed);
+            assert!(cycle >= CAPTURE_INTERVAL);
+            assert!(cycle >= elapsed + Duration::from_millis(33));
+        }
+        let cycles = |rest: Duration| (0..1000).step_by(rest.as_millis() as usize).count();
+        assert_eq!(cycles(Duration::from_millis(33)), 31);
+        assert_eq!(cycles(capture_rest(Duration::ZERO)), 20);
+        eprintln!("合成 1s 零耗时采集：旧 31 次，新 20 次；慢采集不加速");
+    }
+
     fn fake_handle() -> (OverlayHandle, Receiver<Cmd>, Sender<()>, Receiver<()>) {
         let (tx, rx) = channel();
         let (release, wait) = channel();
@@ -1705,10 +1790,147 @@ mod regression_tests {
             level: Arc::new(AtomicU32::new(0)),
             visible: Arc::new(AtomicBool::new(true)),
             stop: Arc::new(AtomicBool::new(false)),
-            capture: Arc::new(Mutex::new(CaptureState::default())),
+            capture: Arc::new(Mutex::new(safe_capture())),
             cards: Arc::new(Mutex::new(BTreeMap::new())),
             thread: Some(thread),
+            wake_count: Some(AtomicU32::new(0)),
         }, rx, release, finished)
+    }
+
+    fn wake_count(handle: &OverlayHandle) -> u32 {
+        handle.wake_count.as_ref().unwrap().load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn toast_passive_card_never_opens_capture_or_posts_show_hide() {
+        let (handle, commands, release, finished) = fake_handle();
+        handle.set_card(card_id::TOAST, Some(Card::passive([10.0, 20.0, 300.0, 100.0], |_| {})));
+        assert!(!handle.cards.lock().unwrap().values().any(|card| card.interactive));
+        assert!(handle.capture.lock().unwrap().begin().is_none());
+        assert!(commands.try_recv().is_err());
+        assert_eq!(wake_count(&handle), 1);
+        handle.set_card(card_id::TOAST, None);
+        handle.set_card(card_id::TOAST, None);
+        assert!(handle.cards.lock().unwrap().is_empty());
+        assert_eq!(wake_count(&handle), 2);
+        assert!(commands.try_recv().is_err());
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn toast_passive_area_allows_click_through_to_underlying_card() {
+        let ctx = egui::Context::default();
+        let target = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(300.0, 100.0));
+        let point = target.center();
+        let mut clicked = false;
+        for frame in 0..5 {
+            let events = if frame >= 3 {
+                vec![egui::Event::PointerMoved(point), egui::Event::PointerButton {
+                    pos: point, button: egui::PointerButton::Primary,
+                    pressed: frame == 3, modifiers: egui::Modifiers::default(),
+                }]
+            } else { vec![] };
+            ctx.begin_pass(egui::RawInput { events, ..Default::default() });
+            card_area(card_id::CONFIRM, target.min, true).order(egui::Order::Foreground).show(&ctx, |ui| {
+                clicked |= ui.allocate_exact_size(target.size(), egui::Sense::click()).1.clicked();
+            });
+            card_area(card_id::TOAST, target.min, false).order(egui::Order::Foreground).show(&ctx, |ui| {
+                ui.allocate_exact_size(target.size(), egui::Sense::hover());
+            });
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+        }
+        assert!(clicked, "被动 toast Area 不得挡住底层确认卡");
+    }
+
+    #[test]
+    fn card_repeated_empty_removals_do_not_notify() {
+        let (handle, _commands, release, finished) = fake_handle();
+        for _ in 0..5 {
+            for id in [card_id::CONFIRM, card_id::MINI, card_id::CLASS, card_id::FLASH, card_id::DOT, card_id::TOAST] {
+                handle.set_card(id, None);
+            }
+        }
+        assert!(handle.cards.lock().unwrap().is_empty());
+        assert_eq!(wake_count(&handle), 0, "5Hz × 6 张空卡不应产生 30 次通知");
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn card_updates_and_last_removal_notify_without_changing_ripple() {
+        for showing in [false, true] {
+            let (handle, _commands, release, finished) = fake_handle();
+            let mut ripple = RippleState::default();
+            if showing {
+                ripple.show();
+            }
+            handle.set_card(card_id::MINI, Some(Card::interactive([0.0; 4], |_| {})));
+            assert_eq!(wake_count(&handle), 1);
+            let replacement = Card::passive([0.0; 4], |_| {});
+            let rect = replacement.rect.clone();
+            handle.set_card(card_id::MINI, Some(replacement));
+            assert_eq!(wake_count(&handle), 2);
+            {
+                let cards = handle.cards.lock().unwrap();
+                assert_eq!(cards.len(), 1);
+                assert!(Arc::ptr_eq(&cards[&card_id::MINI].rect, &rect));
+                assert!(!cards[&card_id::MINI].interactive);
+            }
+            handle.set_card(card_id::DOT, Some(Card::passive([0.0; 4], |_| {})));
+            assert_eq!(wake_count(&handle), 3);
+            handle.set_card(card_id::FLASH, None);
+            assert_eq!(wake_count(&handle), 3);
+            handle.set_card(card_id::MINI, None);
+            assert_eq!(wake_count(&handle), 4);
+            assert!(ripple.active(!handle.cards.lock().unwrap().is_empty()));
+            handle.set_card(card_id::DOT, None);
+            assert_eq!(wake_count(&handle), 5);
+            assert!(handle.cards.lock().unwrap().is_empty());
+            assert_eq!(ripple.active(false), showing);
+            handle.set_card(card_id::DOT, None);
+            assert_eq!(wake_count(&handle), 5);
+            release.send(()).unwrap();
+            finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+    }
+
+    #[test]
+    fn card_poisoned_lock_does_not_notify_or_mutate() {
+        let (handle, _commands, release, finished) = fake_handle();
+        handle.set_card(card_id::MINI, Some(Card::interactive([0.0; 4], |_| {})));
+        let cards = handle.cards.clone();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cards.lock().unwrap();
+            panic!("fake poisoned card slot");
+        })).is_err());
+        handle.set_card(card_id::MINI, None);
+        handle.set_card(card_id::DOT, Some(Card::passive([0.0; 4], |_| {})));
+        assert_eq!(wake_count(&handle), 1);
+        let cards = handle.cards.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(cards.len(), 1);
+        assert!(cards.contains_key(&card_id::MINI));
+        drop(cards);
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn card_shutdown_handle_does_not_notify_or_mutate() {
+        let (mut handle, _commands, release, finished) = fake_handle();
+        handle.set_card(card_id::MINI, Some(Card::interactive([0.0; 4], |_| {})));
+        handle.shutdown();
+        let before = wake_count(&handle);
+        handle.set_card(card_id::MINI, None);
+        handle.set_card(card_id::DOT, Some(Card::passive([0.0; 4], |_| {})));
+        assert_eq!(wake_count(&handle), before);
+        let cards = handle.cards.lock().unwrap();
+        assert_eq!(cards.len(), 1);
+        assert!(cards.contains_key(&card_id::MINI));
+        drop(cards);
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
@@ -1805,6 +2027,7 @@ mod regression_tests {
     #[test]
     fn lifecycle_finished_thread_is_not_alive_even_without_stop_signal() {
         let (mut handle, _commands, release, finished) = fake_handle();
+        handle.set_card(card_id::MINI, Some(Card::interactive([0.0; 4], |_| {})));
         release.send(()).unwrap();
         finished.recv_timeout(Duration::from_secs(1)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -1814,6 +2037,14 @@ mod regression_tests {
         assert!(!handle.stop.load(Ordering::Acquire));
         assert!(!handle.is_alive());
         assert!(!handle.is_visible());
+        let before = wake_count(&handle);
+        handle.set_card(card_id::MINI, None);
+        handle.set_card(card_id::DOT, Some(Card::passive([0.0; 4], |_| {})));
+        assert_eq!(wake_count(&handle), before);
+        let cards = handle.cards.lock().unwrap();
+        assert_eq!(cards.len(), 1);
+        assert!(cards.contains_key(&card_id::MINI));
+        drop(cards);
         handle.show();
         assert!(handle.capture.lock().unwrap().begin().is_none());
         handle.shutdown();
@@ -1830,7 +2061,7 @@ mod regression_tests {
     #[test]
     fn hide_stops_capture_before_fade_with_or_without_cards() {
         for have_cards in [false, true] {
-            let mut capture = CaptureState::default();
+            let mut capture = safe_capture();
             let mut ripple = RippleState::default();
             assert!(capture.begin().is_none());
             assert_eq!(ripple.active(have_cards), have_cards);
@@ -1863,7 +2094,7 @@ mod regression_tests {
 
     #[test]
     fn reshow_rejects_old_in_flight_and_queued_frames() {
-        let mut capture = CaptureState::default();
+        let mut capture = safe_capture();
         let mut ripple = RippleState::default();
         capture.set_enabled(true);
         ripple.show();
@@ -1888,7 +2119,7 @@ mod regression_tests {
 
     #[test]
     fn queued_show_cannot_reopen_gate_after_hide() {
-        let mut capture = CaptureState::default();
+        let mut capture = safe_capture();
         let mut ripple = RippleState::default();
         // 模拟窗口线程尚未排空命令时调用线程已连续 Show/Hide。
         capture.set_enabled(true);
@@ -1908,7 +2139,7 @@ mod regression_tests {
 
     #[test]
     fn repeated_hide_and_show_invalidate_previous_work() {
-        let mut capture = CaptureState::default();
+        let mut capture = safe_capture();
         let mut ripple = RippleState::default();
         for _ in 0..2 {
             capture.set_enabled(false);
@@ -1929,7 +2160,7 @@ mod regression_tests {
 
     #[test]
     fn topology_invalidation_rejects_in_flight_even_if_bounds_return() {
-        let mut capture = CaptureState::default();
+        let mut capture = safe_capture();
         capture.set_enabled(true);
         let old = capture.begin().unwrap();
         capture.invalidate();
@@ -1992,6 +2223,12 @@ mod tests {
         out_w: u32,
         out_h: u32,
     ) -> Option<Vec<u8>> {
+        render_lens_source(img, tex_w, tex_h, out_w, out_h, include_str!("shader.wgsl"))
+    }
+
+    fn render_lens_source(
+        img: &[u8], tex_w: u32, tex_h: u32, out_w: u32, out_h: u32, source: &str,
+    ) -> Option<Vec<u8>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
         let (device, queue) =
@@ -2023,7 +2260,7 @@ mod tests {
             wgpu::Extent3d { width: tex_w, height: tex_h, depth_or_array_layers: 1 },
         );
 
-        let (pipeline, bind_layout) = super::Gfx::lens_pipeline(&device);
+        let (pipeline, bind_layout) = super::Gfx::lens_pipeline_source(&device, source);
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test-uniform"),
@@ -2175,6 +2412,16 @@ mod tests {
             eprintln!("无 GPU adapter，跳过离屏渲染测试");
             return;
         };
+
+        // 恢复优化前的无条件采样，逐像素确认薄裙裁剪不损失画质。
+        let source = include_str!("shader.wgsl");
+        assert_eq!(source.matches("if (vis > 0.0)").count(), 1);
+        let reference_source = source.replace("if (vis > 0.0)", "if (true)");
+        let reference = render_lens_source(&img, W, H, W, H, &reference_source)
+            .expect("首次离屏渲染已成功，参考渲染不应失败");
+        let max_delta = data.iter().zip(&reference).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(max_delta <= 1, "优化前后像素最大差 {max_delta} 超过 1 LSB");
+        eprintln!("合成棋盘 GPU 验收：{} 像素，优化前后最大通道差 {max_delta} LSB", W * H);
 
         let px = |x: u32, y: u32| -> [u8; 4] {
             let i = ((y * W + x) * 4) as usize;

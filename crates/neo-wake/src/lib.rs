@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -101,20 +101,200 @@ fn default_model_dir() -> PathBuf {
 
 #[derive(Debug, Clone)]
 pub enum WakeEvent {
-    Detected { score: f32 },
+    /// epoch 为生成时的测试模式代次，转发时不得重新标记。
+    Detected { epoch: u64, score: f32 },
     /// 听写模式下转发的 16kHz 单声道 f32 音频块（每块 80ms / 1280 样本）
-    Audio(Vec<f32>),
+    Audio { epoch: u64, frame: Vec<f32> },
     /// 引擎线程遇到无法恢复的错误后退出（模型缺失 / 无麦克风 / 推理失败）
     Error(String),
+}
+
+impl WakeEvent {
+    /// 在最终消费端校验：进出测试前已发送、但仍滞留于转发线程的事件也会失效。
+    /// 错误不受代次或测试开关影响；普通听写模式切换不改变此代次。
+    pub fn is_current(&self, current_epoch: u64) -> bool {
+        match self {
+            Self::Detected { epoch, .. } | Self::Audio { epoch, .. } => {
+                current_epoch & 1 == 0 && *epoch == current_epoch
+            }
+            Self::Error(_) => true,
+        }
+    }
 }
 
 // 引擎工作模式（AtomicU8 编码）
 const MODE_DETECT: u8 = 0; // 常规：只跑唤醒词检测
 const MODE_DICTATE: u8 = 1; // 唤醒后听写：转发音频帧，暂停唤醒检测（省 CPU、防复读）
 
+/// 生命周期状态；Ready 表示流已启动，是否填满推理窗口看 warmup_frames。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakePhase {
+    Loading,
+    Ready,
+    Error,
+    Stopped,
+}
+
+/// 单份内存快照，不包含音频或识别文本。所有 *_ms 都是 Unix 毫秒，0 表示尚无数据。
+#[derive(Debug, Clone)]
+pub struct WakeDiagnostics {
+    pub enabled: bool,
+    pub test_mode: bool,
+    pub phase: WakePhase,
+    /// 启动时选中的默认输入设备；设备自动切换后名称可能已过时。
+    pub device_name: Option<String>,
+    pub sample_rate: Option<u32>,
+    /// 归一化单声道输入电平；None 表示未启用或尚无样本，静音为 -120 dBFS。
+    pub rms: Option<f32>,
+    pub dbfs: Option<f32>,
+    pub peak: Option<f32>,
+    pub score: Option<f32>,
+    pub score_peak_2s: Option<f32>,
+    pub threshold: f32,
+    pub warmup_frames: usize,
+    pub warmup_total: usize,
+    pub dictating: bool,
+    /// 整个引擎实例的确认命中数（包括测试模式），不是单帧过阈值次数。
+    pub hit_count: u64,
+    pub last_hit_ms: u64,
+    pub updated_at_ms: u64,
+    pub last_audio_ms: u64,
+    /// 最后一次错误保持到实例销毁，不写日志；最多 512 个字符。
+    pub error: Option<String>,
+}
+
+struct WakeMonitor {
+    enabled: AtomicBool,
+    // 最低位为测试开关，高位为版本；快速 on/off 也必须被工作线程观察到。
+    test_epoch: AtomicU64,
+    snapshot: Mutex<WakeDiagnostics>,
+}
+
+impl WakeMonitor {
+    fn new(threshold: f32) -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            test_epoch: AtomicU64::new(0),
+            snapshot: Mutex::new(WakeDiagnostics {
+                enabled: false, test_mode: false, phase: WakePhase::Loading,
+                device_name: None, sample_rate: None, rms: None, dbfs: None, peak: None,
+                score: None, score_peak_2s: None, threshold, warmup_frames: 0,
+                warmup_total: CHUNK_FRAMES, dictating: false, hit_count: 0,
+                last_hit_ms: 0, updated_at_ms: now_ms(), last_audio_ms: 0, error: None,
+            }),
+        }
+    }
+
+    fn update(&self, update: impl FnOnce(&mut WakeDiagnostics)) {
+        let mut state = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        update(&mut state);
+        state.updated_at_ms = now_ms();
+    }
+
+    fn fail(&self, error: &str) {
+        self.update(|s| {
+            s.phase = WakePhase::Error;
+            s.error = Some(error.chars().take(512).collect());
+        });
+    }
+
+    fn set_test_mode(&self, on: bool) {
+        self.update(|s| {
+            if s.test_mode != on {
+                s.test_mode = on;
+                self.test_epoch.fetch_add(1, Ordering::Release);
+                s.warmup_frames = 0;
+                s.score = None;
+                s.score_peak_2s = None;
+            }
+        });
+    }
+
+    // 与 set_test_mode 共用锁，返回后工作线程不会再发送测试开始前的命中。
+    fn detected(&self, epoch: u64, score: f32, tx: &mpsc::Sender<WakeEvent>) -> bool {
+        let mut s = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        if self.test_epoch.load(Ordering::Acquire) != epoch {
+            return true;
+        }
+        s.hit_count = s.hit_count.saturating_add(1);
+        s.last_hit_ms = now_ms();
+        s.updated_at_ms = s.last_hit_ms;
+        s.test_mode || tx.send(WakeEvent::Detected { epoch, score }).is_ok()
+    }
+}
+
+const DIAGNOSTIC_INTERVAL: Duration = Duration::from_millis(200);
+const SCORE_HISTORY: usize = 32;
+
+struct DiagnosticMeter {
+    enabled: bool,
+    published: Instant,
+    power: f64,
+    samples: usize,
+    peak: f32,
+    score: Option<f32>,
+    scores: VecDeque<(Instant, f32)>,
+    last_audio_ms: u64,
+}
+
+impl DiagnosticMeter {
+    fn new(now: Instant) -> Self {
+        Self { enabled: false, published: now, power: 0.0, samples: 0,
+            peak: 0.0, score: None, scores: VecDeque::with_capacity(SCORE_HISTORY), last_audio_ms: 0 }
+    }
+
+    fn enable(&mut self, enabled: bool, now: Instant) {
+        if self.enabled != enabled {
+            *self = Self::new(now);
+            self.enabled = enabled;
+        }
+    }
+
+    fn audio(&mut self, raw: &[i16]) {
+        if !self.enabled || raw.is_empty() { return; }
+        for &sample in raw {
+            let sample = sample as f32 / 32768.0;
+            self.power += (sample as f64).powi(2);
+            self.peak = self.peak.max(sample.abs());
+        }
+        self.samples += raw.len();
+        self.last_audio_ms = now_ms();
+    }
+
+    fn score(&mut self, now: Instant, score: f32) {
+        if !self.enabled { return; }
+        self.score = Some(score);
+        if self.scores.len() == SCORE_HISTORY { self.scores.pop_front(); }
+        self.scores.push_back((now, score));
+    }
+
+    fn publish(&mut self, monitor: &WakeMonitor, now: Instant, warmup: usize, dictating: bool) {
+        if !self.enabled || now.duration_since(self.published) < DIAGNOSTIC_INTERVAL { return; }
+        while self.scores.front().is_some_and(|(t, _)| now.duration_since(*t) >= Duration::from_secs(2)) {
+            self.scores.pop_front();
+        }
+        monitor.update(|s| {
+            if !s.enabled { return; }
+            s.rms = (self.samples > 0).then(|| (self.power / self.samples as f64).sqrt() as f32);
+            s.dbfs = s.rms.map(|rms| 20.0 * rms.max(1e-6).log10());
+            s.peak = (self.samples > 0).then_some(self.peak);
+            s.score = self.score;
+            s.score_peak_2s = self.scores.iter().map(|(_, s)| *s).reduce(f32::max);
+            s.warmup_frames = warmup;
+            s.dictating = dictating;
+            s.last_audio_ms = self.last_audio_ms;
+        });
+        self.published = now;
+        self.power = 0.0;
+        self.samples = 0;
+        self.peak = 0.0;
+    }
+}
+
 pub struct WakeEngine {
     stop: Arc<AtomicBool>,
     mode: Arc<AtomicU8>,
+    monitor: Arc<WakeMonitor>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -127,21 +307,29 @@ impl WakeEngine {
         let stop2 = stop.clone();
         let mode = Arc::new(AtomicU8::new(MODE_DETECT));
         let mode2 = mode.clone();
+        let monitor = Arc::new(WakeMonitor::new(config.threshold));
+        let monitor2 = monitor.clone();
         let failed = tx.clone();
         let thread = std::thread::Builder::new()
             .name("neo-wake".into())
             .spawn(move || {
                 let failed = tx.clone();
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    engine_main(config, tx, stop2, mode2);
+                    engine_main(config, tx, stop2, mode2, monitor2.clone());
                 })).is_err() {
+                    monitor2.fail("唤醒线程异常中断");
                     let _ = failed.send(WakeEvent::Error("唤醒线程异常中断".into()));
                 }
+                monitor2.update(|s| {
+                    if s.phase != WakePhase::Error { s.phase = WakePhase::Stopped; }
+                });
             });
         let thread = match thread {
             Ok(thread) => Some(thread),
             Err(e) => {
-                let _ = failed.send(WakeEvent::Error(format!("无法启动唤醒线程：{e}")));
+                let error = format!("无法启动唤醒线程：{e}");
+                monitor.fail(&error);
+                let _ = failed.send(WakeEvent::Error(error));
                 None
             }
         };
@@ -149,10 +337,42 @@ impl WakeEngine {
             Self {
                 stop,
                 mode,
+                monitor,
                 thread,
             },
             rx,
         )
+    }
+
+    /// 仅开关额外电平/得分遥测；不启停麦克风、不重载模型、不改变工作模式。
+    pub fn set_diagnostics(&self, on: bool) {
+        self.monitor.update(|s| {
+            self.monitor.enabled.store(on, Ordering::Release);
+            s.enabled = on;
+            if !on {
+                s.rms = None;
+                s.dbfs = None;
+                s.peak = None;
+                s.score = None;
+                s.score_peak_2s = None;
+            }
+        });
+    }
+
+    /// 拉取最新快照（电平最多 5Hz；生命周期/命中即时更新）。错误跨诊断开关保留。
+    pub fn diagnostics(&self) -> WakeDiagnostics {
+        self.monitor.snapshot.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// 测试时只计数、不发送 Detected 或听写 Audio。进出均重新预热且保留原阈值。
+    /// 调用方须在最终消费时以 [`Self::event_epoch`] 校验事件代次，不能仅排空队列。
+    pub fn set_test_mode(&self, on: bool) {
+        self.monitor.set_test_mode(on);
+    }
+
+    /// 当前测试模式代次；普通听写切换不改变它。
+    pub fn event_epoch(&self) -> u64 {
+        self.monitor.test_epoch.load(Ordering::Acquire)
     }
 
     /// 切换听写模式。
@@ -190,6 +410,7 @@ fn engine_main(
     tx: mpsc::Sender<WakeEvent>,
     stop: Arc<AtomicBool>,
     mode: Arc<AtomicU8>,
+    monitor: Arc<WakeMonitor>,
 ) {
     let _lease = loop {
         if stop.load(Ordering::Relaxed) {
@@ -209,6 +430,7 @@ fn engine_main(
     let mut models = match load_models(&config.model_dir) {
         Ok(m) => m,
         Err(e) => {
+            monitor.fail(&e);
             let _ = tx.send(WakeEvent::Error(e));
             return;
         }
@@ -219,11 +441,14 @@ fn engine_main(
     }
     let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<i16>>(SAMPLE_CHUNKS);
     let err_tx = tx.clone();
+    let err_monitor = monitor.clone();
     let stream = match build_stream(sample_tx, move |msg| {
+        err_monitor.fail(&msg);
         let _ = err_tx.send(WakeEvent::Error(msg));
     }) {
         Ok(s) => s,
         Err(e) => {
+            monitor.fail(&e);
             let _ = tx.send(WakeEvent::Error(e));
             return;
         }
@@ -231,10 +456,19 @@ fn engine_main(
     if stop.load(Ordering::Relaxed) {
         return;
     }
+    monitor.update(|s| {
+        s.device_name = Some(stream.device_name.chars().take(256).collect());
+        s.sample_rate = Some(stream.sample_rate);
+    });
     if let Err(e) = stream.stream.play() {
-        let _ = tx.send(WakeEvent::Error(format!("start mic stream: {e}")));
+        let error = format!("start mic stream: {e}");
+        monitor.fail(&error);
+        let _ = tx.send(WakeEvent::Error(error));
         return;
     }
+    monitor.update(|s| {
+        if s.phase != WakePhase::Error { s.phase = WakePhase::Ready; }
+    });
 
     let mut resampler = Resampler::new(stream.sample_rate, SAMPLE_RATE);
     let mut pending: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
@@ -242,19 +476,8 @@ fn engine_main(
     let mut last_fire = Instant::now() - config.debounce * 2;
     let mut chunk = vec![0f32; FRAME_SAMPLES * CHUNK_FRAMES];
 
-    // NEO_WAKE_DEBUG=1 打开遥测：每 2s 报一次「峰值得分 + 输入电平」，
-    // 用来区分「麦克风没声 / 有声但得分低 / 得分够但被防抖拦下」。
-    let debug = std::env::var_os("NEO_WAKE_DEBUG").is_some();
-    if debug {
-        eprintln!(
-            "[neo-wake] 采集设备：{} @ {}Hz（阈值 {:.2}）",
-            stream.device_name, stream.sample_rate, config.threshold
-        );
-    }
-    let mut stat_t = Instant::now();
-    let mut stat_peak = 0f32;
-    let mut stat_pow = 0f64;
-    let mut stat_n = 0usize;
+    let mut meter = DiagnosticMeter::new(Instant::now());
+    let mut test_seen = 0;
     let mut mode_seen = MODE_DETECT;
     // 连续过线帧数（见 CONFIRM_FRAMES）：单帧尖峰不算数。
     let mut streak = 0usize;
@@ -263,32 +486,29 @@ fn engine_main(
         // 模式切换：清缓冲 + 重置防抖。
         // 回到检测模式时，滑窗需要约 2s 重新填满，期间不会误触发；
         // 听写残留的唤醒词尾音也不会在切回后立刻再烧一次。
-        let m = mode.load(Ordering::Relaxed);
-        if m != mode_seen {
+        let test = monitor.test_epoch.load(Ordering::Acquire);
+        let m = if test & 1 != 0 { MODE_DETECT } else { mode.load(Ordering::Relaxed) };
+        if m != mode_seen || test != test_seen {
             mode_seen = m;
             frames.clear();
             pending.clear();
             streak = 0;
             last_fire = Instant::now();
-            if debug {
-                eprintln!("[neo-wake] 模式切换 → {}", if m == MODE_DICTATE { "听写" } else { "检测" });
+            if test != test_seen {
+                reset_test_audio(&sample_rx, &mut resampler, stream.sample_rate, &mut chunk);
+                test_seen = test;
             }
+            meter = DiagnosticMeter::new(Instant::now());
+            monitor.update(|s| {
+                s.warmup_frames = 0;
+                s.dictating = m == MODE_DICTATE;
+                s.score = None;
+                s.score_peak_2s = None;
+            });
         }
-        // 放在收样之前：即使麦克风完全没有数据到达，周期报告也照常输出
-        //（「电平 -inf、峰值 0」本身就是关键诊断信息）。
-        if debug && stat_t.elapsed() >= Duration::from_secs(2) {
-            let rms = if stat_n > 0 {
-                (stat_pow / stat_n as f64).sqrt()
-            } else {
-                0.0
-            };
-            let db = 20.0 * (rms / 32768.0).max(1e-6).log10();
-            eprintln!("[neo-wake] 峰值分 {stat_peak:.3} | 输入电平 {db:.1} dBFS（近 2s）");
-            stat_t = Instant::now();
-            stat_peak = 0.0;
-            stat_pow = 0.0;
-            stat_n = 0;
-        }
+        let now = Instant::now();
+        meter.enable(monitor.enabled.load(Ordering::Acquire), now);
+        meter.publish(&monitor, now, frames.len(), mode_seen == MODE_DICTATE);
         let raw = match sample_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(v) => v,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -298,24 +518,25 @@ fn engine_main(
                 // 只能靠数据兜底。上报后退出，别永远空转装没事。
                 let silent = now_ms().saturating_sub(stream.last_sample.load(Ordering::Relaxed));
                 if silent > MIC_SILENCE_TIMEOUT.as_millis() as u64 {
-                    let _ = tx.send(WakeEvent::Error(
-                        "麦克风已断开（5 秒没有采到任何声音）".to_owned(),
-                    ));
+                    let error = "麦克风已断开（5 秒没有采到任何声音）".to_owned();
+                    monitor.fail(&error);
+                    let _ = tx.send(WakeEvent::Error(error));
                     return;
                 }
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        if debug {
-            stat_pow += raw.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>();
-            stat_n += raw.len();
-        }
+        meter.enable(monitor.enabled.load(Ordering::Acquire), Instant::now());
+        meter.audio(&raw);
         resampler.process(&raw, &mut pending);
 
         while pending.len() >= FRAME_SAMPLES {
             if stop.load(Ordering::Relaxed) {
                 return;
+            }
+            if monitor.test_epoch.load(Ordering::Acquire) != test_seen {
+                break; // 外层统一重置，不能用测试退出前的帧继续推理。
             }
             let frame: Vec<f32> = pending
                 .drain(..FRAME_SAMPLES)
@@ -324,7 +545,9 @@ fn engine_main(
 
             // 听写模式：帧直接转发给上层（VAD/STT），不跑唤醒推理
             if mode_seen == MODE_DICTATE {
-                if tx.send(WakeEvent::Audio(frame)).is_err() {
+                let state = monitor.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+                if monitor.test_epoch.load(Ordering::Acquire) != test_seen { break; }
+                if !state.test_mode && tx.send(WakeEvent::Audio { epoch: test_seen, frame }).is_err() {
                     return;
                 }
                 continue;
@@ -347,9 +570,9 @@ fn engine_main(
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
-                    if debug {
-                        stat_peak = stat_peak.max(score);
-                    }
+                    if monitor.test_epoch.load(Ordering::Acquire) != test_seen { break; }
+                    meter.enable(monitor.enabled.load(Ordering::Acquire), Instant::now());
+                    meter.score(Instant::now(), score);
                     if score >= config.threshold {
                         streak += 1;
                     } else {
@@ -358,25 +581,38 @@ fn engine_main(
                     if streak >= CONFIRM_FRAMES && last_fire.elapsed() >= config.debounce {
                         streak = 0;
                         last_fire = Instant::now();
-                        if debug {
-                            eprintln!("[neo-wake] 触发！score={score:.3}");
-                        }
                         // 检测后清空缓冲，与 Python listener 的 pause 行为一致
                         frames.clear();
                         pending.clear();
-                        if tx.send(WakeEvent::Detected { score }).is_err() {
+                        if !monitor.detected(test_seen, score, &tx) {
                             return;
                         }
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(WakeEvent::Error(format!("inference: {e}")));
+                    let error = format!("inference: {e}");
+                    monitor.fail(&error);
+                    let _ = tx.send(WakeEvent::Error(error));
                     return;
                 }
             }
         }
     }
     // stream 随作用域结束而 drop，采集回调停止
+}
+
+fn reset_test_audio(
+    samples: &mpsc::Receiver<Vec<i16>>,
+    resampler: &mut Resampler,
+    sample_rate: u32,
+    chunk: &mut [f32],
+) {
+    // 有界排空此前采集的块，且清掉重采样滤波器的尾音。
+    for _ in 0..SAMPLE_CHUNKS {
+        if samples.try_recv().is_err() { break; }
+    }
+    *resampler = Resampler::new(sample_rate, SAMPLE_RATE);
+    chunk.fill(0.0);
 }
 
 // ---------------- 模型加载与推理 ----------------
@@ -542,7 +778,7 @@ fn build_stream(
             // 误当致命错误会让唤醒整局失效，这里只记录不上报。
             // （设备拔出且无后继的「假 DeviceChanged、真死流」由数据看门狗兜住。）
             cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged => {
-                eprintln!("[neo-wake] mic stream 瞬态事件（流仍存活，忽略）: {e}");
+                eprintln!("[neo-wake] mic stream 瞬态事件（流仍存活，忽略）");
             }
             _ => on_err(format!("mic stream: {e}")),
         }
@@ -1011,6 +1247,178 @@ fn tap_main(
 }
 
 #[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    fn fake_engine() -> WakeEngine {
+        WakeEngine {
+            stop: Arc::new(AtomicBool::new(false)),
+            mode: Arc::new(AtomicU8::new(MODE_DETECT)),
+            monitor: Arc::new(WakeMonitor::new(0.25)),
+            thread: None,
+        }
+    }
+
+    #[test]
+    fn diagnostics_are_opt_in_and_rate_limited_without_events() {
+        let engine = fake_engine();
+        let start = Instant::now();
+        let mut meter = DiagnosticMeter::new(start);
+        meter.audio(&[i16::MIN, i16::MAX]);
+        meter.score(start, 0.9);
+        assert_eq!(meter.samples, 0);
+        assert_eq!(meter.power, 0.0);
+        assert!(meter.scores.is_empty());
+        engine.set_diagnostics(true);
+        meter.enable(true, start);
+        meter.audio(&[16384, -16384]);
+        meter.score(start, 0.7);
+        meter.publish(&engine.monitor, start + Duration::from_millis(199), 7, false);
+        assert!(engine.diagnostics().rms.is_none());
+        meter.publish(&engine.monitor, start + DIAGNOSTIC_INTERVAL, 7, false);
+        let s = engine.diagnostics();
+        assert_eq!(s.rms, Some(0.5));
+        assert!((s.dbfs.unwrap() + 6.0206).abs() < 0.001);
+        assert_eq!(s.peak, Some(0.5));
+        assert_eq!(s.score, Some(0.7));
+        assert_eq!(s.score_peak_2s, Some(0.7));
+        assert_eq!(s.warmup_frames, 7);
+        assert_eq!(s.warmup_total, 25);
+        assert!(s.last_audio_ms > 0);
+        engine.set_diagnostics(false);
+        meter.enable(false, start + DIAGNOSTIC_INTERVAL);
+        meter.audio(&[i16::MIN; 100]);
+        assert_eq!(meter.samples, 0);
+        assert!(engine.diagnostics().rms.is_none());
+        assert!(engine.diagnostics().score.is_none());
+        assert_eq!(engine.mode.load(Ordering::Relaxed), MODE_DETECT);
+        assert!(!engine.stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn silence_and_full_scale_are_finite_and_old_scores_expire() {
+        let engine = fake_engine();
+        engine.set_diagnostics(true);
+        let start = Instant::now();
+        let mut meter = DiagnosticMeter::new(start);
+        meter.enable(true, start);
+        meter.audio(&[0; 10]);
+        meter.score(start, 0.9);
+        meter.publish(&engine.monitor, start + DIAGNOSTIC_INTERVAL, 25, false);
+        assert_eq!(engine.diagnostics().dbfs, Some(-120.0));
+        meter.audio(&[i16::MIN; 10]);
+        meter.score(start + Duration::from_secs(1), 0.2);
+        meter.publish(&engine.monitor, start + Duration::from_secs(2), 25, false);
+        let s = engine.diagnostics();
+        assert_eq!(s.dbfs, Some(0.0));
+        assert_eq!(s.peak, Some(1.0));
+        assert_eq!(s.score_peak_2s, Some(0.2));
+        meter.publish(&engine.monitor, start + Duration::from_secs(3), 25, false);
+        assert!(engine.diagnostics().score_peak_2s.is_none());
+        assert!(engine.diagnostics().rms.is_none());
+        for _ in 0..1000 { meter.score(start + Duration::from_secs(3), 0.4); }
+        assert_eq!(meter.scores.len(), SCORE_HISTORY);
+    }
+
+    #[test]
+    fn lifecycle_error_is_bounded_and_survives_diagnostic_toggles() {
+        let engine = fake_engine();
+        assert_eq!(engine.diagnostics().phase, WakePhase::Loading);
+        engine.monitor.update(|s| {
+            s.phase = WakePhase::Ready;
+            s.device_name = Some("fake microphone".into());
+            s.sample_rate = Some(48_000);
+        });
+        engine.monitor.fail(&"错".repeat(1000));
+        engine.set_diagnostics(true);
+        engine.set_diagnostics(false);
+        let s = engine.diagnostics();
+        assert_eq!(s.phase, WakePhase::Error);
+        assert_eq!(s.error.unwrap().chars().count(), 512);
+        assert_eq!(s.device_name.as_deref(), Some("fake microphone"));
+        assert_eq!(s.sample_rate, Some(48_000));
+        assert_eq!(s.threshold, 0.25);
+    }
+
+    #[test]
+    fn test_mode_counts_without_dispatch_and_rejects_in_flight_results() {
+        let engine = fake_engine();
+        let (tx, rx) = mpsc::channel();
+        assert!(engine.monitor.detected(0, 0.6, &tx));
+        assert!(matches!(rx.try_recv(), Ok(WakeEvent::Detected { epoch: 0, score }) if score == 0.6));
+        engine.set_test_mode(true);
+        engine.set_test_mode(true); // 幂等，不重复重置正在测试的窗口。
+        assert_eq!(engine.monitor.test_epoch.load(Ordering::Acquire), 1);
+        assert!(engine.monitor.detected(0, 0.8, &tx));
+        assert!(engine.monitor.detected(1, 0.8, &tx));
+        assert!(rx.try_recv().is_err());
+        let s = engine.diagnostics();
+        assert!(s.test_mode);
+        assert_eq!(s.hit_count, 2);
+        assert!(s.last_hit_ms > 0);
+        engine.set_test_mode(false);
+        assert!(engine.monitor.detected(1, 0.8, &tx));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(engine.diagnostics().hit_count, 2);
+        assert_eq!(engine.diagnostics().threshold, 0.25);
+        assert!(engine.monitor.detected(2, 0.5, &tx));
+        assert!(matches!(rx.try_recv(), Ok(WakeEvent::Detected { .. })));
+        engine.set_test_mode(true);
+        engine.set_test_mode(false);
+        assert_eq!(engine.monitor.test_epoch.load(Ordering::Acquire), 4);
+        assert_eq!(engine.diagnostics().warmup_frames, 0);
+    }
+
+    #[test]
+    fn event_epoch_survives_forwarding_and_normal_dictation_switches() {
+        let engine = fake_engine();
+        let (tx, rx) = mpsc::channel();
+        assert!(engine.monitor.detected(engine.event_epoch(), 0.8, &tx));
+        let detected = rx.recv().unwrap();
+        let audio = WakeEvent::Audio { epoch: engine.event_epoch(), frame: vec![0.1; 16] };
+        assert!(detected.is_current(engine.event_epoch()));
+        engine.set_dictation(true);
+        assert!(audio.is_current(engine.event_epoch()));
+        engine.set_dictation(false);
+        assert!(detected.is_current(engine.event_epoch()));
+        assert!(audio.is_current(engine.event_epoch()));
+
+        engine.set_test_mode(true);
+        assert!(!detected.is_current(engine.event_epoch()));
+        assert!(!audio.is_current(engine.event_epoch()));
+        assert!(!WakeEvent::Audio { epoch: engine.event_epoch(), frame: vec![] }.is_current(engine.event_epoch()));
+        assert!(WakeEvent::Error("synthetic failure".into()).is_current(engine.event_epoch()));
+        engine.set_test_mode(false);
+        assert_eq!(engine.event_epoch(), 2);
+        assert!(!detected.is_current(engine.event_epoch()));
+        assert!(!audio.is_current(engine.event_epoch()));
+        assert!(engine.monitor.detected(engine.event_epoch(), 0.7, &tx));
+        assert!(rx.recv().unwrap().is_current(engine.event_epoch()));
+        engine.set_dictation(true);
+        assert!(WakeEvent::Audio { epoch: 2, frame: vec![0.2] }.is_current(engine.event_epoch()));
+        assert!(WakeEvent::Error("synthetic failure".into()).is_current(engine.event_epoch()));
+    }
+
+    #[test]
+    fn test_transition_discards_queued_audio_and_filter_tail() {
+        let (tx, rx) = mpsc::sync_channel(SAMPLE_CHUNKS);
+        for _ in 0..SAMPLE_CHUNKS { tx.try_send(vec![i16::MAX; 10]).unwrap(); }
+        let mut resampler = Resampler::new(48_000, SAMPLE_RATE);
+        let mut pending = Vec::new();
+        resampler.process(&[i16::MAX; 128], &mut pending);
+        assert!(resampler.started);
+        let mut chunk = vec![1.0; FRAME_SAMPLES * CHUNK_FRAMES];
+        reset_test_audio(&rx, &mut resampler, 48_000, &mut chunk);
+        assert!(rx.try_recv().is_err());
+        assert!(!resampler.started);
+        assert!(chunk.iter().all(|&s| s == 0.0));
+        pending.clear();
+        resampler.process(&[0; 128], &mut pending);
+        assert!(pending.iter().all(|&s| s == 0));
+    }
+}
+
+#[cfg(test)]
 mod audio_tap_regression_tests {
     use super::*;
 
@@ -1039,7 +1447,7 @@ mod audio_tap_regression_tests {
     fn cancelled_wake_skips_models_and_microphone() {
         let (tx, rx) = mpsc::channel();
         let _lease = WAKE_LEASE.lock().unwrap_or_else(|p| p.into_inner());
-        engine_main(WakeConfig::default(), tx, Arc::new(AtomicBool::new(true)), Arc::new(AtomicU8::new(MODE_DETECT)));
+        engine_main(WakeConfig::default(), tx, Arc::new(AtomicBool::new(true)), Arc::new(AtomicU8::new(MODE_DETECT)), Arc::new(WakeMonitor::new(0.25)));
         assert!(rx.try_recv().is_err());
     }
 
@@ -1048,7 +1456,7 @@ mod audio_tap_regression_tests {
         let (release, wait) = mpsc::channel();
         let thread = std::thread::spawn(move || { let _ = wait.recv(); });
         let stop = Arc::new(AtomicBool::new(false));
-        let engine = WakeEngine { stop: stop.clone(), mode: Arc::new(AtomicU8::new(MODE_DETECT)), thread: Some(thread) };
+        let engine = WakeEngine { stop: stop.clone(), mode: Arc::new(AtomicU8::new(MODE_DETECT)), monitor: Arc::new(WakeMonitor::new(0.25)), thread: Some(thread) };
         let (done, finished) = mpsc::channel();
         let dropper = std::thread::spawn(move || { drop(engine); let _ = done.send(()); });
         let result = finished.recv_timeout(Duration::from_secs(1));

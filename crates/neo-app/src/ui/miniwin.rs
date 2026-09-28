@@ -461,9 +461,77 @@ fn paint(
     }
 }
 
-/// 边缘流光：一段细线沿卡片边缘顺时针匀速循环，头部实、拖尾渐隐。
-///
-/// 沿弧长（而非点序号）参数化，圆角与直边上的速度才一致。
+#[derive(Clone, Copy, PartialEq)]
+struct BeamKey {
+    size: Vec2,
+    radius: f32,
+    superellipse: f32,
+    segments: usize,
+}
+
+impl BeamKey {
+    fn new(size: Vec2, radius: f32) -> Self {
+        Self {
+            size,
+            radius,
+            superellipse: neo_theme::HARNESS_SUPERELLIPSE,
+            segments: neo_theme::squircle::DEFAULT_SEGMENTS,
+        }
+    }
+}
+
+/// 只缓存局部坐标；避让、淡出上飘和窗口原点变化都不重建几何。
+#[derive(Default)]
+struct BeamGeometry {
+    key: Option<BeamKey>,
+    points: Vec<Pos2>,
+    cumulative: Vec<f32>,
+    total: f32,
+}
+
+impl BeamGeometry {
+    fn ensure(&mut self, key: BeamKey) -> bool {
+        if self.key == Some(key) {
+            return false;
+        }
+        self.points = neo_theme::squircle::squircle_points(
+            Rect::from_min_size(Pos2::ZERO, key.size).shrink(0.5),
+            key.radius,
+            key.superellipse,
+            key.segments,
+        );
+        self.cumulative.clear();
+        self.cumulative.reserve(self.points.len() + 1);
+        self.cumulative.push(0.0);
+        for i in 0..self.points.len() {
+            self.cumulative.push(self.cumulative[i]
+                + self.points[i].distance(self.points[(i + 1) % self.points.len()]));
+        }
+        self.total = *self.cumulative.last().unwrap();
+        self.key = Some(key);
+        true
+    }
+
+    fn at(&self, s: f32) -> Pos2 {
+        let s = s.rem_euclid(self.total);
+        let idx = match self.cumulative.binary_search_by(|c|
+            c.partial_cmp(&s).unwrap_or(std::cmp::Ordering::Equal)) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        }.min(self.points.len() - 1);
+        let seg = (self.cumulative[idx + 1] - self.cumulative[idx]).max(f32::EPSILON);
+        let t = ((s - self.cumulative[idx]) / seg).clamp(0.0, 1.0);
+        self.points[idx] + (self.points[(idx + 1) % self.points.len()] - self.points[idx]) * t
+    }
+
+    fn tail_points(&self, now: f64) -> [Pos2; 29] {
+        let head = ((now / 2.4).fract() as f32) * self.total;
+        let tail = self.total * 0.30;
+        std::array::from_fn(|i| self.at(head - tail + tail * (i as f32 / 28.0)))
+    }
+}
+
+/// 边缘流光：沿弧长匀速循环；每帧只更新相位、平移与颜色。
 fn paint_border_beam(
     painter: &egui::Painter,
     rect: Rect,
@@ -472,55 +540,22 @@ fn paint_border_beam(
     base: Color32,
     width: f32,
 ) {
-    /// 一圈的秒数。
-    const PERIOD: f64 = 2.4;
-    /// 拖尾长度占周长的比例。
-    const TAIL: f32 = 0.30;
-    /// 拖尾分多少段渐隐。
-    const SLICES: usize = 28;
-
-    // shrink(0.5)：对齐静态描边（1px Inside）的中心线。
-    let pts = neo_theme::squircle::squircle_points(
-        rect.shrink(0.5),
-        radius,
-        neo_theme::HARNESS_SUPERELLIPSE,
-        neo_theme::squircle::DEFAULT_SEGMENTS,
-    );
-    if pts.len() < 2 {
+    // Context 独立持有缓存，tick 重建绘制闭包不会丢失它；只克隆 Arc，不克隆 Vec。
+    let cache = painter.ctx().data_mut(|d| {
+        d.get_temp_mut_or_default::<Arc<Mutex<BeamGeometry>>>(Id::new("neo-miniwin-beam"))
+            .clone()
+    });
+    let mut geometry = cache.lock().unwrap();
+    geometry.ensure(BeamKey::new(rect.size(), radius));
+    if geometry.points.len() < 2 || geometry.total <= 0.0 {
         return;
     }
-    // 闭合路径的累计弧长（含末点绕回首点的一段）。
-    let mut cum = Vec::with_capacity(pts.len() + 1);
-    cum.push(0.0f32);
-    for i in 0..pts.len() {
-        cum.push(cum[i] + pts[i].distance(pts[(i + 1) % pts.len()]));
-    }
-    let total = *cum.last().unwrap();
-    if total <= 0.0 {
-        return;
-    }
-    // 弧长 s 处的点：先二分定位采样区间，再在区间内线性插值。
-    let at = |s: f32| -> Pos2 {
-        let s = s.rem_euclid(total);
-        let idx = match cum.binary_search_by(|c| c.partial_cmp(&s).unwrap_or(std::cmp::Ordering::Equal))
-        {
-            Ok(i) => i,
-            Err(i) => i.saturating_sub(1),
-        }
-        .min(pts.len() - 1);
-        let seg = (cum[idx + 1] - cum[idx]).max(f32::EPSILON);
-        let t = ((s - cum[idx]) / seg).clamp(0.0, 1.0);
-        pts[idx] + (pts[(idx + 1) % pts.len()] - pts[idx]) * t
-    };
-    let head = ((now / PERIOD).fract() as f32) * total;
-    let tail_len = total * TAIL;
-    for i in 0..SLICES {
-        // i = 0 是最尾端（最透明），越靠头越亮；平方让尾部更快隐没。
-        let s1 = head - tail_len + tail_len * (i as f32 / SLICES as f32);
-        let s2 = head - tail_len + tail_len * ((i + 1) as f32 / SLICES as f32);
-        let k = (i + 1) as f32 / SLICES as f32;
+    // 相邻线段复用端点：56 次二分变为 29 次，栈数组不分配。
+    let points = geometry.tail_points(now);
+    for (i, pair) in points.windows(2).enumerate() {
+        let k = (i + 1) as f32 / 28.0;
         painter.line_segment(
-            [at(s1), at(s2)],
+            [pair[0] + rect.min.to_vec2(), pair[1] + rect.min.to_vec2()],
             Stroke::new(width, base.gamma_multiply(k * k)),
         );
     }
@@ -971,6 +1006,100 @@ impl MiniWin {
         if open {
             ctx.request_repaint_after(POLL);
         }
+    }
+}
+
+#[cfg(test)]
+mod beam_tests {
+    use super::*;
+
+    #[test]
+    fn beam_cache_invalidates_only_geometry_inputs() {
+        let mut cache = BeamGeometry::default();
+        let mut key = BeamKey::new(Vec2::new(340.0, 96.0), 18.0);
+        assert!(cache.ensure(key));
+        assert!(!cache.ensure(key));
+        key.size.y += 1.0;
+        assert!(cache.ensure(key));
+        key.size.x += 1.0;
+        assert!(cache.ensure(key));
+        key.radius += 1.0;
+        assert!(cache.ensure(key));
+        key.segments += 1;
+        assert!(cache.ensure(key));
+        key.superellipse += 0.1;
+        assert!(cache.ensure(key));
+        assert!(!cache.ensure(key));
+    }
+
+    #[test]
+    fn beam_local_geometry_matches_absolute_reference_and_wraps() {
+        for size in [Vec2::new(340.0, 96.0), Vec2::new(340.0, 273.5), Vec2::new(510.0, 144.0)] {
+            for radius in [0.0, 18.0, 27.0] {
+                let mut cache = BeamGeometry::default();
+                cache.ensure(BeamKey::new(size, radius));
+                for origin in [Pos2::ZERO, Pos2::new(-1280.0, 16.0), Pos2::new(1523.25, 8.75)] {
+                    let pts = neo_theme::squircle::squircle_points(
+                        Rect::from_min_size(origin, size).shrink(0.5), radius,
+                        neo_theme::HARNESS_SUPERELLIPSE, neo_theme::squircle::DEFAULT_SEGMENTS);
+                    let mut cum = vec![0.0];
+                    for i in 0..pts.len() {
+                        cum.push(cum[i] + pts[i].distance(pts[(i + 1) % pts.len()]));
+                    }
+                    let total = *cum.last().unwrap();
+                    for now in [0.0, 0.3, 1.7, 2.39999, 2.4, 23.0] {
+                        let head = ((now / 2.4_f64).fract() as f32) * total;
+                        let tail = total * 0.30;
+                        for (i, p) in cache.tail_points(now).iter().enumerate() {
+                            let s = (head - tail + tail * (i as f32 / 28.0)).rem_euclid(total);
+                            let idx = match cum.binary_search_by(|c| c.partial_cmp(&s).unwrap()) {
+                                Ok(i) => i,
+                                Err(i) => i.saturating_sub(1),
+                            }.min(pts.len() - 1);
+                            let t = ((s - cum[idx]) / (cum[idx + 1] - cum[idx]).max(f32::EPSILON)).clamp(0.0, 1.0);
+                            let reference = pts[idx] + (pts[(idx + 1) % pts.len()] - pts[idx]) * t;
+                            assert!((*p + origin.to_vec2()).distance(reference) < 0.002);
+                        }
+                    }
+                }
+                assert!(cache.at(-cache.total * 0.25).distance(cache.at(cache.total * 0.75)) < 0.001);
+            }
+        }
+    }
+
+    #[test]
+    fn beam_synthetic_frames_reuse_buffers_and_reduce_rebuilds() {
+        const FRAMES: usize = 6000;
+        let key = BeamKey::new(Vec2::new(340.0, 180.0), 18.0);
+        let start = Instant::now();
+        for frame in 0..FRAMES {
+            let mut geometry = BeamGeometry::default();
+            geometry.ensure(std::hint::black_box(key));
+            let head = ((frame as f64 / 60.0 / 2.4).fract() as f32) * geometry.total;
+            let tail = geometry.total * 0.30;
+            for i in 0..28 {
+                std::hint::black_box(geometry.at(head - tail + tail * (i as f32 / 28.0)));
+                std::hint::black_box(geometry.at(head - tail + tail * ((i + 1) as f32 / 28.0)));
+            }
+        }
+        let uncached = start.elapsed();
+        let start = Instant::now();
+        let mut cache = BeamGeometry::default();
+        let mut rebuilds = usize::from(cache.ensure(key));
+        let buffers = (cache.points.as_ptr(), cache.cumulative.as_ptr());
+        let capacities = (cache.points.capacity(), cache.cumulative.capacity());
+        for frame in 0..FRAMES {
+            // 模拟避让平移，局部尺寸不变。
+            let rect = Rect::from_min_size(Pos2::new(frame as f32 * 0.25, 16.0), key.size);
+            rebuilds += usize::from(cache.ensure(BeamKey::new(rect.size(), key.radius)));
+            let points = cache.tail_points(std::hint::black_box(frame as f64 / 60.0));
+            std::hint::black_box(points.map(|p| p + rect.min.to_vec2()));
+            assert_eq!((cache.points.as_ptr(), cache.cumulative.as_ptr()), buffers);
+            assert_eq!((cache.points.capacity(), cache.cumulative.capacity()), capacities);
+        }
+        assert_eq!(rebuilds, 1);
+        eprintln!("{FRAMES} 合成帧：几何重建 {FRAMES} -> {rebuilds}，端点查找 {} -> {}；缓存命中不分配几何 Vec；未缓存 {:?}，缓存 {:?}（仅本机合成 CPU 路径）",
+            FRAMES * 56, FRAMES * 29, uncached, start.elapsed());
     }
 }
 

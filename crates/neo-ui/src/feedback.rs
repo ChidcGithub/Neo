@@ -117,7 +117,7 @@ fn toast_size(ui: &Ui, d: &Design, text: &str) -> Vec2 {
 }
 
 /// 在 rect 内画一条 toast（elevation + squircle 底 + 图标 + 文字）。
-fn paint_toast(ui: &Ui, d: &Design, kind: ToastKind, text: &str, rect: Rect) {
+fn paint_toast_chrome(ui: &Ui, d: &Design, kind: ToastKind, rect: Rect) {
     let m = d.m();
     let c = d.c();
     ui.painter()
@@ -135,6 +135,11 @@ fn paint_toast(ui: &Ui, d: &Design, kind: ToastKind, text: &str, rect: Rect) {
         Vec2::splat(icon_d),
     );
     toast_icon(kind).paint(ui.painter(), icon_rect, toast_accent(d, kind));
+}
+
+fn paint_toast(ui: &Ui, d: &Design, kind: ToastKind, text: &str, rect: Rect) {
+    paint_toast_chrome(ui, d, kind, rect);
+    let m = d.m();
     let font = d.font(d.t().label);
     let inner = inset(rect, m.s(38.0), 0.0, m.s(14.0), 0.0);
     let shown = crate::base::elide(ui.painter(), text, &font, inner.width());
@@ -146,6 +151,38 @@ pub fn toast(ui: &mut Ui, d: &Design, kind: ToastKind, text: &str) -> egui::Resp
     let (rect, resp) = ui.allocate_exact_size(toast_size(ui, d, text), egui::Sense::hover());
     paint_toast(ui, d, kind, text, rect);
     resp
+}
+
+/// 独立提示层的限宽版本：最多三行，保留换行，超长内容收成省略号。
+/// 不创建 egui-memory 队列，生命周期完全由调用方的绝对截止时间管理。
+pub fn toast_wrapped(
+    ui: &mut Ui,
+    d: &Design,
+    kind: ToastKind,
+    text: &str,
+    max_width: f32,
+) -> egui::Response {
+    let m = d.m();
+    let mut job = egui::text::LayoutJob::simple(
+        text.to_owned(),
+        d.font(d.t().label),
+        d.p().label_primary,
+        (max_width - m.s(52.0)).max(1.0),
+    );
+    job.wrap.max_rows = 3;
+    for section in &mut job.sections {
+        section.format.line_height = Some(d.t().label * 1.5);
+    }
+    let galley = ui.painter().layout_job(job);
+    let size = Vec2::new(
+        (galley.size().x + m.s(52.0)).min(max_width),
+        (galley.size().y + m.s(20.0)).max(m.s(40.0)),
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    paint_toast_chrome(ui, d, kind, rect);
+    let pos = egui::pos2(rect.left() + m.s(38.0), rect.center().y - galley.size().y * 0.5);
+    ui.painter().galley(pos, galley, d.p().label_primary);
+    response
 }
 
 /// 单条 toast（指定中心点，陈列室摆位用）。
@@ -167,4 +204,35 @@ pub fn toasts(d: &Design) -> Toasts {
     .anchor(egui::Align2::CENTER_BOTTOM, egui::pos2(0.0, offset_y))
     .direction(egui::Direction::BottomUp)
     .gap(d.m().s(10.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toast_wrapped_long_text_is_bounded_and_stacks_without_overlap() {
+        let ctx = egui::Context::default();
+        let d = Design::new(neo_theme::Theme::new(
+            neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard,
+        ));
+        let mut rects = Vec::new();
+        ctx.begin_pass(egui::RawInput::default());
+        egui::Area::new(egui::Id::new("toast-wrap-test")).show(&ctx, |ui| {
+            ui.spacing_mut().item_spacing.y = 10.0;
+            for text in ["saved".to_owned(), "long text 中文 😀\n".repeat(100), "X".repeat(512)] {
+                rects.push(toast_wrapped(ui, &d, ToastKind::Warning, &text, 260.0).rect);
+            }
+        });
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+        assert!(rects[1].height() > rects[0].height());
+        for rect in &rects {
+            assert!(rect.width() <= 260.0);
+            assert!(rect.height() <= d.t().label * 4.5 + d.m().s(20.0) + 6.0, "height={}, label={}, scale={}", rect.height(), d.t().label, d.m().scale());
+        }
+        for pair in rects.windows(2) {
+            assert!(pair[1].top() >= pair[0].bottom() + 9.0);
+        }
+    }
 }

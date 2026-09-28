@@ -36,6 +36,12 @@ fn test_db_path() -> std::path::PathBuf {
     PATH.with(Clone::clone)
 }
 
+#[cfg(test)]
+thread_local! {
+    static STREAM_START: std::cell::Cell<fn(neo_llm::Config, Vec<neo_llm::Msg>, Vec<serde_json::Value>) -> neo_llm::Stream> =
+        const { std::cell::Cell::new(neo_llm::start_with_tools) };
+}
+
 /// 主题重建的输入指纹。
 type Fingerprint = (ThemeMode, Distance, i32);
 
@@ -88,6 +94,7 @@ pub struct NeoApp {
     store: Option<Store>,
     /// 上次落库的接口配置，用于把「每帧读输入框」节流成「变化时才写」。
     saved_api: (String, String),
+    saved_context_tokens: usize,
     /// 上次落库的活跃会话 id，作用同上。
     saved_active: Option<i64>,
     saved_classroom_safe: bool,
@@ -115,6 +122,8 @@ pub struct NeoApp {
     wake: Option<neo_wake::WakeEngine>,
     /// 唤醒事件的接收端（由转发线程喂入，事件到达即唤起一帧）。
     wake_rx: Option<std::sync::mpsc::Receiver<neo_wake::WakeEvent>>,
+    /// 当前接收端允许的测试代次；进出测试后持续拒收旧事件，不依赖转发时机。
+    wake_epoch: u64,
     /// 引擎线程已报错退出：本次运行不再自动重启（否则帧帧重试）。
     wake_broken: bool,
     /// 系统托盘图标。只在真实客户端装配（`start_tray`），离屏测试没有托盘。
@@ -133,10 +142,9 @@ pub struct NeoApp {
     was_busy: bool,
     /// 上一轮对话完成的时刻（忙→闲沿写入）：5 分钟内再次唤醒续聊用。
     last_round_done: Option<std::time::Instant>,
-    /// 待投递的轻提示（类别 + 内容 + 截止时间）。渲染段统一喂给 toast 队列。
-    /// 存截止时间而不是时长：主窗藏在托盘时提示只积不播，重开那一帧把
-    /// 早就过期的丢掉、没过期的按**剩余**时间播 —— 不当陈年弹幕补播。
+    /// 独立提示窗在 logic-only 路径也消费队列，截止时间不因切窗续期。
     pending_toasts: Vec<(neo_ui::ToastKind, String, std::time::Instant)>,
+    toastwin: ui::toastwin::ToastWin,
     /// 本帧 `persist_ready` 的结果：切会话/新会话的门控（落库失败不切）。
     /// 持久化已挪进 `tick`（托盘隐藏时也照跑），渲染段只读这个结果。
     persistence_ok: bool,
@@ -216,6 +224,7 @@ impl NeoApp {
             fingerprint: None,
             store,
             saved_api: (String::new(), String::new()),
+            saved_context_tokens: neo_llm::CONTEXT_TOKENS,
             saved_active: None,
             saved_classroom_safe: true,
             applied_classroom_safe: true,
@@ -224,6 +233,7 @@ impl NeoApp {
             prev_show_settings: false,
             wake: None,
             wake_rx: None,
+            wake_epoch: 0,
             wake_broken: false,
             tray: None,
             tray_show_id: tray_icon::menu::MenuId::new("neo-tray-show"),
@@ -233,6 +243,7 @@ impl NeoApp {
             exit_blocked: false,
             confirm_discard: false,
             pending_toasts: Vec::new(),
+            toastwin: Default::default(),
             was_busy: false,
             last_round_done: None,
             persistence_ok: true,
@@ -308,7 +319,7 @@ impl NeoApp {
     /// 模型还没训练好 / 采集失败时引擎线程会回一条 [`neo_wake::WakeEvent::Error`]，
     /// 界面降级为"无唤醒"照常工作。设置里关掉唤醒时是空操作。
     pub fn start_wake(&mut self, ctx: &egui::Context) {
-        if !self.state.effective_wake_enabled() || self.wake.is_some() {
+        if !self.state.effective_wake_enabled() || self.wake.is_some() || self.wake_broken {
             return;
         }
         let (engine, rx) = neo_wake::WakeEngine::start(neo_wake::WakeConfig::default());
@@ -327,10 +338,11 @@ impl NeoApp {
                 }
             }) {
             Ok(_) => {
+                self.wake_epoch = engine.event_epoch();
                 self.wake = Some(engine);
                 self.wake_rx = Some(ui_rx);
             }
-            Err(_) => record(Level::Error, "wake", "语音唤醒启动失败"),
+            Err(_) => self.fail_wake("无法启动唤醒事件转发线程".into()),
         }
     }
 
@@ -468,6 +480,7 @@ impl NeoApp {
 
     /// 所有应用内退出都经过同一屏障；系统强杀、断电不受此屏障保证。
     fn request_exit(&mut self, ctx: &egui::Context) {
+        self.stop_wake_test();
         self.cancel_dictation();
         self.wake_rx = None;
         if let Some(engine) = self.wake.take() {
@@ -694,6 +707,8 @@ impl NeoApp {
                 }
             }
         };
+        self.state.context_tokens = neo_llm::restored_context_tokens(get("context_tokens").as_deref());
+        self.saved_context_tokens = self.state.context_tokens;
         self.state.classroom_safe = get("classroom_safe").as_deref() != Some("0");
         if let Some(v) = get("theme") {
             if v == "light" {
@@ -770,14 +785,27 @@ impl NeoApp {
                             Some("此会话有附件记录损坏，已保留可读消息，请重新添加对应文件".into())
                     }
                 }
-                // 工具消息在库里只留了 name + 摘要（见 `ChatMessage::tool_result`）；
-                // 参数与结果不落库，重启后卡片降级为"只读摘要"。
+                match serde_json::from_str(&r.tool_calls) {
+                    Ok(calls) => msg.tool_calls = calls,
+                    Err(_) => state.attachment_error = Some("历史工具协议损坏，结果按低信任参考资料恢复".into()),
+                }
                 if role == Role::Tool {
-                    msg.tool = Some(crate::state::ToolMeta::restored(&msg.meta));
+                    let mut tool = crate::state::ToolMeta::restored(&msg.meta);
+                    tool.call_id = r.tool_call_id;
+                    msg.tool = Some(tool);
                 }
                 msg
             })
             .collect();
+        if let Ok(Some((covered, json))) = store.checkpoint(id) {
+            match serde_json::from_str::<crate::state::ContextCheckpoint>(&json) {
+                Ok(c) if c.covered == covered && c.valid(&state.messages) => {
+                    state.checkpoint = Some(c);
+                    state.compaction_status = Some("已恢复历史摘要，原聊天记录保留".into());
+                }
+                _ => state.compaction_status = Some("历史摘要校验失败，已恢复完整原文".into()),
+            }
+        }
         state.active_session = Some(id);
         state.stage = Stage::Conversation;
         // 生成/流状态在 new_session() 里已复位（含流线程取消标志）。
@@ -874,9 +902,27 @@ impl NeoApp {
         let draft = state.draft.clone();
         let stage = state.stage;
         if state.submit() {
-            if state.can_call_real() {
-                let mut messages = state.api_messages(24);
-                if let Err(error) = neo_llm::budget_messages(&state.llm_config(), &mut messages, &neo_tools::tool_declarations()) {
+            let mut compaction_plan = None;
+            let prepared_messages = if state.can_call_real() {
+                let mut messages = state.api_messages(usize::MAX);
+                let checked = (|| {
+                    // 最新输入单独不能容纳时，摘要也无济于事，恢复草稿而不是联网。
+                    let rejected_history = messages.iter().any(neo_llm::Msg::is_rejected);
+                    let mut latest = if rejected_history {
+                        state.latest_input_messages()
+                    } else {
+                        vec![neo_llm::Msg::new(neo_llm::Role::System, state.system_prompt()), messages.pop().expect("刚提交的用户消息")]
+                    };
+                    let latest_check = neo_llm::budget_messages(&state.llm_config(), &mut latest, &neo_tools::tool_declarations());
+                    if !rejected_history { messages.push(latest.pop().unwrap()); }
+                    latest_check?;
+                    compaction_plan = state.compaction_plan(&messages)?;
+                    if compaction_plan.is_none() {
+                        neo_llm::budget_messages(&state.llm_config(), &mut messages, &neo_tools::tool_declarations())?;
+                    }
+                    Ok::<(), String>(())
+                })();
+                if let Err(error) = checked {
                     let message = state.messages.pop().expect("刚提交的用户消息");
                     state.draft = draft;
                     state.draft_attachments = message.attachments;
@@ -884,7 +930,10 @@ impl NeoApp {
                     state.attachment_error = Some(error);
                     return;
                 }
-            }
+                Some(messages)
+            } else {
+                None
+            };
             if !Self::persist_ready(state, store) {
                 if let Some(message) = state.messages.pop() {
                     state.draft = message.content;
@@ -902,8 +951,10 @@ impl NeoApp {
                 }
                 return;
             }
-            if state.can_call_real() {
-                Self::start_real_stream(state);
+            if let Some(plan) = compaction_plan {
+                Self::launch_compaction(state, plan);
+            } else if let Some(messages) = prepared_messages {
+                Self::start_real_stream_with_messages(state, messages);
             } else {
                 state.wants_demo_reply = true;
             }
@@ -915,8 +966,33 @@ impl NeoApp {
     /// **每一轮都带工具声明** —— 模型因此可以在任何一次回答中途决定读文件、
     /// 改文件或跑命令；工具结果回灌后仍是同一个入口，没有第二条代码路径。
     fn start_real_stream(state: &mut AppState) {
+        if state.task_limit_reached || state.task_tool_calls >= crate::state::TASK_TOOL_LIMIT {
+            state.attachment_error = Some("本任务已达到500次工具调用上限，已停止自动续轮".into());
+            return;
+        }
+        let mut messages = state.api_messages(usize::MAX);
+        match state.compaction_plan(&messages) {
+            Ok(Some(plan)) => Self::launch_compaction(state, plan),
+            Ok(None) => match neo_llm::budget_messages(&state.llm_config(), &mut messages, &neo_tools::tool_declarations()) {
+                Ok(()) => Self::start_real_stream_with_messages(state, messages),
+                Err(e) => state.attachment_error = Some(e),
+            },
+            Err(e) => { state.compaction_status = Some(format!("压缩失败：{e}")); state.attachment_error = Some(e); }
+        }
+    }
+
+    fn launch_compaction(state: &mut AppState, mut plan: crate::state::CompactionPlan) {
+        let messages = std::mem::take(&mut plan.messages);
+        #[cfg(not(test))]
+        let stream = neo_llm::start(state.llm_config(), messages);
+        #[cfg(test)]
+        let stream = STREAM_START.with(|start| start.get()(state.llm_config(), messages, Vec::new()));
+        state.start_compaction(plan, stream);
+    }
+
+    /// 首次发送移交预检后的消息；工具续轮重新构造，两者仍经过 LLM 通用预算。
+    fn start_real_stream_with_messages(state: &mut AppState, msgs: Vec<neo_llm::Msg>) {
         let cfg = state.llm_config();
-        let msgs = state.api_messages(24);
         // 注意：`tool_declarations()` 已经是"每元素一条工具"的扁平列表，
         // 不要再套一层 Vec —— `tools: [[…]]` 会被服务端 422 掉。
         //
@@ -926,15 +1002,11 @@ impl NeoApp {
         // 代价是必须把历史 `reasoning_content` 完整回传（见 `state::api_messages`），
         // 那条由 `neo_llm::build_wire` 按档位把关。
         let tools = neo_tools::tool_declarations();
-        if msgs
-            .iter()
-            .any(|m| m.content.contains("本轮因内容预算省略"))
-        {
-            state.attachment_error =
-                Some("本轮只保留预算内的最近附件；部分历史附件已省略，需要时请重新添加。".into());
-        }
         // 通用入口在联网前执行预算及无分配的线协议计数；错误通过 Failed 回到消息。
+        #[cfg(not(test))]
         let stream = neo_llm::start_with_tools(cfg, msgs, tools);
+        #[cfg(test)]
+        let stream = STREAM_START.with(|start| start.get()(cfg, msgs, tools));
         state.start_generation(StreamSource::Real(Box::new(stream)));
     }
 
@@ -982,10 +1054,11 @@ impl NeoApp {
 
     /// 只提交已经稳定的消息；生成中的占位与未完成工具不能提前保存。
     fn persist_ready(state: &mut AppState, store: Option<&Store>) -> bool {
-        if state.pending_persist >= state.messages.len() {
+        if state.pending_persist >= state.messages.len() && !state.checkpoint_dirty {
             return true;
         }
         let Some(store) = store else {
+            state.checkpoint_dirty = false;
             while let Some(msg) = state.messages.get(state.pending_persist) {
                 if msg.streaming || msg.tool.as_ref().is_some_and(|t| !t.state.is_settled()) {
                     break;
@@ -1007,14 +1080,17 @@ impl NeoApp {
             let result = serde_json::to_string(&msg.attachments)
                 .map_err(|e| e.to_string())
                 .and_then(|json| {
+                    let calls = serde_json::to_string(&msg.tool_calls).map_err(|e| e.to_string())?;
                     store
-                        .append_message_with_attachments(
+                        .append_message_with_protocol(
                             session,
                             msg.role.as_str(),
                             &msg.content,
                             &msg.reasoning,
                             &msg.meta,
                             &json,
+                            &calls,
+                            msg.tool.as_ref().map_or("", |t| t.call_id.as_str()),
                         )
                         .map_err(|e| e.to_string())
                 });
@@ -1025,6 +1101,16 @@ impl NeoApp {
             }
             state.pending_persist += 1;
             wrote = true;
+        }
+        if state.checkpoint_dirty {
+            let saved = state.checkpoint.as_ref().filter(|c| c.valid(&state.messages))
+                .and_then(|c| serde_json::to_string(c).ok().map(|json| (c.covered, json)))
+                .is_some_and(|(covered, json)| store.save_checkpoint(session, covered, &json).is_ok());
+            if !saved {
+                state.attachment_error = Some("历史摘要尚未保存，暂停续轮；请检查数据库后重试".into());
+                return false;
+            }
+            state.checkpoint_dirty = false;
         }
         // 只有真写过（或刚建了新会话）才刷新侧栏 —— 生成中每 33ms 都经过
         // 这里，空转时的全表 SELECT 是纯浪费。
@@ -1072,6 +1158,7 @@ impl NeoApp {
                 }
             };
         }
+        save_pref!(state.context_tokens, self.saved_context_tokens, "context_tokens", &state.context_tokens.to_string());
         save_pref!(state.show_reasoning, self.saved_prefs.0, "show_reasoning", if state.show_reasoning { "1" } else { "0" });
         save_pref!(state.thinking, self.saved_prefs.1, "thinking", state.thinking.key());
         save_pref!(state.theme_mode, self.saved_prefs.2, "theme", theme_mode_key(state.theme_mode));
@@ -1101,6 +1188,7 @@ impl NeoApp {
             return;
         }
         self.applied_classroom_safe = self.state.classroom_safe;
+        self.stop_wake_test();
         if self.state.classroom_safe {
             self.state.cancel();
             self.state.auto_approve_tools = false;
@@ -1113,6 +1201,104 @@ impl NeoApp {
                 self.show_window(ctx);
             }
         }
+    }
+
+    fn poll_wake_events(&mut self, ctx: &egui::Context, suppress: bool) {
+        loop {
+            let event = self.wake_rx.as_ref().map(|rx| rx.try_recv());
+            match event {
+                Some(Ok(event)) if !event.is_current(self.wake_epoch) => continue,
+                Some(Ok(neo_wake::WakeEvent::Detected { score, .. })) => {
+                    if !suppress && self.state.effective_wake_enabled() && !self.wake_broken {
+                        self.on_wake_detected(ctx, score);
+                    }
+                }
+                Some(Ok(neo_wake::WakeEvent::Audio { frame, .. })) => {
+                    if !suppress && self.state.effective_wake_enabled() && !self.wake_broken {
+                        self.on_dictation_audio(ctx, frame);
+                    }
+                }
+                Some(Ok(neo_wake::WakeEvent::Error(msg))) => {
+                    self.fail_wake(msg);
+                    break;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.fail_wake("唤醒线程已断开，请检查设备或学校部署的模型资源".into());
+                    break;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => break,
+            }
+        }
+    }
+
+    fn fail_wake(&mut self, msg: String) {
+        self.capture_wake_diagnostics();
+        self.stop_wake_test();
+        self.cancel_dictation();
+        self.state.wake_test.error = Some(msg.chars().take(512).collect());
+        self.state.wake_test.broken = true;
+        self.wake_broken = true;
+        record(Level::Warn, "wake", "语音唤醒发生错误，已停用");
+        self.pending_toasts.push((
+            neo_ui::ToastKind::Warning,
+            "语音唤醒不可用：请在设置 → 麦克风测试查看错误，关闭再打开语音唤醒可重试".into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(4),
+        ));
+        self.wake_rx = None;
+        self.wake = None;
+    }
+
+    fn stop_wake_test(&mut self) {
+        if self.state.wake_test.running {
+            self.capture_wake_diagnostics();
+            self.wake_epoch = self.wake_epoch.wrapping_add(1);
+            if let Some(wake) = &self.wake {
+                wake.set_test_mode(false);
+                self.wake_epoch = wake.event_epoch();
+                wake.set_diagnostics(false);
+            }
+        }
+        self.state.wake_test.running = false;
+        self.state.wake_test.requested = false;
+    }
+
+    fn capture_wake_diagnostics(&mut self) {
+        if let Some(wake) = &self.wake {
+            let snapshot = wake.diagnostics();
+            if let Some(error) = &snapshot.error {
+                self.state.wake_test.error = Some(error.clone());
+            }
+            self.state.wake_test.snapshot = Some(snapshot);
+        }
+    }
+
+    // 返回值覆盖进出测试的整批队列；错误事件始终保留。
+    fn sync_wake_test(&mut self, engine_available: bool) -> bool {
+        let was_running = self.state.wake_test.running;
+        self.state.wake_test.busy = self.dictating || self.state.generating
+            || self.state.tool_open || self.state.tool_round || self.state.compaction.is_some()
+            || self.state.compaction_resume || self.state.wants_demo_reply;
+        self.state.wake_test.broken = self.wake_broken;
+        let allowed = self.state.show_settings
+            && self.state.settings_tab == crate::state::SettingsTab::WakeTest
+            && self.state.effective_wake_enabled()
+            && !self.state.wake_test.busy && !self.wake_broken
+            && !self.hidden_to_tray && !self.quitting && !self.exit_blocked;
+        if !allowed || !self.state.wake_test.requested {
+            self.stop_wake_test();
+        } else if !was_running && engine_available {
+            self.wake_epoch = self.wake_epoch.wrapping_add(1);
+            if let Some(wake) = &self.wake {
+                wake.set_test_mode(true);
+                self.wake_epoch = wake.event_epoch();
+                wake.set_diagnostics(true);
+            }
+            self.state.wake_test.running = true;
+        }
+        if self.state.wake_test.running {
+            self.capture_wake_diagnostics();
+        }
+        was_running || self.state.wake_test.running || self.state.wake_test.requested
     }
 
     /// 视口尺寸 / 主题 / 距离任一变化时重建主题。
@@ -1149,6 +1335,10 @@ impl NeoApp {
         self.poll_tray(&ctx);
         // 保存失败等待用户选择时，不得再启动生成、工具或音频采集。
         if self.quitting || self.exit_blocked {
+            self.stop_wake_test();
+            if !self.quitting {
+                self.toastwin.tick(&ctx, &mut self.pending_toasts, self.theme, self.overlay.as_ref());
+            }
             return;
         }
         // 启动即后台：首帧直接进托盘等「Hi, Neo」，主界面不露面。
@@ -1166,8 +1356,10 @@ impl NeoApp {
         // Drop 会置停止位并 join 线程；打开则起引擎（start_wake 幂等）。
         // 放在解构借用 state 之前，否则 &mut self 方法会撞借用检查。
         if self.state.effective_wake_enabled() && !self.wake_broken {
+            #[cfg(not(test))]
             self.start_wake(&ctx);
         } else if !self.state.effective_wake_enabled() {
+            self.stop_wake_test();
             self.cancel_dictation();
             // Drop 会 join 引擎线程，而引擎加载模型/开麦克风流不可中断
             //（首次 0.5~3s）——在 UI 线程 join 就是冻结界面。转交后台线程等。
@@ -1206,55 +1398,9 @@ impl NeoApp {
                 }
             }
         }
+        let suppress_wake = self.sync_wake_test(self.wake.is_some());
         self.check_overlay_health(&ctx);
-        // 语音唤醒：事件由转发线程唤起本帧，这里只摘结果。
-        // 先收成局部值再处理 —— 处理时要推 `self.pending_toasts` / 清通道，
-        // 不能一直借着自己的 `wake_rx`。听写期间音频帧 80ms 一批，
-        // 必须一次排空，否则队列越积越深。
-        let mut wake_events: Vec<neo_wake::WakeEvent> = Vec::new();
-        let mut wake_disconnected = false;
-        if let Some(rx) = &self.wake_rx {
-            loop {
-                match rx.try_recv() {
-                    Ok(event) => wake_events.push(event),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        wake_disconnected = true;
-                        break;
-                    }
-                }
-            }
-        }
-        for event in wake_events {
-            match event {
-                neo_wake::WakeEvent::Detected { score } => self.on_wake_detected(&ctx, score),
-                neo_wake::WakeEvent::Audio(frame) => self.on_dictation_audio(&ctx, frame),
-                neo_wake::WakeEvent::Error(msg) => {
-                    // 引擎线程已退出：本次运行不再尝试，提示一次就好。
-                    // wake_broken 挡住帧首的热切换逻辑，避免每帧重启风暴。
-                    record(Level::Warn, "wake", "语音唤醒发生错误，已停用");
-                    if self.dictating {
-                        self.end_dictation();
-                    }
-                    self.wake_broken = true;
-                    self.pending_toasts.push((
-                        neo_ui::ToastKind::Warning,
-                        format!("语音唤醒未启用：{msg}（重新打开开关可重试）"),
-                        std::time::Instant::now() + std::time::Duration::from_secs(4),
-                    ));
-                    self.wake_rx = None;
-                    self.wake = None;
-                }
-            }
-        }
-        if wake_disconnected {
-            if self.dictating {
-                self.end_dictation();
-            }
-            self.wake_rx = None;
-            self.wake = None;
-        }
-        self.check_overlay_health(&ctx);
+        self.poll_wake_events(&ctx, suppress_wake);
         // STT 转写结果：只有空编辑器才直接发送；有未提交输入则唤回主窗确认。
         let stt_out = self.stt_rx.as_ref().map(|rx| rx.try_recv());
         match stt_out {
@@ -1264,6 +1410,7 @@ impl NeoApp {
                 ctx.request_repaint();
             }
             Some(Ok(SttResult::Transcript(_, Ok(text)))) => {
+
                 let text = text.trim().to_owned();
                 if self.dictating && !text.is_empty() {
                     self.end_dictation();
@@ -1456,6 +1603,9 @@ impl NeoApp {
         // 它们只依赖 state 与 ctx，本就该走 logic-only 路径。
         //
         // 每帧从流式来源泵增量；真实 / 演示两种来源在 UI 侧等价。
+        if self.state.poll_compaction() {
+            ctx.request_repaint();
+        }
         if self.state.generating && self.state.pump() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
@@ -1480,6 +1630,20 @@ impl NeoApp {
         // 用户消息在生成开始前立即保存，流式占位只在稳定后提交。
         // 结果给渲染段做「切会话」门控（落库失败不切，免得丢消息）。
         self.persistence_ok = Self::advance_tools(&mut self.state, self.store.as_ref());
+        if self.state.compaction_resume && self.persistence_ok {
+            self.state.compaction_resume = false;
+            let config_matches = self.state.compaction_resume_config.take().as_ref() == Some(&self.state.llm_config());
+            if !config_matches {
+                self.state.compaction_status = Some("配置已改变，摘要后的自动续轮已取消".into());
+            }
+            if config_matches && self.state.can_call_real() && !self.state.round_cancelled && !self.state.task_limit_reached {
+                let mut messages = self.state.api_messages(usize::MAX);
+                match neo_llm::budget_messages(&self.state.llm_config(), &mut messages, &neo_tools::tool_declarations()) {
+                    Ok(()) => Self::start_real_stream_with_messages(&mut self.state, messages),
+                    Err(e) => self.state.attachment_error = Some(e),
+                }
+            }
+        }
         // 演示流：未配置密钥时，submit 之后自动接一条离线演示回复。
         if self.state.wants_demo_reply && self.persistence_ok {
             self.state.wants_demo_reply = false;
@@ -1536,6 +1700,10 @@ impl NeoApp {
                 self.saved_active = self.state.active_session;
             }
         }
+        self.toastwin.tick(&ctx, &mut self.pending_toasts, self.theme, self.overlay.as_ref());
+        if self.state.wake_test.running {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         // 托盘没有 winit 唤醒源：隐藏期间保持低频轮询，托盘菜单点击才有响应。
         if self.hidden_to_tray {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -1559,6 +1727,18 @@ impl NeoApp {
         if self.exit_blocked {
             self.exit_dialog(&ctx);
             return;
+        }
+        if let Some(status) = self.state.compaction_status.clone() {
+            egui::Window::new("上下文状态").collapsible(false).resizable(false)
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 8.0))
+                .show(&ctx, |ui| {
+                    ui.label(status);
+                    if self.state.compaction.is_some() {
+                        if ui.button("取消压缩").clicked() { self.state.cancel(); }
+                    } else if ui.button("关闭提示").clicked() {
+                        self.state.compaction_status = None;
+                    }
+                });
         }
         if self.state.preferences_unsaved {
             egui::Window::new("设置未保存")
@@ -1842,25 +2022,15 @@ impl NeoApp {
             ctx.request_repaint();
         }
 
-        // ---- 5. 轻提示（最上层，一闪而过）----
-        // 队列 / 锚定 / 到期回收全交给 toast 队列；外观是组件库的 squircle 自绘
-        // （neo_ui::toasts 工厂里注册的自绘闭包）。每帧重建实例即可，
-        // 队列本体存在 egui memory 里。隐藏期间积压的按剩余寿命过滤。
-        let mut toasts = neo_ui::toasts(&skin.design);
-        let now = std::time::Instant::now();
-        for (kind, text, deadline) in self.pending_toasts.drain(..) {
-            let remain = deadline.saturating_duration_since(now);
-            if remain.is_zero() {
-                continue;
-            }
-            toasts.add(
-                neo_ui::Toast::new()
-                    .kind(kind)
-                    .text(text)
-                    .options(neo_ui::ToastOptions::default().duration(remain)),
-            );
+        let suppress_wake = self.sync_wake_test(self.wake.is_some());
+        if suppress_wake {
+            self.poll_wake_events(&ctx, true);
         }
-        toasts.show(ui);
+        self.sync_safety(&ctx);
+        // 绘制产生的提示交给下一次 tick，即使随后隐藏主窗也照常投递。
+        if !self.pending_toasts.is_empty() {
+            ctx.request_repaint();
+        }
         // 当前帧改动立即尝试保存；首次失败立即展示，后续低频重试。
         let was_unsaved = self.state.preferences_unsaved;
         if !self.persist_preferences() && !was_unsaved {
@@ -2025,6 +2195,7 @@ mod restore_tests {
         // 缺模型与超预算都在真实请求之前拒绝；不启动发送线程。
         for budget_failure in [false, true] {
             let mut state = AppState::default();
+            state.context_tokens = 32 * 1024;
             state.api_key = "test-key".into();
             let text = if budget_failure {
                 state.restore_models("deepseek-chat", Some("deepseek-chat"));
@@ -2195,6 +2366,7 @@ mod restore_tests {
     #[test]
     fn safety_budget_rejection_keeps_draft_attachments_and_does_not_start_stream() {
         let mut state = AppState::default();
+        state.context_tokens = 32 * 1024;
         state.api_key = "test-key".into();
         state.restore_models("deepseek-chat", Some("deepseek-chat"));
         state.draft = format!("  {}  ", "教学正文".repeat(20_000));
@@ -2273,6 +2445,203 @@ mod restore_tests {
             .any(|command| matches!(command, egui::ViewportCommand::Close)));
     }
 
+    fn wake_test_app(ctx: &egui::Context) -> NeoApp {
+        let mut app = NeoApp::install(ctx);
+        app.state.classroom_safe = false;
+        app.applied_classroom_safe = false;
+        app.state.show_settings = true;
+        app.state.settings_tab = crate::state::SettingsTab::WakeTest;
+        app.state.wake_enabled = true;
+        app.state.wake_test.requested = true;
+        app
+    }
+
+    #[test]
+    fn wake_test_admission_blocks_safety_disabled_tasks_and_dictation() {
+        for case in 0..9 {
+            let ctx = egui::Context::default();
+            let mut app = wake_test_app(&ctx);
+            match case {
+                0 => app.state.classroom_safe = true,
+                1 => app.state.wake_enabled = false,
+                2 => app.state.generating = true,
+                3 => app.state.tool_open = true,
+                4 => app.state.tool_round = true,
+                5 => app.dictating = true,
+                6 => app.wake_broken = true,
+                7 => app.state.compaction_resume = true,
+                _ => app.exit_blocked = true,
+            }
+            app.sync_wake_test(true); // 只注入引擎可用性，不创建硬件引擎。
+            assert!(!app.state.wake_test.running && !app.state.wake_test.requested);
+            assert!(app.wake.is_none());
+        }
+    }
+
+    #[test]
+    fn wake_test_leaving_stops_and_keeps_errors_without_resuming() {
+        for case in 0..5 {
+            let ctx = egui::Context::default();
+            let mut app = wake_test_app(&ctx);
+            assert!(app.sync_wake_test(true));
+            assert!(app.state.wake_test.running);
+            app.state.wake_test.error = Some("resource unavailable".into());
+            match case {
+                0 => app.state.settings_tab = crate::state::SettingsTab::General,
+                1 => app.state.show_settings = false,
+                2 => app.state.classroom_safe = true,
+                3 => app.hidden_to_tray = true,
+                _ => app.state.wake_test.requested = false,
+            }
+            assert!(app.sync_wake_test(true));
+            assert!(!app.state.wake_test.running && !app.state.wake_test.requested);
+            assert_eq!(app.state.wake_test.error.as_deref(), Some("resource unavailable"));
+            app.state.show_settings = true;
+            app.state.settings_tab = crate::state::SettingsTab::WakeTest;
+            app.state.classroom_safe = false;
+            app.hidden_to_tray = false;
+            assert!(!app.sync_wake_test(true));
+        }
+    }
+
+    #[test]
+    fn wake_test_queued_events_never_start_dictation_or_tasks_and_errors_latch() {
+        let ctx = egui::Context::default();
+        let mut app = wake_test_app(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (stt_tx, stt_rx) = std::sync::mpsc::channel();
+        app.stt_tx = Some(stt_tx);
+        app.wake_rx = Some(rx);
+        app.state.draft = "untouched".into();
+        for stopping in [false, true] {
+            tx.send(neo_wake::WakeEvent::Detected { epoch: app.wake_epoch, score: 0.99 }).unwrap();
+            tx.send(neo_wake::WakeEvent::Audio { epoch: app.wake_epoch, frame: vec![0.1; 16] }).unwrap();
+            app.state.wake_test.requested = !stopping;
+            let suppress = app.sync_wake_test(true);
+            assert!(suppress);
+            app.poll_wake_events(&ctx, suppress);
+            assert!(!app.dictating && !app.state.generating && app.state.messages.is_empty());
+            assert_eq!(app.state.draft, "untouched");
+            assert!(stt_rx.try_recv().is_err());
+            assert!(app.pending_toasts.is_empty());
+        }
+        tx.send(neo_wake::WakeEvent::Error("school resource missing".into())).unwrap();
+        app.poll_wake_events(&ctx, true);
+        assert!(app.wake_broken && app.state.wake_test.broken);
+        assert_eq!(app.state.wake_test.error.as_deref(), Some("school resource missing"));
+        app.state.wake_enabled = false;
+        ctx.set_embed_viewports(false);
+        ctx.begin_pass(egui::RawInput::default());
+        app.tick(ctx.clone()); // 复用开关的故障解锁，测试构建不会开麦克风。
+        ctx.end_pass().textures_delta.clear();
+        assert!(!app.wake_broken);
+        app.state.wake_enabled = true;
+        ctx.begin_pass(egui::RawInput::default());
+        app.tick(ctx.clone());
+        ctx.end_pass().textures_delta.clear();
+        assert!(app.wake.is_none() && !app.state.wake_test.requested);
+        assert_eq!(app.state.wake_test.error.as_deref(), Some("school resource missing"));
+    }
+
+    #[test]
+    fn wake_test_delayed_forwarder_rejects_old_detection_and_audio_after_exit() {
+        use neo_wake::WakeEvent;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let ctx = egui::Context::default();
+        let mut app = wake_test_app(&ctx);
+        let (engine_tx, engine_rx) = mpsc::channel();
+        let (ui_tx, ui_rx) = mpsc::channel();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let forward_tx = ui_tx.clone();
+        let forwarder = std::thread::spawn(move || {
+            for event in engine_rx {
+                held_tx.send(()).unwrap();
+                if release_rx.recv().is_err() { break; }
+                forward_tx.send(event).unwrap();
+                sent_tx.send(()).unwrap();
+            }
+        });
+        app.wake_rx = Some(ui_rx);
+        let (stt_tx, stt_rx) = mpsc::channel();
+        app.stt_tx = Some(stt_tx);
+        app.state.draft = "untouched".into();
+        engine_tx.send(WakeEvent::Detected { epoch: app.wake_epoch, score: 0.99 }).unwrap();
+        engine_tx.send(WakeEvent::Audio { epoch: app.wake_epoch, frame: vec![0.1; 16] }).unwrap();
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // 转发线程已收到旧命中，但尚未写入 UI 队列；完整进出测试并排空两次。
+        let suppress = app.sync_wake_test(true);
+        assert!(suppress);
+        app.poll_wake_events(&ctx, suppress);
+        app.state.wake_test.requested = false;
+        let suppress = app.sync_wake_test(true);
+        assert!(suppress);
+        app.poll_wake_events(&ctx, suppress);
+        assert_eq!(app.wake_epoch, 2);
+        assert!(!app.sync_wake_test(true));
+        app.hidden_to_tray = true;
+        release_tx.send(()).unwrap();
+        sent_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.poll_wake_events(&ctx, false);
+        assert!(app.hidden_to_tray);
+        assert!(!app.dictating && app.pending_toasts.is_empty());
+
+        // 独立验证 Audio 没有进入处理器：无覆盖层时，误消费会取消此哨兵听写。
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.dictating = true;
+        app.dictation_epoch = 7;
+        release_tx.send(()).unwrap();
+        sent_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.poll_wake_events(&ctx, false);
+        assert!(app.dictating && app.hidden_to_tray);
+        assert_eq!(app.dictation_epoch, 7);
+        assert!(stt_rx.try_recv().is_err());
+        assert!(!app.state.generating && app.state.messages.is_empty());
+        assert_eq!(app.state.draft, "untouched");
+        drop(engine_tx);
+        forwarder.join().unwrap();
+
+        // 同一接收端仍接受新代事件，不是永久封禁或额外排空队列。
+        ui_tx.send(WakeEvent::Audio { epoch: app.wake_epoch, frame: vec![0.2; 16] }).unwrap();
+        app.poll_wake_events(&ctx, false);
+        assert!(!app.dictating);
+        assert!(matches!(stt_rx.try_recv(), Ok(super::SttCmd::Reset(8))));
+        app.hidden_to_tray = true;
+        ui_tx.send(WakeEvent::Detected { epoch: app.wake_epoch, score: 0.8 }).unwrap();
+        app.poll_wake_events(&ctx, false);
+        assert!(!app.hidden_to_tray);
+        assert!(!app.pending_toasts.is_empty());
+        ui_tx.send(WakeEvent::Error("delayed engine failure".into())).unwrap();
+        app.poll_wake_events(&ctx, false);
+        assert!(app.wake_broken);
+        assert_eq!(app.state.wake_test.error.as_deref(), Some("delayed engine failure"));
+    }
+
+    #[test]
+    fn toast_app_hidden_and_exit_blocked_still_deliver() {
+        for blocked in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_embed_viewports(false);
+            let mut app = NeoApp::install(&ctx);
+            app.hidden_to_tray = !blocked;
+            app.exit_blocked = blocked;
+            app.pending_toasts.push((neo_ui::ToastKind::Warning, "notice".into(),
+                std::time::Instant::now() + std::time::Duration::from_secs(4)));
+            ctx.begin_pass(egui::RawInput::default());
+            app.tick(ctx.clone());
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+            assert!(app.pending_toasts.is_empty());
+            let toast = &output.viewport_output[&egui::ViewportId::from_hash_of("neo-toastwin")];
+            assert!(toast.viewport_ui_cb.is_some());
+            assert!(toast.builder.inner_size.unwrap().x > 1.0);
+        }
+    }
+
     #[test]
     fn safety_send_without_models_only_opens_settings() {
         let mut state = AppState::default();
@@ -2311,6 +2680,29 @@ mod restore_tests {
     }
 
     #[test]
+    fn context_settings_persist_restore_and_invalid_fallback() {
+        let ctx = egui::Context::default();
+        let mut app = NeoApp::install(&ctx);
+        app.store = Some(temp_store("context-config"));
+        app.load_settings();
+        assert_eq!(app.state.context_tokens, 1_000_000);
+        app.state.context_tokens = 65_536;
+        assert!(app.persist_preferences());
+        app.state.context_tokens = 8192;
+        app.load_settings();
+        assert_eq!(app.state.context_tokens, 65_536);
+        assert_eq!(app.saved_context_tokens, 65_536);
+        app.store.as_ref().unwrap().set_setting("context_tokens", "corrupt").unwrap();
+        app.load_settings();
+        assert_eq!(app.state.context_tokens, 1_000_000);
+        app.state.context_tokens = 32_768;
+        app.store = None;
+        assert!(!app.persist_preferences());
+        assert_eq!(app.saved_context_tokens, 1_000_000);
+        assert!(app.state.preferences_unsaved);
+    }
+
+    #[test]
     fn safety_hot_switch_invalidates_dictation_without_render() {
         let ctx = egui::Context::default();
         let mut app = NeoApp::install(&ctx);
@@ -2325,7 +2717,7 @@ mod restore_tests {
         assert!(!app.dictating);
         assert_eq!(app.dictation_epoch, 6);
         assert!(matches!(rx.try_recv(), Ok(super::SttCmd::Reset(6))));
-        assert!(wake_tx.send(neo_wake::WakeEvent::Audio(vec![])).is_err());
+        assert!(wake_tx.send(neo_wake::WakeEvent::Audio { epoch: 0, frame: vec![] }).is_err());
         assert!(!super::current_dictation(app.dictating, app.dictation_epoch, 5));
     }
 
@@ -2642,6 +3034,453 @@ mod restore_tests {
             text: "课堂资料正文".into(),
             image_url: image.then(|| "data:image/png;base64,SAMPLE".into()),
             warning: None,
+        }
+    }
+
+    thread_local! {
+        static CAPTURED_REQUESTS: std::cell::RefCell<Vec<Vec<neo_llm::Msg>>> = const { std::cell::RefCell::new(Vec::new()) };
+        static INCOMING_MESSAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    struct MockStream;
+
+    impl MockStream {
+        fn install() -> Self {
+            crate::state::API_MESSAGE_BUILDS.with(|count| count.set(0));
+            CAPTURED_REQUESTS.with(|requests| requests.borrow_mut().clear());
+            super::STREAM_START.with(|start| start.set(|cfg, mut messages, tools| {
+                // 与通用入口一样，续轮也必须预算；只发送本地 channel 事件。
+                INCOMING_MESSAGES.with(|count| count.set(messages.len()));
+                let result = neo_llm::budget_messages(&cfg, &mut messages, &tools);
+                CAPTURED_REQUESTS.with(|requests| requests.borrow_mut().push(messages));
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send(match result {
+                    Ok(()) => neo_llm::Event::Done { tool_calls: false },
+                    Err(error) => neo_llm::Event::Failed(error),
+                }).unwrap();
+                neo_llm::Stream::new_for_test(rx)
+            }));
+            Self
+        }
+    }
+
+    impl Drop for MockStream {
+        fn drop(&mut self) {
+            super::STREAM_START.with(|start| start.set(neo_llm::start_with_tools));
+            CAPTURED_REQUESTS.with(|requests| requests.borrow_mut().clear());
+        }
+    }
+
+    fn synthetic_send_state(image: bool) -> AppState {
+        use crate::state::{ChatMessage, Role};
+        let mut state = AppState::default();
+        state.context_tokens = 32 * 1024;
+        state.api_key = "synthetic-test".into();
+        state.restore_models("deepseek-chat", Some("deepseek-chat"));
+        state.messages.push(ChatMessage::new(Role::User, "历史问题"));
+        state.messages.push(ChatMessage::new(Role::Assistant, "历史回答"));
+        state.draft = "  分析课堂资料  ".into();
+        let mut attachment = sample_attachment(image);
+        if image {
+            use base64::Engine;
+            // 纯合成 PNG 头及载荷，只供预算验证，不调用解码器或模型。
+            let mut bytes = vec![0; 768 * 1024];
+            bytes[..24].copy_from_slice(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01");
+            attachment.image_url = Some(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)));
+        }
+        state.add_attachment(attachment).unwrap();
+        state
+    }
+
+    #[test]
+    fn send_reuse_synthetic_build_count() {
+        for image in [false, true] {
+            let _mock = MockStream::install();
+            let mut state = synthetic_send_state(image);
+            // 含图片也低于80%压缩阈值；本测试只验证正常发送的构建复用。
+            state.context_tokens = 64 * 1024;
+            NeoApp::send_input(&mut state, None);
+            assert!(state.generating);
+            let builds = crate::state::API_MESSAGE_BUILDS.with(|count| count.get());
+            assert_eq!(builds, 1);
+            CAPTURED_REQUESTS.with(|requests| {
+                let requests = requests.borrow();
+                assert_eq!(requests.len(), 1);
+                let messages = &requests[0];
+                assert_eq!(messages.len(), 4, "image={image}; first={}", messages[0].content);
+                assert!(messages[0].content.contains("课堂安全模式限制"));
+                assert!(messages[3].content.contains("课堂资料正文"));
+                let image_bytes: usize = messages.iter().flat_map(|m| &m.images).map(String::len).sum();
+                assert_eq!(image_bytes, if image { 1024 * 1024 + 22 } else { 0 });
+                println!("synthetic image={image}: api_messages={builds}, image_bytes_per_build={image_bytes}");
+            });
+            state.pump();
+            assert!(!state.generating);
+            assert!(state.messages.last().unwrap().error.is_none());
+        }
+    }
+
+    #[test]
+    fn send_reuse_compacts_instead_of_silently_trimming() {
+        let _mock = MockStream::install();
+        super::STREAM_START.with(|start| start.set(|cfg, mut messages, tools| {
+            assert!(tools.is_empty(), "摘要必须是独立无工具请求");
+            neo_llm::budget_messages(&cfg, &mut messages, &tools).unwrap();
+            assert!(messages[1].content.contains(&"a".repeat(20_000)));
+            CAPTURED_REQUESTS.with(|requests| requests.borrow_mut().push(messages));
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(neo_llm::Event::Delta { content: "旧目标与已完成回答".into(), reasoning: String::new() }).unwrap();
+            tx.send(neo_llm::Event::Done { tool_calls: false }).unwrap();
+            neo_llm::Stream::new_for_test(rx)
+        }));
+        let store = temp_store("compaction-roundtrip");
+        let mut state = synthetic_send_state(false);
+        state.messages[0].content = "a".repeat(20_000);
+        NeoApp::send_input(&mut state, Some(&store));
+        assert!(state.compaction.is_some() && state.generating);
+        assert!(state.stream.is_none());
+        assert!(state.poll_compaction());
+        assert!(state.compaction_resume && state.checkpoint_dirty);
+        assert!(NeoApp::persist_ready(&mut state, Some(&store)));
+        let id = state.active_session.unwrap();
+        assert!(store.checkpoint(id).unwrap().is_some());
+        let expected = state.api_messages(24);
+        assert_eq!(expected.len(), 3);
+        assert_eq!(expected[1].role, neo_llm::Role::User);
+        assert!(expected[1].content.contains("旧目标与已完成回答"));
+        assert!(expected[2].content.contains("分析课堂资料"));
+        assert_eq!(state.messages[0].content.len(), 20_000, "摘要不改本地历史");
+        let mut restored = AppState::default();
+        assert!(NeoApp::open_session(&mut restored, &store, id));
+        assert!(restored.checkpoint.as_ref().unwrap().valid(&restored.messages));
+        assert_eq!(restored.messages.len(), 3);
+        assert_eq!(restored.api_messages(24)[1].content, expected[1].content);
+    }
+
+    #[test]
+    fn send_reuse_compaction_large_history_is_not_mistaken_for_latest_input() {
+        let _mock = MockStream::install();
+        let mut state = synthetic_send_state(false);
+        state.messages[0].content = "x".repeat(neo_llm::MAX_REQUEST_BYTES + 1);
+        let draft = state.draft.clone();
+        NeoApp::send_input(&mut state, None);
+        assert_eq!(state.draft, draft);
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages[0].content.len(), neo_llm::MAX_REQUEST_BYTES + 1);
+        assert!(state.attachment_error.as_ref().unwrap().contains("旧历史无法"));
+        assert!(!state.generating);
+        CAPTURED_REQUESTS.with(|requests| assert!(requests.borrow().is_empty()));
+    }
+
+    #[test]
+    fn compaction_tool_protocol_survives_sqlite_reopen_with_uncovered_results() {
+        use crate::state::{ChatMessage, Role};
+        let store = temp_store("compaction-tool-protocol");
+        let path = std::env::temp_dir().join(format!("neo-restore-compaction-tool-protocol-{}", std::process::id())).join("neo.db");
+        let mut state = synthetic_send_state(false);
+        state.messages[0].content = "a".repeat(20_000);
+        assert!(state.submit());
+        let mut checkpoint = state.compaction_plan(&state.api_messages(24)).unwrap().unwrap().checkpoint;
+        checkpoint.summary = "旧历史摘要".into();
+        state.checkpoint = Some(checkpoint);
+        state.checkpoint_dirty = true;
+        state.messages.push(ChatMessage::new(Role::Assistant, "需要确认"));
+        let arguments = r#"{ "question": "保留原始参数?", "options": ["是", "否"] }"#;
+        state.tool_frags = vec![neo_llm::ToolCallFrag {
+            index: 0, id: Some("persist-call".into()), name: Some("ask_user".into()), args: arguments.into(),
+        }];
+        state.begin_tool_round();
+        state.answer_question(4, Some("是".into()));
+        assert!(NeoApp::persist_ready(&mut state, Some(&store)));
+        let id = state.active_session.unwrap();
+        let expected = state.messages[4].content.clone();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let mut restored = AppState::default();
+        assert!(NeoApp::open_session(&mut restored, &store, id));
+        assert!(restored.checkpoint.is_some());
+        assert_eq!(restored.messages[3].tool_calls[0].arguments, arguments);
+        let mut messages = restored.api_messages(24);
+        neo_llm::budget_messages(&restored.llm_config(), &mut messages, &neo_tools::tool_declarations()).unwrap();
+        assert_eq!(messages.last().unwrap().tool_call_id.as_deref(), Some("persist-call"));
+        assert_eq!(messages.last().unwrap().content, expected);
+        drop(store);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn context_legacy_tool_results_restore_as_low_trust_without_fabricated_calls() {
+        let store = temp_store("context-legacy-tool");
+        let id = store.create_session("旧工具记录").unwrap();
+        store.append_message(id, "assistant", "读取结果", "", "").unwrap();
+        store.append_message(id, "tool", "历史结果不能消失", "", "read_file · 读取完成").unwrap();
+        let mut state = AppState::default();
+        assert!(NeoApp::open_session(&mut state, &store, id));
+        let mut messages = state.api_messages(24);
+        assert!(messages.iter().all(|m| m.tool_calls.is_empty()));
+        let result = messages.last().unwrap();
+        assert_eq!(result.role, neo_llm::Role::User);
+        assert!(result.content.contains("低信任历史工具结果"));
+        assert!(result.content.contains("历史结果不能消失"));
+        neo_llm::budget_messages(&state.llm_config(), &mut messages, &neo_tools::tool_declarations()).unwrap();
+    }
+
+    #[test]
+    fn task_tool_limit_500th_completes_and_persists_but_never_continues() {
+        use crate::state::{ChatMessage, Role, ToolState};
+        for batch in [1, 3] {
+            let _mock = MockStream::install();
+            let store = temp_store(&format!("task-tool-limit-{batch}"));
+            let mut state = synthetic_send_state(false);
+            assert!(state.submit());
+            state.task_tool_calls = 499;
+            state.messages.push(ChatMessage::new(Role::Assistant, "确认"));
+            state.tool_frags = (0..batch).map(|index| neo_llm::ToolCallFrag {
+                index, id: Some(format!("limit-{index}")), name: Some("ask_user".into()), args: r#"{"question":"继续?"}"#.into(),
+            }).collect();
+            assert_eq!(state.begin_tool_round(), batch);
+            assert!(state.task_limit_reached);
+            assert_eq!(state.messages[4].tool.as_ref().unwrap().state, ToolState::AwaitingConfirm);
+            state.answer_question(4, Some("第500次完成".into()));
+            assert!(state.messages[4].tool.as_ref().unwrap().outcome.as_ref().unwrap().is_ok());
+            for msg in &state.messages[5..] {
+                assert_eq!(msg.tool.as_ref().unwrap().state, ToolState::Denied);
+            }
+            assert!(NeoApp::advance_tools(&mut state, Some(&store)));
+            let rows = store.messages(state.active_session.unwrap()).unwrap();
+            assert_eq!(rows.len(), state.messages.len());
+            assert!(rows[4].content.contains("第500次完成"));
+            assert_eq!(rows[4].tool_call_id, "limit-0");
+            let mut messages = state.api_messages(24);
+            neo_llm::budget_messages(&state.llm_config(), &mut messages, &neo_tools::tool_declarations()).unwrap();
+            NeoApp::start_real_stream(&mut state);
+            assert!(!state.generating);
+            CAPTURED_REQUESTS.with(|requests| assert!(requests.borrow().is_empty()));
+        }
+    }
+
+    #[test]
+    fn task_tool_limit_500th_read_dispatches_after_save_and_persists() {
+        use crate::state::{ChatMessage, Role, ToolState};
+        let _mock = MockStream::install();
+        let store = temp_store("task-tool-limit-read");
+        let dir = std::env::temp_dir().join(format!("neo-restore-task-tool-limit-read-{}", std::process::id()));
+        std::fs::write(dir.join("input.txt"), "第500次读取成功").unwrap();
+        let mut state = synthetic_send_state(false);
+        assert!(state.submit());
+        state.task_tool_calls = 499;
+        state.messages.push(ChatMessage::new(Role::Assistant, "读取"));
+        state.tool_frags = vec![neo_llm::ToolCallFrag {
+            index: 0, id: Some("last-read".into()), name: Some("read_file".into()), args: r#"{"path":"input.txt"}"#.into(),
+        }];
+        state.begin_tool_round();
+        assert!(state.task_limit_reached);
+        assert_eq!(state.messages[4].tool.as_ref().unwrap().state, ToolState::Running);
+        assert!(NeoApp::persist_ready(&mut state, Some(&store)));
+        assert_eq!(state.pending_persist, 4);
+        assert_eq!(state.spawn_ready_tools(&neo_tools::Scope::new(&dir)), 1);
+        assert!(state.wait_tool_jobs(std::time::Duration::from_secs(5)));
+        assert!(state.messages[4].tool.as_ref().unwrap().outcome.as_ref().unwrap().is_ok());
+        assert!(NeoApp::persist_ready(&mut state, Some(&store)));
+        assert!(store.messages(state.active_session.unwrap()).unwrap()[4].content.contains("第500次读取成功"));
+        NeoApp::start_real_stream(&mut state);
+        CAPTURED_REQUESTS.with(|requests| assert!(requests.borrow().is_empty()));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn compaction_restore_rejects_corrupt_checkpoint_without_losing_history() {
+        let store = temp_store("compaction-corrupt");
+        let mut state = synthetic_send_state(false);
+        state.messages[0].content = "a".repeat(20_000);
+        assert!(state.submit());
+        assert!(NeoApp::persist_ready(&mut state, Some(&store)));
+        let plan = state.compaction_plan(&state.api_messages(24)).unwrap().unwrap();
+        let mut checkpoint = plan.checkpoint;
+        checkpoint.summary = "历史摘要".into();
+        checkpoint.fingerprint ^= 1;
+        let id = state.active_session.unwrap();
+        store.save_checkpoint(id, checkpoint.covered, &serde_json::to_string(&checkpoint).unwrap()).unwrap();
+        let mut restored = AppState::default();
+        assert!(NeoApp::open_session(&mut restored, &store, id));
+        assert!(restored.checkpoint.is_none());
+        assert!(restored.compaction_status.as_ref().unwrap().contains("校验失败"));
+        assert_eq!(restored.messages.len(), 3);
+        assert_eq!(restored.api_messages(24)[1].content.len(), 20_000);
+    }
+
+    #[test]
+    fn compaction_checkpoint_save_failure_holds_resume_and_cancel_stops_it() {
+        let store = temp_store("compaction-readonly");
+        let mut state = synthetic_send_state(false);
+        state.messages[0].content = "a".repeat(20_000);
+        assert!(state.submit());
+        assert!(NeoApp::persist_ready(&mut state, Some(&store)));
+        let plan = state.compaction_plan(&state.api_messages(24)).unwrap().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.start_compaction(plan, neo_llm::Stream::new_for_test(rx));
+        tx.send(neo_llm::Event::Delta { content: "完整摘要".into(), reasoning: String::new() }).unwrap();
+        tx.send(neo_llm::Event::Done { tool_calls: false }).unwrap();
+        state.poll_compaction();
+        drop(store);
+        let path = std::env::temp_dir().join(format!("neo-restore-compaction-readonly-{}", std::process::id())).join("neo.db");
+        let store = readonly_store(&path);
+        assert!(!NeoApp::persist_ready(&mut state, Some(&store)));
+        assert!(state.compaction_resume && state.checkpoint_dirty);
+        state.draft = "不能越过保存屏障".into();
+        assert!(!state.can_submit());
+        state.cancel();
+        assert!(!state.compaction_resume);
+        assert_eq!(state.messages.len(), 3);
+        assert!(store.checkpoint(state.active_session.unwrap()).unwrap().is_none());
+    }
+
+    #[test]
+    fn compaction_tick_resumes_once_after_checkpoint_save_and_limit_stops_continuation() {
+        let _mock = MockStream::install();
+        super::STREAM_START.with(|start| start.set(|_, messages, tools| {
+            let summary = tools.is_empty();
+            CAPTURED_REQUESTS.with(|requests| requests.borrow_mut().push(messages));
+            let (tx, rx) = std::sync::mpsc::channel();
+            if summary { tx.send(neo_llm::Event::Delta { content: "历史整理完成".into(), reasoning: String::new() }).unwrap(); }
+            tx.send(neo_llm::Event::Done { tool_calls: false }).unwrap();
+            neo_llm::Stream::new_for_test(rx)
+        }));
+        let ctx = egui::Context::default();
+        let mut app = NeoApp::install(&ctx);
+        app.store = Some(temp_store("compaction-tick"));
+        app.state = synthetic_send_state(false);
+        app.state.messages[0].content = "a".repeat(20_000);
+        NeoApp::send_input(&mut app.state, app.store.as_ref());
+        assert!(app.state.compaction.is_some());
+        app.tick(ctx.clone());
+        assert!(!app.state.checkpoint_dirty);
+        assert!(app.store.as_ref().unwrap().checkpoint(app.state.active_session.unwrap()).unwrap().is_some());
+        app.tick(ctx.clone());
+        app.tick(ctx);
+        CAPTURED_REQUESTS.with(|requests| assert_eq!(requests.borrow().len(), 2));
+        assert!(!app.state.generating && !app.state.compaction_resume);
+        app.state.task_tool_calls = 500;
+        app.state.task_limit_reached = true;
+        NeoApp::start_real_stream(&mut app.state);
+        CAPTURED_REQUESTS.with(|requests| assert_eq!(requests.borrow().len(), 2));
+        assert!(app.state.attachment_error.as_ref().unwrap().contains("500"));
+    }
+
+    #[test]
+    fn compaction_config_change_after_completion_cancels_automatic_resume() {
+        let _mock = MockStream::install();
+        let ctx = egui::Context::default();
+        let mut app = NeoApp::install(&ctx);
+        app.store = Some(temp_store("compaction-config-change"));
+        app.state = synthetic_send_state(false);
+        app.state.messages[0].content = "a".repeat(20_000);
+        assert!(app.state.submit());
+        assert!(NeoApp::persist_ready(&mut app.state, app.store.as_ref()));
+        let plan = app.state.compaction_plan(&app.state.api_messages(24)).unwrap().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.state.start_compaction(plan, neo_llm::Stream::new_for_test(rx));
+        tx.send(neo_llm::Event::Delta { content: "历史摘要".into(), reasoning: String::new() }).unwrap();
+        tx.send(neo_llm::Event::Done { tool_calls: false }).unwrap();
+        assert!(app.state.poll_compaction());
+        assert!(app.state.compaction_resume);
+        app.state.context_tokens += 1024;
+        app.tick(ctx);
+        assert!(!app.state.compaction_resume && !app.state.generating);
+        assert!(app.state.compaction_status.as_ref().unwrap().contains("自动续轮已取消"));
+        CAPTURED_REQUESTS.with(|requests| assert!(requests.borrow().is_empty()));
+        assert_eq!(app.state.messages.len(), 3);
+    }
+
+    #[test]
+    fn send_reuse_save_barriers_preserve_draft_and_attachments() {
+        use crate::state::{ChatMessage, Role};
+        let store = temp_store("send-reuse-readonly");
+        let id = store.create_session("原会话").unwrap();
+        let path = std::env::temp_dir().join(format!("neo-restore-send-reuse-readonly-{}", std::process::id())).join("neo.db");
+        drop(store);
+        let store = readonly_store(&path);
+        for before_submit in [true, false] {
+            let _mock = MockStream::install();
+            let mut state = synthetic_send_state(true);
+            state.messages.clear();
+            state.active_session = Some(id);
+            if before_submit {
+                state.messages.push(ChatMessage::new(Role::User, "未保存历史"));
+                state.stage = Stage::Conversation;
+            }
+            let draft = state.draft.clone();
+            let attachments = serde_json::to_string(&state.draft_attachments).unwrap();
+            NeoApp::send_input(&mut state, Some(&store));
+            // 原语义：首屏障失败不触碰草稿，提交后的保存失败恢复已 trim 的正文。
+            assert_eq!(state.draft, if before_submit { draft.as_str() } else { draft.trim() });
+            assert_eq!(serde_json::to_string(&state.draft_attachments).unwrap(), attachments);
+            assert_eq!(state.messages.len(), usize::from(before_submit));
+            assert_eq!(state.pending_persist, 0);
+            assert_eq!(state.stage, if before_submit { Stage::Conversation } else { Stage::Hero });
+            assert_eq!(state.active_session, before_submit.then_some(id));
+            assert!(state.attachment_error.is_some());
+            assert!(!state.generating && !state.wants_demo_reply && state.stream.is_none());
+            assert!(store.messages(id).unwrap().is_empty());
+            CAPTURED_REQUESTS.with(|requests| assert!(requests.borrow().is_empty()));
+            crate::state::API_MESSAGE_BUILDS.with(|count| assert_eq!(count.get(), usize::from(!before_submit)));
+        }
+    }
+
+    #[test]
+    fn send_reuse_budget_failure_restores_original_draft_and_image() {
+        let _mock = MockStream::install();
+        let mut state = synthetic_send_state(true);
+        state.draft = format!("  {}  ", "课堂正文".repeat(20_000));
+        state.stage = Stage::Conversation;
+        let draft = state.draft.clone();
+        let attachments = serde_json::to_string(&state.draft_attachments).unwrap();
+        NeoApp::send_input(&mut state, None);
+        assert_eq!(state.draft, draft);
+        assert_eq!(serde_json::to_string(&state.draft_attachments).unwrap(), attachments);
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.pending_persist, 2);
+        assert_eq!(state.stage, Stage::Conversation);
+        assert!(state.attachment_error.is_some());
+        assert!(!state.generating && !state.wants_demo_reply && state.stream.is_none());
+        CAPTURED_REQUESTS.with(|requests| assert!(requests.borrow().is_empty()));
+        crate::state::API_MESSAGE_BUILDS.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    #[test]
+    fn send_reuse_tool_round_still_checks_budget_and_pairing() {
+        use crate::state::{ChatMessage, Role, ToolMeta};
+        for over_budget in [false, true] {
+            let _mock = MockStream::install();
+            let mut state = synthetic_send_state(false);
+            assert!(state.submit());
+            let mut assistant = ChatMessage::new(Role::Assistant, "");
+            assistant.reasoning = if over_budget { "推理".repeat(20_000) } else { "先读取资料".into() };
+            assistant.tool_calls.push(neo_llm::ToolCall {
+                id: "synthetic-call".into(), name: "read_file".into(), arguments: "{}".into(),
+            });
+            state.messages.push(assistant);
+            let mut meta = ToolMeta::restored("read_file");
+            meta.call_id = "synthetic-call".into();
+            state.messages.push(ChatMessage::tool_result(meta, "工具结果".into()));
+            NeoApp::start_real_stream(&mut state);
+            crate::state::API_MESSAGE_BUILDS.with(|count| assert_eq!(count.get(), 1));
+            CAPTURED_REQUESTS.with(|requests| {
+                let requests = requests.borrow();
+                assert_eq!(requests.len(), 1);
+                if !over_budget {
+                    let messages = &requests[0];
+                    assert_eq!(messages[4].tool_calls[0].id, "synthetic-call");
+                    assert_eq!(messages[5].tool_call_id.as_deref(), Some("synthetic-call"));
+                    assert_eq!(messages[5].content, "工具结果");
+                }
+            });
+            state.poll_compaction();
+            state.pump();
+            assert!(!state.generating);
+            assert_eq!(state.attachment_error.is_some(), over_budget);
+            assert!(state.messages.iter().any(|m| m.content == "工具结果"));
         }
     }
 
