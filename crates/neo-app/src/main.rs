@@ -36,8 +36,10 @@ mod brand;
 mod class;
 mod diagnostics;
 mod notify;
+mod startup;
 mod state;
 mod ui;
+mod updates;
 
 fn window_limits(supported: &eframe::wgpu::Limits) -> eframe::wgpu::Limits {
     // 不把 eframe 默认的 8192 变成硬件门槛；保留设备可用的完整 2D
@@ -47,7 +49,15 @@ fn window_limits(supported: &eframe::wgpu::Limits) -> eframe::wgpu::Limits {
     limits
 }
 
-fn main() -> eframe::Result {
+fn main() {
+    let _startup = match startup::begin() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return,
+        Err(_) => {
+            startup::fatal("instance", "startup initialization failed");
+            return;
+        }
+    };
     // 窗口图标与托盘图标共用同一张鲸鱼位图（品牌蓝、方形内接居中）。
     let (rgba, width, height) = brand::whale_rgba(64);
     let mut wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
@@ -75,7 +85,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native(
+    if eframe::run_native(
         "Neo",
         options,
         Box::new(|cc| {
@@ -90,11 +100,11 @@ fn main() -> eframe::Result {
             // 系统托盘：关窗转后台运行，托盘菜单提供「显示主界面 / 退出」。
             // 装配失败只打日志降级为无托盘，不挡启动。
             app.start_tray();
-            // 原生消息弹窗：告诉老师 Neo 起来了（失败只记日志）。
-            notify::app_started();
             Ok(Box::new(app))
         }),
-    )
+    ).is_err() {
+        startup::fatal("window", "native window initialization failed");
+    }
 }
 
 #[cfg(test)]

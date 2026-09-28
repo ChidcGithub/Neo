@@ -5,9 +5,9 @@
 //!
 //! ## 坐标系
 //!
-//! 全部是**虚拟桌面的物理像素**，原点在虚拟桌面左上角（多显示器时可能为负）。
-//! 这和 `click` / `drag` 用的是同一套坐标 —— **照图里的像素位置写，不用换算缩放**。
-//! 见 [`super::screen`] 里关于 DPI 的说明。
+//! 无引用时参数是虚拟桌面物理像素；给 screenshot_id 时参数是该 PNG 的图内像素。
+//! PNG 的 (0,0) 对应 source_rect 的左上角，由程序累加偏移，不做 DPI 乘除。
+//! 引用裁图是重新捕获当前桌面的对应区域，不是对旧 PNG 做离线裁剪。
 //!
 //! ## 局部截屏
 //!
@@ -19,52 +19,28 @@ use std::path::PathBuf;
 
 use serde_json::json;
 
-use crate::result::{Args, ErrorKind, Outcome, ToolError};
+use crate::result::{Args, Outcome, ToolError};
+#[cfg(test)]
+use crate::result::ErrorKind;
 use crate::spec::Param;
 use crate::Scope;
 
-use super::base64_lite::encode as b64;
-use super::limits;
 use super::screen::{self, Rect};
 
 pub static PARAMS: &[Param] = &[
-    Param::opt_int(
-        "x",
-        "截取区域左上角的 x（虚拟桌面物理像素，多显示器时可能是负数）。\
-         不给就截整个虚拟桌面；给了就要连 y/width/height 一起给。",
-        0,
-        -32768,
-        32768,
-    ),
-    Param::opt_int(
-        "y",
-        "截取区域左上角的 y（虚拟桌面物理像素）。同上：要么四个都给，要么都不给。",
-        0,
-        -32768,
-        32768,
-    ),
-    Param::opt_int(
-        "width",
-        "截取区域宽度（像素），必须为正。只给局部时必填。",
-        0,
-        0,
-        32768,
-    ),
-    Param::opt_int(
-        "height",
-        "截取区域高度（像素），必须为正。只给局部时必填。",
-        0,
-        0,
-        32768,
-    ),
+    Param::opt_text("screenshot_id", "可选短期截图坐标参考；给了就必须同时给 x/y/width/height（图内像素），程序映射后重新截取当前桌面。未知或过期拒绝，不验证目标身份。"),
+    Param { required: false, ..Param::int("x", "区域左上角 x：有 screenshot_id 时为图内像素，无引用时为桌面物理像素。四个区域参数要么全给，要么全省略。", -32768, 32768) },
+    Param { required: false, ..Param::int("y", "区域左上角 y：有 screenshot_id 时为图内像素，否则为桌面物理像素。", -32768, 32768) },
+    Param { required: false, ..Param::int("width", "区域宽度（正像素数），不是 right 右边界；局部截图必填。", 1, 32768) },
+    Param { required: false, ..Param::int("height", "区域高度（正像素数），不是 bottom 下边界；局部截图必填。", 1, 32768) },
 ];
 
 pub fn preview(args: &Args) -> String {
     match region(args) {
         Ok(None) => "截取整个屏幕（并交给模型看）".to_owned(),
         Ok(Some(r)) => format!(
-            "截取屏幕区域 ({}, {}) {}×{}（并交给模型看）",
-            r.x, r.y, r.width, r.height
+            "截取{}区域 ({}, {}) {}×{}（并交给模型看）",
+            if args.has("screenshot_id") { "截图引用图内" } else { "桌面物理" }, r.x, r.y, r.width, r.height
         ),
         Err(_) => "截取屏幕（参数不完整）".to_owned(),
     }
@@ -73,8 +49,13 @@ pub fn preview(args: &Args) -> String {
 /// 解析区域：`Ok(None)` = 整屏。**不在这里校验越界**（那要知道屏幕尺寸，
 /// 交给 `run` 统一做，错误信息里才能带上合法范围）。
 fn region(args: &Args) -> Result<Option<Rect>, ToolError> {
+    super::screenshot_space::validate_args(args)?;
     const KEYS: [&str; 4] = ["x", "y", "width", "height"];
     let given = KEYS.iter().filter(|k| args.has(k)).count();
+    if args.has("screenshot_id") {
+        args.require_str("screenshot_id")?;
+        if given != 4 { return Err(ToolError::bad_args("screenshot_id 必须与完整 x/y/width/height 配对，不能回退整屏")); }
+    }
     if given == 0 {
         return Ok(None);
     }
@@ -102,67 +83,83 @@ pub fn run(scope: &Scope, args: &Args) -> Outcome {
 }
 
 fn shot(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
+    use super::screenshot_space::{self, ImageSpace};
+    // 参数错误在读取真实桌面之前拒绝，尤其不能把 null/拼错参数当成整屏。
+    let requested = region(args)?;
+    let reference = args.has("screenshot_id").then(|| args.require_str("screenshot_id")).transpose()?;
+    let _interaction = super::screen_uia::INTERACTION.lock().unwrap();
+    if scope.is_cancelled() { return Err(crate::cancelled_error()); }
+    let generation = screenshot_space::generation();
+    if let Some(id) = &reference { screenshot_space::require_known(id)?; }
     screen::ensure_dpi_aware();
-    let vs = screen::virtual_screen();
-    if vs.width <= 0 || vs.height <= 0 {
-        return Err(ToolError::new(
-            ErrorKind::Unsupported,
-            "拿不到屏幕尺寸 —— 没有可交互的桌面会话",
-        )
-        .with_hint("确认 Neo 跑在真实登录的桌面会话里（不是服务或无头会话）"));
-    }
-
-    let rect = match region(args)? {
-        None => vs,
-        Some(r) => {
-            if r.width <= 0 || r.height <= 0 {
-                return Err(ToolError::bad_args("截取区域的宽高必须为正")
-                    .with_hint("width / height 是整数像素"));
-            }
-            // 两端都要在桌面内：只查左上角会漏掉"起点在图内、右下角跑到屏外"。
-            if !vs.contains(r.x, r.y) {
-                return Err(vs.outside_error("截取区域左上角", r.x, r.y));
-            }
-            if !vs.contains(r.x + r.width - 1, r.y + r.height - 1) {
-                return Err(vs.outside_error(
-                    "截取区域右下角",
-                    r.x + r.width - 1,
-                    r.y + r.height - 1,
-                ));
-            }
-            r
-        }
+    let topology = screen::monitors()?;
+    let vs = screen::monitor_bounds(&topology)?;
+    let rect = match (requested, &reference) {
+        (Some(r), Some(id)) => screenshot_space::resolve(id, topology.clone())?.crop(r)?,
+        (Some(r), None) => r,
+        (None, None) => vs,
+        (None, Some(_)) => return Err(ToolError::bad_args("截图引用缺少裁图区域")),
     };
-
+    let space = ImageSpace::new(rect, rect.width as u32, rect.height as u32, topology.clone())?;
     let img = screen::capture(rect)?;
+    if img.width != space.sent_width || img.height != space.sent_height {
+        return Err(ToolError::io("实际截图尺寸与坐标参考不匹配，已拒绝发送"));
+    }
+    if screen::monitors()? != topology {
+        screenshot_space::invalidate();
+        return Err(ToolError::bad_args("截屏期间显示拓扑改变，请重新截图"));
+    }
     let png = img.to_png()?;
+    if scope.is_cancelled() { return Err(crate::cancelled_error()); }
 
     // 存进工作区：模型之后能用这个路径做别的事（裁剪、比对、交给用户看）。
     let path = save_png(scope, &png)?;
 
     let scale = screen::dpi_scale_at(rect.x + rect.width / 2, rect.y + rect.height / 2);
     let shown = scope.display(&path);
-    // 单张内联图官方上限 32 MiB。超了就**不发图**、只给路径，并说清下一步怎么办 ——
-    // 静静发一个超限的请求只会换来一个难懂的 400。
-    let attachable = png.len() <= limits::INLINE_IMAGE_BYTES;
+    let prepared = prepare_image(&png, (img.width, img.height));
+    if scope.is_cancelled() { return Err(crate::cancelled_error()); }
+    let attachable = prepared.is_ok();
+    let mapping = space.metadata();
+    let screenshot_id = if attachable { Some(screenshot_space::register(space, scope, generation)?) } else { None };
+    let sent_format = prepared.as_ref().ok().map(|image| if image.url.starts_with("data:image/png;") { "png" } else { "jpeg" });
+    let sent_bytes = prepared.as_ref().ok().map_or(0, |image| {
+        let encoded = image.url.split_once(',').unwrap().1;
+        encoded.len() / 4 * 3 - encoded.bytes().rev().take_while(|b| *b == b'=').count()
+    });
     let mut data = json!({
+        "screenshot_id": screenshot_id,
+        "reference_ttl_seconds": screenshot_space::TTL_SECS,
+        "parent_screenshot_id": reference,
+        "image_space": mapping["image_space"],
+        "desktop_space": mapping["desktop_space"],
+        "image_to_desktop": mapping["image_to_desktop"],
+        "display_topology": mapping["display_topology"],
+        "contains_display_gaps": mapping["contains_display_gaps"],
+        "gap_note": "显示器空洞不是可点击屏幕；图内坐标仍须落在实际显示器上",
+        "source_width": img.width, "source_height": img.height,
+        "source_size": { "width": img.width, "height": img.height },
+        "sent_size": prepared.as_ref().ok().map(|image| json!({ "width": image.sent_size.0, "height": image.sent_size.1 })),
+        "sent_width": if attachable { Some(img.width) } else { None },
+        "sent_height": if attachable { Some(img.height) } else { None },
+        "sent_bytes": sent_bytes,
+        "format": "png", "saved_format": "png", "sent_format": sent_format,
+        "lossless": sent_format.map(|format| format == "png"), "resized": false,
+        "target_identity_verified": false,
+        "reference_note": "截图引用仅作坐标参考；图像变化不会自动被检测。优先 UIA 元素点击，动作后重新观察，不自动重试。引用裁图会读取当前桌面。",
         "path": shown,
         "saved_bytes": png.len(),
         "region": { "x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height },
         "virtual_screen": { "x": vs.x, "y": vs.y, "width": vs.width, "height": vs.height },
         "dpi_scale": scale,
         "image_attached": attachable,
-        "coordinate_space": "虚拟桌面物理像素（与 click / drag 同一套坐标）",
+        "coordinate_space": "原尺寸附图的图内像素；desktop = image + source_rect.origin，不做 DPI 缩放",
     });
     let mut note = "，已把图交给模型";
-    if !attachable {
-        note = "（图太大，未随请求发送）";
-        data["reason"] = json!(format!(
-            "PNG 超过 {} MiB 的内联上限",
-            limits::INLINE_IMAGE_BYTES / 1048576
-        ));
-        data["next"] =
-            json!("改截一块更小的区域（给 x/y/width/height），或用 view_image 看这张已保存的文件");
+    if let Err(reason) = &prepared {
+        note = "（原尺寸附图准备失败，未随请求发送）";
+        data["reason"] = json!(reason);
+        data["next"] = json!("用桌面物理 x/y/width/height 改截更小区域；view_image 可能缩图，其坐标不能套用本截图映射");
     }
 
     let mut outcome = Outcome::ok(
@@ -176,23 +173,43 @@ fn shot(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
         ),
         data,
     );
-    if attachable {
-        outcome = outcome.with_image(format!("data:image/png;base64,{}", b64(&png)));
+    if let Ok(image) = prepared {
+        outcome = outcome.with_image(image.url);
     }
     Ok(outcome)
 }
 
-fn save_png(scope: &Scope, png: &[u8]) -> Result<PathBuf, ToolError> {
-    let rel = format!("screenshots/shot-{}.png", epoch_ms());
-    let path = scope.resolve(&rel)?;
-    scope.verify_new(&path)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ToolError::io(format!("创建 {} 失败：{e}", scope.display(parent))))?;
+fn prepare_image(png: &[u8], source: (u32, u32)) -> Result<super::view_image::ModelImage, String> {
+    let image = super::view_image::model_image_with_sizes(png, false)?;
+    if image.source_size != source || image.sent_size != source {
+        return Err("实际附图尺寸与截图坐标参考不一致，已拒绝发送".into());
     }
-    std::fs::write(&path, png)
-        .map_err(|e| ToolError::io(format!("保存 {} 失败：{e}", scope.display(&path))))?;
-    Ok(path)
+    Ok(image)
+}
+
+fn save_png(scope: &Scope, png: &[u8]) -> Result<PathBuf, ToolError> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..32 {
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let rel = format!("screenshots/shot-{}-{}-{sequence}.png", epoch_ms(), std::process::id());
+        let path = scope.resolve(&rel)?;
+        scope.verify_new(&path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ToolError::io(format!("创建 {} 失败：{e}", scope.display(parent))))?;
+        }
+        scope.verify_new(&path)?;
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(ToolError::io(format!("创建 {} 失败：{e}", scope.display(&path)))),
+        };
+        file.write_all(png).map_err(|e| ToolError::io(format!("保存 {} 失败：{e}", scope.display(&path))))?;
+        return Ok(path);
+    }
+    Err(ToolError::io("无法分配唯一截图文件名，未覆盖已有文件"))
 }
 
 /// 毫秒时间戳，用来给截图起不重名的文件名。
@@ -207,6 +224,69 @@ fn epoch_ms() -> u128 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn original_size_attachment_allows_jpeg_fallback_and_rejects_mismatch() {
+        use base64::Engine;
+        let (width, height) = (1536, 1024);
+        let mut state = 1234567u32;
+        let image = image::RgbImage::from_fn(width, height, |_, _| {
+            let mut rgb = [0; 3];
+            for byte in &mut rgb {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *byte = state as u8;
+            }
+            image::Rgb(rgb)
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        assert!(png.get_ref().len() > super::super::view_image::MAX_MODEL_IMAGE_BYTES);
+        let prepared = prepare_image(png.get_ref(), (width, height)).unwrap();
+        assert!(prepared.url.starts_with("data:image/jpeg;base64,"));
+        assert_eq!(prepared.sent_size, (width, height));
+        let bytes = base64::engine::general_purpose::STANDARD.decode(prepared.url.split_once(',').unwrap().1).unwrap();
+        assert!(bytes.len() <= super::super::view_image::MAX_MODEL_IMAGE_BYTES);
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (width, height));
+        assert!(prepare_image(png.get_ref(), (width / 2, height / 2)).is_err());
+        assert!(prepare_image(b"invalid image", (1, 1)).is_err());
+        let wide = image::RgbImage::new(super::super::view_image::MAX_MODEL_IMAGE_EDGE + 1, 1);
+        let mut png = std::io::Cursor::new(Vec::new());
+        wide.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        assert!(prepare_image(png.get_ref(), (wide.width(), 1)).is_err());
+        let small = image::RgbImage::new(10, 20);
+        let mut png = std::io::Cursor::new(Vec::new());
+        small.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let prepared = prepare_image(png.get_ref(), (10, 20)).unwrap();
+        assert!(prepared.url.starts_with("data:image/png;base64,"));
+        assert_eq!(prepared.source_size, prepared.sent_size);
+    }
+
+    #[test]
+    fn waiting_desktop_tools_cancel_before_any_desktop_access() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        for (name, value) in [("screenshot", json!({})), ("click", json!({"x": 1, "y": 1})),
+            ("drag", json!({"x": 1, "y": 1, "to_x": 2, "to_y": 2}))] {
+            let interaction = super::super::screen_uia::INTERACTION.lock().unwrap();
+            let token = Arc::new(AtomicBool::new(false));
+            let scope = Scope::new(std::env::temp_dir()).with_cancel(token.clone());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let worker_barrier = barrier.clone();
+            let worker = std::thread::spawn(move || {
+                let tool = crate::find(name).unwrap();
+                worker_barrier.wait();
+                (tool.run)(&scope, &Args::new(tool, &value))
+            });
+            barrier.wait();
+            token.store(true, Ordering::Release);
+            drop(interaction);
+            let outcome = worker.join().unwrap();
+            assert_eq!(outcome.error.unwrap().kind, crate::cancelled_error().kind);
+            assert!(outcome.images.is_empty());
+        }
+    }
 
     #[cfg(windows)]
     #[test]
@@ -232,6 +312,47 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(result.unwrap_err().kind, ErrorKind::NotAllowed);
         assert_eq!(outside_count, 0);
+    }
+
+    #[test]
+    fn region_all_sixteen_combinations_and_schema_are_strict() {
+        let tool = crate::find("screenshot").unwrap();
+        let keys = ["x", "y", "width", "height"];
+        for mask in 0..16 {
+            let mut value = json!({});
+            for (bit, key) in keys.iter().enumerate() {
+                if mask & (1 << bit) != 0 { value[*key] = json!(10); }
+            }
+            assert_eq!(region(&Args::new(tool, &value)).is_ok(), mask == 0 || mask == 15, "{mask}");
+        }
+        for value in [json!({"x": null}), json!({"x": null, "y": null, "width": null, "height": null}),
+            json!({"right": 10}), json!({"screenshot_id": null}), json!({"screenshot_id": "old"}),
+            json!({"x": 0, "y": 0, "width": 0, "height": 1}), json!({"x": 0, "y": 0, "width": 1, "height": -1}),
+            json!(null), json!([])] {
+            assert!(region(&Args::new(tool, &value)).is_err(), "{value}");
+            assert!(shot(&Scope::new(std::env::temp_dir()), &Args::new(tool, &value)).is_err());
+        }
+        let unknown = json!({"screenshot_id": "definitely-unknown", "x": 0, "y": 0, "width": 1, "height": 1});
+        assert!(shot(&Scope::new(std::env::temp_dir()), &Args::new(tool, &unknown)).unwrap_err().message.contains("screenshot_id"));
+        let schema = tool.schema();
+        assert_eq!(schema["additionalProperties"], false);
+        for key in ["width", "height"] {
+            assert_eq!(schema["properties"][key]["minimum"], 1);
+            assert!(schema["properties"][key].get("default").is_none());
+        }
+    }
+
+    #[test]
+    fn png_saves_are_unique_and_never_overwrite() {
+        let root = std::env::temp_dir().join(format!("neo-unique-shot-{}-{}", std::process::id(), epoch_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let scope = Scope::new(&root);
+        let first = save_png(&scope, b"first").unwrap();
+        let second = save_png(&scope, b"second").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(first).unwrap(), b"first");
+        assert_eq!(std::fs::read(second).unwrap(), b"second");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

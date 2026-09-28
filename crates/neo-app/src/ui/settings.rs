@@ -262,6 +262,10 @@ fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     state.set_classroom_safe(safe);
     ui.add(egui::Label::new("这不是离线模式：普通问答和用户文件内容仍可发送给模型，联网读取仍可用。开启时暂停语音唤醒、课堂采集和桌面观察，禁止打开、写入、执行操作。").wrap());
     row_divider(ui, skin, width);
+    switch_row(ui, skin, width, "致命启动错误静默退出", "仅课堂安全模式开启时生效，默认关闭",
+        &mut state.silent_startup_errors, "neo-set-silent-startup");
+    hint_row(ui, skin, width, "致命启动错误静默退出，仍记录本地日志；普通工具/网络故障不自动退出。关闭此项时致命故障显示错误弹窗。");
+    row_divider(ui, skin, width);
     section_label_row(ui, skin, width, "窗口与后台");
     switch_row(
         ui,
@@ -466,7 +470,7 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     hint_row(ui, skin, width, &hint);
 }
 
-fn about_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &AppState, loaded: &LoadedFonts) {
+fn about_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState, loaded: &LoadedFonts) {
     let m = skin.m();
     section_label_row(ui, skin, width, "关于");
     let db = state.db_path.as_deref().unwrap_or("不可用");
@@ -484,6 +488,26 @@ fn about_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &AppState, loaded:
     ];
     for (k, v) in rows {
         kv_row(ui, skin, width, k, &v);
+    }
+    ui.add_space(m.s(16.0));
+
+    section_label_row(ui, skin, width, "软件更新");
+    switch_row(ui, skin, width, "自动检查更新", "启动后联网 GitHub 检查一次发布版本；不自动下载或安装",
+        &mut state.auto_check_updates, "neo-set-auto-updates");
+    let checking = matches!(state.update_status, crate::updates::Status::Checking);
+    if ui.add_enabled(!checking, egui::Button::new("立即检查")).clicked() {
+        state.update_check_requested = true;
+    }
+    ui.add_space(m.s(8.0));
+    match &state.update_status {
+        crate::updates::Status::Idle => hint_row(ui, skin, width, "尚未检查更新；手动检查间隔至少 10 秒"),
+        crate::updates::Status::Checking => hint_row(ui, skin, width, "正在连接 GitHub 检查更新…"),
+        crate::updates::Status::UpToDate => hint_row(ui, skin, width, "当前已是最新发布版本"),
+        crate::updates::Status::Available { version, url } => {
+            hint_row(ui, skin, width, &format!("发现新版本 {version}，请自行查看发布说明并下载"));
+            ui.hyperlink_to("查看 GitHub 发布页面", url);
+        }
+        crate::updates::Status::Failed(_) => hint_row(ui, skin, width, "检查失败，请确认网络后稍后重试；不影响继续使用"),
     }
     ui.add_space(m.s(16.0));
 

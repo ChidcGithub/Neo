@@ -10,7 +10,19 @@ use crate::result::{Args, ErrorKind, Outcome, ToolError};
 use crate::spec::Param;
 use crate::Scope;
 
-use super::limits;
+pub const MAX_MODEL_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_MODEL_IMAGE_EDGE: u32 = 4096;
+pub const MAX_MODEL_IMAGE_PIXELS: u64 = 4096 * 2160;
+pub const MAX_SOURCE_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SOURCE_IMAGE_EDGE: u32 = 8192;
+const MAX_SOURCE_IMAGE_PIXELS: u64 = 16_000_000;
+const PREVIEW_EDGE: u32 = 1536;
+
+pub struct ModelImage {
+    pub url: String,
+    pub source_size: (u32, u32),
+    pub sent_size: (u32, u32),
+}
 
 pub static PARAMS: &[Param] = &[
     Param::text("path", "图片路径，相对工作区；例如 `docs/screens/01-hero.png`。"),
@@ -24,7 +36,7 @@ pub static PARAMS: &[Param] = &[
 pub fn preview(args: &Args) -> String {
     let path = args.opt_str("path").unwrap_or_default();
     if args.flag("include_data").unwrap_or(false) {
-        format!("查看图片 {path} 并取回原始数据")
+        format!("查看图片 {path} 并附送模型兼容图片")
     } else {
         format!("查看图片 {path} 的信息")
     }
@@ -54,19 +66,19 @@ fn view(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
         ));
     }
     let path = scope.verify_existing(&path)?;
-    if meta.len() > limits::IMAGE_BYTES {
+    if meta.len() > MAX_SOURCE_IMAGE_BYTES as u64 {
         return Err(ToolError::new(
             ErrorKind::TooLarge,
             format!(
                 "图片 {} 字节，超过 {} 字节上限",
                 meta.len(),
-                limits::IMAGE_BYTES
+                MAX_SOURCE_IMAGE_BYTES
             ),
         )
         .with_hint("先缩小图片再查看，或只用 `bash` 的 file 命令看格式"));
     }
 
-    let bytes = super::read_file::read_bounded(&path, limits::IMAGE_BYTES)?;
+    let bytes = super::read_file::read_bounded(&path, MAX_SOURCE_IMAGE_BYTES as u64)?;
     let Some(img) = sniff(&bytes) else {
         return Err(ToolError::new(
             ErrorKind::Unsupported,
@@ -82,6 +94,11 @@ fn view(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
         "mime": img.mime,
         "width": img.width,
         "height": img.height,
+        "source_size": { "width": img.width, "height": img.height },
+        "sent_size": null,
+        "coordinate_space": "image_local",
+        "desktop_locatable": false,
+        "image_note": "普通图片文件没有可信的桌面 region/origin；不得用于桌面定位，不从文件名或像素猜测原点。",
         "bytes": meta.len(),
     });
     // `include_data` = 把图**交给模型看**：图作为独立的一块附在工具结果后面，
@@ -106,14 +123,22 @@ fn view(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
         data,
     );
     if include_data {
-        if img.width == 0 || img.height == 0 || img.width > 8192 || img.height > 8192
-            || u64::from(img.width) * u64::from(img.height) > 16_000_000 {
+        if img.width == 0 || img.height == 0 || img.width > MAX_SOURCE_IMAGE_EDGE || img.height > MAX_SOURCE_IMAGE_EDGE
+            || u64::from(img.width) * u64::from(img.height) > MAX_SOURCE_IMAGE_PIXELS {
             return Err(ToolError::new(ErrorKind::TooLarge, "图片尺寸未知或超过 8192 边长 / 1600 万像素上限"));
         }
-        let url = model_image(&bytes, true)
+        let prepared = model_image_with_sizes(&bytes, true)
             .map_err(|e| ToolError::new(ErrorKind::Unsupported, e))?;
-        outcome.data["image_note"] = json!("仅发送首帧，最长边1536；原文件和上面的原始尺寸不变。");
-        outcome = outcome.with_image(url);
+        let (sw, sh) = prepared.source_size;
+        let (w, h) = prepared.sent_size;
+        outcome.data["source_size"] = json!({"width": sw, "height": sh});
+        outcome.data["sent_size"] = json!({"width": w, "height": h});
+        outcome.data["source_to_sent_scale"] = json!({
+            "x": {"numerator": w, "denominator": sw},
+            "y": {"numerator": h, "denominator": sh},
+        });
+        outcome.data["image_note"] = json!("仅发送首帧，最长边1536；source_size 为原图，sent_size 为实际附图，比例按各轴精确分数给出。普通图片没有可信的桌面 region/origin，不得用于桌面定位；需要定位时重新 screenshot 获取引用。");
+        outcome = outcome.with_image(prepared.url);
     }
 
     Ok(outcome)
@@ -121,8 +146,13 @@ fn view(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
 
 /// 有界转换供工具与应用回灌共用。桌面图传 false，绝不改变坐标尺度。
 pub fn model_image(bytes: &[u8], resize: bool) -> Result<String, String> {
+    model_image_with_sizes(bytes, resize).map(|image| image.url)
+}
+
+/// 返回真实解码/编码尺寸；resize=false 即使转 JPEG 也保持像素尺寸。
+pub fn model_image_with_sizes(bytes: &[u8], resize: bool) -> Result<ModelImage, String> {
     use std::io::Cursor;
-    if bytes.len() > 32 * 1024 * 1024 {
+    if bytes.len() > MAX_SOURCE_IMAGE_BYTES {
         return Err("图片编码体积超过32 MiB".into());
     }
     let reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()
@@ -133,7 +163,11 @@ pub fn model_image(bytes: &[u8], resize: bool) -> Result<String, String> {
         return Err("仅支持 PNG/JPEG/GIF/BMP/WebP".into());
     }
     let (width, height) = reader.into_dimensions().map_err(|e| format!("图片尺寸损坏：{e}"))?;
-    let (side, pixels) = if resize { (8192, 16_000_000) } else { (4096, 8_000_000) };
+    let (side, pixels) = if resize {
+        (MAX_SOURCE_IMAGE_EDGE, MAX_SOURCE_IMAGE_PIXELS)
+    } else {
+        (MAX_MODEL_IMAGE_EDGE, MAX_MODEL_IMAGE_PIXELS)
+    };
     if width == 0 || height == 0 || width > side || height > side
         || u64::from(width) * u64::from(height) > pixels {
         return Err(format!("图片超过{side}边长或{pixels}像素；桌面截图请缩小区域"));
@@ -145,27 +179,35 @@ pub fn model_image(bytes: &[u8], resize: bool) -> Result<String, String> {
     limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
     let mut decoded = reader.decode().map_err(|e| format!("图片解码失败：{e}"))?;
-    if resize && (width > 1536 || height > 1536) {
-        decoded = decoded.thumbnail(1536, 1536);
+    if resize && (width > PREVIEW_EDGE || height > PREVIEW_EDGE) {
+        decoded = decoded.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
     } else if !resize && matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg)
-        && bytes.len() <= 4 * 1024 * 1024 {
+        && bytes.len() <= MAX_MODEL_IMAGE_BYTES {
         let mime = if format == image::ImageFormat::Png { "image/png" } else { "image/jpeg" };
-        return Ok(format!("data:{mime};base64,{}", b64(bytes)));
+        return Ok(ModelImage {
+            url: format!("data:{mime};base64,{}", b64(bytes)),
+            source_size: (width, height),
+            sent_size: (decoded.width(), decoded.height()),
+        });
     }
     let mut encoded = Cursor::new(Vec::new());
     decoded.write_to(&mut encoded, image::ImageFormat::Png)
         .map_err(|e| format!("图片转换失败：{e}"))?;
     let mut mime = "image/png";
-    if encoded.get_ref().len() > 4 * 1024 * 1024 {
+    if encoded.get_ref().len() > MAX_MODEL_IMAGE_BYTES {
         encoded = Cursor::new(Vec::new());
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 85)
             .encode_image(&decoded.to_rgb8()).map_err(|e| format!("图片转换失败：{e}"))?;
         mime = "image/jpeg";
     }
-    if encoded.get_ref().len() > 4 * 1024 * 1024 {
+    if encoded.get_ref().len() > MAX_MODEL_IMAGE_BYTES {
         return Err("图片转换后仍超过4 MiB，请缩小图片区域".into());
     }
-    Ok(format!("data:{mime};base64,{}", b64(encoded.get_ref())))
+    Ok(ModelImage {
+        url: format!("data:{mime};base64,{}", b64(encoded.get_ref())),
+        source_size: (width, height),
+        sent_size: (decoded.width(), decoded.height()),
+    })
 }
 
 struct ImageInfo {
@@ -292,6 +334,83 @@ mod tests {
         let data = base64::engine::general_purpose::STANDARD.decode(url.split_once(',').unwrap().1).unwrap();
         assert_eq!(image::load_from_memory(&data).unwrap().width(), 1536);
         assert!(model_image(&bytes.get_ref()[..24], true).is_err());
+    }
+
+    #[test]
+    fn view_image_reports_exact_source_and_sent_sizes_without_desktop_origin() {
+        use base64::Engine;
+        let root = std::env::temp_dir().join(format!("neo-image-sizes-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2001, 1003).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        std::fs::write(root.join("shot.png"), bytes.into_inner()).unwrap();
+        let out = crate::dispatch(&Scope::new(&root), "view_image", &json!({"path": "shot.png", "include_data": true}));
+        assert!(out.is_ok());
+        assert_eq!(out.data["source_size"], json!({"width": 2001, "height": 1003}));
+        let bytes = base64::engine::general_purpose::STANDARD.decode(out.images[0].split_once(',').unwrap().1).unwrap();
+        let sent = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(sent.width(), PREVIEW_EDGE);
+        assert_eq!(out.data["sent_size"], json!({"width": sent.width(), "height": sent.height()}));
+        assert_eq!(out.data["source_to_sent_scale"], json!({
+            "x": {"numerator": sent.width(), "denominator": 2001},
+            "y": {"numerator": sent.height(), "denominator": 1003},
+        }));
+        assert_eq!(out.data["desktop_locatable"], false);
+        assert!(out.data.get("region").is_none());
+        assert!(out.data.get("origin").is_none());
+        let info = crate::dispatch(&Scope::new(&root), "view_image", &json!({"path": "shot.png", "include_data": false}));
+        assert!(info.images.is_empty());
+        assert_eq!(info.data["image_attached"], false);
+        assert!(info.data["sent_size"].is_null());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn view_image_input_budget_is_32_mib_not_legacy_8_mib() {
+        let root = std::env::temp_dir().join(format!("neo-image-input-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 3).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let mut bytes = bytes.into_inner();
+        bytes.resize(8 * 1024 * 1024 + 1, 0);
+        let path = root.join("large.png");
+        std::fs::write(&path, &bytes).unwrap();
+        let args = json!({"path": "large.png", "include_data": true});
+        assert!(crate::dispatch(&Scope::new(&root), "view_image", &args).is_ok());
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(MAX_SOURCE_IMAGE_BYTES as u64 + 1).unwrap();
+        let out = crate::dispatch(&Scope::new(&root), "view_image", &args);
+        assert_eq!(out.error.unwrap().kind, ErrorKind::TooLarge);
+        assert!(out.images.is_empty());
+        bytes.resize(MAX_SOURCE_IMAGE_BYTES + 1, 0);
+        assert!(model_image(&bytes, false).unwrap_err().contains("32 MiB"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_image_jpeg_fallback_keeps_coordinate_dimensions() {
+        use base64::Engine;
+        let mut seed = 1u32;
+        let image = image::RgbImage::from_fn(1800, 1000, |_, _| {
+            let mut pixel = [0; 3];
+            for channel in &mut pixel {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                *channel = seed as u8;
+            }
+            image::Rgb(pixel)
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        assert!(bytes.get_ref().len() > MAX_MODEL_IMAGE_BYTES);
+        let prepared = model_image_with_sizes(bytes.get_ref(), false).unwrap();
+        assert!(prepared.url.starts_with("data:image/jpeg;base64,"));
+        assert_eq!(prepared.source_size, (1800, 1000));
+        assert_eq!(prepared.sent_size, prepared.source_size);
+        let sent = base64::engine::general_purpose::STANDARD.decode(prepared.url.split_once(',').unwrap().1).unwrap();
+        assert!(sent.len() <= MAX_MODEL_IMAGE_BYTES);
+        let decoded = image::load_from_memory(&sent).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), prepared.source_size);
     }
 
     #[test]

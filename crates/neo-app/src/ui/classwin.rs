@@ -184,6 +184,7 @@ impl ClassWin {
         let close_wanted = Arc::clone(&self.close_wanted);
         let retry_wanted = Arc::clone(&self.retry_wanted);
         let open_since = Arc::clone(&self.open_since);
+        let suspended = crate::app::desktop_viewport(ctx, viewport_id());
         ctx.show_viewport_deferred(
             viewport_id(),
             ViewportBuilder::default()
@@ -195,10 +196,11 @@ impl ClassWin {
                 // 不抢焦点：老师可能正在操作电脑；关闭靠鼠标点。
                 .with_active(false)
                 .with_transparent(true)
-                .with_visible(true)
+                .with_visible(!suspended)
                 .with_inner_size(if open { size } else { Vec2::new(1.0, 1.0) })
                 .with_position(if open { target } else { OFFSCREEN }),
             move |ui, _class| {
+                if crate::app::desktop_suspended(ui.ctx()) { return; }
                 let Some((subject, summary, over_limit, date, status, retry)) = &snapshot else {
                     return;
                 };

@@ -24,6 +24,7 @@ pub mod screen_element_search;
 pub mod screen_elements;
 pub(crate) mod screen_uia;
 pub mod screenshot;
+pub mod screenshot_space;
 pub mod shell;
 pub mod view_image;
 pub mod web_search;
@@ -185,7 +186,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "screenshot",
         title: "截取屏幕",
-        purpose: "截取整个屏幕或其中一块，并把图直接交给模型看（认界面、读屏幕上的文字）。\n仅在用户请求且需要视觉信息时使用，不要求每次操作前后截图。",
+        purpose: "仅在用户请求且需要视觉信息时截屏，不要求每次操作前后截图。PNG 原点为图内 (0,0)，不等于桌面原点；返回 image_space、image_to_desktop 与短期 screenshot_id。click 或再次 screenshot 可传此引用和图内坐标，由程序累加偏移。width/height 是正宽高，不是 right/bottom。引用裁图重新读取当前桌面，不验证目标身份、不自动处理旧图内容变化。",
         risk: Risk::Read,
         params: screenshot::PARAMS,
         preview: screenshot::preview,
@@ -212,7 +213,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "click",
         title: "点击鼠标",
-        purpose: "在屏幕上某个位置点击鼠标（左键/右键，可双击）。优先传局部元素枚举返回的 snapshot_id + element_id，操作后刷新元素。",
+        purpose: "点击鼠标（左/右键、双击）。优先 UIA 的 snapshot_id + element_id；视觉定位可传 screenshot_id + 图内 x/y，由程序映射，无引用时 x/y 是桌面物理坐标。截图引用不验证身份；陈旧引用拒绝，不猜坐标、不自动重试，操作后按需要重新观察。",
         risk: Risk::Exec,
         params: click::PARAMS,
         preview: click::preview,

@@ -15,7 +15,7 @@
 //!         ↑ 原点在这里；有显示器排在左边/上边时坐标就是**负数**
 //! ```
 //!
-//! 这样"在截图里看到的像素点"和"点击的坐标"是**同一套数字**，模型不需要换算。
+//! PNG 图内原点始终是 (0,0)，不等于桌面原点；截图引用负责累加区域偏移，不做 DPI 乘除。
 //!
 //! ## DPI：为什么必须处理
 //!
@@ -100,8 +100,72 @@ impl Rect {
             self.y,
             i64::from(self.y) + i64::from(self.height) - 1
         ))
-        .with_hint("先用 `screenshot` 看一眼，坐标照图里的像素位置写")
+        .with_hint("使用 screenshot 返回的 screenshot_id 加图内 x/y；无引用时必须给桌面物理坐标")
     }
+}
+
+/// 显示器矩形的包围盒；不把包围盒中的空洞当作显示器。
+pub fn monitor_bounds(monitors: &[Rect]) -> Result<Rect, ToolError> {
+    if monitors.is_empty() || monitors.iter().any(|r| r.width <= 0 || r.height <= 0) {
+        return Err(ToolError::io("没有有效的显示器拓扑"));
+    }
+    let x = monitors.iter().map(|r| r.x).min().unwrap();
+    let y = monitors.iter().map(|r| r.y).min().unwrap();
+    let right = monitors.iter().map(|r| i64::from(r.x) + i64::from(r.width)).max().unwrap();
+    let bottom = monitors.iter().map(|r| i64::from(r.y) + i64::from(r.height)).max().unwrap();
+    let width = i32::try_from(right - i64::from(x)).map_err(|_| ToolError::bad_args("桌面宽度溢出"))?;
+    let height = i32::try_from(bottom - i64::from(y)).map_err(|_| ToolError::bad_args("桌面高度溢出"))?;
+    Ok(Rect { x, y, width, height })
+}
+
+pub fn require_monitor_point(monitors: &[Rect], what: &str, x: i32, y: i32) -> Result<(), ToolError> {
+    if monitors.iter().any(|r| r.contains(x, y)) { return Ok(()); }
+    Err(ToolError::bad_args(format!("{what} ({x}, {y}) 不在屏幕内：位置未被任何实际显示器覆盖（可能是虚拟桌面空洞）"))
+        .with_hint("使用最新 screenshot_id 和图内坐标，或优先使用 UIA 元素定位"))
+}
+
+/// 返回区域中真实显示器覆盖的面积，重叠显示器只算一次。
+pub fn monitor_coverage(rect: Rect, monitors: &[Rect]) -> i64 {
+    let mut clipped = Vec::new();
+    for m in monitors {
+        let left = i64::from(rect.x.max(m.x));
+        let top = i64::from(rect.y.max(m.y));
+        let right = (i64::from(rect.x) + i64::from(rect.width)).min(i64::from(m.x) + i64::from(m.width));
+        let bottom = (i64::from(rect.y) + i64::from(rect.height)).min(i64::from(m.y) + i64::from(m.height));
+        if right > left && bottom > top { clipped.push((left, top, right, bottom)); }
+    }
+    let mut xs: Vec<_> = clipped.iter().flat_map(|r| [r.0, r.2]).collect();
+    xs.sort_unstable();
+    xs.dedup();
+    let mut area = 0;
+    for band in xs.windows(2) {
+        let mut ys: Vec<_> = clipped.iter().filter(|r| r.0 <= band[0] && r.2 >= band[1]).map(|r| (r.1, r.3)).collect();
+        ys.sort_unstable();
+        let mut end = i64::MIN;
+        let mut height = 0;
+        for (top, bottom) in ys {
+            height += (bottom - top.max(end)).max(0);
+            end = end.max(bottom);
+        }
+        area += (band[1] - band[0]) * height;
+    }
+    area
+}
+
+/// 选择 65536 个输入桶中落在目标像素区间内部的整数点，拒绝不可表达的超大桌面。
+pub fn normalize_axis(pixel: i32, origin: i32, span: i32) -> Result<i32, ToolError> {
+    let local = i64::from(pixel) - i64::from(origin);
+    if !(1..=65536).contains(&span) || local < 0 || local >= i64::from(span) {
+        return Err(ToolError::bad_args("输入坐标越界或桌面跨度超过 65536，无法精确表示，已拒绝而非夹取"));
+    }
+    let span = i64::from(span);
+    let first = (local * 65536 + span - 1) / span;
+    let last = ((local + 1) * 65536 + span - 1) / span - 1;
+    Ok(((first + last) / 2) as i32)
+}
+
+fn to_absolute(x: i32, y: i32, vs: Rect) -> Result<(i32, i32), ToolError> {
+    Ok((normalize_axis(x, vs.x, vs.width)?, normalize_axis(y, vs.y, vs.height)?))
 }
 
 /// 鼠标键。
@@ -171,6 +235,66 @@ fn capture_bytes(rect: Rect) -> Result<usize, ToolError> {
         .filter(|n| *n <= isize::MAX as usize && *n <= u32::MAX as usize)
         .ok_or_else(|| ToolError::new(ErrorKind::TooLarge, "截图位图超出 GDI/内存切片尺寸限制"))
 }
+
+// #region debug-point B/C: bounded evidence, populated only by the opt-in click tool
+#[derive(Default)]
+pub(crate) struct ClickEvidence {
+    before: Option<ClickPoint>,
+    after: Option<ClickPoint>,
+    primary: Option<SendEvidence>,
+    release_cleanup: Option<SendEvidence>,
+}
+
+#[derive(serde::Serialize)]
+struct ClickPoint {
+    cursor: Option<(i32, i32)>,
+    target: (i32, i32),
+    target_own_pid: Option<bool>,
+    target_class: TargetClass,
+}
+
+#[derive(serde::Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TargetClass { NoWindow, Unknown, NeoOverlay, Other }
+
+#[cfg(any(windows, test))]
+fn classify_click_class(class: &[u16]) -> TargetClass {
+    if class.iter().copied().eq("neo-overlay".encode_utf16()) {
+        TargetClass::NeoOverlay
+    } else {
+        TargetClass::Other
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SendEvidence {
+    requested: usize,
+    sent: u32,
+    last_error_immediate: u32,
+    elapsed_us: u128,
+}
+
+impl ClickEvidence {
+    pub(super) fn append_events(self, events: &mut Vec<serde_json::Value>, run_id: &str) {
+        use serde_json::json;
+        if self.before.is_some() || self.after.is_some() {
+            events.push(super::click::debug_envelope("C", "click_target_observations", json!({
+                "before": self.before, "after": self.after,
+                "window_from_point_is_observation_not_delivery_proof": true,
+            }), run_id));
+        }
+        if self.primary.is_some() {
+            events.push(super::click::debug_envelope("B", "send_input_completed", json!({
+                "primary": self.primary, "existing_release_cleanup": self.release_cleanup,
+                "accepted_does_not_prove_target_response": true,
+                "target_response_verified": false,
+                "last_error_may_be_stale_on_success": true,
+                "last_error_does_not_identify_uipi": true,
+            }), run_id));
+        }
+    }
+}
+// #endregion debug-point B/C
 
 #[cfg(windows)]
 mod imp {
@@ -249,6 +373,27 @@ mod imp {
         }
     }
 
+    /// 枚举实际显示器，在线程物理像素上下文中读取并稳定排序。
+    pub fn monitors() -> Result<Vec<Rect>, ToolError> {
+        use windows_sys::Win32::Foundation::{LPARAM, RECT};
+        use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
+        unsafe extern "system" fn collect(_monitor: HMONITOR, _dc: HDC, rect: *mut RECT, data: LPARAM) -> i32 {
+            if rect.is_null() { return 0; }
+            let r = unsafe { *rect };
+            let (Ok(width), Ok(height)) = (i32::try_from(i64::from(r.right) - i64::from(r.left)), i32::try_from(i64::from(r.bottom) - i64::from(r.top))) else { return 0; };
+            if width <= 0 || height <= 0 { return 0; }
+            unsafe { &mut *(data as *mut Vec<Rect>) }.push(Rect { x: r.left, y: r.top, width, height });
+            1
+        }
+        let _dpi = physical_pixels()?;
+        let mut result = Vec::<Rect>::new();
+        let ok = unsafe { EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(collect), &mut result as *mut _ as LPARAM) };
+        if ok == 0 || result.is_empty() { return Err(ToolError::io("无法枚举实际显示器，已拒绝桌面操作")); }
+        result.sort_unstable_by_key(|r| (r.x, r.y, r.width, r.height));
+        result.dedup();
+        Ok(result)
+    }
+
     /// 某个点所在显示器的缩放比（1.0 = 96 DPI）。取不到返回 `None`。
     pub fn dpi_scale_at(x: i32, y: i32) -> Option<f64> {
         unsafe {
@@ -295,6 +440,10 @@ mod imp {
     fn capture_impl(rect: Rect) -> Result<Shot, ToolError> {
         let _dpi = physical_pixels()?;
         let bytes = capture_bytes(rect)?;
+        let displays = monitors()?;
+        if monitor_coverage(rect, &displays) == 0 {
+            return Err(ToolError::bad_args("截图区域没有任何实际显示器覆盖，已拒绝捕获空洞"));
+        }
         // 分配失败必须在取得 GDI 资源之前返回，避免 Rust 提前退出泄漏句柄。
         let mut rgba = Vec::new();
         rgba.try_reserve_exact(bytes).map_err(|_| ToolError::io("截图缓冲区分配失败"))?;
@@ -408,23 +557,6 @@ mod imp {
     const MOVE_ABS: MOUSE_EVENT_FLAGS =
         MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
 
-    /// 屏幕坐标 → `SendInput` 的绝对坐标。
-    ///
-    /// 绝对坐标是 **0…65535 的归一化值**，铺满整个虚拟桌面 ——
-    /// 所以必须带 `MOUSEEVENTF_VIRTUALDESK`，否则只映射主显示器，
-    /// 副屏上的点会落到主屏上。
-    fn to_absolute(x: i32, y: i32, vs: Rect) -> (i32, i32) {
-        let span_x = (vs.width - 1).max(1) as f64;
-        let span_y = (vs.height - 1).max(1) as f64;
-        let nx = ((i64::from(x) - i64::from(vs.x)) as f64 / span_x * 65535.0)
-            .round()
-            .clamp(0.0, 65535.0) as i32;
-        let ny = ((i64::from(y) - i64::from(vs.y)) as f64 / span_y * 65535.0)
-            .round()
-            .clamp(0.0, 65535.0) as i32;
-        (nx, ny)
-    }
-
     fn down_up(button: Button) -> (MOUSE_EVENT_FLAGS, MOUSE_EVENT_FLAGS) {
         match button {
             Button::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
@@ -433,13 +565,23 @@ mod imp {
     }
 
     fn send(events: &[INPUT]) -> Result<(), ToolError> {
+        send_with_evidence(events, None)
+    }
+
+    // #region debug-point B: no environment reads or extra Win32 calls when disabled
+    fn send_with_evidence(events: &[INPUT], mut evidence: Option<&mut Option<SendEvidence>>) -> Result<(), ToolError> {
+        // #endregion debug-point B
         if events.is_empty() {
             return Ok(());
         }
         // 底层也失效，覆盖绕过 click/drag 工具直接调用本层的输入。
         super::super::screen_uia::cache_invalidate();
+        super::super::screenshot_space::invalidate();
         // 注入前先置位：事件进系统队列的瞬间，全局左键就可能被采样到「按下」。
         SYNTHETIC_INPUT_AT.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
+        // #region debug-point B: clock only for opt-in calls, immediately before input
+        let started = evidence.as_ref().map(|_| std::time::Instant::now());
+        // #endregion debug-point B
         let sent = unsafe {
             SendInput(
                 events.len() as u32,
@@ -447,9 +589,22 @@ mod imp {
                 std::mem::size_of::<INPUT>() as i32,
             )
         };
+        // #region debug-point B: capture GetLastError before any clock/Win32/log operation
+        let last_error = if evidence.is_some() {
+            Some(unsafe { windows_sys::Win32::Foundation::GetLastError() })
+        } else { None };
+        // #endregion debug-point B
         // 完成后再写一次：drag 的分步移动会持续刷新这个戳，松手后
         // 短暂的窗口期（上层采样间隔）内的按下沿也都算合成的。
         SYNTHETIC_INPUT_AT.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
+        // #region debug-point B: save numbers only, defer transport until cleanup completes
+        if let (Some(slot), Some(started), Some(last_error)) = (evidence.as_mut(), started, last_error) {
+            **slot = Some(SendEvidence {
+                requested: events.len(), sent, last_error_immediate: last_error,
+                elapsed_us: started.elapsed().as_micros(),
+            });
+        }
+        // #endregion debug-point B
         if sent as usize != events.len() {
             // 最典型的成因：目标窗口以**管理员**身份运行而 Neo 不是 ——
             // UIPI 会静默丢掉这些事件。所以这里必须报出来，不能当成功。
@@ -471,12 +626,41 @@ mod imp {
     /// 时间间隔是否小于双击阈值来判定双击，拆成两次 `SendInput` 反而容易被
     /// 线程调度顶出阈值，变成一个单击加一个单击。
     pub fn click(x: i32, y: i32, button: Button, double: bool) -> Result<(), ToolError> {
-        let _dpi = physical_pixels()?;
-        let vs = virtual_screen();
-        if !vs.contains(x, y) {
-            return Err(vs.outside_error("点击位置", x, y));
+        click_with_evidence(x, y, button, double, None)
+    }
+
+    // #region debug-point C: no title/path/raw class or foreign PID leaves this function
+    fn observe_click_point(x: i32, y: i32) -> ClickPoint {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetClassNameW, GetCursorPos, GetWindowThreadProcessId, WindowFromPoint,
+        };
+        unsafe {
+            let mut cursor = POINT { x: 0, y: 0 };
+            let cursor = (GetCursorPos(&mut cursor) != 0).then_some((cursor.x, cursor.y));
+            let window = WindowFromPoint(POINT { x, y });
+            let (target_own_pid, target_class) = if window.is_null() {
+                (None, TargetClass::NoWindow)
+            } else {
+                let mut pid = 0;
+                let thread = GetWindowThreadProcessId(window, &mut pid);
+                let own = (thread != 0 && pid != 0).then(|| pid == windows_sys::Win32::System::Threading::GetCurrentProcessId());
+                let mut class = [0u16; 256];
+                let len = GetClassNameW(window, class.as_mut_ptr(), class.len() as i32);
+                (own, if len <= 0 { TargetClass::Unknown } else { classify_click_class(&class[..len as usize]) })
+            };
+            ClickPoint { cursor, target: (x, y), target_own_pid, target_class }
         }
-        let (nx, ny) = to_absolute(x, y, vs);
+    }
+    // #endregion debug-point C
+
+    // #region debug-point B/C: preserve original batch and original failure release
+    pub(crate) fn click_with_evidence(x: i32, y: i32, button: Button, double: bool, mut evidence: Option<&mut ClickEvidence>) -> Result<(), ToolError> {
+        // #endregion debug-point B/C
+        let _dpi = physical_pixels()?;
+        let displays = monitors()?;
+        let vs = monitor_bounds(&displays)?;
+        require_monitor_point(&displays, "点击位置", x, y)?;
+        let (nx, ny) = to_absolute(x, y, vs)?;
         let (down, up) = down_up(button);
 
         let mut events = vec![mouse(MOVE_ABS, nx, ny), mouse(down, 0, 0), mouse(up, 0, 0)];
@@ -484,11 +668,21 @@ mod imp {
             events.push(mouse(down, 0, 0));
             events.push(mouse(up, 0, 0));
         }
-        let result = send(&events);
+        // #region debug-point C: local observation only, no transport/sleep before input
+        if let Some(evidence) = evidence.as_mut() {
+            evidence.before = Some(observe_click_point(x, y));
+        }
+        // #endregion debug-point C
+        let result = send_with_evidence(&events, evidence.as_mut().map(|e| &mut e.primary));
         if result.is_err() {
             // 批次可能只送达按下而未送达抬起；只释放，不再移动到潜在危险位置。
-            let _ = send(&[mouse(up, 0, 0)]);
+            let _ = send_with_evidence(&[mouse(up, 0, 0)], evidence.as_mut().map(|e| &mut e.release_cleanup));
         }
+        // #region debug-point C: no wait for the target; acceptance is not a response
+        if let Some(evidence) = evidence.as_mut() {
+            evidence.after = Some(observe_click_point(x, y));
+        }
+        // #endregion debug-point C
         result
     }
 
@@ -503,16 +697,14 @@ mod imp {
         duration_ms: u64,
     ) -> Result<(), ToolError> {
         let _dpi = physical_pixels()?;
-        let vs = virtual_screen();
-        if !vs.contains(from.0, from.1) {
-            return Err(vs.outside_error("拖动起点", from.0, from.1));
-        }
-        if !vs.contains(to.0, to.1) {
-            return Err(vs.outside_error("拖动终点", to.0, to.1));
-        }
-
+        let displays = monitors()?;
+        let vs = monitor_bounds(&displays)?;
+        require_monitor_point(&displays, "拖动起点", from.0, from.1)?;
+        require_monitor_point(&displays, "拖动终点", to.0, to.1)?;
+        // 端点和归一化可表达性全部在按下前检查。
+        let (fx, fy) = to_absolute(from.0, from.1, vs)?;
+        to_absolute(to.0, to.1, vs)?;
         let (down, up) = down_up(button);
-        let (fx, fy) = to_absolute(from.0, from.1, vs);
         if let Err(error) = send(&[mouse(MOVE_ABS, fx, fy), mouse(down, 0, 0)]) {
             let _ = send(&[mouse(up, 0, 0)]);
             return Err(error);
@@ -525,8 +717,8 @@ mod imp {
             let t = f64::from(i) / f64::from(steps);
             let x = (f64::from(from.0) + (f64::from(to.0) - f64::from(from.0)) * t).round() as i32;
             let y = (f64::from(from.1) + (f64::from(to.1) - f64::from(from.1)) * t).round() as i32;
-            let (nx, ny) = to_absolute(x, y, vs);
-            if let Err(e) = send(&[mouse(MOVE_ABS, nx, ny)]) {
+            let moved = to_absolute(x, y, vs).and_then(|(nx, ny)| send(&[mouse(MOVE_ABS, nx, ny)]));
+            if let Err(e) = moved {
                 // 中途失败也要先把键松开，否则用户会留下一个"一直按着"的鼠标。
                 let _ = send(&[mouse(up, 0, 0)]);
                 return Err(e);
@@ -555,6 +747,8 @@ mod imp {
 
     pub fn physical_pixels() -> Result<(), ToolError> { Err(unsupported()) }
 
+    pub fn monitors() -> Result<Vec<Rect>, ToolError> { Err(unsupported()) }
+
     pub fn virtual_screen() -> Rect {
         Rect {
             x: 0,
@@ -580,6 +774,12 @@ mod imp {
         Err(unsupported())
     }
 
+    // #region debug-point B/C: unsupported platforms retain the same error
+    pub(crate) fn click_with_evidence(x: i32, y: i32, button: Button, double: bool, _evidence: Option<&mut ClickEvidence>) -> Result<(), ToolError> {
+        click(x, y, button, double)
+    }
+    // #endregion debug-point B/C
+
     pub fn drag(
         _from: (i32, i32),
         _to: (i32, i32),
@@ -595,6 +795,59 @@ pub use imp::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_normalization_exhaustive_pixel_buckets() {
+        for span in [1, 1920, 3840, 7680, 65536] {
+            for origin in [0, -1920, -7680] {
+                for pixel in 0..span {
+                    let n = normalize_axis(origin + pixel, origin, span).unwrap();
+                    assert!((0..65536).contains(&n));
+                    assert_eq!(i64::from(n) * i64::from(span) / 65536, i64::from(pixel));
+                }
+            }
+        }
+        for (pixel, origin, span) in [(0, 0, 65537), (0, 0, 0), (-1, 0, 1920), (1920, 0, 1920)] {
+            assert!(normalize_axis(pixel, origin, span).is_err());
+        }
+    }
+
+    #[test]
+    fn display_coverage_rejects_holes_and_unions_overlap() {
+        let displays = [Rect { x: -100, y: -100, width: 100, height: 100 }, Rect { x: 0, y: 0, width: 200, height: 100 }];
+        let bounds = monitor_bounds(&displays).unwrap();
+        assert_eq!(bounds, Rect { x: -100, y: -100, width: 300, height: 200 });
+        assert_eq!(monitor_coverage(bounds, &displays), 30000);
+        assert!(require_monitor_point(&displays, "点击位置", -1, -1).is_ok());
+        assert!(require_monitor_point(&displays, "拖动终点", 0, -1).is_err());
+        assert_eq!(monitor_coverage(Rect { x: 0, y: -100, width: 200, height: 100 }, &displays), 0);
+        assert_eq!(monitor_coverage(displays[0], &[displays[0], displays[0]]), 10000);
+    }
+
+    #[test]
+    fn click_debug_evidence_is_bounded_and_does_not_claim_target_response() {
+        let mut events = Vec::new();
+        ClickEvidence::default().append_events(&mut events, "pure-test");
+        assert!(events.is_empty());
+        let evidence = ClickEvidence {
+            before: Some(ClickPoint {
+                cursor: Some((-1, 2)), target: (3, 4), target_own_pid: Some(true),
+                target_class: classify_click_class(&"neo-overlay".encode_utf16().collect::<Vec<_>>()),
+            }),
+            primary: Some(SendEvidence { requested: 3, sent: 3, last_error_immediate: 5, elapsed_us: 1 }),
+            ..Default::default()
+        };
+        evidence.append_events(&mut events, "pure-test");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["data"]["before"]["target_class"], "neo_overlay");
+        assert_eq!(events[0]["data"]["before"]["target_own_pid"], true);
+        assert_eq!(events[1]["data"]["primary"]["sent"], 3);
+        assert_eq!(events[1]["data"]["target_response_verified"], false);
+        assert_eq!(events[1]["data"]["accepted_does_not_prove_target_response"], true);
+        assert_eq!(events[1]["data"]["last_error_may_be_stale_on_success"], true);
+        assert_eq!(classify_click_class(&"private-window-class".encode_utf16().collect::<Vec<_>>()), TargetClass::Other);
+        assert_eq!(serde_json::to_string(&TargetClass::Other).unwrap(), "\"other\"");
+    }
 
     #[test]
     fn geometry_and_capture_size_reject_overflow_without_desktop_access() {

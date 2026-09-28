@@ -1058,10 +1058,12 @@ impl MiniWin {
         let refade = Arc::clone(&self.refade_since);
         let fadeout = Arc::clone(&self.fadeout_since);
         let measure = Arc::clone(&self.content_h);
+        let suspended = crate::app::desktop_viewport(ctx, viewport_id());
         ctx.show_viewport_deferred(
             viewport_id(),
-            Self::builder(size, open),
+            Self::builder(size, open).with_visible(!suspended),
             move |ui, _class| {
+                if crate::app::desktop_suspended(ui.ctx()) { return; }
                 let Some(snapshot) = &snapshot else { return };
                 let ctx = ui.ctx().clone();
                 // ---- 回调自驱的动画（主视口托盘态被 eframe 节流到 10fps，
@@ -1533,6 +1535,7 @@ impl ShotFlash {
         } else {
             None
         };
+        let suspended = crate::app::desktop_viewport(ctx, flash_viewport_id());
         ctx.show_viewport_deferred(
             flash_viewport_id(),
             ViewportBuilder::default()
@@ -1545,7 +1548,7 @@ impl ShotFlash {
                 .with_transparent(true)
                 .with_mouse_passthrough(true)
                 // 恒可见（见 OFFSCREEN 注释）：熄闪态是 1x1 屏幕外。
-                .with_visible(true)
+                .with_visible(!suspended)
                 .with_inner_size(if on { vs_size } else { Vec2::new(1.0, 1.0) })
                 .with_position(if on { origin } else { OFFSCREEN }),
             move |ui, _class| {

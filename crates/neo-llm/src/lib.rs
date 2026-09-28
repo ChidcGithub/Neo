@@ -291,7 +291,7 @@ pub struct Msg {
     /// 三种给图方式（base64 内联 / 外链 / Files API）中最省事的一种，本地图片
     /// 不用先上传。格式由**字节内容**判定，不看扩展名。
     ///
-    /// 本客户端统一预算：PNG/JPEG 单张 ≤ 4 MiB、每边 ≤ 4096、≤ 800 万像素，
+    /// 本客户端统一预算：PNG/JPEG 单张 ≤ 4 MiB、每边 ≤ 4096、≤ 4096×2160 像素，
     /// 整轮最多 4 张，每张预留 4096 个估算 token（非供应商精确计费）。
     /// 请求总 JSON ≤ 32 MiB；文本和图片仍共同受 32K 上下文预算约束。
     ///
@@ -394,6 +394,10 @@ const TOOL_RESERVE: usize = 4096;
 pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_IMAGES: usize = 4;
 const IMAGE_TOKENS: usize = 4096;
+// 与 neo-tools::tools::view_image 保持一致；跨 crate 一致性由离线测试约束。
+pub const MAX_MODEL_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_MODEL_IMAGE_EDGE: u32 = 4096;
+pub const MAX_MODEL_IMAGE_PIXELS: u64 = 4096 * 2160;
 
 /// 不是模型精确 tokenizer：每个 UTF-8 字节计一个估算 token。
 /// 中文通常每字计三份，ASCII 也不假定能压缩，避免随机串/代码被低估。
@@ -441,11 +445,13 @@ fn serialized_size(value: &impl Serialize, limit: usize) -> Result<usize, String
 
 /// 不解码整张图或分配像素：在 base64 上按位置读取 PNG/JPEG 尺寸元数据。
 pub fn validate_image(url: &str) -> Result<(), String> {
-    let bad =
-        || "图片须为有效 PNG/JPEG data URL，单张不超过 4 MiB、4096 边长和 800 万像素".to_owned();
+    let bad = || format!(
+        "图片须为有效 PNG/JPEG data URL，单张不超过 {} 字节、{} 边长和 {} 像素",
+        MAX_MODEL_IMAGE_BYTES, MAX_MODEL_IMAGE_EDGE, MAX_MODEL_IMAGE_PIXELS
+    );
     let (mime, data) = url.split_once(',').ok_or_else(bad)?;
     if !matches!(mime, "data:image/png;base64" | "data:image/jpeg;base64")
-        || data.len() > (4 * 1024 * 1024 + 2) / 3 * 4
+        || data.len() > (MAX_MODEL_IMAGE_BYTES + 2) / 3 * 4
         || data.len() % 4 != 0
         || data.is_empty()
     {
@@ -470,7 +476,7 @@ pub fn validate_image(url: &str) -> Result<(), String> {
         return Err(bad());
     }
     let len = data.len() / 4 * 3 - padding;
-    if len > 4 * 1024 * 1024 {
+    if len > MAX_MODEL_IMAGE_BYTES {
         return Err(bad());
     }
     let byte = |i: usize| -> Option<u8> {
@@ -533,7 +539,8 @@ pub fn validate_image(url: &str) -> Result<(), String> {
         size
     };
     let (w, h) = dimensions.ok_or_else(bad)?;
-    if w == 0 || h == 0 || w > 4096 || h > 4096 || u64::from(w) * u64::from(h) > 8_000_000 {
+    if w == 0 || h == 0 || w > MAX_MODEL_IMAGE_EDGE || h > MAX_MODEL_IMAGE_EDGE
+        || u64::from(w) * u64::from(h) > MAX_MODEL_IMAGE_PIXELS {
         return Err(bad());
     }
     Ok(())
@@ -1608,6 +1615,27 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn image_budget_matches_tools_and_preserves_4k_boundary() {
+        use neo_tools::tools::view_image;
+        assert_eq!(MAX_MODEL_IMAGE_BYTES, view_image::MAX_MODEL_IMAGE_BYTES);
+        assert_eq!(MAX_MODEL_IMAGE_EDGE, view_image::MAX_MODEL_IMAGE_EDGE);
+        assert_eq!(MAX_MODEL_IMAGE_PIXELS, view_image::MAX_MODEL_IMAGE_PIXELS);
+        assert_eq!(3840u64 * 2160, 8_294_400);
+        assert_eq!(MAX_MODEL_IMAGE_PIXELS, 8_847_360);
+        assert_eq!(MAX_MODEL_IMAGE_EDGE, 4096);
+        assert_eq!(MAX_MODEL_IMAGE_BYTES, 4 * 1024 * 1024);
+        assert_eq!(view_image::MAX_SOURCE_IMAGE_BYTES, 32 * 1024 * 1024);
+        for (w, h) in [(3840, 2160), (4096, 2160), (2160, 4096), (4096, 1)] {
+            assert!(validate_image(&png_url(w, h, 0)).is_ok());
+        }
+        for (w, h) in [(4096, 2161), (2161, 4096), (4097, 1), (1, 4097)] {
+            assert!(validate_image(&png_url(w, h, 0)).is_err());
+        }
+        assert!(validate_image(&png_url(1, 1, MAX_MODEL_IMAGE_BYTES - 24)).is_ok());
+        assert!(validate_image(&png_url(1, 1, MAX_MODEL_IMAGE_BYTES - 23)).is_err());
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! 抬起"在多数应用里会被当成单击（中间没有鼠标移动消息）。所以这里按
 //! `duration_ms` 切成若干步，每步之间小睡 —— 观感上就是人手拖了一下。
 //!
-//! 坐标与 `screenshot` / `click` 同一套（虚拟桌面物理像素）。
+//! 坐标是虚拟桌面物理像素，不是局部 PNG 图内坐标；本工具不接受截图引用。
 
 use serde_json::json;
 
@@ -64,7 +64,8 @@ pub fn run(scope: &Scope, args: &Args) -> Outcome {
     }
 }
 
-fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
+fn act(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
+    super::screenshot_space::validate_args(args)?;
     let from = (args.require_int("x")? as i32, args.require_int("y")? as i32);
     let to = (
         args.require_int("to_x")? as i32,
@@ -74,8 +75,10 @@ fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     let duration_ms = args.opt_int("duration_ms")?.max(0) as u64;
 
     let _interaction = super::screen_uia::INTERACTION.lock().unwrap();
+    if scope.is_cancelled() { return Err(crate::cancelled_error()); }
     screen::ensure_dpi_aware();
     super::screen_uia::cache_invalidate();
+    super::screenshot_space::invalidate();
     screen::drag(from, to, button, duration_ms)?;
 
     Ok(Outcome::ok(
@@ -91,6 +94,8 @@ fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
             "duration_ms": duration_ms,
             "dpi_scale": screen::dpi_scale_at(to.0, to.1),
             "snapshot_invalidated": true,
+            "screenshot_references_invalidated": true,
+            "coordinate_space": "desktop_physical_pixels",
             "target_identity_verified": false,
             "next": "坐标拖动未验证目标身份；旧元素快照已失效，请运行 screen_elements 或 screenshot 确认结果。",
         }),
@@ -118,7 +123,9 @@ mod tests {
         let scope = Scope::new(std::env::temp_dir());
         for value in [json!({"x": 1, "y": 2, "to_x": 3}),
             json!({"x": 1, "y": 2, "to_x": 3, "to_y": 4, "button": "invalid"}),
-            json!({"x": 1, "y": 2, "to_x": 3, "to_y": 4, "duration_ms": 10001})] {
+            json!({"x": 1, "y": 2, "to_x": 3, "to_y": 4, "duration_ms": 10001}),
+            json!(null), json!([]), json!({"x": null, "y": 2, "to_x": 3, "to_y": 4}),
+            json!({"x": 1, "y": 2, "to_x": 3, "to_y": 4, "screenshot_id": "old"})] {
             assert!(act(&scope, &Args::new(tool, &value)).is_err());
         }
     }

@@ -22,11 +22,19 @@ use crate::result::ToolError;
 ///
 /// `id` 是给模型引用的编号（SoM：模型答「点击 7」，不用算坐标）；
 /// `rect` 是 `[x, y, w, h]`，虚拟桌面物理像素。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScreenElement {
     pub id: usize,
     pub role: &'static str,
+    /// 未裁剪的 CurrentName，只用于身份核验；显示与搜索使用 label。
     pub name: String,
+    pub label: String,
+    pub label_source: &'static str,
+    pub enabled: bool,
+    pub foreground: bool,
+    pub offscreen: bool,
+    pub actionable: bool,
+    pub clickable_point: Option<(i32, i32)>,
     /// 元素属于哪个顶层窗口（标题）。
     pub window: String,
     pub rect: [i32; 4],
@@ -46,7 +54,23 @@ pub struct ElementIdentity {
 }
 
 impl ScreenElement {
-    /// 中心点（`click` 的 `element_id` 就点这里）。
+    pub fn identity_verifiable(&self) -> bool {
+        let i = &self.identity;
+        i.hwnd != 0 && i.process_id > 0 && i.process_started != 0
+            && i.window_process_id != 0 && i.window_process_started != 0
+            && !i.runtime_id.is_empty() && !i.window_runtime_id.is_empty()
+    }
+
+    pub fn non_executable_reason(&self) -> Option<&'static str> {
+        if !self.enabled { Some("disabled_or_unknown") }
+        else if !self.foreground { Some("background_window") }
+        else if self.offscreen { Some("offscreen_or_unknown") }
+        else if !self.actionable { Some("no_click_action") }
+        else if !self.identity_verifiable() { Some("unverifiable_identity") }
+        else { None }
+    }
+
+    /// 原始矩形中心；点击还需选择可见候选并即时核验。
     pub fn center(&self) -> (i32, i32) {
         (
             self.rect[0].saturating_add(self.rect[2] / 2),
@@ -59,6 +83,13 @@ impl ScreenElement {
 pub struct RawElement {
     pub role: &'static str,
     pub name: String,
+    pub label: String,
+    pub label_source: &'static str,
+    pub enabled: bool,
+    pub foreground: bool,
+    pub offscreen: bool,
+    pub actionable: bool,
+    pub clickable_point: Option<(i32, i32)>,
     pub window: String,
     pub rect: [i32; 4],
     /// 父元素的 ControlType id（滚动条子按钮靠它过滤；`None` = 顶层）。
@@ -88,7 +119,7 @@ fn is_scrollbar_noise(name: &str) -> bool {
 /// 收尾：过滤 → 排序 → 编号。
 ///
 /// - **叶子级可见性**：bbox 与虚拟桌面求交（不信任 UIA 的 IsOffscreen，见模块注释）
-/// - 丢无名元素（实测 96% 的可交互元素有名字，无名的几乎全是噪音）
+/// - 无显示标签且没有明确操作能力的元素丢弃；有能力的保留为 unlabeled
 /// - 丢滚动条步进按钮（父元素是 ScrollBar，或名字特征命中）
 /// - 去重（同窗口同名同 bbox 的只留一个）
 /// - 按 **上 → 下、左 → 右** 排序后编号 —— 与人的阅读顺序一致，
@@ -107,8 +138,8 @@ pub fn finalize(
         if !visible {
             continue;
         }
-        let name = e.name.trim().to_string();
-        if name.is_empty() || is_scrollbar_noise(&name) {
+        let name = e.name;
+        if (e.label.is_empty() && !e.actionable) || is_scrollbar_noise(&e.label) {
             continue;
         }
         if e.parent_role == Some(SCROLLBAR) {
@@ -124,6 +155,13 @@ pub fn finalize(
             id: 0, // 排序后统一编
             role: e.role,
             name,
+            label: e.label,
+            label_source: e.label_source,
+            enabled: e.enabled,
+            foreground: e.foreground,
+            offscreen: e.offscreen,
+            actionable: e.actionable,
+            clickable_point: e.clickable_point,
             window: e.window,
             rect: e.rect,
             identity: e.identity,
@@ -207,6 +245,10 @@ pub fn cache_consume(snapshot: &str, id: usize) -> Option<ScreenElement> {
 
 /// 验证失败绝不退回旧坐标；成功也只代表输入前的即时核验，不是原子安全保证。
 pub fn validate_target(element: &ScreenElement) -> Result<(i32, i32), ToolError> {
+    if let Some(reason) = element.non_executable_reason() {
+        return Err(ToolError::bad_args(format!("该快照目标不可直接点击：{reason}"))
+            .with_hint("请确认前台窗口并重新枚举；不会自动激活窗口或退回旧坐标"));
+    }
     if !same_target(element, element, true, false) || element.rect[2] <= 0 || element.rect[3] <= 0 {
         return Err(ToolError::bad_args("快照缺少可验证的目标身份或矩形；请重新枚举"));
     }
@@ -238,14 +280,94 @@ pub fn intersects(a: [i32; 4], b: [i32; 4]) -> bool {
     w > 0 && h > 0 && bw > 0 && bh > 0 && x + w > bx && y + h > by && x < bx + bw && y < by + bh
 }
 
+const LABEL_CHARS: usize = 96;
+const LABEL_VISITS: usize = 16;
+const LABEL_PIECES: usize = 3;
+const LABEL_DEPTH: usize = 2;
+const HIT_ANCESTORS: usize = 4;
+
+fn display_label(name: &str) -> String { name.trim().chars().take(LABEL_CHARS).collect() }
+
+fn protected_name<E>(password: bool, read: impl FnOnce() -> Result<String, E>) -> Result<String, E> {
+    if password { Ok(String::new()) } else { read() }
+}
+
+fn visible_on_monitors(rect: [i32; 4], monitors: &[[i32; 4]]) -> bool {
+    monitors.iter().any(|monitor| intersects(rect, *monitor))
+}
+
+fn verified_candidate<E>(points: Vec<(i32, i32)>, mut verify: impl FnMut((i32, i32)) -> Result<bool, E>) -> Option<(i32, i32)> {
+    points.into_iter().find(|point| verify(*point).unwrap_or(false))
+}
+
+fn passive_content(role: &str, action: bool, focusable: bool, password: bool) -> bool {
+    matches!(role, "Text" | "Image") && !action && !focusable && !password
+}
+
+fn label_node_allowed(role: &str, action: bool, focusable: bool, password: bool, depth: usize, visits: usize) -> bool {
+    depth <= LABEL_DEPTH && visits <= LABEL_VISITS && !password && !action && !focusable
+        && matches!(role, "Text" | "Image" | "Pane" | "Group")
+}
+
+fn may_ascend_hit(expected: &ScreenElement, current: &ScreenElement, passive: bool, depth: usize, enabled: bool, offscreen: bool) -> bool {
+    depth < HIT_ANCESTORS && passive && enabled && !offscreen
+        && current.identity.process_id == expected.identity.process_id
+        && current.identity.process_started == expected.identity.process_started
+        && current.identity.hwnd == expected.identity.hwnd
+        && current.identity.window_runtime_id == expected.identity.window_runtime_id
+        && current.identity.window_process_id == expected.identity.window_process_id
+        && current.identity.window_process_started == expected.identity.window_process_started
+}
+
+fn add_label_piece(pieces: &mut Vec<String>, name: &str) {
+    let text = display_label(name);
+    if !text.is_empty() && pieces.len() < LABEL_PIECES && !pieces.contains(&text) {
+        pieces.push(text);
+    }
+}
+
+fn point_in(rect: [i32; 4], point: (i32, i32)) -> bool {
+    super::screen::Rect { x: rect[0], y: rect[1], width: rect[2], height: rect[3] }.contains(point.0, point.1)
+}
+
+fn candidate_points(rect: [i32; 4], preferred: Option<(i32, i32)>, monitors: &[[i32; 4]]) -> Vec<(i32, i32)> {
+    let mut points = Vec::new();
+    if let Some(p) = preferred.filter(|p| point_in(rect, *p) && monitors.iter().any(|m| point_in(*m, *p))) {
+        points.push(p);
+    }
+    for m in monitors.iter().take(32) {
+        if !intersects(rect, *m) { continue; }
+        let [x, y, w, h] = rect.map(i64::from);
+        let [mx, my, mw, mh] = m.map(i64::from);
+        let (left, top, right, bottom) = (x.max(mx), y.max(my), (x + w).min(mx + mw), (y + h).min(my + mh));
+        for (nx, ny) in [(2, 2), (1, 1), (3, 1), (1, 3), (3, 3)] {
+            let p = ((left + (right - left - 1) * nx / 4) as i32,
+                (top + (bottom - top - 1) * ny / 4) as i32);
+            if !points.contains(&p) { points.push(p); }
+        }
+    }
+    points
+}
+
+pub fn parse_role(value: &str) -> Result<Option<&'static str>, ToolError> {
+    const ROLES: &[&str] = &["Button", "Hyperlink", "MenuItem", "TabItem", "ListItem", "CheckBox",
+        "RadioButton", "ComboBox", "Edit", "Slider", "TreeItem", "DataItem", "Calendar", "Spinner", "SplitButton", "Custom"];
+    if value.trim().is_empty() { return Ok(None); }
+    ROLES.iter().copied().find(|r| r.eq_ignore_ascii_case(value.trim())).map(Some)
+        .ok_or_else(|| ToolError::bad_args(format!("未知 role；支持 {}", ROLES.join("、"))))
+}
+
 #[derive(Default)]
 pub struct Query<'a> {
     pub window_id: Option<isize>,
     pub keyword: &'a str,
+    pub role: Option<&'static str>,
     pub region: Option<[i32; 4]>,
 }
 
 impl Query<'_> {
+    fn matches_role(&self, role: &str) -> bool { self.role.is_none_or(|wanted| wanted == role) }
+
     fn matches(&self, name: &str, rect: [i32; 4]) -> bool {
         name.to_lowercase().contains(&self.keyword.to_lowercase())
             && self.region.is_none_or(|r| intersects(rect, r))
@@ -416,49 +538,151 @@ mod imp {
         fn drop(&mut self) { unsafe { CoUninitialize(); } }
     }
 
+    fn monitors() -> WinResult<Vec<[i32; 4]>> {
+        use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, HMONITOR, HDC};
+        unsafe extern "system" fn visit(_: HMONITOR, _: HDC, r: *mut windows_sys::Win32::Foundation::RECT, data: isize) -> i32 {
+            unsafe {
+                let out = &mut *(data as *mut Vec<[i32; 4]>);
+                let r = &*r;
+                if let (Some(w), Some(h)) = (r.right.checked_sub(r.left), r.bottom.checked_sub(r.top)) {
+                    if w > 0 && h > 0 { out.push([r.left, r.top, w, h]); }
+                }
+                1
+            }
+        }
+        let mut out = Vec::new();
+        if unsafe { EnumDisplayMonitors(core::ptr::null_mut(), core::ptr::null(), Some(visit), (&mut out as *mut Vec<[i32; 4]>) as isize) } == 0 || out.is_empty() {
+            return Err(windows::core::Error::from_thread());
+        }
+        Ok(out)
+    }
+
+    fn action_pattern_state(el: &IUIAutomationElement) -> Option<bool> {
+        use windows::Win32::UI::Accessibility::{UIA_InvokePatternId, UIA_TogglePatternId, UIA_SelectionItemPatternId, UIA_ExpandCollapsePatternId};
+        let mut known = true;
+        for id in [UIA_InvokePatternId, UIA_TogglePatternId, UIA_SelectionItemPatternId, UIA_ExpandCollapsePatternId] {
+            match unsafe { el.GetCurrentPattern(id) } {
+                Ok(_) => return Some(true), // 仅查询接口，绝不调用 Invoke/Toggle。
+                Err(e) if matches!(e.code().0 as u32, 0x80004002 | 0x80004003 | 0x80040204) => {},
+                Err(_) => known = false,
+            }
+        }
+        known.then_some(false)
+    }
+
+    fn action_pattern(el: &IUIAutomationElement) -> bool { action_pattern_state(el) == Some(true) }
+
+    fn passive(el: &IUIAutomationElement) -> WinResult<bool> {
+        unsafe {
+            let role = match el.CurrentControlType()?.0 { 50020 => "Text", 50006 => "Image", _ => "" };
+            Ok(super::passive_content(role, action_pattern_state(el) != Some(false), el.CurrentIsKeyboardFocusable()?.as_bool(), el.CurrentIsPassword()?.as_bool()))
+        }
+    }
+
+    fn label(el: &IUIAutomationElement, walker: &IUIAutomationTreeWalker, name: &str, password: bool) -> (String, &'static str) {
+        if password { return (String::new(), "unlabeled"); }
+        let own = super::display_label(name);
+        if !own.is_empty() { return (own, "name"); }
+        unsafe {
+            if let Ok(other) = el.CurrentLabeledBy() {
+                if passive(&other).unwrap_or(false) {
+                    if let Ok(text) = other.CurrentName() {
+                        let text = super::display_label(&text.to_string());
+                        if !text.is_empty() { return (text, "labeled_by"); }
+                    }
+                }
+            }
+            // 输入控件不向内部取文本；从不读取 Value/TextPattern。
+            if el.CurrentControlType().map(|t| t.0 == 50004).unwrap_or(true) {
+                return (String::new(), "unlabeled");
+            }
+            let mut stack = Vec::new();
+            if let Ok(child) = walker.GetFirstChildElement(el) { stack.push((child, 1)); }
+            let mut pieces = Vec::new();
+            let mut visits = 1; // 为 LabeledBy 探测预留一次，整条回退路径最多 16 个节点。
+            while let Some((node, depth)) = stack.pop() {
+                if visits >= super::LABEL_VISITS || pieces.len() >= super::LABEL_PIECES { break; }
+                visits += 1;
+                if visits < super::LABEL_VISITS {
+                    if let Ok(sibling) = walker.GetNextSiblingElement(&node) { stack.push((sibling, depth)); }
+                }
+                let role = match node.CurrentControlType().map(|t| t.0).unwrap_or(0) {
+                    50020 => "Text", 50006 => "Image", 50033 => "Pane", 50026 => "Group", _ => "",
+                };
+                if !super::label_node_allowed(role, action_pattern_state(&node) != Some(false),
+                    node.CurrentIsKeyboardFocusable().map(|v| v.as_bool()).unwrap_or(true),
+                    node.CurrentIsPassword().map(|v| v.as_bool()).unwrap_or(true), depth, visits) { continue; }
+                if role == "Text" {
+                    if let Ok(text) = node.CurrentName() { super::add_label_piece(&mut pieces, &text.to_string()); }
+                }
+                if depth < super::LABEL_DEPTH && visits < super::LABEL_VISITS && pieces.len() < super::LABEL_PIECES {
+                    if let Ok(child) = walker.GetFirstChildElement(&node) { stack.push((child, depth + 1)); }
+                }
+            }
+            let text = super::display_label(&pieces.join(" "));
+            let source = if text.is_empty() { "unlabeled" } else { "child_text" };
+            (text, source)
+        }
+    }
+
+    fn resolve_hit(uia: &IUIAutomation, walker: &IUIAutomationTreeWalker, expected: &ScreenElement, point: (i32, i32)) -> WinResult<Option<IUIAutomationElement>> {
+        unsafe {
+            let top = uia.ElementFromHandle(HWND(expected.identity.hwnd as _))?;
+            let top_id = runtime_id(&top)?;
+            let mut el = uia.ElementFromPoint(windows::Win32::Foundation::POINT { x: point.0, y: point.1 })?;
+            for depth in 0..=super::HIT_ANCESTORS {
+                if el.CurrentIsPassword()?.as_bool() { return Ok(None); }
+                let current = ScreenElement {
+                    role: role_of(el.CurrentControlType()?.0).unwrap_or(""),
+                    name: el.CurrentName()?.to_string(), window: top.CurrentName()?.to_string(),
+                    rect: rect_values(el.CurrentBoundingRectangle()?)?,
+                    identity: identity(&el, expected.identity.hwnd, top_id.clone())?,
+                    ..Default::default()
+                };
+                if !current.identity_verifiable() { return Ok(None); }
+                let enabled = el.CurrentIsEnabled()?.as_bool();
+                let offscreen = el.CurrentIsOffscreen()?.as_bool();
+                if super::same_target(expected, &current, enabled, offscreen) {
+                    return Ok(actionable(&el, current.role).then_some(el));
+                }
+                if !super::may_ascend_hit(expected, &current, passive(&el)?, depth, enabled, offscreen) {
+                    return Ok(None);
+                }
+                el = walker.GetParentElement(&el)?;
+            }
+            Ok(None)
+        }
+    }
+
+    fn actionable(el: &IUIAutomationElement, role: &str) -> bool {
+        action_pattern(el) || (role == "Edit" && unsafe { el.CurrentIsKeyboardFocusable().map(|v| v.as_bool()).unwrap_or(false) })
+    }
+
     pub fn validate(expected: &ScreenElement) -> Result<(i32, i32), ToolError> {
         let _com = ComGuard::new().map_err(|e| ToolError::io(e.to_string()))?;
-        let check = || -> WinResult<bool> { unsafe {
+        let check = || -> WinResult<Option<(i32, i32)>> { unsafe {
             let uia: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
-            let (x, y) = expected.center();
+            let walker = uia.RawViewWalker()?;
             let hwnd = expected.identity.hwnd as windows_sys::Win32::Foundation::HWND;
-            let hit = WindowFromPoint(windows_sys::Win32::Foundation::POINT { x, y });
-            if hwnd.is_null() || GetForegroundWindow() != hwnd || GetAncestor(hit, GA_ROOT) != hwnd || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
-                return Ok(false);
-            }
-            let top = uia.ElementFromHandle(HWND(hwnd))?;
+            if hwnd.is_null() || GetForegroundWindow() != hwnd || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 { return Ok(None); }
             let mut cloaked = 0u32;
             DwmGetWindowAttribute(HWND(hwnd), DWMWA_CLOAKED, (&mut cloaked as *mut u32).cast(), 4)?;
-            if cloaked != 0 { return Ok(false); }
-            // 严格命中实际控件；子节点或重叠节点不猜测归属。
-            let el = uia.ElementFromPoint(windows::Win32::Foundation::POINT { x, y })?;
-            let r = el.CurrentBoundingRectangle()?;
-            let current = ScreenElement {
-                id: expected.id,
-                role: role_of(el.CurrentControlType()?.0).unwrap_or(""),
-                name: el.CurrentName()?.to_string().trim().to_owned(),
-                window: top.CurrentName()?.to_string(),
-                rect: rect_values(r)?,
-                identity: identity(&el, expected.identity.hwnd, runtime_id(&top)?)?,
-            };
-            if !super::same_target(expected, &current, el.CurrentIsEnabled()?.as_bool(), el.CurrentIsOffscreen()?.as_bool()) {
-                return Ok(false);
-            }
-            // 属性读取可能耗时，再核对一次命中，缩小检查与输入之间的窗口。
-            let latest = uia.ElementFromPoint(windows::Win32::Foundation::POINT { x, y })?;
-            let latest_rect = latest.CurrentBoundingRectangle()?;
-            let hit = WindowFromPoint(windows_sys::Win32::Foundation::POINT { x, y });
-            Ok(GetForegroundWindow() == hwnd && GetAncestor(hit, GA_ROOT) == hwnd
-                && identity(&latest, expected.identity.hwnd, runtime_id(&uia.ElementFromHandle(HWND(hwnd))?)?)? == expected.identity
-                && uia.CompareElements(&el, &latest)?.as_bool()
-                && rect_values(latest_rect)? == expected.rect
-                && latest.CurrentIsEnabled()?.as_bool() && !latest.CurrentIsOffscreen()?.as_bool()
-                && GetForegroundWindow() == hwnd
-                && GetAncestor(WindowFromPoint(windows_sys::Win32::Foundation::POINT { x, y }), GA_ROOT) == hwnd)
+            if cloaked != 0 { return Ok(None); }
+            let monitors = monitors()?;
+            let started = Instant::now();
+            Ok(super::verified_candidate(super::candidate_points(expected.rect, expected.clickable_point, &monitors), |point| -> WinResult<bool> {
+                if started.elapsed() > Duration::from_secs(2) { return Ok(false); }
+                let window_hit = || GetForegroundWindow() == hwnd && GetAncestor(WindowFromPoint(windows_sys::Win32::Foundation::POINT { x: point.0, y: point.1 }), GA_ROOT) == hwnd;
+                if !window_hit() { return Ok(false); }
+                let Some(el) = resolve_hit(&uia, &walker, expected, point)? else { return Ok(false); };
+                let Some(latest) = resolve_hit(&uia, &walker, expected, point)? else { return Ok(false); };
+                use windows_sys::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONULL};
+                Ok(uia.CompareElements(&el, &latest)?.as_bool() && window_hit()
+                    && started.elapsed() <= Duration::from_secs(2)
+                    && !MonitorFromPoint(windows_sys::Win32::Foundation::POINT { x: point.0, y: point.1 }, MONITOR_DEFAULTTONULL).is_null())
+            }))
         }};
-        if check().map_err(|e| ToolError::io(e.to_string()))? {
-            Ok(expected.center())
-        } else { Err(ToolError::bad_args("实时命中与快照不一致")) }
+        check().map_err(|e| ToolError::io(e.to_string()))?.ok_or_else(|| ToolError::bad_args("实时命中与快照不一致"))
     }
 
     pub fn overview() -> Result<(Vec<WindowSummary>, bool), ToolError> {
@@ -510,6 +734,7 @@ mod imp {
             id if id == UIA_CalendarControlTypeId.0 => "Calendar",
             id if id == UIA_SpinnerControlTypeId.0 => "Spinner",
             id if id == UIA_SplitButtonControlTypeId.0 => "SplitButton",
+            50025 => "Custom",
             _ => return None,
         })
     }
@@ -543,6 +768,7 @@ mod imp {
             let uia: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
             let walker: IUIAutomationTreeWalker = uia.ControlViewWalker()?;
             let root = uia.GetRootElement()?;
+            let monitors = monitors()?;
 
             let t0 = Instant::now();
             let mut raw: Vec<RawElement> = Vec::new();
@@ -562,7 +788,7 @@ mod imp {
                     top = parent;
                 }
                 let title = top.CurrentName().map(|s| s.to_string()).unwrap_or_default();
-                dfs(&walker, &top, title, per_window.min(total), &mut raw, Instant::now(), t0, query);
+                dfs(&walker, &top, title, per_window.min(total), &mut raw, Instant::now(), t0, query, &monitors);
                 return Ok(raw);
             }
 
@@ -584,7 +810,7 @@ mod imp {
                         title.clone(),
                         per_window.min(total - raw.len()),
                         &mut raw,
-                        Instant::now(), t0, query,
+                        Instant::now(), t0, query, &monitors,
                     );
                 }
                 let next = walker.GetNextSiblingElement(&top);
@@ -607,6 +833,7 @@ mod imp {
         t0: Instant,
         total_start: Instant,
         query: &Query<'_>,
+        monitors: &[[i32; 4]],
     ) {
         unsafe {
             let hwnd = window_el.CurrentNativeWindowHandle().map(|h| h.0 as isize).unwrap_or(0);
@@ -621,19 +848,27 @@ mod imp {
                     return;
                 }
                 let ctype = el.CurrentControlType().map(|t| t.0).unwrap_or(0);
-                if let Some(role) = role_of(ctype) {
-                    if let Ok(r) = el.CurrentBoundingRectangle() {
-                        let name = el.CurrentName().map(|s| s.to_string()).unwrap_or_default();
-                        if let Ok(rect) = rect_values(r) {
-                            if !name.trim().is_empty() && parent_type != super::SCROLLBAR
-                                && !super::is_scrollbar_noise(&name) && query.matches(&name, rect) {
+                if let Some(role) = role_of(ctype).filter(|role| query.matches_role(role)) {
+                    let action = actionable(&el, role);
+                    if role != "Custom" || action {
+                        if let Some(rect) = el.CurrentBoundingRectangle().and_then(rect_values).ok()
+                            .filter(|rect| super::visible_on_monitors(*rect, monitors)) {
+                            let password = el.CurrentIsPassword().map(|v| v.as_bool()).unwrap_or(true);
+                            let raw_name = super::protected_name(password, || el.CurrentName().map(|s| s.to_string()));
+                            let (text, source) = label(&el, walker, raw_name.as_deref().unwrap_or(""), password);
+                            if (!text.is_empty() || action) && parent_type != super::SCROLLBAR
+                                && !super::is_scrollbar_noise(&text) && query.matches(&text, rect) {
+                                let mut point = windows::Win32::Foundation::POINT::default();
+                                let clickable_point = el.GetClickablePoint(&mut point).ok().filter(|v| v.as_bool()).map(|_| (point.x, point.y));
+                                let ident = if raw_name.is_ok() && !password { identity(&el, hwnd, window_runtime_id.clone()).ok() } else { None };
                                 out.push(RawElement {
-                                    identity: identity(&el, hwnd, window_runtime_id.clone())
-                                        .unwrap_or_else(|_| ElementIdentity { hwnd, ..Default::default() }),
-                                    role,
-                                    name,
-                                    window: window.clone(),
-                                    rect,
+                                    identity: ident.unwrap_or_else(|| ElementIdentity { hwnd, ..Default::default() }),
+                                    role, name: raw_name.unwrap_or_default(), label: text, label_source: source,
+                                    enabled: el.CurrentIsEnabled().map(|v| v.as_bool()).unwrap_or(false),
+                                    foreground: hwnd != 0 && GetForegroundWindow() as isize == hwnd,
+                                    offscreen: el.CurrentIsOffscreen().map(|v| v.as_bool()).unwrap_or(true),
+                                    actionable: action, clickable_point,
+                                    window: window.clone(), rect,
                                     parent_role: if parent_type == 0 { None } else { Some(parent_type) },
                                 });
                                 count += 1;
@@ -641,6 +876,7 @@ mod imp {
                         }
                     }
                 }
+                if el.CurrentIsPassword().map(|v| v.as_bool()).unwrap_or(true) { continue; }
                 if depth < 14 {
                     // 栈是 LIFO，孩子的入栈顺序无所谓 —— finalize 会按空间重排。
                     // guard 防御个别控件 GetNextSibling 自环（实测见过这类坏控件）。
@@ -729,7 +965,8 @@ mod tests {
     fn raw(name: &str, rect: [i32; 4]) -> RawElement {
         RawElement {
             role: "Button",
-            name: name.to_owned(),
+            name: name.to_owned(), label: display_label(name), label_source: "name",
+            enabled: true, foreground: true, offscreen: false, actionable: false, clickable_point: None,
             window: "窗口".to_owned(),
             rect,
             parent_role: None,
@@ -845,6 +1082,7 @@ mod tests {
             window: "任务栏".into(),
             rect: [1061, 1904, 90, 96],
             identity: ElementIdentity::default(),
+            ..Default::default()
         }];
         let _interaction = INTERACTION.lock().unwrap();
         let snapshot = cache_store(&els);
@@ -855,6 +1093,12 @@ mod tests {
         let newer = cache_store(&els);
         assert!(cache_lookup(&snapshot, 1).is_none());
         assert!(cache_lookup(&newer, 1).is_some());
+        CACHE.lock().unwrap().as_mut().unwrap().at = Instant::now() - Duration::from_secs(59);
+        assert!(cache_snapshot().is_some());
+        assert!(cache_remaining_seconds() <= 1);
+        let at = CACHE.lock().unwrap().as_ref().unwrap().at;
+        assert!(cache_snapshot().is_some());
+        assert_eq!(CACHE.lock().unwrap().as_ref().unwrap().at, at);
         cache_invalidate();
         assert!(cache_snapshot().is_none());
         assert!(cache_lookup(&newer, 1).is_none());
@@ -916,12 +1160,142 @@ mod tests {
 
     #[test]
     fn local_query_filters_before_result_budget_and_handles_negative_coordinates() {
-        let query = Query { keyword: "ä保", window_id: Some(42), region: Some([-1920, 0, 200, 200]) };
+        let query = Query { keyword: "ä保", window_id: Some(42), region: Some([-1920, 0, 200, 200]), ..Default::default() };
         assert!(query.matches("Ä保存", [-1900, 10, 100, 40]));
         assert!(!query.matches("Ä保存", [100, 10, 100, 40]));
         assert!(!query.matches("删除", [-1900, 10, 100, 40]));
         assert!(intersects([i32::MAX - 1, 0, 100, 1], [i32::MAX, 0, 1, 1]));
         assert!(!intersects([0, 0, 10, 10], [10, 0, 10, 10]));
+    }
+
+    #[test]
+    fn labels_do_not_change_raw_identity_and_unlabeled_actions_survive() {
+        let full = format!("  {}尾部", "中".repeat(120));
+        let mut source = raw(&full, [0, 0, 100, 40]);
+        source.identity = ElementIdentity { hwnd: 42, process_id: 7, process_started: 100,
+            window_process_id: 7, window_process_started: 100, window_runtime_id: vec![4], runtime_id: vec![1] };
+        let expected = finalize(vec![source], vs(), 1).remove(0);
+        assert_eq!(expected.name, full);
+        assert_eq!(expected.label.chars().count(), LABEL_CHARS);
+        let mut current = expected.clone();
+        current.label = "不同显示文字".into(); current.label_source = "child_text";
+        assert!(same_target(&expected, &current, true, false));
+        current.name.push('变');
+        assert!(!same_target(&expected, &current, true, false));
+        let mut unnamed = raw("", [0, 0, 10, 10]);
+        unnamed.actionable = true; unnamed.label_source = "unlabeled";
+        let result = finalize(vec![unnamed], vs(), 1);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].label.is_empty());
+        let mut executable = expected.clone(); executable.actionable = true;
+        assert!(executable.non_executable_reason().is_none());
+        executable.foreground = false;
+        assert_eq!(executable.non_executable_reason(), Some("background_window"));
+        assert!(validate_target(&executable).is_err());
+    }
+
+    #[test]
+    fn label_limits_exclude_password_input_and_nested_actions() {
+        assert!(label_node_allowed("Text", false, false, false, 2, 16));
+        for (role, action, focus, password, depth, visits) in [
+            ("Text", false, false, true, 1, 1), ("Edit", false, false, false, 1, 1),
+            ("Button", false, false, false, 1, 1), ("Text", true, false, false, 1, 1),
+            ("Text", false, true, false, 1, 1), ("Text", false, false, false, 3, 1),
+            ("Text", false, false, false, 1, 17),
+        ] { assert!(!label_node_allowed(role, action, focus, password, depth, visits)); }
+        let mut pieces = Vec::new();
+        for text in ["甲", "乙", "丙", "丁"] { add_label_piece(&mut pieces, text); }
+        assert_eq!(pieces.len(), 3);
+        assert_eq!(display_label(&"中".repeat(200)).chars().count(), 96);
+        assert!(!passive_content("Text", false, false, true));
+        assert!(passive_content("Image", false, false, false));
+        assert!(!passive_content("Unknown", false, false, false));
+        assert!(!passive_content("Text", true, false, false));
+        assert!(!passive_content("Image", false, true, false));
+        assert!(!label_node_allowed("Unknown", false, false, false, 1, 1));
+        assert!(!label_node_allowed("Pane", true, false, false, 1, 1));
+    }
+
+    #[test]
+    fn partial_offscreen_candidates_use_visible_pixels_not_original_center_or_gaps() {
+        let rect = [-90, 10, 100, 40];
+        let monitors = [[0, 0, 100, 100], [200, 0, 100, 100]];
+        let points = candidate_points(rect, Some((-40, 30)), &monitors);
+        assert!(!points.is_empty());
+        assert!(points.iter().all(|p| point_in(rect, *p) && point_in(monitors[0], *p)));
+        assert!(candidate_points([110, 10, 50, 40], Some((120, 20)), &monitors).is_empty());
+        let points = candidate_points([0, 0, 300, 100], Some((150, 50)), &monitors);
+        assert!(points.iter().all(|p| monitors.iter().any(|m| point_in(*m, *p))));
+        assert_eq!(rect, [-90, 10, 100, 40]);
+    }
+
+    #[test]
+    fn text_ownership_requires_exact_ancestor_and_rejects_nested_button() {
+        let mut expected = finalize(vec![raw("保存", [0, 0, 100, 40])], vs(), 1).remove(0);
+        expected.identity = ElementIdentity { hwnd: 42, process_id: 7, process_started: 100,
+            window_process_id: 7, window_process_started: 100, window_runtime_id: vec![4], runtime_id: vec![1] };
+        let mut text = expected.clone(); text.role = "Text"; text.identity.runtime_id = vec![2];
+        assert!(!same_target(&expected, &text, true, false));
+        assert!(may_ascend_hit(&expected, &text, passive_content("Text", false, false, false), 0, true, false));
+        assert!(same_target(&expected, &expected, true, false));
+        assert!(!may_ascend_hit(&expected, &text, passive_content("Button", true, false, false), 0, true, false));
+        assert!(!may_ascend_hit(&expected, &text, true, HIT_ANCESTORS, true, false));
+        assert!(!may_ascend_hit(&expected, &text, true, 0, false, false));
+        assert!(!may_ascend_hit(&expected, &text, true, 0, true, true));
+        let mut sibling = expected.clone(); sibling.identity.runtime_id = vec![9];
+        assert!(!same_target(&expected, &sibling, true, false));
+        text.identity.hwnd += 1;
+        assert!(!may_ascend_hit(&expected, &text, true, 0, true, false));
+    }
+
+    #[test]
+    fn passwords_never_read_their_own_name() {
+        let name = protected_name::<()>(true, || panic!("password Name must not be read"));
+        assert_eq!(name.unwrap(), "");
+        assert_eq!(protected_name::<()>(false, || Ok("  原始名称  ".into())).unwrap(), "  原始名称  ");
+        assert!(protected_name(false, || Err::<String, _>("provider failure")).is_err());
+    }
+
+    #[test]
+    fn candidate_failures_do_not_bypass_occlusion_or_abort_other_candidates() {
+        let monitors = [[0, 0, 100, 100]];
+        let points = candidate_points([0, 0, 100, 100], Some((10, 10)), &monitors);
+        let mut visited = Vec::new();
+        let selected = verified_candidate(points.clone(), |point| {
+            visited.push(point);
+            match visited.len() {
+                1 => Err("provider failure"),
+                2 => Ok(false), // 遮挡不能退回几何坐标。
+                _ => Ok(true),
+            }
+        });
+        assert_eq!(visited, points[..3]);
+        assert_eq!(selected, Some(points[2]));
+        assert_eq!(verified_candidate(points, |_| Ok::<_, ()>(false)), None);
+        let fallback = candidate_points([0, 0, 100, 100], None, &monitors);
+        assert!(!fallback.is_empty());
+        assert_eq!(verified_candidate(fallback, |_| Err::<bool, _>("unknown")), None);
+    }
+
+    #[test]
+    fn monitor_gaps_do_not_consume_visible_element_budget() {
+        let monitors = [[-100, 0, 100, 100], [100, 0, 100, 100]];
+        let found: Vec<_> = [[10, 10, 50, 50], [-10, 10, 30, 30], [110, 10, 30, 30]].into_iter()
+            .filter(|rect| visible_on_monitors(*rect, &monitors)).take(1).collect();
+        assert_eq!(found, vec![[-10, 10, 30, 30]]);
+        assert!(!visible_on_monitors([0, 0, 100, 100], &monitors));
+        assert!(!visible_on_monitors([0, 0, 1, 1], &[]));
+    }
+
+    #[test]
+    fn role_prefilter_spends_budget_only_on_normalized_roles() {
+        assert_eq!(parse_role(" button ").unwrap(), Some("Button"));
+        assert_eq!(parse_role(" custom ").unwrap(), Some("Custom"));
+        assert!(parse_role("Buttons").is_err());
+        let query = Query { role: parse_role("button").unwrap(), ..Default::default() };
+        let found: Vec<_> = ["Edit", "Edit", "Button", "Button"].into_iter()
+            .filter(|r| query.matches_role(r)).take(1).collect();
+        assert_eq!(found, vec!["Button"]);
     }
 
     /// 只读的 Windows UIA 烟雾探针；默认忽略，避免无头 CI 被桌面会话影响。

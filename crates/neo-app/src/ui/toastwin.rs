@@ -208,7 +208,9 @@ impl ToastWin {
         self.fallback_started = true;
         let root = ctx.clone();
         // 常驻休眠，不用 Visible(false) / Close：下次恢复不经历透明 surface 黑帧。
-        ctx.show_viewport_deferred(viewport_id(), Self::builder(rect), move |ui, _| {
+        let suspended = crate::app::desktop_viewport(ctx, viewport_id());
+        ctx.show_viewport_deferred(viewport_id(), Self::builder(rect).with_visible(!suspended), move |ui, _| {
+            if crate::app::desktop_suspended(ui.ctx()) { return; }
             let Some(snapshot) = &snapshot else { return };
             let now = Instant::now();
             snapshot.paint(ui, now);

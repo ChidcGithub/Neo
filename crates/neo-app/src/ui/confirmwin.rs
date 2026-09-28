@@ -183,6 +183,7 @@ impl ConfirmWin {
             }
             self.open = open;
         }
+        let suspended = crate::app::desktop_viewport(ctx, viewport_id());
         ctx.show_viewport_deferred(
             viewport_id(),
             ViewportBuilder::default()
@@ -193,10 +194,12 @@ impl ConfirmWin {
                 .with_always_on_top()
                 .with_active(false)
                 .with_transparent(true)
-                .with_visible(true)
+                .with_visible(!suspended)
                 .with_inner_size(if open { size } else { Vec2::new(1.0, 1.0) })
                 .with_position(if open { center } else { OFFSCREEN }),
-            move |ui, _class| draw(ui),
+            move |ui, _class| {
+                if !crate::app::desktop_suspended(ui.ctx()) { draw(ui); }
+            },
         );
     }
 }

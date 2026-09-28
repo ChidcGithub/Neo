@@ -1,4 +1,4 @@
-//! Windows 原生消息通知（WinRT toast）：启动与任务完成时弹系统通知。
+//! Windows 原生消息通知（WinRT toast）：任务完成时弹系统通知。
 //!
 //! 未打包（unpackaged）进程要能发 toast，关键是给进程设一个
 //! AppUserModelID（`SetCurrentProcessExplicitAppUserModelID`），并用同一个
@@ -48,13 +48,6 @@ fn toast(title: &str, body: &str) -> Result<(), String> {
 #[cfg(not(windows))]
 fn toast(_title: &str, _body: &str) -> Result<(), String> {
     Err("非 Windows：无系统通知".into())
-}
-
-/// 启动完成（真实客户端才调，离屏测试不经这里）。
-pub fn app_started() {
-    if let Err(e) = toast("Neo 已启动", "叫我「嗨 Neo」试试，或从托盘打开主界面。") {
-        eprintln!("[neo] 启动通知失败（忽略）: {e}");
-    }
 }
 
 /// 一轮任务执行完成。`line` 取最后一条回复的首行（已裁好长度）。

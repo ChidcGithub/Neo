@@ -82,7 +82,94 @@ impl Drop for EngineLease {
 enum Cmd {
     Show,
     Hide,
+    Suspend(Sender<Result<(), String>>, Instant, Arc<AtomicBool>),
+    Resume,
     Shutdown,
+}
+
+fn desktop_can_show(count: &AtomicU32) -> bool {
+    count.load(Ordering::Acquire) == 0
+}
+
+fn desktop_request_live(deadline: Instant, live: &AtomicBool) -> bool {
+    live.load(Ordering::Acquire) && Instant::now() < deadline
+}
+
+fn hide_for_desktop(hwnd: HWND) -> Result<(), String> {
+    if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(hwnd) == 0 } {
+        return Err("浮层窗口已失效，拒绝执行桌面工具".into());
+    }
+    unsafe { ShowWindow(hwnd, SW_HIDE); }
+    if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd) == 0 } {
+        Ok(())
+    } else {
+        Err("浮层未成功隐藏，拒绝执行桌面工具".into())
+    }
+}
+
+/// 桌面工具的短期租约；只在后台线程等待窗口线程的隐藏回执。
+#[derive(Clone)]
+pub struct DesktopGate {
+    tx: Sender<Cmd>,
+    tid: u32,
+    count: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
+}
+
+pub struct DesktopGuard(DesktopGate, Arc<AtomicBool>);
+
+impl DesktopGate {
+    fn wake(&self) {
+        if self.tid != 0 {
+            unsafe { PostThreadMessageW(self.tid, WM_NEO_CMD, 0, 0); }
+        }
+    }
+
+    fn reserve(&self) -> DesktopGuard {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        DesktopGuard(self.clone(), Arc::new(AtomicBool::new(true)))
+    }
+
+    pub fn acquire(&self, cancel: &AtomicBool, timeout: Duration) -> Result<DesktopGuard, String> {
+        let deadline = Instant::now() + timeout;
+        if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err("桌面屏障已取消或超时".into());
+        }
+        let guard = self.reserve();
+        let (tx, rx) = channel();
+        self.tx.send(Cmd::Suspend(tx, deadline, guard.1.clone())).map_err(|_| "桌面屏障窗口线程已退出")?;
+        self.wake();
+        loop {
+            if cancel.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
+                return Err("桌面屏障已取消或窗口线程已退出".into());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("桌面屏障等待隐藏回执超时，未执行工具".into());
+            }
+            match rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(result) => {
+                    result?;
+                    if cancel.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                        return Err("桌面屏障已取消、超时或窗口线程已退出".into());
+                    }
+                    return Ok(guard);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => return Err("桌面屏障未收到隐藏回执".into()),
+            }
+        }
+    }
+}
+
+impl Drop for DesktopGuard {
+    fn drop(&mut self) {
+        self.1.store(false, Ordering::Release);
+        if self.0.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _ = self.0.tx.send(Cmd::Resume);
+            self.0.wake();
+        }
+    }
 }
 
 /// 采集门和帧槽共用短锁；锁绝不跨越系统抓屏或 GPU 操作。
@@ -315,12 +402,19 @@ pub struct OverlayHandle {
     stop: Arc<AtomicBool>,
     capture: FrameSlot,
     cards: CardSlot,
+    suspended: Arc<AtomicU32>,
     thread: Option<JoinHandle<()>>,
     #[cfg(test)]
     wake_count: Option<AtomicU32>,
 }
 
 impl OverlayHandle {
+    pub fn desktop_gate(&self) -> DesktopGate {
+        DesktopGate {
+            tx: self.tx.clone(), tid: self.tid, count: self.suspended.clone(), stop: self.stop.clone(),
+        }
+    }
+
     /// 显示全屏跑马灯并开始渲染。
     pub fn show(&self) {
         self.post(Cmd::Show);
@@ -434,6 +528,7 @@ pub fn start() -> Result<OverlayHandle, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let capture = Arc::new(Mutex::new(CaptureState::default()));
     let cards: CardSlot = Arc::new(Mutex::new(BTreeMap::new()));
+    let suspended = Arc::new(AtomicU32::new(0));
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
     // 窗口线程初始化完成后回传线程 id（命令唤醒要靠它）。
     let (ready_tx, ready_rx) = channel::<Result<u32, String>>();
@@ -443,11 +538,12 @@ pub fn start() -> Result<OverlayHandle, String> {
         let stop = stop.clone();
         let capture = capture.clone();
         let cards = cards.clone();
+        let suspended = suspended.clone();
         std::thread::Builder::new()
             .name("neo-overlay".into())
             .spawn(move || {
                 let _lease = lease;
-                run(ready_tx, cmd_rx, level, visible, stop, capture, cards);
+                run(ready_tx, cmd_rx, level, visible, stop, capture, cards, suspended);
             })
             .map_err(|e| format!("创建 neo-overlay 线程失败: {e}"))?
     };
@@ -459,6 +555,7 @@ pub fn start() -> Result<OverlayHandle, String> {
         stop,
         capture,
         cards,
+        suspended,
         thread: Some(thread),
         #[cfg(test)]
         wake_count: None,
@@ -474,6 +571,7 @@ fn run(
     stop: Arc<AtomicBool>,
     slot: FrameSlot,
     cards: CardSlot,
+    suspended: Arc<AtomicU32>,
 ) {
     // 正常退出/初始化失败都关闭采集；release panic=abort 不会运行析构，
     // 因此尺寸与能力必须在 GPU 调用前校验，不能靠展开或 catch_unwind 保护。
@@ -529,7 +627,7 @@ fn run(
                 stop.store(true, Ordering::Relaxed);
                 return;
             }
-            msg_loop(gfx, cmd_rx, level, visible, stop);
+            msg_loop(gfx, cmd_rx, level, visible, stop, suspended);
         }
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -546,6 +644,7 @@ fn msg_loop(
     level: Arc<AtomicU32>,
     visible: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    suspended: Arc<AtomicU32>,
 ) {
     let hwnd = gfx.hwnd;
     let mut ripple = RippleState::default();
@@ -566,6 +665,17 @@ fn msg_loop(
                     ripple.hide();
                     gfx.tgt = PH_IDLE;
                 }
+                Cmd::Suspend(ack, deadline, live) => {
+                    if !desktop_request_live(deadline, &live) {
+                        let _ = ack.send(Err("过期桌面请求，未隐藏浮层".into()));
+                        continue;
+                    }
+                    let result = hide_for_desktop(hwnd);
+                    shown = false;
+                    visible.store(false, Ordering::Release);
+                    let _ = ack.send(result);
+                }
+                Cmd::Resume => {}
                 Cmd::Shutdown => shutdown = true,
             }
         }
@@ -580,7 +690,7 @@ fn msg_loop(
             .unwrap_or(false);
         gfx.set_hit_testable(hwnd, interactive);
 
-        if ripple.active(have_cards) {
+        if desktop_can_show(&suspended) && ripple.active(have_cards) {
             // 非阻塞泵消息：线程消息不需要分发，系统消息（含鼠标输入）要处理
             let mut msg = MSG::default();
             unsafe {
@@ -1795,6 +1905,204 @@ impl Gfx {
 mod regression_tests {
     use super::*;
 
+    // #region debug-point A: opt-in HTTP evidence, test builds only
+    fn routing_debug_event(message: &str, data: &str) {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        assert_eq!(std::env::var("DEBUG_SESSION_ID").as_deref(), Ok("agent-click-routing"));
+        assert_eq!(std::env::var("DEBUG_SERVER_URL").as_deref(), Ok("http://127.0.0.1:7777/event"));
+        let timeout = Duration::from_millis(800);
+        let mut stream = TcpStream::connect_timeout(&"127.0.0.1:7777".parse().unwrap(), timeout).unwrap();
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        stream.set_write_timeout(Some(timeout)).unwrap();
+        let body = format!(r#"{{"sessionId":"agent-click-routing","runId":"isolated-post-{}","hypothesisId":"A","location":"neo-overlay/src/lib.rs:regression_tests","message":"{message}","data":{data}}}"#, std::process::id());
+        write!(stream, "POST /event HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200"));
+    }
+
+    #[test]
+    #[ignore = "explicit isolated desktop diagnostic; requires local HTTP collector"]
+    fn isolated_click_routing_probe() {
+        routing_debug_event("pre_probe", r#"{"business_logic_changed":true,"production_hide_helper":true,"real_input":false,"desktop_switch":false}"#);
+        // #region debug-point B: controlled windows on a never-activated desktop
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SendMessageTimeoutW, WindowFromPoint, WS_EX_NOREDIRECTIONBITMAP,
+            SMTO_ABORTIFHUNG, UnregisterClassW,
+        };
+        // These desktop APIs are test-only; avoid adding production dependency features.
+        #[link(name = "user32")]
+        extern "system" {
+            fn CreateDesktopW(name: *const u16, device: *const u16, mode: *const std::ffi::c_void,
+                flags: u32, access: u32, security: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn SetThreadDesktop(desktop: *mut std::ffi::c_void) -> i32;
+            fn CloseDesktop(desktop: *mut std::ffi::c_void) -> i32;
+        }
+        const QUERY_POINT: u32 = WM_APP + 91;
+        static OVERLAY_HITS: AtomicU32 = AtomicU32::new(0);
+        static BASE_BUTTONS: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn base_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+            match msg {
+                QUERY_POINT => {
+                    let (x, y) = unpack_client(lp);
+                    unsafe { WindowFromPoint(POINT { x, y }) as LRESULT }
+                }
+                WM_NCHITTEST => HTCLIENT as LRESULT,
+                WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP => {
+                    BASE_BUTTONS.fetch_add(1, Ordering::Relaxed);
+                    0
+                }
+                _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+            }
+        }
+        unsafe extern "system" fn probe_overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+            if msg == WM_NCHITTEST {
+                OVERLAY_HITS.fetch_add(1, Ordering::Relaxed);
+            }
+            unsafe { overlay_wnd_proc(hwnd, msg, wp, lp) }
+        }
+        struct Desktop(*mut std::ffi::c_void);
+        impl Drop for Desktop {
+            fn drop(&mut self) { unsafe { CloseDesktop(self.0); } }
+        }
+        struct Window(HWND);
+        impl Drop for Window {
+            fn drop(&mut self) {
+                unsafe {
+                    SetWindowLongPtrW(self.0, GWLP_USERDATA, 0);
+                    DestroyWindow(self.0);
+                }
+            }
+        }
+        struct Worker(Arc<AtomicBool>, Option<JoinHandle<()>>);
+        impl Drop for Worker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                if let Some(thread) = self.1.take() { let _ = thread.join(); }
+            }
+        }
+        fn send(hwnd: HWND, msg: u32, lp: LPARAM) -> LRESULT {
+            let mut result = 0;
+            assert_ne!(unsafe { SendMessageTimeoutW(hwnd, msg, 0, lp, SMTO_ABORTIFHUNG, 1000, &mut result) }, 0,
+                "controlled SendMessageTimeoutW failed: {}", unsafe { GetLastError() });
+            result as LRESULT
+        }
+        let name: Vec<u16> = format!("neo-routing-probe-{}\0", std::process::id()).encode_utf16().collect();
+        // Access deliberately excludes DESKTOP_SWITCHDESKTOP. No input APIs are used.
+        let desktop = Desktop(unsafe { CreateDesktopW(name.as_ptr(), std::ptr::null(),
+            std::ptr::null(), 0, 0x0083, std::ptr::null()) });
+        routing_debug_event("desktop_created", &format!(r#"{{"ok":{},"error":{},"switch_access":false}}"#,
+            !desktop.0.is_null(), unsafe { GetLastError() }));
+        assert!(!desktop.0.is_null());
+        let desk = desktop.0 as usize;
+        let result = std::thread::spawn(move || {
+            assert_ne!(unsafe { SetThreadDesktop(desk as _) }, 0);
+            let base_name: Vec<u16> = "neo-routing-probe-base\0".encode_utf16().collect();
+            let overlay_name: Vec<u16> = "neo-routing-probe-overlay\0".encode_utf16().collect();
+            let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+            for (name, proc) in [(&base_name, base_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
+                (&overlay_name, probe_overlay_proc)] {
+                let wc = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                    lpfnWndProc: Some(proc), hInstance: instance, lpszClassName: name.as_ptr(), ..Default::default() };
+                assert_ne!(unsafe { RegisterClassExW(&wc) }, 0);
+            }
+            let create = |name: &[u16], ex| {
+                let hwnd = unsafe { CreateWindowExW(ex, name.as_ptr(), std::ptr::null(), WS_POPUP,
+                    0, 0, 640, 480, std::ptr::null_mut(), std::ptr::null_mut(),
+                    GetModuleHandleW(std::ptr::null()), std::ptr::null()) };
+                assert!(!hwnd.is_null());
+                Window(hwnd)
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = stop.clone();
+            let (tx, rx) = channel();
+            let worker_name = base_name.clone();
+            let worker = Worker(stop, Some(std::thread::spawn(move || {
+                assert_ne!(unsafe { SetThreadDesktop(desk as _) }, 0);
+                let base = create(&worker_name, WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+                unsafe { ShowWindow(base.0, SW_SHOWNA); }
+                tx.send((base.0 as usize, unsafe { GetCurrentThreadId() })).unwrap();
+                while !worker_stop.load(Ordering::Acquire) {
+                    let mut msg = MSG::default();
+                    unsafe {
+                        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                            TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })));
+            let (foreign, foreign_tid) = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let foreign = foreign as HWND;
+            let same = create(&base_name, WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+            let state = Box::new(WndState {
+                bounds: Mutex::new(DesktopBounds { origin: (0, 0), size: (640, 480) }),
+                display_dirty: AtomicBool::new(false), ppp: AtomicU32::new(1.0f32.to_bits()),
+                hit_rects: Mutex::new(vec![[400, 300, 100, 100]]), events: Mutex::new(Vec::new()),
+                pointer: Mutex::new(egui::Pos2::ZERO), inside: AtomicBool::new(false),
+            });
+            let ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP;
+            let overlay = create(&overlay_name, ex);
+            unsafe {
+                SetWindowLongPtrW(overlay.0, GWLP_USERDATA, &*state as *const WndState as isize);
+                ShowWindow(overlay.0, SW_SHOWNA);
+                SetWindowPos(overlay.0, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            routing_debug_event("windows_ready", &format!(r#"{{"owner_tid":{},"target_tid":{},"overlay":{},"foreign_base":{},"same_base":{},"exstyle":{},"card":[400,300,100,100]}}"#,
+                unsafe { GetCurrentThreadId() }, foreign_tid, overlay.0 as usize, foreign as usize,
+                same.0 as usize, unsafe { GetWindowLongPtrW(overlay.0, GWL_EXSTYLE) }));
+            let observe = |case: &str, x: i32, y: i32| {
+                let lp = ((y as u32) << 16 | x as u32) as LPARAM;
+                let before = OVERLAY_HITS.load(Ordering::Relaxed);
+                let owner_found = unsafe { WindowFromPoint(POINT { x, y }) };
+                let owner_calls = OVERLAY_HITS.load(Ordering::Relaxed) - before;
+                let before = OVERLAY_HITS.load(Ordering::Relaxed);
+                let foreign_found = send(foreign, QUERY_POINT, lp) as HWND;
+                let foreign_calls = OVERLAY_HITS.load(Ordering::Relaxed) - before;
+                let direct_hit = send(overlay.0, WM_NCHITTEST, lp);
+                routing_debug_event("hit_observation", &format!(r#"{{"case":"{case}","point":[{x},{y}],"exstyle":{},"owner_found":{},"foreign_found":{},"owner_hit_calls":{owner_calls},"foreign_hit_calls":{foreign_calls},"explicit_overlay_hit":{direct_hit}}}"#,
+                    unsafe { GetWindowLongPtrW(overlay.0, GWL_EXSTYLE) }, owner_found as usize, foreign_found as usize));
+                foreign_found
+            };
+            observe("cross_thread_card_inside", 450, 350);
+            let found = observe("cross_thread_card_outside", 100, 100);
+            // Explicit delivery to the queried controlled HWND is not hardware-input routing.
+            assert!(found == overlay.0 || found == foreign || found == same.0);
+            state.events.lock().unwrap().clear();
+            BASE_BUTTONS.store(0, Ordering::Relaxed);
+            for msg in [WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP] {
+                send(found, msg, (100 << 16) | 100);
+            }
+            routing_debug_event("controlled_delivery_only", &format!(r#"{{"selected":{},"overlay_events":{},"base_buttons":{},"hardware_routing_proven":false}}"#,
+                found as usize, state.events.lock().unwrap().len(), BASE_BUTTONS.load(Ordering::Relaxed)));
+            unsafe { ShowWindow(foreign, SW_HIDE); ShowWindow(same.0, SW_SHOWNA); }
+            observe("same_thread_card_outside", 100, 100);
+            unsafe {
+                ShowWindow(same.0, SW_HIDE); ShowWindow(foreign, SW_SHOWNA);
+                SetWindowLongPtrW(overlay.0, GWL_EXSTYLE, (ex | WS_EX_TRANSPARENT) as isize);
+                SetWindowPos(overlay.0, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            }
+            observe("cross_thread_transparent_style", 100, 100);
+            hide_for_desktop(overlay.0).unwrap();
+            let hidden_hit = observe("overlay_hidden_control", 100, 100);
+            assert_eq!(hidden_hit, foreign);
+            routing_debug_event("barrier_hide_verified", r#"{"production_hide_helper":true,"root_matches_target":true,"real_input":false}"#);
+            drop(overlay);
+            drop(same);
+            drop(worker);
+            unsafe { UnregisterClassW(overlay_name.as_ptr(), instance); UnregisterClassW(base_name.as_ptr(), instance); }
+        }).join();
+        drop(desktop);
+        routing_debug_event("post_probe", &format!(r#"{{"completed":{},"real_input":false,"desktop_switch":false}}"#, result.is_ok()));
+        result.unwrap();
+        // #endregion debug-point B
+    }
+    // #endregion debug-point A
+
     #[test]
     fn dimensions_request_adapter_capacity_and_reject_insufficient_limits() {
         let supported = wgpu::Limits { max_texture_dimension_2d: 16384, ..wgpu::Limits::default() };
@@ -1915,6 +2223,7 @@ mod regression_tests {
             stop: Arc::new(AtomicBool::new(false)),
             capture: Arc::new(Mutex::new(safe_capture())),
             cards: Arc::new(Mutex::new(BTreeMap::new())),
+            suspended: Arc::new(AtomicU32::new(0)),
             thread: Some(thread),
             wake_count: Some(AtomicU32::new(0)),
         }, rx, release, finished)
@@ -1922,6 +2231,64 @@ mod regression_tests {
 
     fn wake_count(handle: &OverlayHandle) -> u32 {
         handle.wake_count.as_ref().unwrap().load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn desktop_barrier_ack_then_thread_exit_and_cancel_fail_closed() {
+        let (handle, commands, release, finished) = fake_handle();
+        let gate = handle.desktop_gate();
+        let cancel = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| gate.acquire(&cancel, Duration::from_secs(1)));
+            let Cmd::Suspend(ack, deadline, live) = commands.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!("必须先申请隐藏") };
+            assert!(desktop_request_live(deadline, &live));
+            assert!(!desktop_can_show(&gate.count));
+            ack.send(Ok(())).unwrap();
+            let guard = waiting.join().unwrap().unwrap();
+            assert!(!desktop_can_show(&gate.count));
+            drop(guard);
+            assert!(desktop_can_show(&gate.count));
+        });
+        while commands.try_recv().is_ok() {}
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| gate.acquire(&cancel, Duration::from_secs(1)));
+            let Cmd::Suspend(ack, _, _) = commands.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!("必须先申请隐藏") };
+            gate.stop.store(true, Ordering::Release);
+            let _ = ack.send(Ok(()));
+            assert!(waiting.join().unwrap().is_err());
+        });
+        assert!(desktop_can_show(&gate.count));
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn desktop_barrier_timeout_and_last_guard_restore() {
+        let (handle, commands, release, finished) = fake_handle();
+        let gate = handle.desktop_gate();
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        assert!(gate.acquire(&cancel, Duration::from_millis(15)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(gate.count.load(Ordering::Acquire), 0);
+        let Cmd::Suspend(_, deadline, live) = commands.recv().unwrap() else { panic!("缺少过期请求") };
+        assert!(!desktop_request_live(deadline, &live), "迟到请求不能隐藏窗口");
+        assert!(!desktop_request_live(Instant::now(), &AtomicBool::new(true)));
+        while commands.try_recv().is_ok() {}
+        let first = gate.reserve();
+        let second = gate.reserve();
+        handle.show();
+        handle.set_card(card_id::MINI, Some(Card::interactive([0.0; 4], |_| {})));
+        assert!(!desktop_can_show(&gate.count));
+        drop(first);
+        assert!(!desktop_can_show(&gate.count));
+        drop(second);
+        assert!(desktop_can_show(&gate.count));
+        cancel.store(true, Ordering::Release);
+        assert!(gate.acquire(&cancel, Duration::from_secs(1)).is_err());
+        assert_eq!(gate.count.load(Ordering::Acquire), 0);
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]

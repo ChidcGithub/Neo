@@ -95,6 +95,196 @@ fn current_dictation(active: bool, current: u64, received: u64) -> bool {
     active && current == received
 }
 
+/// 只决定请求时机，不执行网络操作；关闭自动检查后本会话不再自动排队。
+#[derive(Default)]
+struct UpdateSchedule {
+    ready_at: Option<std::time::Instant>,
+    auto_done: bool,
+    last_request: Option<std::time::Instant>,
+    auto_inflight: bool,
+    notified: bool,
+}
+
+impl UpdateSchedule {
+    fn request_due(&mut self, now: std::time::Instant, enabled: bool, manual: bool, checking: bool) -> Option<bool> {
+        let ready = *self.ready_at.get_or_insert(now + std::time::Duration::from_secs(3));
+        if !enabled {
+            self.auto_done = true;
+        }
+        if checking || self.last_request.is_some_and(|last| now.saturating_duration_since(last) < std::time::Duration::from_secs(10)) {
+            return None;
+        }
+        let automatic = !manual;
+        if automatic && (!enabled || self.auto_done || now < ready) {
+            return None;
+        }
+        self.auto_done = true;
+        self.last_request = Some(now);
+        self.auto_inflight = automatic;
+        Some(automatic)
+    }
+}
+
+pub(crate) fn desktop_suspended(ctx: &egui::Context) -> bool {
+    ctx.data(|data| data.get_temp::<bool>(egui::Id::new("neo-desktop-suspended"))).unwrap_or(false)
+}
+
+pub(crate) fn desktop_viewport(ctx: &egui::Context, viewport: egui::ViewportId) -> bool {
+    let suspended = desktop_suspended(ctx);
+    let key = egui::Id::new(("neo-desktop-viewport", viewport));
+    let previous = ctx.data_mut(|data| {
+        let previous = data.get_temp::<bool>(key).unwrap_or(false);
+        data.insert_temp(key, suspended);
+        previous
+    });
+    if suspended != previous {
+        ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Visible(!suspended));
+    }
+    suspended
+}
+
+/// 只在拥有窗口的 UI 线程调用。主窗句柄来自 eframe，不按标题猜测窗口。
+#[derive(Default)]
+struct DesktopWindows {
+    hidden: Vec<isize>,
+    main_avoided: bool,
+    #[cfg(all(windows, not(test)))]
+    main: isize,
+    #[cfg(all(windows, not(test)))]
+    placement: Option<windows_sys::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT>,
+    #[cfg(test)]
+    fail_verify: bool,
+}
+
+fn desktop_window_obstructs(visible: bool, minimized: bool) -> bool {
+    visible && !minimized
+}
+
+impl DesktopWindows {
+    #[cfg(all(windows, not(test)))]
+    fn bind(&mut self, frame: &eframe::Frame) {
+        use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = frame.window_handle() {
+            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                self.main = handle.hwnd.get();
+            }
+        }
+    }
+
+    #[cfg(all(windows, not(test)))]
+    fn visible_windows(&self) -> Result<Vec<isize>, String> {
+        use windows_sys::Win32::{Foundation::*, UI::WindowsAndMessaging::*, System::Threading::GetCurrentThreadId};
+        unsafe extern "system" fn visit(hwnd: HWND, data: LPARAM) -> i32 {
+            unsafe {
+                if desktop_window_obstructs(IsWindowVisible(hwnd) != 0, IsIconic(hwnd) != 0) {
+                    (*(data as *mut Vec<isize>)).push(hwnd as isize);
+                }
+            }
+            1
+        }
+        let mut windows = Vec::<isize>::new();
+        if unsafe { EnumThreadWindows(GetCurrentThreadId(), Some(visit), &mut windows as *mut _ as isize) } == 0 {
+            return Err("无法枚举 Neo 窗口，拒绝派发桌面工具".into());
+        }
+        Ok(windows)
+    }
+
+    #[cfg(all(windows, not(test)))]
+    fn hide(&mut self, avoid_main: bool) -> Result<(), String> {
+        use windows_sys::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*, System::Threading::GetCurrentThreadId};
+        let main = self.main as HWND;
+        if main.is_null() || unsafe { GetWindowThreadProcessId(main, std::ptr::null_mut()) != GetCurrentThreadId() } {
+            return Err("无法确认 Neo 主窗口归属，拒绝派发桌面工具".into());
+        }
+        let windows = self.visible_windows()?;
+        if windows.iter().any(|&hwnd| hwnd != self.main && unsafe { GetWindowLongPtrW(hwnd as HWND, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST == 0 }) {
+            return Err("请先关闭 Neo 的对话框，再请求桌面工具".into());
+        }
+        for hwnd in windows {
+            if hwnd == self.main {
+                if !avoid_main { return Err("Neo 主窗口仍可见，拒绝派发桌面工具".into()); }
+                if self.placement.is_none() {
+                    let mut placement: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+                    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+                    if unsafe { GetWindowPlacement(main, &mut placement) } == 0 {
+                        return Err("无法保存 Neo 主窗口状态".into());
+                    }
+                    self.placement = Some(placement);
+                    self.main_avoided = true;
+                }
+                unsafe { ShowWindow(main, SW_MINIMIZE); }
+            } else {
+                if !self.hidden.contains(&hwnd) { self.hidden.push(hwnd); }
+                unsafe { ShowWindow(hwnd as HWND, SW_HIDE); }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(not(windows), test))]
+    fn hide(&mut self, avoid_main: bool) -> Result<(), String> {
+        self.main_avoided |= avoid_main;
+        Ok(())
+    }
+
+    fn manually_restored(&self) -> bool {
+        #[cfg(all(windows, not(test)))]
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::*;
+            let hwnd = self.main as windows_sys::Win32::Foundation::HWND;
+            return self.main_avoided && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0;
+        }
+        #[cfg(any(not(windows), test))]
+        false
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        #[cfg(all(windows, not(test)))]
+        if !self.visible_windows()?.is_empty() {
+            return Err("Neo 窗口尚未完成暂避，拒绝派发桌面工具".into());
+        }
+        #[cfg(test)]
+        if self.fail_verify { return Err("模拟窗口暂避失败".into()); }
+        Ok(())
+    }
+
+    fn restore(&mut self) {
+        for _hwnd in self.hidden.drain(..) {
+            #[cfg(all(windows, not(test)))]
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::*;
+                let hwnd = _hwnd as windows_sys::Win32::Foundation::HWND;
+                if IsWindow(hwnd) != 0 && GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) == windows_sys::Win32::System::Threading::GetCurrentThreadId() {
+                    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE as isize);
+                    ShowWindow(hwnd, SW_SHOWNA);
+                }
+            }
+        }
+        #[cfg(all(windows, not(test)))]
+        if let Some(mut placement) = self.placement.take() {
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::*;
+                let hwnd = self.main as windows_sys::Win32::Foundation::HWND;
+                if IsWindow(hwnd) != 0 && GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) == windows_sys::Win32::System::Threading::GetCurrentThreadId() {
+                    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE as isize);
+                    if placement.showCmd == SW_SHOWNORMAL as u32 {
+                        placement.showCmd = SW_SHOWNOACTIVATE as u32;
+                    }
+                    SetWindowPlacement(hwnd, &placement);
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+                }
+            }
+        }
+        self.main_avoided = false;
+    }
+}
+
+impl Drop for DesktopWindows {
+    fn drop(&mut self) { self.restore(); }
+}
+
 pub struct NeoApp {
     state: AppState,
     whale: WhaleMark,
@@ -109,6 +299,10 @@ pub struct NeoApp {
     /// 上次落库的活跃会话 id，作用同上。
     saved_active: Option<i64>,
     saved_classroom_safe: bool,
+    saved_silent_startup_errors: bool,
+    saved_auto_check_updates: bool,
+    update_checker: crate::updates::UpdateChecker,
+    update_schedule: UpdateSchedule,
     applied_classroom_safe: bool,
     /// 上次落库的面板内设置。直接修改 state 的控件统一在帧末检测变化。
     /// 元素顺序：思考过程 / 思考挡位 / 主题 / 距离 / 最小化到托盘 / 语音唤醒 / 启动即后台 / 课堂总结。
@@ -162,6 +356,13 @@ pub struct NeoApp {
     /// 全屏跑马灯覆盖层（唤醒聆听时亮起）。离屏测试没有 GPU 窗口线程，为 `None`。
     overlay: Option<neo_overlay::OverlayHandle>,
     overlay_attempted: bool,
+    desktop_rx: std::sync::mpsc::Receiver<crate::state::DesktopRequest>,
+    desktop_pending: Vec<crate::state::DesktopRequest>,
+    desktop_windows: DesktopWindows,
+    desktop_show_pending: bool,
+    desktop_restore_pending: bool,
+    desktop_exit_pending: bool,
+    desktop_cancels: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// 后台执行期间的角落迷你窗（对话速览 / 截屏回避 / 打断确认）。
     miniwin: ui::miniwin::MiniWin,
     /// 截屏完成后的区域闪光（整屏截图 = 全屏边框一闪）。
@@ -220,12 +421,17 @@ impl NeoApp {
             Ok(s) => (Some(s), true),
             Err(_) => {
                 record(Level::Error, "storage", "数据库打开失败，将以纯内存模式运行");
+                crate::startup::record_error("database", "数据库打开失败，将以纯内存模式运行");
                 (None, false)
             }
         };
         let db_path = db_path.to_string_lossy().into_owned();
 
-        let state = AppState::with_store(store_ok, Some(db_path));
+        let mut state = AppState::with_store(store_ok, Some(db_path));
+        let (requests, desktop_rx) = std::sync::mpsc::channel();
+        state.desktop_execution = Some(crate::state::DesktopExecution {
+            requests, active: Default::default(), overlay: None,
+        });
 
         let mut app = Self {
             state,
@@ -238,6 +444,10 @@ impl NeoApp {
             saved_context_tokens: neo_llm::CONTEXT_TOKENS,
             saved_active: None,
             saved_classroom_safe: true,
+            saved_silent_startup_errors: false,
+            saved_auto_check_updates: true,
+            update_checker: Default::default(),
+            update_schedule: Default::default(),
             applied_classroom_safe: true,
             workspace_picker: None,
             prev_stage: Stage::Hero,
@@ -260,6 +470,13 @@ impl NeoApp {
             persistence_ok: true,
             overlay: None,
             overlay_attempted: false,
+            desktop_rx,
+            desktop_pending: Vec::new(),
+            desktop_windows: DesktopWindows::default(),
+            desktop_show_pending: false,
+            desktop_restore_pending: false,
+            desktop_exit_pending: false,
+            desktop_cancels: Vec::new(),
             miniwin: Default::default(),
             shotflash: Default::default(),
             class_dot: Default::default(),
@@ -290,8 +507,11 @@ impl NeoApp {
 
         app.load_settings();
         app.saved_api = (app.state.api_base.clone(), app.state.api_key.clone());
-        // 启动只读本地缓存；联网刷新必须由用户在设置页明确触发。
+        // 模型启动只读本地缓存；更新检查由独立调度器延后执行。
         app.saved_classroom_safe = app.state.classroom_safe;
+        app.saved_silent_startup_errors = app.state.silent_startup_errors;
+        app.saved_auto_check_updates = app.state.auto_check_updates;
+        app.state.sync_startup_policy(crate::startup::set_silent_policy);
         app.applied_classroom_safe = app.state.classroom_safe;
         record(Level::Info, "app", "应用已启动");
         // 装载之后同步一次基准值，否则第一帧会把"从库里读到的"当成"用户刚改的"。
@@ -498,6 +718,12 @@ impl NeoApp {
 
     /// 所有应用内退出都经过同一屏障；系统强杀、断电不受此屏障保证。
     fn request_exit(&mut self, ctx: &egui::Context) {
+        self.update_checker.cancel();
+        self.update_schedule.auto_inflight = false;
+        self.state.update_check_requested = false;
+        if matches!(self.state.update_status, crate::updates::Status::Checking) {
+            self.state.update_status = crate::updates::Status::Idle;
+        }
         self.stop_wake_test();
         self.cancel_dictation();
         self.wake_rx = None;
@@ -534,6 +760,16 @@ impl NeoApp {
     fn finish_exit(&mut self, ctx: &egui::Context) {
         self.quitting = true;
         self.exit_blocked = false;
+        if self.state.desktop_execution.as_ref().is_some_and(|gate| gate.active.load(std::sync::atomic::Ordering::Acquire) != 0) {
+            self.state.cancel();
+            for cancel in &self.desktop_cancels { cancel.store(true, std::sync::atomic::Ordering::Release); }
+            self.desktop_exit_pending = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.request_repaint_after(std::time::Duration::from_millis(10));
+            return;
+        }
+        self.desktop_exit_pending = false;
+        self.desktop_windows.restore();
         drop(self.tray.take());
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         ctx.request_repaint();
@@ -597,6 +833,17 @@ impl NeoApp {
 
     /// 从托盘唤回主窗口。
     fn show_window(&mut self, ctx: &egui::Context) {
+        if self.desktop_windows.main_avoided { self.state.cancel(); }
+        if self.state.desktop_execution.as_ref().is_some_and(|gate| gate.active.load(std::sync::atomic::Ordering::Acquire) != 0) {
+            for cancel in &self.desktop_cancels {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            self.state.cancel();
+            self.desktop_show_pending = true;
+            return;
+        }
+        self.desktop_show_pending = false;
+        self.desktop_windows.restore();
         self.hidden_to_tray = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -606,6 +853,10 @@ impl NeoApp {
     /// 关窗转后台：取消关闭，隐藏窗口（同时最小化，wgpu 对隐藏窗仍会
     /// 尝试取交换链，最小化让渲染循环走「尺寸为零跳过」的既有路径）。
     fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        // 用户主动转托盘覆盖临时暂避前的可见状态。
+        self.desktop_windows.main_avoided = false;
+        #[cfg(all(windows, not(test)))]
+        { self.desktop_windows.placement = None; }
         self.hidden_to_tray = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -656,7 +907,7 @@ impl NeoApp {
             // 打断沿的基线：进入瞬间正按着不算（那是触发前的点击尾巴）。
             self.dictation_lmb_down = lmb_down();
         } else {
-            if self.hidden_to_tray {
+            if self.hidden_to_tray || self.desktop_windows.main_avoided {
                 self.show_window(ctx);
             }
             // "Hi, Neo"：焦点交给输入框，老师接着输入即可。
@@ -728,6 +979,9 @@ impl NeoApp {
         self.state.context_tokens = neo_llm::restored_context_tokens(get("context_tokens").as_deref());
         self.saved_context_tokens = self.state.context_tokens;
         self.state.classroom_safe = get("classroom_safe").as_deref() != Some("0");
+        self.state.silent_startup_errors = get("silent_startup_errors").as_deref() == Some("1");
+        self.state.auto_check_updates = get("auto_check_updates").as_deref() != Some("0");
+        self.state.sync_startup_policy(crate::startup::set_silent_policy);
         if let Some(v) = get("theme") {
             if v == "light" {
                 self.state.theme_mode = ThemeMode::Light;
@@ -1186,6 +1440,8 @@ impl NeoApp {
         save_pref!(state.start_in_tray, self.saved_prefs.6, "start_in_tray", if state.start_in_tray { "1" } else { "0" });
         save_pref!(state.class_enabled, self.saved_prefs.7, "class_enabled", if state.class_enabled { "1" } else { "0" });
         save_pref!(state.classroom_safe, self.saved_classroom_safe, "classroom_safe", if state.classroom_safe { "1" } else { "0" });
+        save_pref!(state.silent_startup_errors, self.saved_silent_startup_errors, "silent_startup_errors", if state.silent_startup_errors { "1" } else { "0" });
+        save_pref!(state.auto_check_updates, self.saved_auto_check_updates, "auto_check_updates", if state.auto_check_updates { "1" } else { "0" });
         if (state.api_base.as_str(), state.api_key.as_str())
             != (self.saved_api.0.as_str(), self.saved_api.1.as_str())
         {
@@ -1202,6 +1458,7 @@ impl NeoApp {
     }
 
     fn sync_safety(&mut self, ctx: &egui::Context) {
+        self.state.sync_startup_policy(crate::startup::set_silent_policy);
         if self.applied_classroom_safe == self.state.classroom_safe {
             return;
         }
@@ -1334,15 +1591,141 @@ impl NeoApp {
         self.fingerprint = Some(key);
     }
 
+    fn queue_duplicate(&mut self, duplicate: bool) {
+        if duplicate {
+            self.pending_toasts.push((
+                neo_ui::ToastKind::Info,
+                "Neo 已经在运行".into(),
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            ));
+        }
+    }
+
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        use crate::updates::Status;
+        let now = std::time::Instant::now();
+        if !self.state.auto_check_updates && self.update_schedule.auto_inflight {
+            self.update_checker.cancel();
+            self.update_schedule.auto_inflight = false;
+            self.state.update_status = Status::Idle;
+        }
+        if let Some(status) = self.update_checker.poll() {
+            self.accept_update_status(status);
+        }
+        let manual = std::mem::take(&mut self.state.update_check_requested);
+        let checking = self.update_checker.is_running()
+            || matches!(self.state.update_status, Status::Checking);
+        if self.update_schedule.request_due(now, self.state.auto_check_updates, manual, checking).is_some() {
+            // 测试只验证调度和状态，不接触网络。
+            #[cfg(not(test))]
+            {
+                self.update_checker.request(ctx);
+                self.state.update_status = self.update_checker.status().clone();
+            }
+            #[cfg(test)]
+            {
+                self.state.update_status = Status::Checking;
+            }
+        }
+        if !self.update_schedule.auto_done {
+            if let Some(ready) = self.update_schedule.ready_at {
+                ctx.request_repaint_after(ready.saturating_duration_since(now));
+            }
+        }
+    }
+
+    fn accept_update_status(&mut self, status: crate::updates::Status) {
+        use crate::updates::Status;
+        if matches!(status, Status::Failed(_)) {
+            record(Level::Warn, "updates", "更新检查失败，可稍后手动重试");
+            crate::startup::record_error("updates", "更新检查失败，可稍后手动重试");
+        }
+        if self.update_schedule.auto_inflight && self.state.auto_check_updates
+            && !self.update_schedule.notified && matches!(status, Status::Available { .. })
+        {
+            self.update_schedule.notified = true;
+            self.pending_toasts.push((neo_ui::ToastKind::Info,
+                "Neo 有新版本，可在设置 → 关于查看；不会自动下载".into(),
+                std::time::Instant::now() + std::time::Duration::from_secs(8)));
+        }
+        self.update_schedule.auto_inflight = false;
+        self.state.update_status = status;
+    }
+
     /// 一帧的纯逻辑部分：托盘事件、语音唤醒、STT 结果、超时与轮询调度。
     ///
     /// 独立出来的原因：窗口隐藏（托盘）时 eframe 不再调 `App::ui`，只调
     /// `App::logic`（默认是空实现）——不挂它，后台时托盘点击与唤醒检测全停摆。
     /// 可见时由 `render` 开头调用，隐藏时由 `App::logic` 调用，二者互斥。
+    fn tick_desktop_barrier(&mut self, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering;
+        let active = self.state.desktop_execution.as_ref().is_some_and(|gate| gate.active.load(Ordering::Acquire) != 0);
+        if self.desktop_windows.manually_restored() {
+            self.show_window(ctx);
+            if active {
+                // 任务栏恢复也算用户打断；旧 UIA 退出前仍保持暂避。
+                let _ = self.desktop_windows.hide(true);
+            }
+        }
+        let blocked = self.desktop_show_pending || self.quitting || self.exit_blocked
+            || self.state.awaiting_tool().is_some();
+        // hide 与 verify 分属两帧；verify 不再补 hide，避免把失败当作成功。
+        for request in std::mem::take(&mut self.desktop_pending) {
+            let result = if !request.live() || blocked {
+                Err("桌面请求已取消、超时或仍待审批，未派发".into())
+            } else {
+                self.desktop_windows.verify()
+            };
+            if result.is_err() { self.desktop_restore_pending = true; }
+            if request.ack.send(result).is_err() { self.desktop_restore_pending = true; }
+        }
+        for request in self.desktop_rx.try_iter() {
+            if !request.live() || blocked {
+                let _ = request.ack.send(Err("旧桌面请求已失效或仍待审批，未暂避".into()));
+                continue;
+            }
+            self.desktop_cancels.push(request.cancel.clone());
+            match self.desktop_windows.hide(!self.hidden_to_tray) {
+                Ok(()) => self.desktop_pending.push(request),
+                Err(error) => {
+                    self.desktop_restore_pending = true;
+                    let _ = request.ack.send(Err(error));
+                }
+            }
+        }
+        // 同一轮观察→操作之间不恢复主窗，不让 snapshot 的真实前台被 Neo 改变。
+        // 新审批则在所有旧 UIA 租约结束后恢复，以保持审批界面可见。
+        let round_busy = self.state.generating || self.state.tool_open || self.state.tool_round;
+        let hold_main = self.desktop_windows.main_avoided && round_busy && !blocked
+            && !self.desktop_restore_pending;
+        let suspended = active && !self.desktop_cancels.is_empty()
+            || !self.desktop_pending.is_empty() || hold_main;
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("neo-desktop-suspended"), suspended));
+        if !active && self.desktop_pending.is_empty() && !hold_main {
+            self.desktop_windows.restore();
+            self.desktop_cancels.clear();
+            self.desktop_restore_pending = false;
+            if self.desktop_exit_pending { self.finish_exit(ctx); }
+            else if self.desktop_show_pending { self.show_window(ctx); }
+        }
+        if suspended || active {
+            ctx.request_repaint_after(std::time::Duration::from_millis(10));
+        }
+        if let Some(gate) = &mut self.state.desktop_execution {
+            gate.overlay = self.overlay.as_ref().map(|overlay| overlay.desktop_gate());
+        }
+    }
+
     fn tick(&mut self, ctx: egui::Context) {
+        self.tick_desktop_barrier(&ctx);
+        // 主界面已完成装配；所有提前返回路径之前都结束启动覆盖窗。
+        crate::startup::finish_splash();
         if self.quitting {
             return;
         }
+        self.queue_duplicate(crate::startup::poll_duplicate());
+        // 重复启动事件没有界面输入，主窗静止或隐藏时仍须响应。
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
         self.sync_safety(&ctx);
         if !self.persist_preferences() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
@@ -1359,6 +1742,7 @@ impl NeoApp {
             }
             return;
         }
+        self.poll_updates(&ctx);
         // 启动即后台：首帧直接进托盘等「Hi, Neo」，主界面不露面。
         // 走首帧而不是 `ViewportBuilder::with_visible(false)`：hide_to_tray 的
         // 注释提到 wgpu 对隐藏窗仍会取交换链，最小化走「尺寸为零跳过」的既有路径。
@@ -1609,7 +1993,7 @@ impl NeoApp {
             neo_tools::tools::open_app::SHOW_WINDOW_AT.load(std::sync::atomic::Ordering::Relaxed);
         if show_at != self.show_window_seen {
             self.show_window_seen = show_at;
-            if show_at != 0 && self.hidden_to_tray {
+            if show_at != 0 && (self.hidden_to_tray || self.desktop_windows.main_avoided) {
                 self.show_window(&ctx);
             }
         }
@@ -2079,6 +2463,168 @@ mod restore_tests {
             .replace('%', "%25").replace(' ', "%20").replace('#', "%23").replace('?', "%3F");
         Store::open(std::path::Path::new(&format!("file:{path}?mode=ro")))
             .expect("打开真实 SQLite 只读连接")
+    }
+
+    #[test]
+    fn startup_preferences_roundtrip_and_failed_writes_keep_exit_barrier() {
+        let ctx = egui::Context::default();
+        let mut app = NeoApp::install(&ctx);
+        assert!(!app.state.silent_startup_errors);
+        assert!(app.state.auto_check_updates);
+        app.state.silent_startup_errors = true;
+        app.state.auto_check_updates = false;
+        assert!(app.persist_preferences());
+        assert!(app.saved_silent_startup_errors);
+        assert!(!app.saved_auto_check_updates);
+        app.state.silent_startup_errors = false;
+        app.state.auto_check_updates = true;
+        app.load_settings();
+        assert!(app.state.silent_startup_errors);
+        assert!(!app.state.auto_check_updates);
+        for value in ["broken", "", "false", "1", "0"] {
+            let store = app.store.as_ref().unwrap();
+            store.set_setting("silent_startup_errors", value).unwrap();
+            store.set_setting("auto_check_updates", value).unwrap();
+            app.load_settings();
+            assert_eq!(app.state.silent_startup_errors, value == "1");
+            assert_eq!(app.state.auto_check_updates, value != "0");
+        }
+        app.state.silent_startup_errors = true;
+        app.state.auto_check_updates = false;
+        assert!(app.persist_preferences());
+        app.store = Some(readonly_store(&super::test_db_path()));
+        app.state.silent_startup_errors = false;
+        app.state.auto_check_updates = true;
+        assert!(!app.persist_preferences());
+        assert!(app.saved_silent_startup_errors);
+        assert!(!app.saved_auto_check_updates);
+        assert!(app.state.preferences_unsaved);
+        app.request_exit(&ctx);
+        assert!(app.exit_blocked && !app.quitting);
+        app.store = Some(Store::open(&super::test_db_path()).unwrap());
+        assert!(app.persist_preferences());
+        assert!(!app.saved_silent_startup_errors);
+        assert!(app.saved_auto_check_updates);
+        assert!(!app.state.preferences_unsaved);
+    }
+
+    #[test]
+    fn startup_silent_policy_requires_both_preferences() {
+        let mut state = AppState::default();
+        for safe in [false, true] {
+            for silent in [false, true] {
+                state.classroom_safe = safe;
+                state.silent_startup_errors = silent;
+                let mut received = None;
+                state.sync_startup_policy(|classroom, enabled| received = Some((classroom, enabled)));
+                assert_eq!(received, Some((safe, safe && silent)));
+            }
+        }
+    }
+
+    #[test]
+    fn startup_update_schedule_delays_once_and_throttles_manual_requests() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut schedule = super::UpdateSchedule::default();
+        assert_eq!(schedule.request_due(now, true, false, false), None);
+        assert_eq!(schedule.request_due(now + Duration::from_secs(2), true, false, false), None);
+        assert_eq!(schedule.request_due(now + Duration::from_secs(3), true, false, false), Some(true));
+        assert_eq!(schedule.request_due(now + Duration::from_secs(30), true, false, false), None);
+        assert_eq!(schedule.request_due(now + Duration::from_secs(12), true, true, false), None);
+        assert_eq!(schedule.request_due(now + Duration::from_secs(13), true, true, false), Some(false));
+        assert_eq!(schedule.request_due(now + Duration::from_secs(23), true, true, true), None);
+        assert_eq!(schedule.request_due(now + Duration::from_secs(23), true, true, false), Some(false));
+    }
+
+    #[test]
+    fn startup_update_disable_cancels_pending_automatic_check() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        for initially_enabled in [false, true] {
+            let mut schedule = super::UpdateSchedule::default();
+            assert_eq!(schedule.request_due(now, initially_enabled, false, false), None);
+            assert_eq!(schedule.request_due(now + Duration::from_secs(1), false, false, false), None);
+            assert_eq!(schedule.request_due(now + Duration::from_secs(30), true, false, false), None);
+            assert_eq!(schedule.request_due(now + Duration::from_secs(31), false, true, true), None);
+            assert!(schedule.last_request.is_none());
+            assert_eq!(schedule.request_due(now + Duration::from_secs(31), false, true, false), Some(false));
+        }
+    }
+
+    #[test]
+    fn startup_update_poll_schedules_idle_repaint_and_manual_survives_disable() {
+        use crate::updates::Status;
+        use std::time::{Duration, Instant};
+        let ctx = egui::Context::default();
+        let mut app = NeoApp::install(&ctx);
+        for _ in 0..3 {
+            ctx.begin_pass(egui::RawInput::default());
+            app.poll_updates(&ctx);
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+            assert!(output.viewport_output[&egui::ViewportId::ROOT].repaint_delay <= Duration::from_secs(3));
+            assert_eq!(app.state.update_status, Status::Idle);
+        }
+        app.update_schedule.ready_at = Some(Instant::now() - Duration::from_secs(1));
+        app.poll_updates(&ctx);
+        assert_eq!(app.state.update_status, Status::Checking);
+        assert!(app.update_schedule.auto_inflight);
+        app.state.auto_check_updates = false;
+        app.poll_updates(&ctx);
+        assert_eq!(app.state.update_status, Status::Idle);
+        app.update_schedule.last_request = Some(Instant::now() - Duration::from_secs(10));
+        app.state.update_check_requested = true;
+        app.poll_updates(&ctx);
+        assert_eq!(app.state.update_status, Status::Checking);
+        assert!(!app.update_schedule.auto_inflight);
+        app.accept_update_status(Status::UpToDate);
+        app.poll_updates(&ctx);
+        assert_eq!(app.state.update_status, Status::UpToDate);
+        assert!(app.pending_toasts.is_empty());
+    }
+
+    #[test]
+    fn startup_update_results_only_notify_available_once_and_do_not_exit() {
+        use crate::updates::Status;
+        let ctx = egui::Context::default();
+        let mut app = NeoApp::install(&ctx);
+        app.state.silent_startup_errors = true;
+        app.update_schedule.auto_inflight = true;
+        app.accept_update_status(Status::Failed("不可落盘的原始错误".into()));
+        assert!(app.pending_toasts.is_empty());
+        assert!(!app.quitting && !app.exit_blocked);
+        app.update_schedule.auto_inflight = true;
+        app.accept_update_status(Status::UpToDate);
+        assert!(app.pending_toasts.is_empty());
+        let available = Status::Available { version: "9.0.0".into(), url: "https://github.com/ChidcGithub/Neo/releases/tag/v9.0.0".into() };
+        for _ in 0..2 {
+            app.update_schedule.auto_inflight = true;
+            app.accept_update_status(available.clone());
+        }
+        assert_eq!(app.pending_toasts.len(), 1);
+        app.pending_toasts.clear();
+        app.state.auto_check_updates = false;
+        app.update_schedule.auto_inflight = true;
+        app.state.update_status = Status::Checking;
+        app.poll_updates(&ctx);
+        assert_eq!(app.state.update_status, Status::Idle);
+        assert!(!app.update_schedule.auto_inflight);
+        assert!(app.pending_toasts.is_empty());
+    }
+
+    #[test]
+    fn startup_duplicate_queues_toast_even_when_main_window_hidden() {
+        let ctx = egui::Context::default();
+        let mut app = NeoApp::install(&ctx);
+        app.hidden_to_tray = true;
+        app.queue_duplicate(false);
+        assert!(app.pending_toasts.is_empty());
+        app.queue_duplicate(true);
+        assert_eq!(app.pending_toasts.len(), 1);
+        assert_eq!(app.pending_toasts[0].1, "Neo 已经在运行");
+        assert!(app.hidden_to_tray);
+        assert!(!app.quitting);
     }
 
     #[test]
@@ -2780,6 +3326,158 @@ mod restore_tests {
             app.start_overlay();
         }
         assert!(app.overlay.is_none());
+    }
+
+    fn desktop_request(app: &NeoApp, deadline: std::time::Instant) -> (std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::mpsc::Receiver<Result<(), String>>) {
+        let gate = app.state.desktop_execution.as_ref().unwrap();
+        gate.active.store(1, std::sync::atomic::Ordering::Release);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ack, rx) = std::sync::mpsc::channel();
+        gate.requests.send(crate::state::DesktopRequest { cancel: cancel.clone(), deadline, ack }).unwrap();
+        (cancel, rx)
+    }
+
+    #[test]
+    fn desktop_barrier_visible_main_auto_avoids_without_tray_and_holds_round() {
+        let ctx = egui::Context::default();
+        let mut app = NeoApp::install(&ctx);
+        app.state.tool_open = true;
+        let (_, rx) = desktop_request(&app, std::time::Instant::now() + std::time::Duration::from_secs(10));
+        app.tick_desktop_barrier(&ctx);
+        assert!(rx.try_recv().is_err(), "必须等下一帧验证");
+        assert!(app.desktop_windows.main_avoided);
+        assert!(!app.hidden_to_tray);
+        assert!(app.tray.is_none());
+        app.tick_desktop_barrier(&ctx);
+        assert!(rx.try_recv().unwrap().is_ok());
+        app.state.desktop_execution.as_ref().unwrap().active.store(0, std::sync::atomic::Ordering::Release);
+        app.tick_desktop_barrier(&ctx);
+        assert!(app.desktop_windows.main_avoided, "同轮观察与点击之间不恢复主窗");
+        app.state.tool_open = false;
+        ctx.begin_pass(egui::RawInput::default());
+        app.tick_desktop_barrier(&ctx);
+        assert!(!app.desktop_windows.main_avoided);
+        assert!(!super::desktop_suspended(&ctx));
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+        assert!(output.viewport_output.values().flat_map(|v| &v.commands)
+            .all(|c| !matches!(c, egui::ViewportCommand::Focus)));
+    }
+
+    #[test]
+    fn desktop_barrier_manual_show_cancels_and_waits_for_uia() {
+        let ctx = egui::Context::default();
+        let mut app = NeoApp::install(&ctx);
+        let (cancel, rx) = desktop_request(&app, std::time::Instant::now() + std::time::Duration::from_secs(10));
+        app.tick_desktop_barrier(&ctx);
+        app.show_window(&ctx);
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        app.tick_desktop_barrier(&ctx);
+        assert!(rx.try_recv().unwrap().is_err());
+        assert!(app.desktop_windows.main_avoided);
+        assert!(app.desktop_show_pending);
+        app.state.desktop_execution.as_ref().unwrap().active.store(0, std::sync::atomic::Ordering::Release);
+        app.tick_desktop_barrier(&ctx);
+        assert!(!app.desktop_windows.main_avoided);
+        assert!(!app.desktop_show_pending);
+    }
+
+    #[test]
+    fn desktop_barrier_verify_failure_restores_even_during_round() {
+        let ctx = egui::Context::default();
+        let mut app = NeoApp::install(&ctx);
+        app.state.tool_open = true;
+        let (_, rx) = desktop_request(&app, std::time::Instant::now() + std::time::Duration::from_secs(10));
+        app.tick_desktop_barrier(&ctx);
+        app.desktop_windows.fail_verify = true;
+        app.tick_desktop_barrier(&ctx);
+        assert!(rx.try_recv().unwrap().is_err());
+        app.state.desktop_execution.as_ref().unwrap().active.store(0, std::sync::atomic::Ordering::Release);
+        app.tick_desktop_barrier(&ctx);
+        assert!(!app.desktop_windows.main_avoided);
+    }
+
+    #[test]
+    fn desktop_barrier_stale_deadline_and_approval_do_not_hide() {
+        for pending_approval in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = NeoApp::install(&ctx);
+            let deadline = if pending_approval {
+                let mut meta = crate::state::ToolMeta::restored("click");
+                meta.state = crate::state::ToolState::AwaitingConfirm;
+                app.state.messages.push(crate::state::ChatMessage::tool_result(meta, String::new()));
+                std::time::Instant::now() + std::time::Duration::from_secs(10)
+            } else { std::time::Instant::now() };
+            let (_, rx) = desktop_request(&app, deadline);
+            app.tick_desktop_barrier(&ctx);
+            assert!(rx.try_recv().unwrap().is_err());
+            assert!(!app.desktop_windows.main_avoided);
+            assert!(!super::desktop_suspended(&ctx));
+        }
+    }
+
+    #[test]
+    fn desktop_barrier_exit_waits_and_tray_state_is_preserved() {
+        for tray in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = NeoApp::install(&ctx);
+            app.hidden_to_tray = tray;
+            let (cancel, rx) = desktop_request(&app, std::time::Instant::now() + std::time::Duration::from_secs(10));
+            app.tick_desktop_barrier(&ctx);
+            assert_eq!(app.desktop_windows.main_avoided, !tray);
+            app.finish_exit(&ctx);
+            assert!(app.desktop_exit_pending);
+            assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+            app.tick_desktop_barrier(&ctx);
+            assert!(rx.try_recv().unwrap().is_err());
+            app.state.desktop_execution.as_ref().unwrap().active.store(0, std::sync::atomic::Ordering::Release);
+            app.tick_desktop_barrier(&ctx);
+            assert!(!app.desktop_exit_pending);
+            assert!(!app.desktop_windows.main_avoided);
+            assert_eq!(app.hidden_to_tray, tray);
+        }
+    }
+
+    #[test]
+    fn desktop_barrier_pending_deadline_never_admits() {
+        let ctx = egui::Context::default();
+        let mut app = NeoApp::install(&ctx);
+        let (_, rx) = desktop_request(&app, std::time::Instant::now() + std::time::Duration::from_secs(10));
+        app.tick_desktop_barrier(&ctx);
+        app.desktop_pending[0].deadline = std::time::Instant::now();
+        app.tick_desktop_barrier(&ctx);
+        assert!(rx.try_recv().unwrap().is_err());
+        app.state.desktop_execution.as_ref().unwrap().active.store(0, std::sync::atomic::Ordering::Release);
+        app.tick_desktop_barrier(&ctx);
+        assert!(!app.desktop_windows.main_avoided);
+    }
+
+    #[test]
+    fn desktop_barrier_fallback_hidden_windows_are_not_restore_candidates() {
+        // TOPMOST 不参与候选判断；原本隐藏/最小化的窗口不应进入恢复集合。
+        assert!(!super::desktop_window_obstructs(false, false));
+        assert!(!super::desktop_window_obstructs(false, true));
+        assert!(!super::desktop_window_obstructs(true, true));
+        assert!(super::desktop_window_obstructs(true, false));
+    }
+
+    #[test]
+    fn desktop_barrier_fallback_visibility_only_changes_on_edges() {
+        let ctx = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("fake-miniwin");
+        for suspended in [false, true, true, false] {
+            ctx.begin_pass(egui::RawInput::default());
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new("neo-desktop-suspended"), suspended));
+            assert_eq!(super::desktop_viewport(&ctx, viewport), suspended);
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+            for command in output.viewport_output.values().flat_map(|v| &v.commands) {
+                if let egui::ViewportCommand::Visible(visible) = command {
+                    assert_eq!(*visible, !suspended);
+                }
+                assert!(!matches!(command, egui::ViewportCommand::Focus));
+            }
+        }
     }
 
     #[test]
@@ -3591,14 +4289,17 @@ mod restore_tests {
     fn attachment_and_text_sends_reach_local_mock_model() {
         use std::io::{Read, Write};
         for mode in 0..3 {
+            let store = temp_store(&format!("mock-model-{mode}"));
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
                 let mut stream = loop {
-                    if let Ok((stream, _)) = listener.accept() {
-                        break stream;
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => panic!("本地模型 accept 失败: {error}"),
                     }
                     assert!(std::time::Instant::now() < deadline, "模型没有收到请求");
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -3607,9 +4308,13 @@ mod restore_tests {
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
                 let mut bytes = Vec::new();
                 let mut chunk = [0u8; 4096];
                 let (offset, length) = loop {
+                    assert!(std::time::Instant::now() < deadline, "模型请求头超时");
                     let count = stream.read(&mut chunk).unwrap();
                     assert!(count > 0);
                     bytes.extend_from_slice(&chunk[..count]);
@@ -3627,6 +4332,7 @@ mod restore_tests {
                     }
                 };
                 while bytes.len() < offset + length {
+                    assert!(std::time::Instant::now() < deadline, "模型请求体超时");
                     let count = stream.read(&mut chunk).unwrap();
                     assert!(count > 0);
                     bytes.extend_from_slice(&chunk[..count]);
@@ -3644,11 +4350,26 @@ mod restore_tests {
             if mode == 0 {
                 state.draft = "纯文字".into();
             } else {
-                state.add_attachment(sample_attachment(mode == 2)).unwrap();
+                let mut attachment = sample_attachment(mode == 2);
+                if mode == 2 {
+                    use base64::Engine;
+                    let mut bytes = std::io::Cursor::new(Vec::new());
+                    image::DynamicImage::new_rgb8(1, 1)
+                        .write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+                    attachment.bytes = bytes.get_ref().len() as u64;
+                    attachment.image_url = Some(format!("data:image/png;base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(bytes.get_ref())));
+                }
+                state.add_attachment(attachment).unwrap();
             }
-            NeoApp::send_input(&mut state, None);
-            assert!(state.generating);
+            NeoApp::send_input(&mut state, Some(&store));
+            let generating = state.generating;
             let body = server.join().unwrap();
+            assert!(generating);
+            assert_eq!(state.pending_persist, 1);
+            let persisted = store.messages(state.active_session.unwrap()).unwrap();
+            assert_eq!(persisted.len(), 1);
+            assert_eq!(persisted[0].content, state.messages[0].content);
             let user = &body["messages"][1]["content"];
             if mode == 0 {
                 assert_eq!(user, "纯文字");
@@ -3701,12 +4422,16 @@ impl App for NeoApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        #[cfg(all(windows, not(test)))]
+        self.desktop_windows.bind(_frame);
         self.render(ui);
     }
 
     /// 窗口隐藏（托盘）时 eframe 只调这个——纯逻辑照跑，后台才能响应
     /// 托盘点击与「Hi, Neo」唤醒。与 `ui` 互斥，不会同帧双跑。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(all(windows, not(test)))]
+        self.desktop_windows.bind(_frame);
         self.tick(ctx.clone());
     }
 }

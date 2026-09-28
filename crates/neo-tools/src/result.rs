@@ -235,6 +235,10 @@ impl<'a> Args<'a> {
         }
     }
 
+    pub(crate) fn raw(&self) -> &Value {
+        self.value
+    }
+
     /// 参数**是否出现过**（显式给 `null` 算没给）。
     ///
     /// 用来区分"没给"与"给了默认值"—— `screenshot` 的局部区域要靠它判断
@@ -494,6 +498,11 @@ mod tests {
         let args = Args::new(tool, &v);
         assert_eq!(args.opt_int("limit").unwrap(), 400);
         assert_eq!(args.opt_int("offset").unwrap(), 0);
+        let null = json!({ "path": "a.txt", "limit": null });
+        let args = Args::new(tool, &null);
+        assert!(args.raw()["limit"].is_null());
+        assert!(!args.has("limit"));
+        assert_eq!(args.opt_int("limit").unwrap(), 400);
     }
 
     #[test]

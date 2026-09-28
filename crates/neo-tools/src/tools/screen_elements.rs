@@ -65,9 +65,28 @@ pub fn run(scope: &Scope, args: &Args) -> Outcome {
     }
 }
 
-/// 元素列表的字符预算。`result.rs` 的 `MODEL_JSON_CHARS`（24K）是整个工具结果
-/// 的外壳预算，这里留出外壳与 `data` 其它字段的量。
-const DATA_CHARS_BUDGET: usize = 20_000;
+/// 最终模型 JSON（包含 Outcome 外壳）的 UTF-8 字节预算；图片走独立通道。
+pub(super) const JSON_BYTES_BUDGET: usize = 12 * 1024;
+
+pub(super) fn outcome_bytes(tool: &'static str, summary: &str, data: &Value) -> usize {
+    Outcome::ok(tool, summary, data.clone()).to_model_json(usize::MAX).len()
+}
+
+pub(super) fn element_json(e: &screen_uia::ScreenElement) -> Value {
+    let label: String = e.label.chars().take(96).collect();
+    let window: String = e.window.chars().take(48).collect();
+    json!({
+        "id": e.id, "element_id": e.id, "role": e.role, "name": label, "label": label,
+        "label_source": e.label_source, "window": window, "window_id": e.identity.hwnd.to_string(),
+        "enabled": e.enabled, "foreground": e.foreground, "identity_verifiable": e.identity_verifiable(),
+        "clickable": e.non_executable_reason().map(|_| false),
+        "click_candidate": e.non_executable_reason().is_none(),
+        "non_executable_reason": e.non_executable_reason().unwrap_or("requires_live_validation"),
+        "text_truncated": label != e.label || window != e.window || (e.label_source == "name" && e.label != e.name.trim()),
+        "intent_hint": if e.label.is_empty() { "用途未知" } else { intent_hint(e.role) },
+        "x": e.rect[0], "y": e.rect[1], "w": e.rect[2], "h": e.rect[3],
+    })
+}
 
 /// 每次最多给模型 50 个元素，避免可访问树淹没上下文。
 const PAGE_SIZE: usize = 50;
@@ -117,29 +136,18 @@ fn take_page(key: &str, els: &[screen_uia::ScreenElement], cursor: &mut PageCurs
     let mut items = Vec::with_capacity(els.len());
     let mut ranges = Vec::new();
     let mut start = 0;
-    let mut used = 2; // JSON 数组的方括号。
     for e in els {
-        let mut item = json!({
-            "id": e.id, "element_id": e.id, "role": e.role, "name": e.name, "window": e.window,
-            "window_id": e.identity.hwnd.to_string(),
-            "intent_hint": intent_hint(e.role, &e.name),
-            "x": e.rect[0], "y": e.rect[1], "w": e.rect[2], "h": e.rect[3],
-        });
-        if item.to_string().chars().count() + 2 > DATA_CHARS_BUDGET {
-            // 单项也必须可完整送达；保留编号/坐标，避免最终外壳截断后游标跳过它。
-            for field in ["name", "window", "intent_hint"] {
-                item[field] = json!(item[field].as_str().unwrap().chars().take(512).collect::<String>());
-            }
-            item["text_truncated"] = json!(true);
-        }
-        let len = item.to_string().chars().count();
+        let item = element_json(e);
         let count = items.len() - start;
-        if count > 0 && (count == PAGE_SIZE || used + 1 + len > DATA_CHARS_BUDGET) {
+        let mut candidate = items[start..].to_vec();
+        candidate.push(item.clone());
+        // 使用最终外壳与保守元数据测量，选定整项后才推进游标。
+        let data = page_data(&cursor.snapshot_id, els.len(), &candidate, els.len(), els.len(), false, false, false,
+            screen::Rect { x: i32::MIN, y: i32::MIN, width: i32::MAX, height: i32::MAX }, 60);
+        if count > 0 && (count == PAGE_SIZE || outcome_bytes("screen_elements", &page_summary(els.len()), &data) > JSON_BYTES_BUDGET) {
             ranges.push((start, items.len(), count < PAGE_SIZE));
             start = items.len();
-            used = 2;
         }
-        used += len + usize::from(items.len() > start);
         items.push(item);
     }
     ranges.push((start, items.len(), false));
@@ -157,8 +165,8 @@ fn take_page(key: &str, els: &[screen_uia::ScreenElement], cursor: &mut PageCurs
     }
 }
 
-fn intent_hint(role: &str, name: &str) -> String {
-    let action = match role {
+fn intent_hint(role: &str) -> &'static str {
+    match role {
         "Button" | "SplitButton" => "执行",
         "Hyperlink" => "打开链接或跳转到",
         "MenuItem" => "选择菜单项",
@@ -170,11 +178,26 @@ fn intent_hint(role: &str, name: &str) -> String {
         "Edit" => "输入或编辑",
         "Slider" | "Spinner" => "调整",
         "Calendar" => "选择日期",
-        _ => "操作",
-    };
-    format!(
-        "可能用于{action}“{name}”；这是根据控件类型和可访问名称生成的提示，需结合窗口与截图确认"
-    )
+        _ => "用途未知",
+    }
+}
+
+fn page_summary(count: usize) -> String { format!("屏幕上 {count} 个元素（阅读顺序编号）") }
+
+fn page_data(snapshot: &str, count: usize, items: &[Value], page: usize, pages: usize,
+    has_more: bool, truncated: bool, all: bool, vs: screen::Rect, expires: u64) -> Value {
+    json!({
+        "snapshot_id": snapshot, "expires_in_seconds": expires,
+        "enumeration_complete": false,
+        "coverage_note": "UIA 有节点、深度、数量和协作式时间预算；未找到不代表不存在。请用 window_id/query/区域缩小范围。intent_hint 仅为类型提示，不证明用途。click_candidate 仅通过快照预检；clickable=null 表示遮挡与实时命中尚未核验，不保证可执行。",
+        "count": count, "shown": items.len(), "page": page, "pages": pages,
+        "has_more": has_more, "truncated": truncated, "byte_budget": JSON_BYTES_BUDGET,
+        "scope": if all { "all_windows" } else { "focused_window" },
+        "coordinate_space": "虚拟桌面物理像素",
+        "virtual_screen": {"x": vs.x, "y": vs.y, "width": vs.width, "height": vs.height},
+        "elements": items,
+        "next": "相同范围与内容轮换下一页，不延长原60秒TTL；click 需 snapshot_id+element_id 且即时核验。后台窗口不可直接点击，本工具不激活窗口。刷新、过期或动作后旧引用失效。",
+    })
 }
 
 pub(super) fn query_region(args: &Args) -> Result<Option<[i32; 4]>, ToolError> {
@@ -196,7 +219,7 @@ pub(super) fn parse_window_id(value: &str) -> Result<Option<isize>, ToolError> {
 
 fn overview_data(windows: &[screen_uia::WindowSummary], incomplete: bool) -> Value {
     let mut data = json!({"mode": "overview", "windows": [], "shown": 0,
-        "truncated": incomplete, "enumerated": windows.len(), "char_budget": 8000,
+        "truncated": incomplete, "enumerated": windows.len(), "byte_budget": 8000,
         "next": "用 screen_elements 的 window_id 精确查询目标窗口，配合 query 或 x/y/width/height 缩小范围；概览不产生可点击编号。"});
     for w in windows {
         let item = json!({"window_id": w.hwnd.to_string(), "title": w.title.chars().take(160).collect::<String>(),
@@ -204,7 +227,7 @@ fn overview_data(windows: &[screen_uia::WindowSummary], incomplete: bool) -> Val
             "rect": w.rect, "foreground": w.foreground, "minimized": w.minimized});
         data["windows"].as_array_mut().unwrap().push(item);
         data["shown"] = json!(data["windows"].as_array().unwrap().len());
-        if data.to_string().chars().count() > 8000 {
+        if outcome_bytes("screen_elements", "全桌面顶层窗口概览", &data) > 8000 {
             data["windows"].as_array_mut().unwrap().pop();
             data["shown"] = json!(data["windows"].as_array().unwrap().len());
             data["truncated"] = json!(true);
@@ -236,7 +259,7 @@ fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     let filter = Some(window.trim()).filter(|s| !s.is_empty());
     let all_windows = all || filter.is_some() || window_id.is_some();
     let _interaction = screen_uia::INTERACTION.lock().unwrap();
-    let query = screen_uia::Query { window_id, keyword: keyword.trim(), region };
+    let query = screen_uia::Query { window_id, keyword: keyword.trim(), region, ..Default::default() };
     let els = screen_uia::enumerate_query(filter, all_windows, 600, 800, &query)
         .inspect_err(|_| screen_uia::cache_invalidate())?;
     if els.is_empty() {
@@ -262,35 +285,9 @@ fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     let has_more = page.end < els.len();
 
     let vs = screen::virtual_screen();
-    let data = json!({
-        "snapshot_id": snapshot_id,
-        "expires_in_seconds": screen_uia::cache_remaining_seconds(),
-        "enumeration_complete": false,
-        "coverage_note": "UIA 枚举受节点、深度、元素数量与协作式时间预算限制；没有结果不代表目标不存在。单次系统调用无法被时间预算中断。",
-        "count": els.len(),
-        "shown": page.items.len(),
-        "page": page.page,
-        "pages": page.pages,
-        "has_more": has_more,
-        "truncated": page.truncated,
-        "scope": if all_windows { "all_windows" } else { "focused_window" },
-        "coordinate_space": "虚拟桌面物理像素（与 screenshot / click / drag 同一坐标系）",
-        "virtual_screen": {
-            "x": vs.x, "y": vs.y, "width": vs.width, "height": vs.height
-        },
-        "elements": page.items,
-        "next": if has_more {
-            "相同范围且内容未变化时轮换下一页，沿用未过期的 snapshot_id（不延长原始60秒有效期）。内容变化、刷新或动作后从第一页重新开始；点击需 snapshot_id 与 element_id。"
-        } else {
-            "click 必须同时给本次 snapshot_id 与 element_id；刷新、过期或动作后旧引用失效。坐标模式不验证目标身份。"
-        },
-    });
-
-    let mut outcome = Outcome::ok(
-        "screen_elements",
-        format!("屏幕上 {} 个可交互元素（已按上→下、左→右编号）", els.len()),
-        data,
-    );
+    let data = page_data(&snapshot_id, els.len(), &page.items, page.page, page.pages, has_more,
+        page.truncated, all_windows, vs, screen_uia::cache_remaining_seconds());
+    let mut outcome = Outcome::ok("screen_elements", page_summary(els.len()), data);
 
     if annotate {
         // 标注图超限就不附（32 MiB 是官方单图上限），清单本身仍然完整可用。
@@ -490,17 +487,42 @@ mod tests {
     }
 
     #[test]
-    fn intent_hint_is_explicitly_heuristic() {
-        let hint = intent_hint("Button", "保存");
-        assert!(hint.contains("执行"));
-        assert!(hint.contains("需结合窗口与截图确认"));
+    fn intent_hint_is_short_and_does_not_invent_unlabeled_purpose() {
+        assert_eq!(intent_hint("Button"), "执行");
+        assert_eq!(element_json(&elements(1, "")[0])["intent_hint"], "用途未知");
     }
 
     fn elements(count: usize, name: &str) -> Vec<screen_uia::ScreenElement> {
         (1..=count).map(|id| screen_uia::ScreenElement {
-            id, role: "Button", name: name.into(), window: "窗口".into(), rect: [0, 0, 10, 10],
-            identity: screen_uia::ElementIdentity::default(),
+            id, role: "Button", name: name.into(), label: name.into(), label_source: "name", window: "窗口".into(), rect: [0, 0, 10, 10],
+            identity: screen_uia::ElementIdentity::default(), ..Default::default()
         }).collect()
+    }
+
+    #[test]
+    fn execution_metadata_never_promises_an_unverified_click() {
+        let mut el = elements(1, "按钮").remove(0);
+        el.enabled = true; el.foreground = true; el.actionable = true;
+        el.identity = screen_uia::ElementIdentity { hwnd: 42, process_id: 7, process_started: 100,
+            window_process_id: 7, window_process_started: 100, window_runtime_id: vec![4], runtime_id: vec![1] };
+        let item = element_json(&el);
+        assert_eq!(item["click_candidate"], true);
+        assert!(item["clickable"].is_null());
+        assert_eq!(item["non_executable_reason"], "requires_live_validation");
+        for reason in ["disabled_or_unknown", "background_window", "offscreen_or_unknown", "no_click_action", "unverifiable_identity"] {
+            let mut blocked = el.clone();
+            match reason {
+                "disabled_or_unknown" => blocked.enabled = false,
+                "background_window" => blocked.foreground = false,
+                "offscreen_or_unknown" => blocked.offscreen = true,
+                "no_click_action" => blocked.actionable = false,
+                _ => blocked.identity.runtime_id.clear(),
+            }
+            let item = element_json(&blocked);
+            assert_eq!(item["click_candidate"], false);
+            assert_eq!(item["clickable"], false);
+            assert_eq!(item["non_executable_reason"], reason);
+        }
     }
 
     #[test]
@@ -510,7 +532,7 @@ mod tests {
             rect: [-1920, 0, 800, 600], foreground: hwnd == 1, minimized: false,
         }).collect();
         let data = overview_data(&windows, false);
-        assert!(data.to_string().chars().count() <= 8000);
+        assert!(outcome_bytes("screen_elements", "全桌面顶层窗口概览", &data) <= 8000);
         assert_eq!(data["truncated"], true);
         assert_eq!(data["windows"][0]["window_id"], "1");
         let out = Outcome::ok("screen_elements", "合成概览", data);
@@ -535,9 +557,10 @@ mod tests {
         let els = elements(121, "按钮");
         let mut cursor = PageCursor::default();
         let first = page_snapshot("scope", &els, &mut cursor);
-        assert_eq!(take_page("scope", &els, &mut cursor).start, 0);
+        let first_page = take_page("scope", &els, &mut cursor);
+        assert_eq!(first_page.start, 0);
         assert_eq!(page_snapshot("scope", &els, &mut cursor), first);
-        assert_eq!(take_page("scope", &els, &mut cursor).start, 50);
+        assert_eq!(take_page("scope", &els, &mut cursor).start, first_page.end);
         screen_uia::cache_invalidate();
         assert_ne!(page_snapshot("scope", &els, &mut cursor), first);
         assert_eq!(take_page("scope", &els, &mut cursor).start, 0);
@@ -548,14 +571,37 @@ mod tests {
     }
 
     #[test]
+    fn display_or_execution_state_change_resets_snapshot() {
+        let _interaction = screen_uia::INTERACTION.lock().unwrap();
+        let mut els = elements(80, "按钮");
+        let mut cursor = PageCursor::default();
+        let first = page_snapshot("scope", &els, &mut cursor);
+        take_page("scope", &els, &mut cursor);
+        els[0].label = "子文字已变化".into();
+        let second = page_snapshot("scope", &els, &mut cursor);
+        assert_ne!(first, second);
+        assert_eq!(take_page("scope", &els, &mut cursor).start, 0);
+        els[0].foreground = !els[0].foreground;
+        assert_ne!(page_snapshot("scope", &els, &mut cursor), second);
+        assert_eq!(take_page("scope", &els, &mut cursor).start, 0);
+        screen_uia::cache_invalidate();
+    }
+
+    #[test]
     fn pages_rotate_with_same_scope() {
         let els = elements(121, "按钮");
         let mut cursor = PageCursor::default();
-        for (number, start, end) in [(1, 0, 50), (2, 50, 100), (3, 100, 121), (1, 0, 50)] {
+        let mut next = 0;
+        let mut number = 0;
+        loop {
             let page = take_page("scope", &els, &mut cursor);
-            assert_eq!((page.page, page.pages, page.start, page.end), (number, 3, start, end));
-            assert_eq!(page.end < els.len(), number < 3);
+            number += 1;
+            assert_eq!((page.page, page.start), (number, next));
+            assert!(page.end - page.start <= PAGE_SIZE);
+            next = page.end;
+            if next == els.len() { assert_eq!(page.pages, number); break; }
         }
+        assert_eq!(take_page("scope", &els, &mut cursor).start, 0);
     }
 
     #[test]
@@ -569,7 +615,7 @@ mod tests {
                 let page = take_page("scope", &els, &mut cursor);
                 page_count += 1;
                 assert_eq!(page.page, page_count);
-                assert!(serde_json::to_string(&page.items).unwrap().chars().count() <= DATA_CHARS_BUDGET);
+                assert!(serde_json::to_string(&page.items).unwrap().len() <= JSON_BYTES_BUDGET);
                 assert_eq!(page.items.len(), page.end - page.start);
                 ids.extend(page.items.iter().map(|v| v["id"].as_u64().unwrap() as usize));
                 if page.end == els.len() {
@@ -590,21 +636,31 @@ mod tests {
         for name in ["\u{0000}".repeat(400), "\\\"中文".repeat(400), "\u{0000}".repeat(30_000)] {
             let mut els = elements(121, &name);
             for el in &mut els { el.window = name.clone(); }
-            let mut cursor = PageCursor::default();
+            let mut cursor = PageCursor { snapshot_id: "4294967295-18446744073709551615-18446744073709551615".into(), ..Default::default() };
+            let mut ids = Vec::new();
             loop {
                 let page = take_page("scope", &els, &mut cursor);
-                // 额外预留超过真实固定字段的外壳开销；以最终模型 JSON 而非原文长度核算。
-                let out = Outcome::ok("screen_elements", "屏幕上 121 个可交互元素", json!({
-                    "snapshot_id": "123456-1234567890123-18446744073709551615",
-                    "metadata_reserve": "字".repeat(3000), "elements": page.items,
-                }));
+                let data = page_data(&cursor.snapshot_id, els.len(), &page.items, page.page, page.pages,
+                    page.end < els.len(), page.truncated, false,
+                    screen::Rect { x: -1920, y: 0, width: 3840, height: 1080 }, 60);
+                let out = Outcome::ok("screen_elements", page_summary(els.len()), data);
+                assert!(out.to_model_json(usize::MAX).len() <= JSON_BYTES_BUDGET);
                 let text = crate::to_model_message(&out);
-                assert!(text.chars().count() <= 24_000);
+                assert!(text.len() <= JSON_BYTES_BUDGET);
                 let model: Value = serde_json::from_str(&text).unwrap();
                 assert!(model.get("truncated").is_none());
-                assert_eq!(model["data"]["elements"].as_array().unwrap().len(), page.end - page.start);
+                let received = model["data"]["elements"].as_array().unwrap();
+                assert_eq!(received.len(), page.end - page.start);
+                for (index, item) in received.iter().enumerate() {
+                    assert_eq!(item["id"], page.start + index + 1);
+                    assert_eq!(item["element_id"], item["id"]);
+                    ids.push(item["id"].as_u64().unwrap() as usize);
+                    assert!(item["window_id"].is_string());
+                    for key in ["x", "y", "w", "h"] { assert!(item[key].is_number()); }
+                }
                 if page.end == els.len() { break; }
             }
+            assert_eq!(ids, (1..=els.len()).collect::<Vec<_>>());
         }
     }
 
@@ -621,7 +677,7 @@ mod tests {
         assert!(model.get("truncated").is_none());
         assert_eq!(model["data"]["elements"][0]["id"], 1);
         assert_eq!(model["data"]["elements"][0]["text_truncated"], true);
-        assert!(out.data["elements"].to_string().chars().count() <= DATA_CHARS_BUDGET);
+        assert!(out.to_model_json(usize::MAX).len() <= JSON_BYTES_BUDGET);
     }
 
     #[test]
@@ -629,8 +685,8 @@ mod tests {
         let mut cursor = PageCursor::default();
         let first = elements(80, "旧窗口按钮");
         let second = elements(80, "新窗口按钮");
-        take_page("focus|", &first, &mut cursor);
-        assert_eq!(cursor.next_start, 50);
+        let page = take_page("focus|", &first, &mut cursor);
+        assert_eq!(cursor.next_start, page.end);
         assert_eq!(take_page("focus|", &second, &mut cursor).start, 0);
     }
 
@@ -696,7 +752,7 @@ mod tests {
             name: "副屏按钮".into(),
             window: "测试".into(),
             rect: [-1910, 30, 40, 20],
-            identity: screen_uia::ElementIdentity::default(),
+            identity: screen_uia::ElementIdentity::default(), ..Default::default()
         }];
         let marked = annotate_shot(&shot, &els, (-1920, 0)).expect("标注");
         let pixel = image::RgbaImage::from_raw(marked.width, marked.height, marked.rgba)

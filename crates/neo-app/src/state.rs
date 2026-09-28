@@ -321,6 +321,81 @@ pub enum MemoryIoMsg {
     Exported(Result<usize, String>),
 }
 
+/// 只有这些工具读取或操作实时桌面；纯缓存搜索不需要隐藏审批界面。
+pub(crate) fn needs_desktop(name: &str, args: &serde_json::Value) -> bool {
+    matches!(name, "screenshot" | "screen_elements" | "click" | "drag")
+        || (name == "screen_element_search" && args.get("refresh").and_then(|v| v.as_bool()) == Some(true))
+}
+
+pub(crate) struct DesktopRequest {
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub deadline: std::time::Instant,
+    pub ack: std::sync::mpsc::Sender<Result<(), String>>,
+}
+
+impl DesktopRequest {
+    pub(crate) fn live(&self) -> bool {
+        !self.cancel.load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < self.deadline
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DesktopExecution {
+    pub requests: std::sync::mpsc::Sender<DesktopRequest>,
+    pub active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub overlay: Option<neo_overlay::DesktopGate>,
+}
+
+struct DesktopLease {
+    active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    _overlay: Option<neo_overlay::DesktopGuard>,
+}
+
+impl Drop for DesktopLease {
+    fn drop(&mut self) {
+        // Overlay 的恢复命令须先入队，UI 才能看到最后一个执行租约结束。
+        drop(self._overlay.take());
+        self.active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl DesktopExecution {
+    fn acquire(&self, cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>, timeout: std::time::Duration) -> Result<DesktopLease, String> {
+        use std::sync::atomic::Ordering;
+        let deadline = std::time::Instant::now() + timeout;
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let mut lease = DesktopLease { active: self.active.clone(), _overlay: None };
+        let (ack, rx) = std::sync::mpsc::channel();
+        if cancel.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+            return Err("桌面请求已取消或超时，未请求隐藏".into());
+        }
+        self.requests.send(DesktopRequest { cancel: cancel.clone(), deadline, ack })
+            .map_err(|_| "桌面屏障 UI 线程不可用")?;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err("桌面工具已取消，未派发".into());
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("桌面屏障等待 UI 隐藏回执超时，未派发".into());
+            }
+            match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(10))) {
+                Ok(result) => { result?; break; }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => return Err("桌面屏障 UI 回执丢失，未派发".into()),
+            }
+        }
+        if let Some(overlay) = &self.overlay {
+            lease._overlay = Some(overlay.acquire(cancel, deadline.saturating_duration_since(std::time::Instant::now()))?);
+        }
+        if cancel.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+            return Err("桌面屏障已取消或超时，未派发".into());
+        }
+        Ok(lease)
+    }
+}
+
 /// 一次后台执行的句柄。
 struct ToolJob {
     /// 结果该写回哪条消息。
@@ -574,6 +649,12 @@ pub struct AppState {
     pub class_enabled: bool,
     /// 默认开启；有效后台开关和工具权限始终由此收紧。
     pub classroom_safe: bool,
+    /// 仅课堂安全模式下生效；普通工具或网络错误不因此退出。
+    pub silent_startup_errors: bool,
+    /// 每次运行延后检查一次 GitHub 发布，不自动下载。
+    pub auto_check_updates: bool,
+    pub update_check_requested: bool,
+    pub update_status: crate::updates::Status,
     /// 课堂总结状态行（「记录中…」「等待收尾…」），由 app 每帧从 ClassMonitor 同步。
     pub class_status: Option<String>,
 
@@ -625,6 +706,7 @@ pub struct AppState {
     /// 工具可能是几分钟的编译，**不能在渲染循环里同步跑**；这里只存句柄，
     /// 结果由 [`AppState::poll_tool_jobs`] 逐帧收。
     tool_jobs: Vec<ToolJob>,
+    pub(crate) desktop_execution: Option<DesktopExecution>,
 
     /// 可选模型列表。**默认为空** —— 只由模型商提供：
     /// 启动时先从库里读回上次拉到的那份（见 `NeoApp::load_settings`），
@@ -696,6 +778,10 @@ impl Default for AppState {
             start_in_tray: true,
             class_enabled: false,
             classroom_safe: true,
+            silent_startup_errors: false,
+            auto_check_updates: true,
+            update_check_requested: false,
+            update_status: crate::updates::Status::Idle,
             class_status: None,
             renaming: None,
             rename_draft: String::new(),
@@ -722,6 +808,7 @@ impl Default for AppState {
             compaction_resume: false,
             compaction_resume_config: None,
             tool_jobs: Vec::new(),
+            desktop_execution: None,
             // 默认为空：模型列表由模型商拉取，不在代码里写死。
             models: Vec::new(),
             model_fetch: None,
@@ -737,6 +824,11 @@ impl Default for AppState {
 }
 
 impl AppState {
+    /// 启动和运行时共用接线；只传布尔策略，不把普通故障变成退出信号。
+    pub(crate) fn sync_startup_policy(&self, apply: impl FnOnce(bool, bool)) {
+        apply(self.classroom_safe, self.classroom_safe && self.silent_startup_errors);
+    }
+
     pub fn effective_wake_enabled(&self) -> bool {
         self.wake_enabled && !self.classroom_safe
     }
@@ -1513,10 +1605,15 @@ impl AppState {
              screen_elements 元素页用相同参数轮换；overview 和 screen_element_search 没有 offset，按各自 next 提示处理。\n\
              powershell 是 Windows PowerShell 5.1，多语句用 ;，丢输出用 > $null；bash 才用 &&、/dev/null。\
              看图用 view_image(include_data=true) 或 screenshot，只有视觉模型支持；image_warning 表示未附图，不得声称看见。\
-             桌面坐标是虚拟桌面物理像素，可能为负；局部截图需加 region 原点，不能按缩放预览推测坐标。\
+             任何截图（含负原点全桌面、局部及二次裁剪）都按 image_space/image_to_desktop 理解：桌面点=region 原点+图内点，不乘 DPI，也不要除 dpi_scale；不能按缩放预览推测坐标。\
+             优先 snapshot_id+element_id 定位，其次 screenshot_id 截图引用+图内点；click/drag/screenshot 参数名就是 screenshot_id，直接传返回的 ID，不手工加偏移。\
+             例如 region 原点(-100,-50)，图内点(20,30)：click(screenshot_id=返回ID,x=20,y=30)，程序映射为桌面(-80,-20)。\
+             无截图引用时必须明确使用虚拟桌面物理坐标，可能为负；image_attached=false 或明确未发送图片时，不得使用该结果的 screenshot_id。\
+             view_image 的 source_size/sent_size 仅描述文件图片，没有可信 region/origin，不得当桌面定位依据。\
              仅在用户要求且策略允许时观察桌面：先 screen_elements(mode=overview)，再按 window_id/query 局部枚举。\
-             click 使用 snapshot_id+element_id，操作后刷新局部结果。screen_element_search(refresh=false) 只查缓存，\
-             refresh=true 才枚举。截图仅用于必要视觉信息；双击用 double。",
+             摘要或上下文压缩后，旧屏幕/截图坐标不得当实时依据，必须重新观察。\
+             成功 SendInput 仅表示 input_sent，不表示任务完成；操作后重新小范围观察验证，不自动重试有副作用操作。\
+             screen_element_search(refresh=false) 只查缓存，refresh=true 才枚举。截图仅用于必要视觉信息；双击用 double。",
             self.memory_block(),
             neo_tools::classlog::today_key(),
         )
@@ -1802,6 +1899,9 @@ impl AppState {
     ///
     /// 返回本次启动的任务数。
     pub fn spawn_ready_tools(&mut self, scope: &neo_tools::Scope) -> usize {
+        if self.awaiting_tool().is_some() {
+            return 0;
+        }
         let mut started = 0usize;
         let policy = self.tool_policy();
         for i in 0..self.messages.len() {
@@ -1835,10 +1935,20 @@ impl AppState {
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let job_scope = scope.clone().with_cancel(cancel.clone());
             let (tx, rx) = std::sync::mpsc::channel();
+            let desktop = self.desktop_execution.clone();
+            let job_cancel = cancel.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("neo-tool-{name}"))
                 .spawn(move || {
-                    let outcome = neo_tools::dispatch(&job_scope, &name, &args);
+                    let admission = if needs_desktop(&name, &args) {
+                        desktop.as_ref().ok_or_else(|| "桌面执行屏障未安装，未派发".to_owned())
+                            .and_then(|gate| gate.acquire(&job_cancel, std::time::Duration::from_secs(2))).map(Some)
+                    } else { Ok(None) };
+                    let outcome = match admission {
+                        Ok(_lease) if !job_cancel.load(std::sync::atomic::Ordering::Acquire) => neo_tools::dispatch(&job_scope, &name, &args),
+                        Ok(_) => neo_tools::Outcome::fail(tool_name, neo_tools::ToolError::not_allowed("工具已取消，未派发")),
+                        Err(error) => neo_tools::Outcome::fail(tool_name, neo_tools::ToolError::not_allowed(error)),
+                    };
                     // 接收端若已消失（会话被换掉），send 失败即丢弃结果。
                     let _ = tx.send(outcome);
                 });
@@ -1876,10 +1986,21 @@ impl AppState {
         let mut done = 0usize;
         let mut pending = Vec::with_capacity(self.tool_jobs.len());
         for job in std::mem::take(&mut self.tool_jobs) {
+            if job.cancel.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
             match job.rx.try_recv() {
                 Ok(outcome) => {
                     if let Some(msg) = self.messages.get_mut(job.index) {
                         store_outcome(msg, outcome);
+                        if let Some(outcome) = msg.tool.as_ref().and_then(|meta| meta.outcome.as_ref()) {
+                            if outcome.is_ok() && !msg.images.is_empty() {
+                                if let Some(id) = outcome.data["screenshot_id"].as_str() {
+                                    // 已交付的引用不再跟随 job Drop；任务取消仍统一失效。
+                                    let _ = neo_tools::tools::screenshot_space::confirm_delivery(id);
+                                }
+                            }
+                        }
                     }
                     done += 1;
                 }
@@ -2198,6 +2319,7 @@ impl AppState {
         self.tool_open = false;
         // ToolJob::drop 先置取消 token，再丢接收端；已发生的副作用无法回滚。
         self.tool_jobs.clear();
+        neo_tools::tools::screenshot_space::invalidate();
         // 挂起/执行中的工具标记为已取消，并补上对模型可见的结果：
         // 只改 state 的话 content 是空的 —— call_id 在 answered 列表里，
         // api_messages 的「无结果补说明」分支永远不会为它触发，模型每轮
@@ -2387,6 +2509,20 @@ mod tests {
     }
 
     #[test]
+    fn safety_desktop_prompt_requires_fresh_referenced_coordinates_and_verification() {
+        let prompt = super::AppState::default().system_prompt();
+        for rule in [
+            "负原点全桌面、局部及二次裁剪", "image_space/image_to_desktop", "不乘 DPI", "不要除 dpi_scale",
+            "click(screenshot_id=返回ID,x=20,y=30)", "桌面(-80,-20)", "image_attached=false",
+            "snapshot_id+element_id", "screenshot_id", "无截图引用时必须明确",
+            "source_size/sent_size", "不得当桌面定位依据", "必须重新观察",
+            "input_sent，不表示任务完成", "重新小范围观察", "不自动重试有副作用操作",
+        ] {
+            assert!(prompt.contains(rule), "missing rule: {rule}");
+        }
+    }
+
+    #[test]
     fn safety_plan_policy_blocks_side_effects_even_with_approval() {
         let mut state = super::AppState::default();
         state.classroom_safe = false;
@@ -2417,6 +2553,169 @@ mod tests {
             neo_tools::Decision::Allow
         ));
         assert!(state.system_prompt().contains("关闭计划模式再执行"));
+    }
+
+    #[test]
+    fn desktop_barrier_timeout_cancel_and_stale_ack_never_admit() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::channel};
+        use std::time::{Duration, Instant};
+        let (requests, rx) = channel();
+        let gate = DesktopExecution { requests, active: Default::default(), overlay: None };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        assert!(gate.acquire(&cancel, Duration::from_millis(15)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(gate.active.load(Ordering::Acquire), 0);
+        let stale = rx.recv().unwrap();
+        assert!(stale.ack.send(Ok(())).is_err());
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| gate.acquire(&cancel, Duration::from_secs(1)));
+            let request = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            cancel.store(true, Ordering::Release);
+            let _ = request.ack.send(Ok(()));
+            assert!(waiting.join().unwrap().is_err());
+        });
+        assert_eq!(gate.active.load(Ordering::Acquire), 0);
+        let next_cancel = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| gate.acquire(&next_cancel, Duration::from_secs(1)));
+            rx.recv_timeout(Duration::from_secs(1)).unwrap().ack.send(Ok(())).unwrap();
+            let lease = waiting.join().unwrap().unwrap();
+            assert_eq!(gate.active.load(Ordering::Acquire), 1);
+            drop(lease);
+        });
+        assert_eq!(gate.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn desktop_barrier_pending_approval_does_not_request_hide() {
+        let mut state = AppState::with_store(false, None);
+        state.classroom_safe = false;
+        let (requests, rx) = std::sync::mpsc::channel();
+        state.desktop_execution = Some(DesktopExecution { requests, active: Default::default(), overlay: None });
+        for (name, status) in [("click", ToolState::Running), ("drag", ToolState::AwaitingConfirm)] {
+            let mut meta = ToolMeta::restored(name);
+            meta.name = name.into();
+            meta.state = status;
+            state.messages.push(ChatMessage::tool_result(meta, String::new()));
+        }
+        assert_eq!(state.spawn_ready_tools(&neo_tools::Scope::new(std::env::temp_dir())), 0);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.desktop_execution.as_ref().unwrap().active.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn desktop_barrier_scope_and_missing_gate_fail_closed() {
+        for name in ["click", "drag", "screenshot", "screen_elements"] {
+            assert!(needs_desktop(name, &serde_json::json!({})));
+            assert!(neo_tools::find(name).is_some());
+        }
+        assert!(needs_desktop("screen_element_search", &serde_json::json!({"refresh": true})));
+        assert!(!needs_desktop("screen_element_search", &serde_json::json!({})));
+        assert!(!needs_desktop("screen_element_search", &serde_json::json!({"refresh": false})));
+        assert!(!needs_desktop("screen_element_search", &serde_json::json!({"refresh": null})));
+        let search = neo_tools::find("screen_element_search").unwrap();
+        assert!(!neo_tools::Args::new(search, &serde_json::json!({})).flag("refresh").unwrap());
+        assert!(!needs_desktop("read_file", &serde_json::json!({})));
+        let mut state = AppState::with_store(false, None);
+        let mut meta = ToolMeta::restored("click");
+        meta.name = "click".into();
+        meta.state = ToolState::Running;
+        meta.args = serde_json::json!({"x": 1, "y": 1});
+        state.classroom_safe = false;
+        state.messages.push(ChatMessage::tool_result(meta, String::new()));
+        assert_eq!(state.spawn_ready_tools(&neo_tools::Scope::new(std::env::temp_dir())), 1);
+        assert!(state.wait_tool_jobs(std::time::Duration::from_secs(1)));
+        let outcome = state.messages[0].tool.as_ref().unwrap().outcome.as_ref().unwrap();
+        assert!(outcome.error.as_ref().unwrap().message.contains("屏障未安装"));
+    }
+
+    fn queue_synthetic_screenshot_job(state: &mut AppState, failed: bool) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use base64::Engine;
+        use neo_tools::tools::{screen::Rect, screenshot_space};
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scope = neo_tools::Scope::new(std::env::temp_dir()).with_cancel(cancel.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let index = state.messages.len();
+        let mut meta = ToolMeta::restored("screenshot");
+        meta.name = "screenshot".into();
+        meta.state = ToolState::Running;
+        state.messages.push(ChatMessage::tool_result(meta, String::new()));
+        state.tool_jobs.push(ToolJob { index, rx, cancel: cancel.clone() });
+        let id = std::thread::spawn(move || {
+            let rect = Rect { x: -100, y: -50, width: 20, height: 30 };
+            let space = screenshot_space::ImageSpace::new(rect, 20, 30, vec![rect]).unwrap();
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(20, 30).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+            let id = screenshot_space::register(space.clone(), &scope, screenshot_space::generation()).unwrap();
+            let mut data = space.metadata();
+            data["region"] = screenshot_space::rect_json(rect);
+            data["screenshot_id"] = serde_json::json!(id);
+            data["image_attached"] = serde_json::json!(true);
+            let mut outcome = neo_tools::Outcome::ok("screenshot", "合成截图", data)
+                .with_image(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())));
+            if failed { outcome.error = Some(neo_tools::ToolError::not_allowed("合成交付失败")); }
+            tx.send(outcome).unwrap();
+            id
+        }).join().unwrap();
+        (id, cancel)
+    }
+
+    #[test]
+    fn screenshot_job_delivery_survives_drop_and_resolves_next_click_until_cancel_or_session_reset() {
+        use neo_tools::tools::{screen, screenshot_space};
+        use std::sync::atomic::Ordering;
+        for switch_session in [false, true] {
+            let mut state = AppState::with_store(false, None);
+            let (id, cancel) = queue_synthetic_screenshot_job(&mut state, false);
+            assert_eq!(state.poll_tool_jobs(), 1);
+            assert!(!state.tools_running());
+            assert!(cancel.load(Ordering::Acquire), "正常收件仍执行 ToolJob 的安全取消");
+            assert!(screenshot_space::require_known(&id).is_ok());
+            let outcome = state.messages[0].tool.as_ref().unwrap().outcome.as_ref().unwrap();
+            assert_eq!(outcome.data["screenshot_id"], id);
+            assert_eq!(state.messages[0].images.len(), 1);
+
+            // 复用 click 的纯坐标解析步骤，注入合成拓扑；不调用桌面查询或输入。
+            let click = serde_json::json!({"screenshot_id": id, "x": 7, "y": 9});
+            let args = neo_tools::Args::new(neo_tools::find("click").unwrap(), &click);
+            screenshot_space::validate_args(&args).unwrap();
+            let reference = args.require_str("screenshot_id").unwrap();
+            screenshot_space::require_known(&reference).unwrap();
+            let topology = vec![screen::Rect { x: -100, y: -50, width: 20, height: 30 }];
+            let space = screenshot_space::resolve(&reference, topology.clone()).unwrap();
+            let mapped = space.point(args.opt_int("x").unwrap() as i32, args.opt_int("y").unwrap() as i32).unwrap();
+            screen::require_monitor_point(&topology, "合成点击", mapped.0, mapped.1).unwrap();
+            assert_eq!(mapped, (-93, -41));
+
+            if switch_session { state.new_session(); } else { state.cancel(); }
+            assert!(screenshot_space::require_known(&id).is_err());
+            assert!(screenshot_space::confirm_delivery(&id).is_err());
+        }
+    }
+
+    #[test]
+    fn screenshot_job_failed_cancelled_and_undelivered_results_never_detach() {
+        use neo_tools::tools::screenshot_space;
+        use std::sync::atomic::Ordering;
+        for variant in 0..5 {
+            let mut state = AppState::with_store(false, None);
+            let (id, cancel) = queue_synthetic_screenshot_job(&mut state, variant == 0);
+            match variant {
+                1 => state.cancel(),
+                2 => state.new_session(),
+                3 => cancel.store(true, Ordering::Release),
+                4 => state.messages.clear(),
+                _ => {}
+            }
+            state.poll_tool_jobs();
+            assert!(cancel.load(Ordering::Acquire));
+            assert!(screenshot_space::require_known(&id).is_err(), "variant {variant}");
+            assert!(screenshot_space::confirm_delivery(&id).is_err());
+            if variant == 1 { assert_eq!(state.messages[0].tool.as_ref().unwrap().state, ToolState::Cancelled); }
+            if variant == 2 || variant == 4 { assert!(state.messages.is_empty()); }
+            if variant == 3 { assert!(state.messages[0].images.is_empty()); }
+        }
     }
 
     #[test]
@@ -3282,6 +3581,64 @@ mod tests {
                 assert_eq!(message.reasoning.as_deref(), Some("继续读取并检查结果"));
             }
         }
+    }
+
+    #[test]
+    fn context_tool_image_keeps_negative_region_and_call_association() {
+        let mut state = AppState::default();
+        state.messages.push(ChatMessage::new(Role::User, "查看局部"));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 3).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let url = neo_tools::tools::view_image::model_image(png.get_ref(), false).unwrap();
+        let region = serde_json::json!({"x": -100, "y": -50, "width": 2, "height": 3});
+        let rect = neo_tools::tools::screen::Rect { x: -100, y: -50, width: 2, height: 3 };
+        let mut metadata = neo_tools::tools::screenshot_space::ImageSpace::new(rect, 2, 3, vec![rect]).unwrap().metadata();
+        metadata["region"] = region.clone();
+        metadata["screenshot_id"] = serde_json::json!("shot-reference");
+        metadata["image_attached"] = serde_json::json!(true);
+        metadata["sent_size"] = serde_json::json!({"width": 2, "height": 3});
+        let mut outcome = neo_tools::Outcome::ok("screenshot", "截图", metadata.clone()).with_image(url.clone());
+        crate::attachments::prepare_tool_images(&mut outcome);
+        append_context_result(&mut state, "shot-call", outcome);
+        let stored = state.messages.last().unwrap();
+        let stored_data: serde_json::Value = serde_json::from_str(&stored.content).unwrap();
+        assert_eq!(stored_data["data"]["screenshot_id"], "shot-reference");
+        assert_eq!(stored.images, vec![url.clone()]);
+        let mut messages = state.api_messages(24);
+        neo_llm::budget_messages(&state.llm_config(), &mut messages, &neo_tools::tool_declarations()).unwrap();
+        let body = neo_llm::request_body(&state.llm_config(), &messages, neo_tools::tool_declarations());
+        let wire = body["messages"].as_array().unwrap();
+        let result = wire.iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(result["tool_call_id"], "shot-call");
+        let data: serde_json::Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(data["data"]["region"], region);
+        assert_eq!(data["data"]["screenshot_id"], "shot-reference");
+        for key in ["image_to_desktop", "image_space", "sent_size"] {
+            assert_eq!(data["data"][key], metadata[key]);
+        }
+        let blocks = &wire.last().unwrap()["content"];
+        assert_eq!(blocks[1]["text"], "shot-call");
+        assert_eq!(blocks[2]["image_url"]["url"], url);
+    }
+
+    #[test]
+    fn context_missing_screenshot_cannot_keep_reference_or_claim_image() {
+        let mut state = AppState::default();
+        state.messages.push(ChatMessage::new(Role::User, "查看局部"));
+        append_context_result(&mut state, "missing-shot", neo_tools::Outcome::ok("screenshot", "已把图交给模型",
+            serde_json::json!({"screenshot_id": "unusable", "image_attached": true,
+                "sent_size": {"width": 2, "height": 3}, "image_to_desktop": {"scale_x": 1}})));
+        let result = state.messages.last().unwrap();
+        assert!(result.images.is_empty());
+        assert!(!result.meta.contains("已把图交给模型"));
+        let data: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(data["data"]["image_attached"], false);
+        assert!(data["data"]["screenshot_id"].is_null());
+        assert!(data["data"].get("image_to_desktop").is_none());
+        let messages = state.api_messages(24);
+        let result = messages.iter().find(|message| message.role == ApiRole::Tool).unwrap();
+        assert!(result.images.is_empty());
+        assert!(!result.content.contains("unusable"));
     }
 
     #[test]

@@ -89,9 +89,12 @@ impl LogViewState {
             ui.set_max_width(width);
             ui.spacing_mut().item_spacing = egui::vec2(m.s(8.0), m.s(8.0));
             ui.add(egui::Label::new(
-                RichText::new("仅内存日志，重启后丢失；不落盘、不上传、不进入模型上下文。")
+                RichText::new("下方为进程内诊断，重启后丢失，不落盘、不上传、不进入模型上下文。启动故障另记本地安全概括日志，不含聊天或工具原文；此处清空不删除启动日志。")
                     .font(skin.prop(skin.t().caption)).color(p.label_secondary),
             ).wrap());
+            if let Some(dir) = crate::startup::log_dir() {
+                super::settings::kv_row(ui, skin, width, "启动日志目录", &dir.display().to_string());
+            }
             let selected = self.level.and_then(|level| Level::ALL.iter().position(|value| *value == level))
                 .map_or(0, |index| index + 1);
             let options = ["全部", "调试", "信息", "警告", "错误"];
