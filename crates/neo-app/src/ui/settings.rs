@@ -95,7 +95,7 @@ pub fn panel(
     let nav_w = m.s(152.0);
     let gap = m.s(16.0);
     let content_rect = if compact {
-        let nav_rect = Rect::from_min_size(inner.min, Vec2::new(inner.width(), m.s(42.0)));
+        let nav_rect = Rect::from_min_size(inner.min, Vec2::new(inner.width(), m.s(32.0)));
         at(ui, nav_rect, |ui| {
             let nav = egui::ComboBox::from_id_salt("settings-compact-nav")
                 .selected_text(page_name(state.settings_tab))
@@ -142,7 +142,7 @@ pub fn panel(
         let cw = content_rect.width();
 
         // 标题按实际字高布局，并为关闭按钮单独留出点击区。
-        let close_d = m.s(30.0);
+        let close_d = m.hit_target(m.s(28.0)).min(cw * 0.5);
         let title = ui.painter().layout(
             page_name(state.settings_tab).to_owned(),
             d.font_bold(d.t().label + m.s(4.0)),
@@ -153,17 +153,19 @@ pub fn panel(
             Vec2::new(cw, title.size().y.max(close_d)), Sense::hover());
         ui.painter().galley(title_rect.min, title, p.label_primary);
         let close_center = egui::pos2(title_rect.right() - close_d * 0.5, title_rect.center().y);
-        if IconButton::new(Icon::Close)
-            .ghost()
-            .id_salt("neo-settings-close")
-            .show_at(ui, &d, close_center)
-            .clicked()
-        {
+        let close_rect = Rect::from_min_max(
+            egui::pos2(title_rect.right() - close_d, title_rect.top()), title_rect.max);
+        let close = ui.scope(|ui| {
+            ui.shrink_clip_rect(close_rect);
+            IconButton::new(Icon::Close).ghost().label("关闭设置")
+                .id_salt("neo-settings-close").show_at(ui, &d, close_center)
+        }).inner;
+        if close.clicked() {
             closed = true;
         }
         #[cfg(test)]
         ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("settings-title-probe"),
-            (title_rect, Rect::from_center_size(close_center, Vec2::splat(close_d)))));
+            (title_rect, close.rect)));
         ui.add_space(m.s(8.0));
         // 低矮窗口把说明和完整错误放入同一滚动区，不让固定头部吃掉正文。
         let scroll_intro = content_rect.height() < m.s(360.0);
@@ -547,7 +549,16 @@ fn memory_tab_with_edit(
     skin: &Skin<'_>,
     width: f32,
     state: &mut AppState,
+    edit: impl FnMut(u64, &str) -> Result<Option<neo_tools::tools::memory::Memory>, neo_tools::ToolError>,
+) {
+    memory_tab_with_actions(ui, skin, width, state, edit,
+        |id| neo_tools::tools::memory::forget_memory(&format!("#{id}")));
+}
+
+fn memory_tab_with_actions(
+    ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState,
     mut edit: impl FnMut(u64, &str) -> Result<Option<neo_tools::tools::memory::Memory>, neo_tools::ToolError>,
+    mut delete: impl FnMut(u64) -> Result<Option<neo_tools::tools::memory::Memory>, neo_tools::ToolError>,
 ) {
     use neo_tools::tools::memory as mem;
 
@@ -557,6 +568,12 @@ fn memory_tab_with_edit(
 
     let error_id = egui::Id::new("neo-memory-write-error");
     let mut error = ui.ctx().data(|data| data.get_temp::<String>(error_id));
+    let owner_id = error_id.with("row");
+    let mut error_owner = ui.ctx().data(|data| data.get_temp::<u64>(owner_id));
+    let confirm_id = egui::Id::new("neo-memory-delete-confirm");
+    let mut confirming = ui.ctx().data(|data| data.get_temp::<(u64, bool)>(confirm_id));
+    let scroll_id = error_id.with("scroll");
+    let scroll_error = ui.ctx().data_mut(|data| data.remove_temp::<bool>(scroll_id)).unwrap_or(false);
 
     section_label_row(ui, skin, width, "AI 记住的事");
 
@@ -572,6 +589,7 @@ fn memory_tab_with_edit(
     // 行内动作先记账、循环外落地 —— 避免边遍历边改 Vec / 编辑态。
     enum Act {
         Edit(u64, String),
+        RequestDelete(u64),
         Delete(u64),
         Save,
         Cancel,
@@ -579,13 +597,37 @@ fn memory_tab_with_edit(
     let mut act: Option<Act> = None;
 
     for item in &state.memories {
+        if error_owner == Some(item.id) {
+            if let Some(message) = &error {
+                let notice = neo_ui::InlineNotice::new(("memory-error", item.id), message)
+                    .tone(neo_ui::NoticeTone::Error).show(ui, &d);
+                if scroll_error { notice.scroll_to_me(Some(egui::Align::Min)); }
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-memory-error-probe"), (notice.rect, ui.clip_rect())));
+                ui.add_space(m.s(6.0));
+            }
+        }
+        if let Some((id, opening)) = confirming.filter(|(id, _)| *id == item.id) {
+            let question = format!("删除记忆 #{}？此操作无法撤销。\n{}", id, item.content);
+            let result = neo_ui::list::ConfirmBar::new(&question)
+                .show(ui, &d, ("memory-confirm", id), opening);
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-memory-confirm-probe"), (result.cancel.rect, result.confirm.rect)));
+            confirming = Some((id, false));
+            match result.outcome {
+                neo_ui::list::ConfirmOutcome::Confirm => act = Some(Act::Delete(id)),
+                neo_ui::list::ConfirmOutcome::Cancel => confirming = None,
+                neo_ui::list::ConfirmOutcome::None => {}
+            }
+            ui.add_space(m.s(8.0));
+            continue;
+        }
         let editing = matches!(&state.memory_editing, Some((id, _)) if *id == item.id);
         if editing {
             // 窄屏让输入与操作分行，避免按钮挤出内容区。
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(m.s(6.0), m.s(6.0));
-                let input_w = if width < m.s(240.0) { width }
-                    else { (width - m.s(30.0) * 2.0 - m.s(12.0)).max(0.0) };
+                let input_w = width;
                 if let Some((_, draft)) = state.memory_editing.as_mut() {
                     TextField::new(draft)
                         .id_salt(("neo-mem-edit", item.id))
@@ -593,8 +635,9 @@ fn memory_tab_with_edit(
                 }
                 let save = IconButton::new(Icon::Check)
                     .ghost()
+                    .label("保存记忆")
                     .id_salt(("neo-mem-save", item.id))
-                    .show(ui, &d);
+                    .show_touch(ui, &d);
                 #[cfg(test)]
                 ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-memory-save-probe"), save.rect));
                 if save.clicked() {
@@ -602,8 +645,9 @@ fn memory_tab_with_edit(
                 }
                 if IconButton::new(Icon::Close)
                     .ghost()
+                    .label("取消编辑记忆")
                     .id_salt(("neo-mem-cancel", item.id))
-                    .show(ui, &d)
+                    .show_touch(ui, &d)
                     .clicked()
                 {
                     act = Some(Act::Cancel);
@@ -613,94 +657,61 @@ fn memory_tab_with_edit(
             continue;
         }
 
-        // 常规态：#id + 内容（超长截断），右侧恒显 编辑/删除（教室一体机没有 hover）。
-        // 行体不可点 —— 整行刷 hover 底色是在承诺点击行为，别画（项目规矩：
-        // 「给没有点击行为的控件画 hover 态是在撒谎」）。
-        let (rect, _resp) = ui.allocate_exact_size(Vec2::new(width, m.s(36.0)), Sense::hover());
-
-        let btn_d = m.s(26.0);
-        let trash_center = egui::pos2(rect.right() - btn_d * 0.5, rect.center().y);
-        let pen_center = egui::pos2(rect.right() - btn_d * 1.5 - m.s(4.0), rect.center().y);
-        if IconButton::new(Icon::Pen)
-            .ghost()
-            .id_salt(("neo-mem-pen", item.id))
-            .show_at(ui, &d, pen_center)
-            .clicked()
-        {
-            act = Some(Act::Edit(item.id, item.content.clone()));
-        }
-        if IconButton::new(Icon::Trash)
-            .danger()
-            .id_salt(("neo-mem-trash", item.id))
-            .show_at(ui, &d, trash_center)
-            .clicked()
-        {
-            act = Some(Act::Delete(item.id));
-        }
-
-        // 文字区给按钮让位；内容里的换行压成空格，保证单行不顶破行高。
-        let text_rect = Rect::from_min_max(
-            rect.min + egui::vec2(m.s(8.0), 0.0),
-            egui::pos2(pen_center.x - btn_d * 0.5 - m.s(8.0), rect.bottom()),
-        );
-        let id_font = skin.prop(skin.t().caption);
-        let id_text = format!("#{}", item.id);
-        let id_w = ui
-            .painter()
-            .layout_no_wrap(id_text.clone(), id_font.clone(), p.label_caption)
-            .size()
-            .x;
-        ui.painter().text(
-            text_rect.left_center(),
-            egui::Align2::LEFT_CENTER,
-            id_text,
-            id_font,
-            p.label_caption,
-        );
-        let body_rect = Rect::from_min_max(
-            egui::pos2(text_rect.left() + id_w + m.s(8.0), text_rect.top()),
-            text_rect.max,
-        );
-        let font = d.font(d.t().label);
-        let flat = item.content.replace(['\r', '\n'], " ");
-        let shown = neo_ui::elide(ui.painter(), &flat, &font, body_rect.width());
-        ui.painter().text(
-            body_rect.left_center(),
-            egui::Align2::LEFT_CENTER,
-            shown,
-            font,
-            p.label_primary,
-        );
-        ui.add_space(m.s(2.0));
+        ui.add(egui::Label::new(egui::RichText::new(format!("#{} · {}", item.id, item.content))
+            .font(d.font(d.t().label)).color(p.label_primary)).wrap());
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::splat(m.s(6.0));
+            let pen = IconButton::new(Icon::Pen).ghost().label("编辑记忆")
+                .id_salt(("neo-mem-pen", item.id)).show_touch(ui, &d);
+            let trash = IconButton::new(Icon::Trash).danger().label("删除记忆")
+                .id_salt(("neo-mem-trash", item.id)).show_touch(ui, &d);
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(egui::Id::new(("neo-memory-actions-probe", item.id)), (pen.rect, trash.rect));
+            });
+            if pen.clicked() { act = Some(Act::Edit(item.id, item.content.clone())); }
+            if trash.clicked() { act = Some(Act::RequestDelete(item.id)); }
+        });
+        ui.add_space(m.s(8.0));
     }
 
+    let acted = act.is_some();
     match act {
         Some(Act::Edit(id, content)) => {
-            if state.memory_editing.is_some() {
+            if let Some((editing_id, _)) = state.memory_editing.as_ref() {
+                error_owner = Some(*editing_id);
                 error = Some("请先保存或取消当前编辑，草稿已保留".to_owned());
             } else {
                 state.memory_editing = Some((id, content));
             }
         }
-        Some(Act::Delete(id)) => match mem::forget_memory(&format!("#{id}")) {
-            Ok(Some(_)) => {
-                error = None;
-                reload_memories(state);
+        Some(Act::RequestDelete(id)) => confirming = Some((id, true)),
+        Some(Act::Delete(id)) => {
+            confirming = None;
+            error_owner = Some(id);
+            match delete(id) {
+                Ok(Some(_)) => {
+                    error = None;
+                    state.memories.retain(|item| item.id != id);
+                    state.memories_file_ms = None;
+                }
+                Ok(None) => error = Some("删除失败：该记忆已不存在".to_owned()),
+                Err(e) => error = Some(format!("删除失败：{}", e.message)),
             }
-            Ok(None) => error = Some("删除失败：该记忆已不存在".to_owned()),
-            Err(e) => error = Some(format!("删除失败：{}", e.message)),
         },
         Some(Act::Save) => {
             if let Some((id, draft)) = &state.memory_editing {
+                error_owner = Some(*id);
                 let trimmed = draft.trim();
                 if trimmed.is_empty() {
                     error = Some("记忆内容不能为空；如需删除请取消编辑后使用删除按钮".to_owned());
                 } else {
                     match edit(*id, trimmed) {
-                        Ok(Some(_)) => {
+                        Ok(Some(updated)) => {
+                            if let Some(item) = state.memories.iter_mut().find(|item| item.id == updated.id) { *item = updated; }
                             state.memory_editing = None;
                             error = None;
-                            reload_memories(state);
+                            state.memories_file_ms = None;
                         }
                         Ok(None) => error = Some("保存失败：该记忆已不存在，草稿已保留".to_owned()),
                         Err(e) => error = Some(format!("保存失败：{}（草稿已保留）", e.message)),
@@ -708,19 +719,26 @@ fn memory_tab_with_edit(
                 }
             }
         }
-        Some(Act::Cancel) => state.memory_editing = None,
+        Some(Act::Cancel) => { state.memory_editing = None; error = None; }
         None => {}
     }
+    ui.ctx().data_mut(|data| {
+        if let Some(value) = confirming { data.insert_temp(confirm_id, value); }
+        else { data.remove::<(u64, bool)>(confirm_id); }
+        if acted && error.is_some() && error_owner.is_some() {
+            data.insert_temp(scroll_id, true);
+        }
+    });
 
     // 添加与备份。
     ui.add_space(m.s(10.0));
     section_label_row(ui, skin, width, "添加与备份");
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(m.s(8.0), m.s(8.0));
-        let input_w = if width < m.s(240.0) { width }
-            else { (width - m.s(64.0) - m.s(8.0)).max(0.0) };
+        let input_w = width;
         input_row(ui, skin, input_w, &mut state.memory_draft, false, "neo-mem-new");
         if neo_ui::Button::new("记下")
+            .touch_layout()
             .elevated()
             .show(ui, &d)
             .clicked()
@@ -733,15 +751,19 @@ fn memory_tab_with_edit(
                         error = None;
                         reload_memories(state);
                     }
-                    Err(e) => error = Some(format!("添加失败：{}（草稿已保留）", e.message)),
+                    Err(e) => { error_owner = None; error = Some(format!("添加失败：{}（草稿已保留）", e.message)); },
                 }
             }
         }
     });
-    if let Some(message) = &error {
-        ui.add(egui::Label::new(egui::RichText::new(message).color(p.error)).wrap());
+    if error_owner.is_none() {
+        if let Some(message) = &error {
+            neo_ui::InlineNotice::new("memory-add-error", message).tone(neo_ui::NoticeTone::Error).show(ui, &d);
+        }
     }
     ui.ctx().data_mut(|data| {
+        if let Some(owner) = error_owner.filter(|_| error.is_some()) { data.insert_temp(owner_id, owner); }
+        else { data.remove::<u64>(owner_id); }
         if let Some(message) = error {
             data.insert_temp(error_id, message);
         } else {
@@ -752,6 +774,7 @@ fn memory_tab_with_edit(
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(m.s(8.0), m.s(8.0));
         if neo_ui::Button::new("导入…")
+            .touch_layout()
             .ghost()
             .show(ui, &d)
             .clicked()
@@ -759,6 +782,7 @@ fn memory_tab_with_edit(
             state.import_memories_dialog(ui.ctx());
         }
         if neo_ui::Button::new("导出…")
+            .touch_layout()
             .ghost()
             .show(ui, &d)
             .clicked()
@@ -1044,7 +1068,7 @@ mod ui_regression {
                 render(vec![]);
                 let output = render(vec![]);
                 let (title, close): (Rect, Rect) = probe(&ctx, "settings-title-probe");
-                assert!(title.contains_rect(close));
+                assert!(title.contains_rect(close), "标题热区 {width}/{scale}: {title:?}, {close:?}");
                 let mut found = false;
                 for clipped in &output.shapes {
                     if let egui::Shape::Text(text) = &clipped.shape {
@@ -1120,6 +1144,157 @@ mod ui_regression {
             assert_eq!(seen.len(), warning_rows);
             assert!(database_seen, "body unreachable {width}/{height}/{scale}");
         }
+    }
+
+    #[test]
+    fn memory_controls_expose_full_accessible_labels_and_disabled_state() {
+        let ctx = context();
+        ctx.enable_accesskit();
+        let output = frame(&ctx, egui::vec2(320.0, 600.0), vec![], |ui, skin| {
+            let button = neo_ui::Button::new("完整的危险操作说明不能只剩省略号")
+                .id_salt("disabled-semantic-button").enabled(false).touch_layout().show(ui, &skin.d());
+            assert!(!button.enabled());
+            let icon = IconButton::new(Icon::Trash).label("删除当前记忆，需再次确认")
+                .id_salt("disabled-semantic-icon").enabled(false).show_touch(ui, &skin.d());
+            assert!(!icon.enabled());
+        });
+        let tree = output.platform_output.accesskit_update.unwrap();
+        for label in ["完整的危险操作说明不能只剩省略号", "删除当前记忆，需再次确认"] {
+            let node = tree.nodes.iter().find(|(_, node)| node.label() == Some(label)).expect("full accessible button label");
+            assert!(node.1.is_disabled());
+        }
+    }
+
+    #[test]
+    fn memory_delete_requires_confirmation_and_targets_do_not_overlap() {
+        for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
+            for scale in [0.85, 1.0, 1.75, 2.8] {
+                for width in [240.0, 320.0, 560.0] {
+                    for cancel in [false, true] {
+                        let ctx = context();
+                        neo_theme::fonts::install(&ctx);
+                        let theme = neo_theme::Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
+                        theme.apply(&ctx);
+                        let whale = crate::brand::WhaleMark::cached(&ctx);
+                        let skin = Skin::new(theme, &whale);
+                        let mut state = AppState::default();
+                        state.memories = (1..=3).map(|id| neo_tools::tools::memory::Memory {
+                            id, content: "memory".into(), updated_ms: 0,
+                        }).collect();
+                        let calls = std::cell::Cell::new(0);
+                        let mut render = |events| {
+                            let mut output = ctx.run_ui(egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 6000.0))),
+                                events, ..Default::default()
+                            }, |ui| {
+                                ui.set_max_width(width - 16.0);
+                                memory_tab_with_actions(ui, &skin, width - 16.0, &mut state,
+                                    |_, _| panic!("unexpected edit"), |id| {
+                                        calls.set(calls.get() + 1);
+                                        Ok(Some(neo_tools::tools::memory::Memory { id, content: "memory".into(), updated_ms: 0 }))
+                                    });
+                            });
+                            output.textures_delta.clear();
+                        };
+                        render(vec![]); render(vec![]);
+                        let mut rects = Vec::new();
+                        for id in 1..=3_u64 {
+                            let (pen, trash): (Rect, Rect) = probe(&ctx, ("neo-memory-actions-probe", id));
+                            rects.extend([pen, trash]);
+                        }
+                        for (i, rect) in rects.iter().enumerate() {
+                            assert!(rect.right() <= width);
+                            for other in &rects[i + 1..] { assert!(!rect.shrink(0.1).intersects(other.shrink(0.1))); }
+                        }
+                        render(pointer(rects[1].center(), true));
+                        render(pointer(rects[1].center(), false));
+                        assert_eq!(calls.get(), 0);
+                        render(vec![]); render(vec![]);
+                        assert_eq!(calls.get(), 0);
+                        let (cancel_rect, confirm_rect): (Rect, Rect) = probe(&ctx, "neo-memory-confirm-probe");
+                        let target = if cancel { cancel_rect } else { confirm_rect };
+                        render(pointer(target.center(), true));
+                        render(pointer(target.center(), false));
+                        assert_eq!(calls.get(), if cancel { 0 } else { 1 });
+                        for _ in 0..4 { render(vec![]); }
+                        render(pointer(target.center(), false));
+                        assert_eq!(calls.get(), if cancel { 0 } else { 1 }, "后续帧不得重复删除");
+                        drop(render);
+                        assert_eq!(state.memories.len(), if cancel { 3 } else { 2 });
+                        assert_eq!(state.memories[0].id, if cancel { 1 } else { 2 });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_memory_list_scrolls_back_to_error_owner_and_preserves_draft() {
+        let ctx = context();
+        let theme = neo_theme::Theme::from_metrics(neo_theme::ThemeMode::Dark, neo_theme::Metrics::from_scale(1.0));
+        theme.apply(&ctx);
+        let whale = crate::brand::WhaleMark::cached(&ctx);
+        let skin = Skin::new(theme, &whale);
+        let mut state = AppState::default();
+        state.memories = (1..=80).map(|id| neo_tools::tools::memory::Memory {
+            id, content: "original".into(), updated_ms: 0,
+        }).collect();
+        state.memory_editing = Some((1, "unsaved draft".into()));
+        let mut step = 0;
+        let mut render = |events, bottom| {
+            step += 1;
+            let mut output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(320.0, 480.0))),
+                time: Some(step as f64 * 0.1), events, ..Default::default()
+            }, |ui| {
+                let mut scroll = egui::ScrollArea::vertical().id_salt("error-owner-scroll");
+                if bottom { scroll = scroll.vertical_scroll_offset(100000.0); }
+                scroll.show(ui, |ui| {
+                    ui.set_max_width(280.0);
+                    memory_tab_with_actions(ui, &skin, 280.0, &mut state,
+                        |_, _| panic!("不得写入真实记忆"), |_| panic!("不得删除真实记忆"));
+                });
+            });
+            output.textures_delta.clear();
+        };
+        render(vec![], true); render(vec![], true); render(vec![], false);
+        let (pen, _): (Rect, Rect) = probe(&ctx, ("neo-memory-actions-probe", 80_u64));
+        assert!(pen.is_positive() && pen.top() > 0.0 && pen.bottom() < 480.0);
+        render(pointer(pen.center(), true), false);
+        render(pointer(pen.center(), false), false);
+        for _ in 0..20 { render(vec![], false); }
+        let (notice, clip): (Rect, Rect) = probe(&ctx, "neo-memory-error-probe");
+        assert!(clip.contains_rect(notice), "应从列表底部回到草稿所在行: {notice:?}/{clip:?}");
+        drop(render);
+        assert_eq!(state.memory_editing, Some((1, "unsaved draft".into())));
+        assert_eq!(state.memories.len(), 80);
+    }
+
+    #[test]
+    fn long_memory_list_keeps_failed_first_row_visible() {
+        let ctx = context();
+        let mut state = AppState::default();
+        state.memories = (1..=80).map(|id| neo_tools::tools::memory::Memory {
+            id, content: "original".into(), updated_ms: 0,
+        }).collect();
+        state.memory_editing = Some((1, "draft".into()));
+        let size = egui::vec2(320.0, 480.0);
+        let mut render = |ui: &mut Ui, skin: &Skin<'_>| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.set_max_width(280.0);
+                memory_tab_with_actions(ui, skin, 280.0, &mut state,
+                    |_, _| Err(neo_tools::ToolError::io("write denied")), |_| panic!("unexpected delete"));
+            });
+        };
+        frame(&ctx, size, vec![], &mut render);
+        frame(&ctx, size, vec![], &mut render);
+        let save: Rect = probe(&ctx, "neo-memory-save-probe");
+        frame(&ctx, size, pointer(save.center(), true), &mut render);
+        frame(&ctx, size, pointer(save.center(), false), &mut render);
+        for _ in 0..8 { frame(&ctx, size, vec![], &mut render); }
+        let (notice, clip): (Rect, Rect) = probe(&ctx, "neo-memory-error-probe");
+        assert!(clip.expand(1.0).contains_rect(notice));
+        assert_eq!(state.memory_editing, Some((1, "draft".into())));
     }
 
     #[test]

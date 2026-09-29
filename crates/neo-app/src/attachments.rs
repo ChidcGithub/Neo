@@ -105,6 +105,50 @@ pub fn prepare_tool_images(outcome: &mut neo_tools::Outcome) {
     }
 }
 
+// 仅改出站副本；数据库正文和摘要指纹仍保留原始审计记录。
+pub fn tool_content_without_images(content: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return if content.contains("已附图") || content.contains("已把图交给模型") {
+            "[历史图片未随本次请求提供；原始记录保留在聊天历史中，操作前必须重新观察]".into()
+        } else { content.to_owned() };
+    };
+    let data = &value["data"];
+    if data["image_attached"] != true && !data["screenshot_id"].is_string()
+        && data.get("image_to_desktop").is_none() && data.get("image_space").is_none()
+        && !content.contains("已附图") && !content.contains("已把图交给模型") {
+        return content.to_owned();
+    }
+    if !value.is_object() { return content.to_owned(); }
+    let path = value["data"]["path"].as_str().map(str::to_owned);
+    value.as_object_mut().unwrap().retain(|key, _| {
+        matches!(key.as_str(), "ok" | "tool" | "call_id" | "tool_call_id")
+    });
+    value["historical_image"] = serde_json::json!(true);
+    value["data"] = serde_json::json!({"image_attached": false});
+    if let Some(path) = path { value["data"]["path"] = serde_json::json!(path); }
+    value["data"]["next"] = serde_json::json!("重新观察并获取新的图片和引用，不得使用历史映射操作桌面。");
+    value["summary"] = serde_json::json!("历史图片未随本次请求提供；原始审计记录仅保留在聊天历史中。");
+    value.to_string()
+}
+
+fn clear_image_reference(data: &mut serde_json::Value) {
+    if let Some(data) = data.as_object_mut() {
+        data.insert("screenshot_id".into(), serde_json::Value::Null);
+        data.insert("reference_status".into(), serde_json::json!("stale"));
+        for key in ["image_to_desktop", "image_space", "source_to_sent_scale", "reference_ttl_seconds"] {
+            data.remove(key);
+        }
+    }
+}
+
+pub fn mark_stale_screenshot(outcome: &mut neo_tools::Outcome) {
+    // 图仍是历史观察证据，但交付前引用已失效；不重新注册或猜测当前桌面。
+    outcome.data["historical_reference"] = serde_json::json!(true);
+    clear_image_reference(&mut outcome.data);
+    outcome.data["next"] = serde_json::json!("截图引用在交付前已失效；附图仅为历史观察，操作前必须重新观察获取新引用。");
+    outcome.summary = "保留历史观察图，截图引用已失效；操作前必须重新观察。".into();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +307,40 @@ mod tests {
             assert_eq!(screenshot_space::generation(), generation);
             screenshot_space::revoke(&good);
         }
+    }
+
+    #[test]
+    fn historical_tool_images_only_change_outbound_copy() {
+        for (summary, data) in [
+            ("已附图", serde_json::json!({"path":"audit.png"})),
+            ("历史截图", serde_json::json!({"image_to_desktop":{"offset_x":1},"path":"audit.png"})),
+            ("历史图片", serde_json::json!({"image_attached":true,"sent_size":{"width":2,"height":3},"path":"audit.png"})),
+            ("历史引用", serde_json::json!({"image_attached":true,"path":"audit.png",
+                "historical_reference_audit":{"screenshot_id":"old-shot","image_to_desktop":{"offset_x":1}},
+                "extra_audit":"x".repeat(24_000)})),
+        ] {
+            let content = neo_tools::Outcome::ok("view_image", summary, data).to_model_json(usize::MAX);
+            let value: serde_json::Value = serde_json::from_str(&tool_content_without_images(&content)).unwrap();
+            assert_eq!(value["historical_image"], true);
+            assert!(value.get("historical_image_audit").is_none());
+            assert!(value.to_string().len() < 1024);
+            assert!(!value.to_string().contains("old-shot"));
+            assert!(!value.to_string().contains("historical_reference_audit"));
+            assert_eq!(tool_content_without_images(&value.to_string()), value.to_string());
+            let original: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(original["summary"], summary);
+            assert_eq!(value["data"]["path"], "audit.png");
+            assert_eq!(value["data"]["image_attached"], false);
+            assert!(value["data"]["screenshot_id"].is_null());
+            assert!(value["data"].get("image_to_desktop").is_none());
+            assert!(value["data"].get("sent_size").is_none());
+            assert!(value["summary"].as_str().unwrap().contains("未随本次请求提供"));
+        }
+        let plain = "旧记录：已附图，路径 audit.png";
+        let outbound = tool_content_without_images(plain);
+        assert!(outbound.contains("未随本次请求提供") && !outbound.contains(plain));
+        let normal = neo_tools::Outcome::ok("read_file", "读取完成", serde_json::json!({"content":"x"})).to_model_json(usize::MAX);
+        assert_eq!(tool_content_without_images(&normal), normal);
     }
 
     #[test]

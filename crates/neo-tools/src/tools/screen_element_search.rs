@@ -33,7 +33,9 @@ pub fn run(scope: &Scope, args: &Args) -> Outcome {
     }
 }
 
-fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
+fn act(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
+    let mut generation = screen_uia::cache_generation();
+    screen_uia::cache_check(scope, generation)?;
     let query = args.opt_str("query")?;
     let role = screen_uia::parse_role(&args.opt_str("role")?)?;
     let position = args.opt_str("position")?.trim().to_ascii_lowercase();
@@ -46,17 +48,22 @@ fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     let limit = args.opt_int("limit")? as usize;
     let refresh = args.flag("refresh")?;
     let _interaction = screen_uia::INTERACTION.lock().unwrap();
-    if refresh {
-        screen_uia::cache_invalidate();
+    screen_uia::cache_check(scope, generation)?;
+    let (cached_id, elements) = if refresh {
+        generation = screen_uia::cache_invalidate_checked(scope, generation)?;
         let filter = Some(window.trim()).filter(|v| !v.is_empty());
         let spec = screen_uia::Query { window_id, keyword: query.trim(), region, role };
-        let elements = screen_uia::enumerate_query(filter, filter.is_some() || window_id.is_some(), 600, 800, &spec)?;
-        screen_uia::cache_store(&elements);
-    }
-    let (snapshot_id, elements) = screen_uia::cache_snapshot().ok_or_else(|| {
-        ToolError::not_found("屏幕元素快照缺失或已失效")
-            .with_hint("重新运行 screen_elements，或显式给 refresh=true；不会静默切换到其他窗口")
-    })?;
+        let result = screen_uia::enumerate_query(filter, filter.is_some() || window_id.is_some(), 600, 800, &spec);
+        screen_uia::cache_check(scope, generation)?;
+        (None, result?)
+    } else {
+        let (id, elements) = screen_uia::cache_snapshot().ok_or_else(|| {
+            ToolError::not_found("屏幕元素快照缺失或已失效")
+                .with_hint("重新运行 screen_elements，或显式给 refresh=true；不会静默切换到其他窗口")
+        })?;
+        (Some(id), elements)
+    };
+    screen_uia::cache_check(scope, generation)?;
     let vs = super::screen::virtual_screen();
     let matches: Vec<&ScreenElement> = elements.iter().filter(|element| {
         matches_element(element, &query, role.unwrap_or(""), &position, vs)
@@ -64,7 +71,15 @@ fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
             && window_id.is_none_or(|id| element.identity.hwnd == id)
             && region.is_none_or(|r| screen_uia::intersects(element.rect, r))
     }).collect();
-    let data = search_data(&snapshot_id, &matches, elements.len(), limit, refresh, vs);
+    let mut data = search_data(cached_id.as_deref().unwrap_or("4294967295-18446744073709551615-18446744073709551615"),
+        &matches, elements.len(), limit, refresh, vs);
+    let snapshot_id = if let Some(id) = cached_id {
+        screen_uia::cache_check(scope, generation)?;
+        id
+    } else {
+        screen_uia::cache_store_checked(&elements, scope, generation)?
+    };
+    data["snapshot_id"] = json!(snapshot_id);
     Ok(Outcome::ok("screen_element_search", format!("找到 {} 个屏幕元素候选", matches.len()), data))
 }
 
@@ -130,6 +145,17 @@ mod tests {
         ScreenElement { id: 1, role: "Button", name: "保存设置".into(), label: "保存设置".into(), label_source: "name", window: "Neo".into(),
             rect: [-1900, 0, 80, 40], identity: screen_uia::ElementIdentity::default(), ..Default::default() }
     }
+    #[test]
+    fn cancelled_search_never_refreshes_or_reads_desktop() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let scope = Scope::new(std::env::temp_dir()).with_cancel(cancel);
+        let tool = crate::find("screen_element_search").unwrap();
+        for refresh in [false, true] {
+            let value = json!({"refresh": refresh});
+            assert_eq!(act(&scope, &Args::new(tool, &value)).unwrap_err().kind, crate::cancelled_error().kind);
+        }
+    }
+
     #[test]
     fn region_names_are_spatial() {
         assert_eq!(region_name([-1920, 0, 1, 1], vs()), "top_left");

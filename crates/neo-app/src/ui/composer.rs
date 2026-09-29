@@ -708,6 +708,46 @@ pub(super) mod ui_regression {
     }
 
     #[test]
+    fn scaled_composer_keyboard_respects_disabled_send_and_tool_stop() {
+        for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
+            for scale in [0.85, 1.0, 1.75, 2.8] {
+                for width in [240.0, 320.0, 560.0] {
+                    let ctx = context();
+                    let theme = neo_theme::Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
+                    theme.apply(&ctx);
+                    let whale = crate::brand::WhaleMark::cached(&ctx);
+                    let skin = Skin::new(theme, &whale);
+                    let mut state = AppState::default();
+                    let mut outcome = Outcome::default();
+                    for busy in [false, true] {
+                        state.tool_open = busy;
+                        for step in 0..4 {
+                            if step == 3 { ctx.memory_mut(|m| m.request_focus(neo_ui::hash_id("neo-composer-send"))); }
+                            let mut output = ctx.run_ui(egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 1600.0))),
+                                events: if step == 3 { vec![egui::Event::Key { key: egui::Key::Enter,
+                                    physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }] } else { vec![] },
+                                ..Default::default()
+                            }, |ui| {
+                                let rect = Rect::from_min_size(egui::pos2(8.0, 8.0),
+                                    Vec2::new(width - 16.0, block_height(ui, &skin, &state, width - 16.0, false)));
+                                outcome = draw(ui, &skin, rect, &mut state, false);
+                            });
+                            output.textures_delta.clear();
+                            let (send, clip): (Rect, Rect) = probe(&ctx, "neo-composer-send-probe");
+                            assert!(clip.contains_rect(send));
+                            assert!(send.left() >= 8.0 && send.right() <= width - 8.0);
+                        }
+                        assert!(!outcome.send, "空草稿不得通过键盘发送");
+                        assert_eq!(outcome.stop, busy, "工具审批期间停止键须可用 {width}/{scale}");
+                        assert!(state.draft.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn long_model_keeps_send_and_stop_visible_and_clickable() {
         for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
         let frame = |ctx: &egui::Context, size, events, draw: &mut dyn FnMut(&mut Ui, &Skin<'_>)| {

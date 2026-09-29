@@ -101,6 +101,7 @@ struct UpdateSchedule {
     ready_at: Option<std::time::Instant>,
     auto_done: bool,
     last_request: Option<std::time::Instant>,
+    manual_pending: bool,
     auto_inflight: bool,
     notified: bool,
 }
@@ -111,17 +112,33 @@ impl UpdateSchedule {
         if !enabled {
             self.auto_done = true;
         }
+        self.manual_pending |= manual;
         if checking || self.last_request.is_some_and(|last| now.saturating_duration_since(last) < std::time::Duration::from_secs(10)) {
             return None;
         }
-        let automatic = !manual;
+        let automatic = !self.manual_pending;
         if automatic && (!enabled || self.auto_done || now < ready) {
             return None;
         }
+        self.manual_pending = false;
         self.auto_done = true;
         self.last_request = Some(now);
         self.auto_inflight = automatic;
         Some(automatic)
+    }
+
+    fn next_deadline(&self, now: std::time::Instant, checking: bool) -> Option<std::time::Instant> {
+        // 在飞的 worker 完成时会唤醒 UI；不为已到期的请求安排忙轮询。
+        if checking {
+            return None;
+        }
+        if self.manual_pending {
+            return Some(self.last_request.map_or(now, |last| last + std::time::Duration::from_secs(10)));
+        }
+        if !self.auto_done {
+            return self.ready_at;
+        }
+        None
     }
 }
 
@@ -197,9 +214,6 @@ impl DesktopWindows {
             return Err("无法确认 Neo 主窗口归属，拒绝派发桌面工具".into());
         }
         let windows = self.visible_windows()?;
-        if windows.iter().any(|&hwnd| hwnd != self.main && unsafe { GetWindowLongPtrW(hwnd as HWND, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST == 0 }) {
-            return Err("请先关闭 Neo 的对话框，再请求桌面工具".into());
-        }
         for hwnd in windows {
             if hwnd == self.main {
                 if !avoid_main { return Err("Neo 主窗口仍可见，拒绝派发桌面工具".into()); }
@@ -720,6 +734,8 @@ impl NeoApp {
     fn request_exit(&mut self, ctx: &egui::Context) {
         self.update_checker.cancel();
         self.update_schedule.auto_inflight = false;
+        self.update_schedule.auto_done = true;
+        self.update_schedule.manual_pending = false;
         self.state.update_check_requested = false;
         if matches!(self.state.update_status, crate::updates::Status::Checking) {
             self.state.update_status = crate::updates::Status::Idle;
@@ -776,6 +792,8 @@ impl NeoApp {
     }
 
     fn handle_close(&mut self, ctx: &egui::Context) {
+        self.update_schedule.manual_pending = false;
+        self.state.update_check_requested = false;
         if self.quitting {
             return;
         }
@@ -1602,8 +1620,16 @@ impl NeoApp {
     }
 
     fn poll_updates(&mut self, ctx: &egui::Context) {
+        self.poll_updates_at(ctx, std::time::Instant::now());
+    }
+
+    fn poll_updates_at(&mut self, ctx: &egui::Context, now: std::time::Instant) {
         use crate::updates::Status;
-        let now = std::time::Instant::now();
+        if self.quitting || self.exit_blocked {
+            self.state.update_check_requested = false;
+            self.update_schedule.manual_pending = false;
+            return;
+        }
         if !self.state.auto_check_updates && self.update_schedule.auto_inflight {
             self.update_checker.cancel();
             self.update_schedule.auto_inflight = false;
@@ -1616,21 +1642,17 @@ impl NeoApp {
         let checking = self.update_checker.is_running()
             || matches!(self.state.update_status, Status::Checking);
         if self.update_schedule.request_due(now, self.state.auto_check_updates, manual, checking).is_some() {
-            // 测试只验证调度和状态，不接触网络。
             #[cfg(not(test))]
-            {
-                self.update_checker.request(ctx);
-                self.state.update_status = self.update_checker.status().clone();
-            }
+            self.update_checker.request(ctx);
+            // 测试走同一 single-flight/结果通道，只替换 worker，绝不接触网络。
             #[cfg(test)]
-            {
-                self.state.update_status = Status::Checking;
-            }
+            self.update_checker.request_controlled(ctx, Status::UpToDate)();
+            self.state.update_status = self.update_checker.status().clone();
         }
-        if !self.update_schedule.auto_done {
-            if let Some(ready) = self.update_schedule.ready_at {
-                ctx.request_repaint_after(ready.saturating_duration_since(now));
-            }
+        let checking = self.update_checker.is_running()
+            || matches!(self.state.update_status, Status::Checking);
+        if let Some(deadline) = self.update_schedule.next_deadline(now, checking) {
+            ctx.request_repaint_after(deadline.saturating_duration_since(now));
         }
     }
 
@@ -2582,6 +2604,111 @@ mod restore_tests {
         app.poll_updates(&ctx);
         assert_eq!(app.state.update_status, Status::UpToDate);
         assert!(app.pending_toasts.is_empty());
+    }
+
+    #[test]
+    fn startup_update_cancelled_worker_retains_one_manual_until_completion_and_throttle() {
+        use crate::updates::Status;
+        use std::time::{Duration, Instant};
+        for completion_secs in [5, 15] {
+            let ctx = egui::Context::default();
+            let mut app = NeoApp::install(&ctx);
+            let now = Instant::now();
+            let stale = Status::Available { version: "9.0.0".into(), url: "https://github.com/ChidcGithub/Neo/releases/tag/v9.0.0".into() };
+            let old_worker = app.update_checker.request_controlled(&ctx, stale);
+            app.state.update_status = Status::Checking;
+            app.update_schedule.last_request = Some(now);
+            app.update_schedule.auto_done = true;
+            app.update_schedule.auto_inflight = true;
+            app.state.auto_check_updates = false;
+            for _ in 0..10 {
+                app.state.update_check_requested = true;
+                app.poll_updates_at(&ctx, now + Duration::from_secs(1));
+                assert!(app.update_checker.is_running());
+                assert!(app.update_schedule.manual_pending);
+                assert_eq!(app.state.update_status, Status::Idle);
+                assert_eq!(app.update_schedule.last_request, Some(now));
+                assert_eq!(app.update_schedule.next_deadline(now, true), None);
+            }
+            for _ in 0..3 {
+                ctx.begin_pass(egui::RawInput::default());
+                let mut output = ctx.end_pass();
+                output.textures_delta.clear();
+            }
+            let repaints = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let received = repaints.clone();
+            ctx.set_request_repaint_callback(move |_| {
+                received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+            old_worker();
+            assert!(repaints.load(std::sync::atomic::Ordering::Relaxed) > 0);
+            assert!(!app.update_checker.is_running());
+            let completed_at = now + Duration::from_secs(completion_secs);
+            app.poll_updates_at(&ctx, completed_at);
+            if completion_secs < 10 {
+                let deadline = now + Duration::from_secs(10);
+                assert!(app.update_schedule.manual_pending);
+                assert_eq!(app.state.update_status, Status::Idle);
+                assert_eq!(app.update_schedule.next_deadline(completed_at, false), Some(deadline));
+                // 没有任何新点击，空闲帧仍明确安排节流到期的重绘。
+                for _ in 0..3 {
+                    ctx.begin_pass(egui::RawInput::default());
+                    app.poll_updates_at(&ctx, completed_at);
+                    let mut output = ctx.end_pass();
+                    output.textures_delta.clear();
+                    assert!(output.viewport_output[&egui::ViewportId::ROOT].repaint_delay <= Duration::from_secs(5));
+                }
+                app.poll_updates_at(&ctx, deadline);
+            }
+            assert!(!app.update_schedule.manual_pending);
+            assert!(!app.update_schedule.auto_inflight);
+            assert_eq!(app.state.update_status, Status::Checking);
+            assert_eq!(app.update_schedule.last_request, Some(now + Duration::from_secs(completion_secs.max(10))));
+            app.poll_updates_at(&ctx, now + Duration::from_secs(30));
+            assert_eq!(app.state.update_status, Status::UpToDate);
+            assert_eq!(app.update_schedule.next_deadline(now, false), None);
+            assert!(app.pending_toasts.is_empty(), "discarded automatic result must not notify");
+        }
+    }
+
+    #[test]
+    fn startup_update_manual_throttle_retains_click_without_another_click() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut schedule = super::UpdateSchedule::default();
+        assert_eq!(schedule.request_due(now, false, true, false), Some(false));
+        assert_eq!(schedule.request_due(now + Duration::from_secs(1), false, true, false), None);
+        assert_eq!(schedule.next_deadline(now, false), Some(now + Duration::from_secs(10)));
+        assert_eq!(schedule.request_due(now + Duration::from_secs(10), false, false, false), Some(false));
+        assert_eq!(schedule.request_due(now + Duration::from_secs(20), true, false, false), None);
+        assert!(!schedule.manual_pending);
+    }
+
+    #[test]
+    fn startup_update_close_and_exit_cancel_pending_manual_even_if_save_blocks() {
+        use crate::updates::Status;
+        for close in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = NeoApp::install(&ctx);
+            let worker = app.update_checker.request_controlled(&ctx, Status::UpToDate);
+            app.state.update_status = Status::Checking;
+            app.update_schedule.manual_pending = true;
+            app.state.update_check_requested = true;
+            app.store = None;
+            if close { app.handle_close(&ctx); } else { app.request_exit(&ctx); }
+            assert!(!app.update_schedule.manual_pending);
+            assert!(!app.state.update_check_requested);
+            assert!(app.update_schedule.auto_done);
+            assert!(app.update_checker.is_running());
+            worker();
+            app.poll_updates(&ctx);
+            assert_eq!(app.state.update_status, Status::Idle);
+            assert!(app.pending_toasts.is_empty());
+            app.exit_blocked = false;
+            app.quitting = false;
+            app.poll_updates(&ctx);
+            assert_eq!(app.state.update_status, Status::Idle);
+        }
     }
 
     #[test]
@@ -3937,6 +4064,144 @@ mod restore_tests {
     }
 
     #[test]
+    fn compaction_crash_after_call_persist_uses_same_unknown_result_as_context() {
+        use crate::state::{ChatMessage, Role, ToolMeta, ToolState};
+        let store = temp_store("crash-tool-intent");
+        let mut state = AppState::default();
+        state.context_tokens = 32 * 1024;
+        state.messages.push(ChatMessage::new(Role::User, "旧目标"));
+        let mut assistant = ChatMessage::new(Role::Assistant, "a".repeat(16_000));
+        assistant.tool_calls.push(neo_llm::ToolCall { id: "crash-call".into(), name: "write_file".into(), arguments: "{ \"path\": \"audit.txt\", \"content\": \"x\" }".into() });
+        state.messages.push(assistant);
+        let mut meta = ToolMeta::restored("write_file");
+        meta.call_id = "crash-call".into();
+        meta.state = ToolState::Running;
+        state.messages.push(ChatMessage::tool_result(meta, String::new()));
+        assert!(NeoApp::persist_ready(&mut state, Some(&store)));
+        let id = state.active_session.unwrap();
+        assert_eq!(state.pending_persist, 2);
+        assert_eq!(store.messages(id).unwrap().len(), 2, "崩溃边界只持久化调用意图");
+        state.messages.push(ChatMessage::new(Role::User, "继续分析，不重跑工具"));
+        assert!(state.compaction_plan(&state.api_messages(24)).unwrap().is_none(), "真实 running 不得压缩");
+        let mut restored = AppState::default();
+        restored.context_tokens = 32 * 1024;
+        assert!(NeoApp::open_session(&mut restored, &store, id));
+        restored.messages.push(ChatMessage::new(Role::User, "继续分析，不重跑工具"));
+        let mut messages = restored.api_messages(24);
+        restored.context_tokens = neo_llm::context_usage(&restored.llm_config(), &messages, &neo_tools::tool_declarations()).unwrap() + 100;
+        neo_llm::budget_messages(&restored.llm_config(), &mut messages, &neo_tools::tool_declarations()).unwrap();
+        let result = messages.iter().find(|m| m.role == neo_llm::Role::Tool).unwrap();
+        assert!(result.content.contains("执行状态未知"));
+        assert!(!result.content.contains("未执行"));
+        let plan = restored.compaction_plan(&messages).unwrap().unwrap();
+        let history: serde_json::Value = serde_json::from_str(&plan.messages[1].content).unwrap();
+        let result_in_summary = history.as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(result_in_summary["content"], result.content);
+        assert_eq!(result_in_summary["tool_call_id"], "crash-call");
+        let mut checkpoint = plan.checkpoint;
+        checkpoint.summary = "历史调用执行状态未知，不得自动重跑".into();
+        assert!(checkpoint.valid(&restored.messages));
+        assert!(!restored.tools_running());
+        assert_eq!(restored.spawn_ready_tools(&neo_tools::Scope::new(std::env::temp_dir())), 0);
+        assert_eq!(restored.messages.len(), 3, "未知结果仅存在于请求副本");
+        assert_eq!(store.messages(id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn uia_restore_session_isolation_rejects_old_reference_and_late_publication() {
+        use neo_tools::tools::screen_uia;
+        let store = temp_store("uia-session-isolation");
+        let first = store.create_session("第一会话").unwrap();
+        let second = store.create_session("第二会话").unwrap();
+        let mut state = AppState::default();
+        assert!(NeoApp::open_session(&mut state, &store, first));
+        let scope = neo_tools::Scope::new(std::env::temp_dir());
+        let element = screen_uia::ScreenElement { id: 1, role: "Button", name: "合成按钮".into(),
+            label: "合成按钮".into(), enabled: true, foreground: true, actionable: true,
+            rect: [0, 0, 10, 10], ..Default::default() };
+        for switch in [false, true] {
+            let id = screen_uia::cache_store_checked(&[element.clone()], &scope, screen_uia::cache_generation()).unwrap();
+            let generation = screen_uia::cache_generation();
+            assert_eq!(screen_uia::cache_snapshot().unwrap().0, id);
+            if switch { assert!(NeoApp::open_session(&mut state, &store, second)); } else { state.cancel(); }
+            assert!(screen_uia::cache_consume(&id, 1).is_none());
+            assert!(screen_uia::cache_store_checked(&[element.clone()], &scope, generation).is_err());
+            assert!(screen_uia::cache_snapshot().is_none());
+        }
+    }
+
+    #[test]
+    fn screenshot_restore_session_switch_clears_only_outbound_reference_and_keeps_audit() {
+        use crate::state::{ChatMessage, Role, ToolMeta};
+        let store = temp_store("screenshot-wire-restore");
+        let mut state = AppState::default();
+        state.messages.push(ChatMessage::new(Role::User, "查看图片"));
+        let mut assistant = ChatMessage::new(Role::Assistant, "观察");
+        assistant.tool_calls.push(neo_llm::ToolCall { id: "image-call".into(), name: "screenshot".into(), arguments: "{}".into() });
+        state.messages.push(assistant);
+        let mut meta = ToolMeta::restored("screenshot");
+        meta.call_id = "image-call".into();
+        let content = neo_tools::Outcome::ok("screenshot", "已附图，已把图交给模型", serde_json::json!({
+            "path":"audit.png", "image_attached":true, "screenshot_id":"old-shot",
+            "image_space":{"width":2,"height":3}, "image_to_desktop":{"offset_x":-100}
+        })).to_model_json(usize::MAX);
+        let mut result = ChatMessage::tool_result(meta, content.clone());
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 3).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        result.images.push(neo_tools::tools::view_image::model_image(png.get_ref(), false).unwrap());
+        state.messages.push(result);
+        let live = state.api_messages(24);
+        assert_eq!(live.last().unwrap().content, content);
+        let live_wire = neo_llm::request_body(&state.llm_config(), &live, vec![]);
+        assert!(live_wire["messages"].as_array().unwrap().last().unwrap()["content"].is_array());
+        assert!(NeoApp::persist_ready(&mut state, Some(&store)));
+        let id = state.active_session.unwrap();
+        let other = store.create_session("其他会话").unwrap();
+        assert!(NeoApp::open_session(&mut state, &store, other));
+        assert!(NeoApp::open_session(&mut state, &store, id));
+        assert_eq!(state.messages[2].content, content);
+        assert!(state.messages[2].images.is_empty());
+        let mut messages = state.api_messages(24);
+        neo_llm::budget_messages(&state.llm_config(), &mut messages, &neo_tools::tool_declarations()).unwrap();
+        let wire = neo_llm::request_body(&state.llm_config(), &messages, vec![]);
+        let tool = wire["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(tool["tool_call_id"], "image-call");
+        let outbound: serde_json::Value = serde_json::from_str(tool["content"].as_str().unwrap()).unwrap();
+        assert_eq!(outbound["data"]["image_attached"], false);
+        assert!(outbound["data"]["screenshot_id"].is_null());
+        assert!(outbound["data"].get("image_to_desktop").is_none());
+        assert!(outbound["data"].get("image_space").is_none());
+        assert_eq!(outbound["data"]["path"], "audit.png");
+        assert_eq!(outbound["historical_image"], true);
+        assert!(outbound.get("historical_image_audit").is_none());
+        assert!(!tool["content"].as_str().unwrap().contains("old-shot"));
+        assert!(outbound["summary"].as_str().unwrap().contains("未随本次请求提供"));
+        assert_eq!(store.messages(id).unwrap()[2].content, content);
+
+        state.messages.push(ChatMessage::new(Role::User, "继续分析历史，但不得凭旧截图操作"));
+        state.context_tokens = neo_llm::context_usage(&state.llm_config(), &state.api_messages(24),
+            &neo_tools::tool_declarations()).unwrap();
+        let plan = state.compaction_plan(&state.api_messages(24)).unwrap().unwrap();
+        assert!(plan.messages.iter().all(|m| m.images.is_empty()));
+        let history: serde_json::Value = serde_json::from_str(&plan.messages[1].content).unwrap();
+        let compacted: serde_json::Value = serde_json::from_str(history[2]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(compacted, outbound);
+        assert!(!plan.messages[1].content.contains("old-shot"));
+        assert!(!plan.messages[1].content.contains("image_to_desktop"));
+        assert_eq!(state.messages[2].content, content);
+        let mut checkpoint = plan.checkpoint;
+        checkpoint.summary = "历史图片未提供，后续操作需重新观察".into();
+        assert!(checkpoint.valid(&state.messages));
+        state.checkpoint = Some(checkpoint);
+        state.checkpoint_dirty = true;
+        assert!(NeoApp::persist_ready(&mut state, Some(&store)));
+        assert!(NeoApp::open_session(&mut state, &store, id));
+        assert!(state.checkpoint.as_ref().unwrap().valid(&state.messages));
+        assert_eq!(state.messages[2].content, content);
+        assert_eq!(store.messages(id).unwrap()[2].content, content);
+    }
+
+    #[test]
     fn context_legacy_tool_results_restore_as_low_trust_without_fabricated_calls() {
         let store = temp_store("context-legacy-tool");
         let id = store.create_session("旧工具记录").unwrap();
@@ -5163,6 +5428,8 @@ mod snapshot {
     #[test]
     fn denied_tool_reports_back_to_model() {
         let mut st = AppState::default();
+        st.classroom_safe = false;
+        st.auto_approve_tools = false;
         st.messages
             .push(ChatMessage::new(Role::Assistant, String::new()));
         st.tool_frags = vec![frag(

@@ -690,47 +690,38 @@ mod imp {
     ///
     /// 分步是必需的：直接"按下 → 跳到终点 → 抬起"在多数应用里会被当成单击
     /// （中间没有鼠标移动消息）。步数按 `duration_ms` 切，每步之间小睡。
-    pub fn drag(
-        from: (i32, i32),
-        to: (i32, i32),
-        button: Button,
-        duration_ms: u64,
+    #[cfg(test)]
+    pub fn drag(from: (i32, i32), to: (i32, i32), button: Button, duration_ms: u64) -> Result<(), ToolError> {
+        drag_cancellable(from, to, button, duration_ms, || false)
+    }
+
+    pub fn drag_cancellable(
+        from: (i32, i32), to: (i32, i32), button: Button, duration_ms: u64,
+        cancelled: impl Fn() -> bool,
     ) -> Result<(), ToolError> {
+        if cancelled() { return Err(crate::cancelled_error()); }
         let _dpi = physical_pixels()?;
         let displays = monitors()?;
         let vs = monitor_bounds(&displays)?;
         require_monitor_point(&displays, "拖动起点", from.0, from.1)?;
         require_monitor_point(&displays, "拖动终点", to.0, to.1)?;
         // 端点和归一化可表达性全部在按下前检查。
-        let (fx, fy) = to_absolute(from.0, from.1, vs)?;
+        to_absolute(from.0, from.1, vs)?;
         to_absolute(to.0, to.1, vs)?;
         let (down, up) = down_up(button);
-        if let Err(error) = send(&[mouse(MOVE_ABS, fx, fy), mouse(down, 0, 0)]) {
-            let _ = send(&[mouse(up, 0, 0)]);
-            return Err(error);
-        }
-
-        // 每步固定 15ms：步数上限对齐参数声明的 duration_ms 上限（10s），
-        // 否则慢拖（框选/滑块常要几秒）被静默压成 ~0.9s。
-        let steps = (duration_ms / 15).clamp(1, 667) as i32;
-        for i in 1..=steps {
-            let t = f64::from(i) / f64::from(steps);
-            let x = (f64::from(from.0) + (f64::from(to.0) - f64::from(from.0)) * t).round() as i32;
-            let y = (f64::from(from.1) + (f64::from(to.1) - f64::from(from.1)) * t).round() as i32;
-            let moved = to_absolute(x, y, vs).and_then(|(nx, ny)| send(&[mouse(MOVE_ABS, nx, ny)]));
-            if let Err(e) = moved {
-                // 中途失败也要先把键松开，否则用户会留下一个"一直按着"的鼠标。
-                let _ = send(&[mouse(up, 0, 0)]);
-                return Err(e);
+        drag_with(from, to, duration_ms, |input| match input {
+            DragInput::Start((x, y)) => {
+                let (nx, ny) = to_absolute(x, y, vs)?;
+                if cancelled() { return Err(crate::cancelled_error()); }
+                send(&[mouse(MOVE_ABS, nx, ny), mouse(down, 0, 0)])
             }
-            if i < steps {
-                std::thread::sleep(Duration::from_millis(15));
+            DragInput::Move((x, y)) => {
+                let (nx, ny) = to_absolute(x, y, vs)?;
+                if cancelled() { return Err(crate::cancelled_error()); }
+                send(&[mouse(MOVE_ABS, nx, ny)])
             }
-        }
-
-        let result = send(&[mouse(up, 0, 0)]);
-        if result.is_err() { let _ = send(&[mouse(up, 0, 0)]); }
-        result
+            DragInput::Release => send(&[mouse(up, 0, 0)]),
+        }, std::thread::sleep, &cancelled)
     }
 }
 
@@ -780,6 +771,7 @@ mod imp {
     }
     // #endregion debug-point B/C
 
+    #[cfg(test)]
     pub fn drag(
         _from: (i32, i32),
         _to: (i32, i32),
@@ -788,13 +780,126 @@ mod imp {
     ) -> Result<(), ToolError> {
         Err(unsupported())
     }
+
+    pub fn drag_cancellable(
+        _from: (i32, i32), _to: (i32, i32), _button: Button, _duration_ms: u64,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<(), ToolError> {
+        if cancelled() { return Err(crate::cancelled_error()); }
+        Err(unsupported())
+    }
 }
 
 pub use imp::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragInput {
+    Start((i32, i32)),
+    Move((i32, i32)),
+    Release,
+}
+
+fn drag_with(
+    from: (i32, i32), to: (i32, i32), duration_ms: u64,
+    mut send: impl FnMut(DragInput) -> Result<(), ToolError>,
+    mut sleep: impl FnMut(std::time::Duration),
+    cancelled: impl Fn() -> bool,
+) -> Result<(), ToolError> {
+    if cancelled() { return Err(crate::cancelled_error()); }
+    if let Err(error) = send(DragInput::Start(from)) {
+        return Err(drag_cleanup(&mut send, error));
+    }
+    // 每步最多等待 15ms；取消只允许释放，不再移动或按下。
+    let steps = (duration_ms / 15).clamp(1, 667) as i32;
+    for i in 1..=steps {
+        let t = f64::from(i) / f64::from(steps);
+        let x = (f64::from(from.0) + (f64::from(to.0) - f64::from(from.0)) * t).round() as i32;
+        let y = (f64::from(from.1) + (f64::from(to.1) - f64::from(from.1)) * t).round() as i32;
+        if cancelled() { return Err(drag_cleanup(&mut send, crate::cancelled_error())); }
+        if let Err(error) = send(DragInput::Move((x, y))) {
+            return Err(drag_cleanup(&mut send, error));
+        }
+        if cancelled() { return Err(drag_cleanup(&mut send, crate::cancelled_error())); }
+        if i < steps { sleep(std::time::Duration::from_millis(15)); }
+    }
+    if let Err(error) = send(DragInput::Release) {
+        return Err(drag_cleanup(&mut send, error));
+    }
+    if cancelled() { return Err(crate::cancelled_error()); }
+    Ok(())
+}
+
+fn drag_cleanup(send: &mut impl FnMut(DragInput) -> Result<(), ToolError>, mut error: ToolError) -> ToolError {
+    if let Err(release) = send(DragInput::Release) {
+        // 释放失败不能伪装成普通取消；保留原始错误及无法确认松键的诊断。
+        error.message = format!("{}；鼠标释放失败：{}", error.message, release.message);
+        error.kind = release.kind;
+        error.hint = release.hint;
+    }
+    error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drag_cancel_after_sleep_only_releases_without_late_moves() {
+        let cancel = std::cell::Cell::new(false);
+        let mut inputs = Vec::new();
+        let result = drag_with((0, 0), (1000, 1000), 10_000,
+            |input| { inputs.push(input); Ok(()) }, |_| cancel.set(true), || cancel.get());
+        assert!(result.is_err(), "取消不得报告拖拽成功；实际输入数 {}", inputs.len());
+        assert_eq!(inputs.len(), 3);
+        assert!(matches!(inputs[0], DragInput::Start(_)));
+        assert!(matches!(inputs[1], DragInput::Move(_)));
+        assert_eq!(inputs[2], DragInput::Release);
+    }
+
+    #[test]
+    fn drag_cancel_on_start_and_release_failure_preserves_diagnostics() {
+        for release_fails in [false, true] {
+            let cancel = std::cell::Cell::new(false);
+            let mut inputs = Vec::new();
+            let error = drag_with((0, 0), (10, 10), 300, |input| {
+                inputs.push(input);
+                if matches!(input, DragInput::Start(_)) { cancel.set(true); }
+                if input == DragInput::Release && release_fails { Err(ToolError::io("假释放失败")) } else { Ok(()) }
+            }, |_| panic!("取消后不得等待"), || cancel.get()).unwrap_err();
+            assert_eq!(inputs, vec![DragInput::Start((0, 0)), DragInput::Release]);
+            assert_eq!(error.kind, if release_fails { ErrorKind::Io } else { crate::cancelled_error().kind });
+            if release_fails { assert!(error.message.contains("假释放失败")); }
+        }
+    }
+
+    #[test]
+    fn drag_failures_only_cleanup_and_never_report_success() {
+        for fail_at in [0, 1, 2] {
+            let mut inputs = Vec::new();
+            let error = drag_with((0, 0), (10, 10), 0, |input| {
+                inputs.push(input);
+                if inputs.len() == fail_at + 1 { Err(ToolError::io("假输入失败")) } else { Ok(()) }
+            }, |_| panic!("单步无需等待"), || false).unwrap_err();
+            assert_eq!(inputs.last(), Some(&DragInput::Release));
+            assert_eq!(inputs.len(), fail_at + 2);
+            assert!(error.message.contains("假输入失败"));
+        }
+        let mut inputs = Vec::new();
+        let mut sleeps = 0;
+        drag_with((-10, 20), (100, -30), 300,
+            |input| { inputs.push(input); Ok(()) }, |_| sleeps += 1, || false).unwrap();
+        assert_eq!(inputs.len(), 22);
+        assert_eq!(sleeps, 19);
+        assert_eq!(inputs[20], DragInput::Move((100, -30)));
+        assert_eq!(inputs[21], DragInput::Release);
+    }
+
+    #[test]
+    fn drag_precancel_has_no_input_or_sleep() {
+        let result = drag_with((0, 0), (10, 10), 300,
+            |_| panic!("取消后不得输入"), |_| panic!("取消后不得等待"), || true);
+        assert_eq!(result.unwrap_err().kind, crate::cancelled_error().kind);
+    }
 
     #[test]
     fn input_normalization_exhaustive_pixel_buckets() {

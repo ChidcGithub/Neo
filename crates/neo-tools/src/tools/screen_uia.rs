@@ -195,17 +195,67 @@ pub static INTERACTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const CACHE_TTL: Duration = Duration::from_secs(60);
 static NEXT_SNAPSHOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-pub fn cache_store(els: &[ScreenElement]) -> String {
+// 代次的所有读取和修改都在 CACHE 锁内；空缓存失效同样推进代次。
+static CACHE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn store_locked(cell: &mut Option<Cached>, els: &[ScreenElement]) -> String {
     let serial = NEXT_SNAPSHOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let id = format!("{}-{}-{serial}", std::process::id(), super::screen::epoch_millis());
-    *CACHE.lock().unwrap() = Some(Cached {
-        at: Instant::now(), id: id.clone(), els: els.to_vec(),
-    });
+    *cell = Some(Cached { at: Instant::now(), id: id.clone(), els: els.to_vec() });
+    CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     id
 }
 
+#[cfg(test)]
+pub fn cache_store(els: &[ScreenElement]) -> String {
+    store_locked(&mut CACHE.lock().unwrap(), els)
+}
+
+pub fn cache_generation() -> u64 {
+    let _cell = CACHE.lock().unwrap();
+    CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn check_locked(scope: &crate::Scope, expected_generation: u64) -> Result<(), ToolError> {
+    if scope.is_cancelled() { return Err(crate::cancelled_error()); }
+    if CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed) != expected_generation {
+        return Err(ToolError::bad_args("屏幕元素观察期间缓存已失效或刷新；请重新枚举"));
+    }
+    Ok(())
+}
+
+pub fn cache_check(scope: &crate::Scope, expected_generation: u64) -> Result<(), ToolError> {
+    let _cell = CACHE.lock().unwrap();
+    check_locked(scope, expected_generation)
+}
+
+pub fn cache_store_checked(els: &[ScreenElement], scope: &crate::Scope, expected_generation: u64) -> Result<String, ToolError> {
+    cache_publish_checked(els, scope, expected_generation, None)
+}
+
+/// 只在发布时检查 Scope，不把短命任务的取消标记保存到成功快照中。
+/// 同内容分页可复用原快照，绝不刷新其 TTL；检查与写入在同一锁内。
+pub fn cache_publish_checked(els: &[ScreenElement], scope: &crate::Scope, expected_generation: u64, reuse: Option<&str>) -> Result<String, ToolError> {
+    let mut cell = CACHE.lock().unwrap();
+    check_locked(scope, expected_generation)?;
+    if let Some(cached) = cell.as_ref().filter(|c| Some(c.id.as_str()) == reuse && c.els == els && c.at.elapsed() <= CACHE_TTL) {
+        return Ok(cached.id.clone());
+    }
+    Ok(store_locked(&mut cell, els))
+}
+
+/// 调用方取消任务时无需等待 INTERACTION；迟到的旧代发布必然失败。
 pub fn cache_invalidate() {
-    *CACHE.lock().unwrap() = None;
+    let mut cell = CACHE.lock().unwrap();
+    *cell = None;
+    CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn cache_invalidate_checked(scope: &crate::Scope, expected_generation: u64) -> Result<u64, ToolError> {
+    let mut cell = CACHE.lock().unwrap();
+    check_locked(scope, expected_generation)?;
+    *cell = None;
+    Ok(CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
 }
 
 pub fn cache_remaining_seconds() -> u64 {
@@ -240,6 +290,7 @@ pub fn cache_consume(snapshot: &str, id: usize) -> Option<ScreenElement> {
     let mut cell = CACHE.lock().unwrap();
     let element = lookup(cell.as_ref()?, snapshot, id)?;
     *cell = None;
+    CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(element)
 }
 
@@ -972,6 +1023,75 @@ mod tests {
             parent_role: None,
             identity: ElementIdentity::default(),
         }
+    }
+
+    #[test]
+    fn cancelled_and_late_publishers_cannot_replace_new_snapshot() {
+        let _interaction = INTERACTION.lock().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scope = crate::Scope::new(std::env::temp_dir()).with_cancel(cancel.clone());
+        let old_generation = cache_generation();
+        cache_invalidate();
+        let newer = cache_store(&[]);
+        let late = cache_store_checked(&[], &scope, old_generation);
+        let unchanged = cache_snapshot().unwrap().0 == newer;
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        let cancelled = cache_store_checked(&[], &scope, cache_generation());
+        let still_unchanged = cache_snapshot().unwrap().0 == newer;
+        let stale_invalidation = cache_invalidate_checked(&crate::Scope::new(std::env::temp_dir()), old_generation);
+        let not_cleared = cache_snapshot().is_some();
+        cache_invalidate();
+        drop(_interaction);
+        assert!(late.is_err(), "失效前启动的发布者必须拒绝");
+        assert!(unchanged && still_unchanged, "旧代或已取消发布者不能覆盖新快照");
+        assert!(cancelled.is_err(), "取消的 Scope 必须拒绝发布");
+        assert!(stale_invalidation.is_err() && not_cleared, "旧观察失败也不能清空新缓存");
+    }
+
+    #[test]
+    fn checked_publish_survives_job_drop_but_not_explicit_invalidation() {
+        let _interaction = INTERACTION.lock().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scope = crate::Scope::new(std::env::temp_dir()).with_cancel(cancel.clone());
+        let id = cache_store_checked(&[], &scope, cache_generation()).unwrap();
+        let at = CACHE.lock().unwrap().as_ref().unwrap().at;
+        let generation = cache_generation();
+        assert_eq!(cache_publish_checked(&[], &scope, generation, Some(&id)).unwrap(), id);
+        assert_eq!(CACHE.lock().unwrap().as_ref().unwrap().at, at);
+        assert_eq!(cache_generation(), generation);
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        drop(scope);
+        assert_eq!(cache_snapshot().unwrap().0, id, "正常任务结束不使成功快照失效");
+        cache_invalidate();
+        assert!(cache_snapshot().is_none());
+        assert_ne!(cache_generation(), generation);
+        let empty_generation = cache_generation();
+        cache_invalidate();
+        assert_ne!(cache_generation(), empty_generation);
+    }
+
+    #[test]
+    fn publication_waiting_on_cache_lock_rechecks_cancellation_inside_lock() {
+        let _interaction = INTERACTION.lock().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scope = crate::Scope::new(std::env::temp_dir()).with_cancel(cancel.clone());
+        let newer = cache_store(&[]);
+        let generation = cache_generation();
+        let lock = CACHE.lock().unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let result = std::thread::scope(|threads| {
+            let job = threads.spawn(|| {
+                started.send(()).unwrap();
+                cache_store_checked(&[], &scope, generation)
+            });
+            ready.recv().unwrap();
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+            drop(lock);
+            job.join().unwrap()
+        });
+        assert!(result.is_err());
+        assert_eq!(cache_snapshot().unwrap().0, newer);
+        cache_invalidate();
     }
 
     #[test]

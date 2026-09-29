@@ -361,7 +361,7 @@ pub fn header_height(skin: &Skin<'_>) -> f32 {
 /// - **摘要与标题同一行**，中间隔一个 2pt 圆点，摘要用三级色 + 省略号；
 /// - **行首**平时是变体图标，失败时换成红点、待确认时换成强调色点
 ///   （上游 `leadingFor`：error → 红点、stopped → warning 点）；
-/// - **执行中**整行扫过一道柔和高光（上游 2.6s 循环的 sweep）；
+/// - **执行中**显示独立状态文字与转圈，不与已完成摘要混淆；
 /// - 命令**非零退出**时摘要后跟一个红色退出码胶囊（上游 `terminalFailed` 的红 pill）。
 ///
 /// 失败时下面补一行原因 —— 卡片本身就是给老师看的"为什么没成"。
@@ -377,11 +377,12 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     };
 
     let variant = Variant::of(&tool.name);
+    let (status, tone) = tool_status(tool);
     let awaiting = tool.state == ToolState::AwaitingConfirm;
+    let running = tool.state == ToolState::Running;
+    let failed = tone == neo_ui::NoticeTone::Error;
     let denied = tool.state == ToolState::Denied;
     let cancelled = tool.state == ToolState::Cancelled;
-    // 取消不是失败：中性灰，不上错误色。
-    let failed = denied || (tool.outcome.is_some() && !tool.ok());
 
     // 标题：变体名；认不出来的工具退回自己的名字（上游：`工具名 · 摘要`）。
     let title = if variant == Variant::Others {
@@ -425,17 +426,8 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     } else {
         None
     };
-    let err_color = if failed {
-        p.error
-    } else if cancelled {
-        p.label_caption
-    } else {
-        p.accent
-    };
-    let err_galley = err_text.as_ref().map(|txt| {
-        ui.painter()
-            .layout(txt.clone(), skin.prop(t.caption), err_color, content_w - m.s(12.0))
-    });
+    ui.add(egui::Label::new(egui::RichText::new(status)
+        .font(skin.prop(t.caption)).color(if failed { p.error } else { p.label_secondary })).wrap());
 
     // 上游：一行 14px/24px；leading 16px，右侧 6px。
     let lh = t.label_lh.max(t.label * 1.5);
@@ -444,11 +436,7 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     let sep = m.s(2.0);
     let gap = m.s(8.0);
 
-    let err_h = err_galley
-        .as_ref()
-        .map(|g| g.size().y + m.s(4.0))
-        .unwrap_or(0.0);
-    let h = lh + m.s(6.0) * 2.0 + err_h;
+    let h = lh + m.s(6.0) * 2.0;
     let (rect, _resp) = ui.allocate_exact_size(Vec2::new(content_w, h), Sense::hover());
 
     // 行本身透明（上游 `_row` 无底色）。不可点，所以悬停也不给底色 ——
@@ -466,7 +454,10 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
         egui::pos2(row.left() + pad_x + lead * 0.5, cy),
         Vec2::splat(lead),
     );
-    if failed || denied {
+    if running {
+        neo_ui::Spinner::new().show_painter(painter, &skin.d(), lead_rect, p.accent);
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
+    } else if failed || denied {
         painter.circle_filled(lead_rect.center(), m.s(4.0), p.error);
     } else if awaiting {
         // 上游 stopped 用 warning 点；Neo 没有 warning token，用强调色代替。
@@ -482,19 +473,7 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     let summary_font = skin.prop(t.label);
     let mut x = lead_rect.right() + m.s(6.0);
 
-    // 退出码胶囊按文本量宽：Windows 崩溃码（如 -1073741819）比个位数长得多。
-    let pill_w = exit_code
-        .filter(|c| *c != 0)
-        .map(|c| {
-            painter
-                .layout_no_wrap(c.to_string(), skin.mono(t.caption), p.error)
-                .size()
-                .x
-                + m.s(12.0)
-        })
-        .map(|w| w.max(m.s(30.0)))
-        .unwrap_or(0.0);
-    let avail_end = row.right() - pad_x - pill_w;
+    let avail_end = row.right() - pad_x;
     // 标题也要 elide：模型给的异常长工具名不该画出内容列右缘。
     let shown_title = super::elide(painter, &title, &title_font, (avail_end - x).max(0.0));
     let title_w = painter
@@ -528,29 +507,33 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
         );
     }
 
-    // ---- 退出码胶囊（非零）----
-    if let Some(code) = exit_code.filter(|c| *c != 0) {
-        let pill = Rect::from_min_size(
-            egui::pos2(avail_end, cy - m.s(9.0)),
-            Vec2::new(pill_w, m.s(18.0)),
-        );
-        painter.squircle_filled(pill, m.s(6.0), p.error.gamma_multiply(0.18));
-        painter.text(
-            pill.center(),
-            egui::Align2::CENTER_CENTER,
-            code.to_string(),
-            skin.mono(t.caption),
-            p.error,
-        );
+    // 退出码另占布局；极窄列放不下徽标时保留完整换行文本。
+    if let Some(code) = exit_code.filter(|c| *c != 0 && tool.state == ToolState::Done) {
+        let text = code.to_string();
+        let badge = neo_ui::Badge::new(&text).tone(neo_ui::BadgeTone::Danger);
+        if badge.width(ui, &skin.d()) <= content_w {
+            badge.show(ui, &skin.d());
+        } else {
+            ui.add(egui::Label::new(egui::RichText::new(text).font(skin.mono(t.caption)).color(p.error)).wrap());
+        }
     }
+    if let Some(text) = err_text.filter(|_| failed) {
+        neo_ui::InlineNotice::new(("tool-error", &tool.call_id), &text)
+            .tone(tone).show(ui, &skin.d());
+    }
+}
 
-    // ---- 失败：第二行说明 ----
-    if let Some(g) = err_galley {
-        painter.galley(
-            egui::pos2(row.left() + pad_x, row.bottom() + m.s(4.0)),
-            g,
-            p.error,
-        );
+fn tool_status(tool: &crate::state::ToolMeta) -> (&'static str, neo_ui::NoticeTone) {
+    use crate::state::ToolState;
+    use neo_ui::NoticeTone;
+    match tool.state {
+        ToolState::AwaitingConfirm => ("等待确认", NoticeTone::Info),
+        ToolState::Running => ("正在运行…", NoticeTone::Info),
+        ToolState::Denied => ("已拒绝", NoticeTone::Error),
+        ToolState::Cancelled => ("已取消", NoticeTone::Neutral),
+        ToolState::Done if tool.outcome.is_some() && !tool.ok() => ("执行失败", NoticeTone::Error),
+        ToolState::Done if tool.ok() => ("执行成功", NoticeTone::Success),
+        ToolState::Done => ("已结束", NoticeTone::Neutral),
     }
 }
 
@@ -558,6 +541,81 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
 mod ui_regression {
     use super::*;
     use crate::ui::composer::ui_regression::{context, frame_themed, probe};
+
+    #[test]
+    fn running_tool_repaints_but_done_tool_settles() {
+        use crate::state::{ToolMeta, ToolState};
+        let ctx = context();
+        let mut msg = crate::state::ChatMessage::new(Role::Tool, String::new());
+        msg.tool = Some(ToolMeta { call_id: "repaint".into(), name: "bash".into(), title: "执行", risk: "exec",
+            preview: "preview".into(), args: serde_json::Value::Null, state: ToolState::Running, outcome: None });
+        for state in [ToolState::Running, ToolState::Done] {
+            msg.tool.as_mut().unwrap().state = state;
+            let mut delay = std::time::Duration::ZERO;
+            for _ in 0..8 {
+                let output = frame_themed(&ctx, Vec2::new(320.0, 600.0), vec![], neo_theme::ThemeMode::Dark,
+                    |ui, skin| draw_tool_card(ui, skin, &msg, 280.0));
+                delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            }
+            if state == ToolState::Running { assert!(delay <= std::time::Duration::from_millis(60)); }
+            else { assert_eq!(delay, std::time::Duration::MAX, "完成态不得继续请求动画重绘"); }
+        }
+    }
+
+    #[test]
+    fn tool_states_are_exclusive_and_errors_remain_accessible() {
+        use crate::state::{ToolMeta, ToolState};
+        let successful = ToolMeta { call_id: "success".into(), name: "bash".into(), title: "执行", risk: "exec",
+            preview: "preview".into(), args: serde_json::Value::Null, state: ToolState::Done,
+            outcome: Some(neo_tools::Outcome::ok("bash", "done", serde_json::Value::Null)) };
+        assert_eq!(tool_status(&successful), ("执行成功", neo_ui::NoticeTone::Success));
+        let message = "执行失败原因 very_long_token_".repeat(8);
+        let hint = "检查路径及权限后手动决定下一步".repeat(4);
+        for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
+            for width in [240.0, 320.0, 560.0] {
+                for scale in [0.85, 1.0, 1.75, 2.8] {
+                    for state in [ToolState::AwaitingConfirm, ToolState::Running, ToolState::Done, ToolState::Denied, ToolState::Cancelled] {
+                        let ctx = context();
+                        ctx.enable_accesskit();
+                        let theme = neo_theme::Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
+                        theme.apply(&ctx);
+                        let whale = crate::brand::WhaleMark::cached(&ctx);
+                        let skin = Skin::new(theme, &whale);
+                        let mut outcome = neo_tools::Outcome::fail("bash", neo_tools::ToolError::io(&message).with_hint(&hint));
+                        outcome.data = serde_json::json!({"exit_code": -1073741819_i64});
+                        let mut msg = crate::state::ChatMessage::new(Role::Assistant, String::new());
+                        msg.tool = Some(ToolMeta { call_id: "stable-tool".into(), name: "bash".into(), title: "执行", risk: "exec",
+                            preview: "preview".into(), args: serde_json::json!({"command": "echo summary"}), state, outcome: Some(outcome) });
+                        let (status, tone) = tool_status(msg.tool.as_ref().unwrap());
+                        if state == ToolState::Cancelled { assert_eq!(tone, neo_ui::NoticeTone::Neutral); }
+                        let mut output = ctx.run_ui(egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 6000.0))),
+                            ..Default::default()
+                        }, |ui| {
+                            ui.set_max_width(width - 16.0);
+                            draw_tool_card(ui, &skin, &msg, width - 16.0);
+                        });
+                        output.textures_delta.clear();
+                        let texts: Vec<_> = output.shapes.iter().filter_map(|s| match &s.shape { egui::Shape::Text(t) => Some(t), _ => None }).collect();
+                        assert!(texts.iter().any(|t| t.galley.text() == status));
+                        if tone == neo_ui::NoticeTone::Error {
+                            let full = format!("{message}（建议：{hint}）");
+                            let text = texts.iter().find(|t| t.galley.text() == full).unwrap();
+                            assert!(!text.galley.elided);
+                            assert!(text.pos.x + text.galley.size().x <= width);
+                            let tree = output.platform_output.accesskit_update.as_ref().expect("AccessKit enabled by eframe");
+                            assert!(tree.nodes.iter().any(|(_, node)| node.value() == Some(full.as_str())));
+                        } else {
+                            assert!(!texts.iter().any(|t| t.galley.text().contains(&message)));
+                        }
+                        if state == ToolState::Cancelled {
+                            assert!(!texts.iter().any(|t| t.fallback_color == skin.p().error));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn long_code_and_wide_table_stay_readable_inside_message_column() {

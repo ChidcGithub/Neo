@@ -249,9 +249,53 @@ impl<'a> ConfirmBar<'a> {
             confirm: "删除",
         }
     }
+
+    /// 布局流入口；`opening` 表示本次确认首次展示，该帧不会提交删除。
+    pub fn show(&self, ui: &mut Ui, d: &Design, id: impl std::hash::Hash, opening: bool) -> ConfirmResponse {
+        let id = crate::hash_id(id);
+        let inner = ui.push_id(id, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::splat(d.m().s(8.0));
+            let question = ui.add(egui::Label::new(egui::RichText::new(self.question)
+                .font(d.font(d.t().label)).color(d.p().label_primary)).wrap());
+            // 整行或两行按钮都按实际热区排版，不再外扩覆盖问句。
+            let available = ui.available_width();
+            let button_w = ["取消", self.confirm].map(|text| {
+                d.m().hit_target(ui.painter().layout_no_wrap(text.to_owned(),
+                    d.font_bold(d.t().label), d.p().label_primary).size().x + d.m().s(32.0))
+            });
+            let stacked = button_w[0] + button_w[1] + d.m().s(8.0) > available;
+            let buttons = ui.with_layout(if stacked { egui::Layout::top_down(egui::Align::Min) }
+                else { egui::Layout::left_to_right(egui::Align::Center) }, |ui| {
+                let cancel = crate::Button::new("取消").elevated().touch_layout()
+                    .id_salt(id.with("cancel")).show(ui, d);
+                let confirm = crate::Button::new(self.confirm).danger().touch_layout()
+                    .id_salt(id.with("confirm")).show(ui, d);
+                (cancel, confirm)
+            }).inner;
+            (question, buttons.0, buttons.1)
+        });
+        let (question, cancel, confirm) = inner.inner;
+        if opening { cancel.request_focus(); }
+        let escaped = ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let outcome = if escaped || (!opening && cancel.clicked()) {
+            ConfirmOutcome::Cancel
+        } else if !opening && confirm.clicked() {
+            ConfirmOutcome::Confirm
+        } else { ConfirmOutcome::None };
+        ConfirmResponse { response: inner.response, question, cancel, confirm, outcome }
+    }
+}
+
+pub struct ConfirmResponse {
+    pub response: egui::Response,
+    pub question: egui::Response,
+    pub cancel: egui::Response,
+    pub confirm: egui::Response,
+    pub outcome: ConfirmOutcome,
 }
 
 /// 删除确认行的绘制结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfirmOutcome {
     Confirm,
     Cancel,
@@ -415,6 +459,62 @@ mod confirm_tests {
 
     fn design(mode: ThemeMode, viewport_h: f32, distance: Distance) -> Design {
         Design::new(Theme::new(mode, viewport_h, distance))
+    }
+
+    #[test]
+    fn flow_confirmation_wraps_targets_and_keyboard_is_safe() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            for scale in [0.85, 1.0, 1.75, 2.8] {
+                for width in [240.0, 320.0, 560.0] {
+                    let ctx = egui::Context::default();
+                    neo_theme::fonts::install(&ctx);
+                    let theme = Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
+                    theme.apply(&ctx);
+                    let d = Design::new(theme);
+                    let question = "删除这条记忆？此操作无法撤销。Long question ".repeat(5);
+                    let draw = |opening, events| {
+                        let mut result = None;
+                        let mut output = ctx.run_ui(egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 4000.0))),
+                            events, ..Default::default()
+                        }, |ui| {
+                            let parent = Rect::from_min_size(egui::pos2(8.0, 8.0), Vec2::new(width - 16.0, 3984.0));
+                            crate::at(ui, parent, |ui| {
+                                ui.shrink_clip_rect(parent);
+                                let response = ConfirmBar::new(&question).show(ui, &d, "safe-confirm", opening);
+                                for rect in [response.cancel.rect, response.confirm.rect] {
+                                    assert!(ui.clip_rect().contains_rect(rect), "确认热区不得越过父级裁剪");
+                                }
+                                result = Some(response);
+                            });
+                        });
+                        output.textures_delta.clear();
+                        result.unwrap()
+                    };
+                    let key = |key| vec![egui::Event::Key { key, physical_key: None, pressed: true,
+                        repeat: false, modifiers: egui::Modifiers::NONE }];
+                    let first = draw(true, vec![]);
+                    assert_eq!(first.outcome, ConfirmOutcome::None);
+                    let settled = draw(false, vec![]);
+                    assert!(settled.cancel.has_focus());
+                    assert_eq!(first.cancel.id, settled.cancel.id);
+                    assert!(settled.question.rect.bottom() <= settled.cancel.rect.top());
+                    assert!(!settled.cancel.rect.shrink(0.1).intersects(settled.confirm.rect.shrink(0.1)));
+                    for rect in [settled.cancel.rect, settled.confirm.rect] {
+                        assert!(rect.right() <= width);
+                        assert!(rect.height() >= d.m().hit_target(0.0));
+                    }
+                    assert_eq!(draw(false, key(egui::Key::Enter)).outcome, ConfirmOutcome::Cancel);
+                    draw(true, vec![]);
+                    draw(false, key(egui::Key::Tab));
+                    let focused = draw(false, vec![]);
+                    assert!(focused.confirm.has_focus(), "Tab {width}/{scale}");
+                    assert_eq!(draw(false, key(egui::Key::Enter)).outcome, ConfirmOutcome::Confirm);
+                    assert_eq!(draw(false, key(egui::Key::Escape)).outcome, ConfirmOutcome::Cancel);
+                    assert_eq!(draw(true, key(egui::Key::Enter)).outcome, ConfirmOutcome::None);
+                }
+            }
+        }
     }
 
     /// **回归**：文案区必须严格在按钮左边（曾经重叠 22pt，把「删除」压在问句上）。

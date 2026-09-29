@@ -467,11 +467,12 @@ fn extract_xml_text(data: &[u8], text: &mut Text) -> Result<(), String> {
     let mut in_text = false;
     walk_xml(data, |event| {
         match event {
-            Event::Start(tag) => {
-                if tag.local_name().as_ref() == b"t" {
-                    in_text = true;
-                }
-            }
+            Event::Start(tag) => match tag.local_name().as_ref() {
+                b"t" => in_text = true,
+                b"tab" => text.push("\t"),
+                b"br" | b"cr" => text.newline(),
+                _ => {}
+            },
             Event::End(tag) => match tag.local_name().as_ref() {
                 b"t" => in_text = false,
                 b"p" | b"tr" => text.newline(),
@@ -974,6 +975,30 @@ mod tests {
         assert_eq!(attachment.kind, "document");
         assert!(attachment.text.contains("中文 & A\t末尾\n表格"));
         assert!(attachment.image_url.is_none());
+    }
+
+    #[test]
+    fn xml_break_forms_and_paired_controls_preserve_separators() {
+        for br in ["<a:br/>", "<a:br></a:br>", "<a:br><a:rPr lang='zh-CN'/></a:br>"] {
+            let xml = format!(
+                "<a:p xmlns:a='urn:a'><a:r><a:t>before</a:t></a:r>{br}<a:r><a:t>after</a:t><a:tab></a:tab><a:t>tab</a:t><a:cr></a:cr><a:t>end</a:t></a:r></a:p>"
+            );
+            let mut text = Text::default();
+            extract_xml_text(xml.as_bytes(), &mut text).unwrap();
+            assert_eq!(text.value, "before\nafter\ttab\nend\n", "{br}");
+        }
+    }
+
+    #[test]
+    fn pptx_keeps_styled_break_between_runs() {
+        let data = zip(&[
+            ("[Content_Types].xml", b"<Types/>"),
+            ("ppt/presentation.xml", b"<p:presentation xmlns:p='p' xmlns:r='r'><p:sldIdLst><p:sldId id='256' r:id='first'/></p:sldIdLst></p:presentation>"),
+            ("ppt/_rels/presentation.xml.rels", b"<Relationships><Relationship Id='first' Type='urn:office/slide' Target='slides/slide1.xml'/></Relationships>"),
+            ("ppt/slides/slide1.xml", b"<p:sld xmlns:p='p' xmlns:a='a'><a:p><a:r><a:t>before</a:t></a:r><a:br><a:rPr lang='en-US'/></a:br><a:r><a:t>after</a:t></a:r></a:p></p:sld>"),
+        ]);
+        let attachment = parse("break.pptx", "pptx", &data).unwrap();
+        assert_eq!(attachment.text, "--- 幻灯片 1 ---\nbefore\nafter");
     }
 
     #[test]

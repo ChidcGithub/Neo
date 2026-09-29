@@ -267,9 +267,18 @@ pub fn assemble(frags: &[ToolCallFrag]) -> Vec<ToolCall> {
         }
         slot.arguments.push_str(&f.args);
     }
+    // 先保留所有显式 ID，避免补齐时与后面的调用或其他合成 ID 碰撞。
+    let mut used: std::collections::HashSet<String> = slots.iter()
+        .filter(|c| !c.id.is_empty()).map(|c| c.id.clone()).collect();
     for (i, c) in slots.iter_mut().enumerate() {
         if c.id.is_empty() {
-            c.id = format!("call_{i}");
+            let base = format!("call_{i}");
+            c.id = base.clone();
+            let mut suffix = 0;
+            while !used.insert(c.id.clone()) {
+                suffix += 1;
+                c.id = format!("{base}_{suffix}");
+            }
         }
     }
     slots.retain(|c| !c.name.is_empty());
@@ -1192,6 +1201,9 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
     let mut last_data = Instant::now();
     let mut output_bytes = 0usize;
     let mut output_events = 0usize;
+    let mut event_data = String::new();
+    let mut has_data = false;
+    let mut first_line = true;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -1214,8 +1226,11 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
         };
         last_data = Instant::now();
 
+        let eof = matches!(msg, LineEvent::Eof);
         let line = match msg {
             LineEvent::Line(l) => l,
+            // 兼容省略末尾空行的服务端；仍须完整 JSON 和正常结束标志。
+            LineEvent::Eof if has_data => String::new(),
             LineEvent::Eof => break,
             LineEvent::Failed(e) => {
                 let _ = tx.send(Event::Failed(e));
@@ -1223,20 +1238,40 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
             }
         };
 
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
+        let line = if first_line {
+            first_line = false;
+            line.strip_prefix('\u{feff}').unwrap_or(&line)
+        } else {
+            &line
+        };
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if !line.is_empty() {
+            let (field, value) = line.split_once(':').unwrap_or((line, ""));
+            if field == "data" {
+                let value = value.strip_prefix(' ').unwrap_or(value);
+                let added = value.len().saturating_add(usize::from(has_data));
+                if added > MAX_EVENT_BYTES.saturating_sub(event_data.len()) {
+                    let _ = tx.send(Event::Failed("响应事件过长（疑似畸形流），已中断".into()));
+                    return;
+                }
+                if has_data {
+                    event_data.push('\n');
+                }
+                event_data.push_str(value);
+                has_data = true;
+            }
+            continue; // 注释 / 其他字段不触发 dispatch，也不打断 data 拼接。
+        }
+        if !has_data {
             continue;
         }
-        let Some(payload) = trimmed.strip_prefix("data:") else {
-            continue; // 注释行 / 未知前缀
-        };
-        let payload = payload.trim();
-        if payload == "[DONE]" {
+        if event_data == "[DONE]" {
             completed = true;
             break;
         }
 
-        match parse_chunk(payload) {
+        match parse_chunk(&event_data) {
             Ok(chunk) => {
                 output_bytes = output_bytes
                     .saturating_add(chunk.content.len())
@@ -1292,6 +1327,11 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
                 return;
             }
         }
+        event_data.clear();
+        has_data = false;
+        if eof {
+            break;
+        }
     }
 
     if !completed {
@@ -1302,6 +1342,11 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
     }
     let calls = assemble(&tool_frags);
     let indices: std::collections::HashSet<_> = tool_frags.iter().map(|f| f.index).collect();
+    let mut ids = std::collections::HashSet::new();
+    if calls.iter().any(|call| !ids.insert(call.id.as_str())) {
+        let _ = tx.send(Event::Failed("工具调用 ID 重复，已阻止执行".to_owned()));
+        return;
+    }
     if calls.len() != indices.len()
         || calls.iter().any(|call| {
             !matches!(
@@ -1329,6 +1374,8 @@ enum LineEvent {
 
 /// 单个 SSE 行的字节上限。正常的增量块最多几百 KB（大段工具参数）。
 const MAX_LINE_BYTES: u64 = 1 << 20;
+// 多 data 行拼成的事件也限 1 MiB，在追加到缓冲前拒绝超限。
+const MAX_EVENT_BYTES: usize = 1 << 20;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STREAM_EVENTS: usize = 16_384;
@@ -1780,6 +1827,161 @@ mod tests {
         assert!(!events.iter().any(|e| matches!(e, Event::Done { .. })));
     }
 
+    struct SingleByteReader<'a>(&'a [u8]);
+
+    impl Read for SingleByteReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let len = buf.len().min(1);
+            self.0.read(&mut buf[..len])
+        }
+    }
+
+    #[test]
+    fn sse_single_byte_bom_chinese_and_body_bom_are_preserved() {
+        let content = "中文\u{feff}正文";
+        let chunk = serde_json::json!({"choices":[{"delta":{
+            "content":content, "reasoning_content":"\u{feff}思考"
+        }}]});
+        for prefix in ["\u{feff}", "\u{feff}: keepalive\r\n\r\n"] {
+            let body = format!("{prefix}data: {chunk}\r\n\r\ndata: [DONE]\r\n\r\n");
+            let events = reader_events(SingleByteReader(body.as_bytes()));
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert!(matches!(&events[0], Event::Delta { content: c, reasoning }
+                if c == content && reasoning == "\u{feff}思考"));
+            assert!(matches!(events[1], Event::Done { tool_calls: false }));
+        }
+        for body in [
+            "data: \u{feff}{}\n\ndata: [DONE]\n\n",
+            "data: [DONE]\u{feff}\n\n",
+            "\u{feff}\u{feff}data: [DONE]\n\n",
+            ": first\n\u{feff}data: [DONE]\n\n",
+        ] {
+            assert_failed(&reader_events(SingleByteReader(body.as_bytes())));
+        }
+    }
+
+    #[test]
+    fn sse_multiline_json_comments_crlf_and_empty_fields() {
+        let body = concat!(
+            ": heartbeat\r\n\r\nevent: message\r\nid: 1\r\n",
+            "data\r\ndata: {\r\n: between data lines\r\n",
+            "data: \"choices\": [\r\nretry: 1000\r\n",
+            "data:{\"delta\": {\"content\": \"你好\",\r\n",
+            "data: \"reasoning_content\": \"思考\"}}]}\r\ndata:\r\n\r\n",
+            ": heartbeat\r\n\r\ndata: [DONE]\r\n\r\n"
+        );
+        let events = reader_events(SingleByteReader(body.as_bytes()));
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(&events[0], Event::Delta { content, reasoning }
+            if content == "你好" && reasoning == "思考"));
+        assert!(matches!(events[1], Event::Done { tool_calls: false }));
+        // 每个 data 值必须由换行连接，不能直接拼接或按行独立解析。
+        for body in [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\ndata: b\"}}]}\n\ndata: [DONE]\n\n",
+            "data: {}\ndata: {}\n\ndata: [DONE]\n\n",
+            "data: [DONE]\ndata: {}\n\n",
+        ] {
+            assert_failed(&reader_events(body.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn sse_data_removes_only_one_ascii_space() {
+        for value in ["[DONE]", " [DONE]"] {
+            let events = reader_events(format!("data:{value}\n\n").as_bytes());
+            assert!(matches!(events.last(), Some(Event::Done { tool_calls: false })));
+        }
+        for value in ["  [DONE]", "\t[DONE]", "\u{a0}[DONE]", " [DONE] ", " [DONE]\t"] {
+            assert_failed(&reader_events(format!("data:{value}\n\n").as_bytes()));
+        }
+    }
+
+    #[test]
+    fn sse_eof_dispatch_keeps_finish_reason_and_tool_safety() {
+        for ending in ["", "\n", "\r\n", "\n\n"] {
+            let events = reader_events(format!("data: [DONE]{ending}").as_bytes());
+            assert!(matches!(events.last(), Some(Event::Done { tool_calls: false })));
+            for reason in ["stop", "tool_calls"] {
+                for args in ["{}", "{", "", "[]", "{}{}"] {
+                    let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                        {"function":{"name":"read_file","arguments":args}}
+                    ]},"finish_reason":reason}]});
+                    let body = format!("data: {{\ndata: \"choices\":{} }}{ending}", chunk["choices"]);
+                    let events = reader_events(body.as_bytes());
+                    if args == "{}" {
+                        assert!(matches!(events.last(), Some(Event::Done { tool_calls: true })), "{events:?}");
+                    } else {
+                        assert_failed(&events);
+                    }
+                }
+            }
+            let body = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"partial\"}}}}]}}{ending}");
+            assert_failed(&reader_events(body.as_bytes()));
+            assert_failed(&reader_events(format!("data: {{\ndata: \"choices\": [{ending}").as_bytes()));
+        }
+    }
+
+    #[test]
+    fn sse_multiline_event_limit_includes_joined_newlines() {
+        let half = " ".repeat(MAX_EVENT_BYTES / 2);
+        for extra in [0, 1] {
+            // 2 字节 JSON + 两行间换行 + padding，恰好上限时仍可解析。
+            let body = format!("data: {{}}{half}\ndata: {}\n\ndata: [DONE]\n\n",
+                " ".repeat(MAX_EVENT_BYTES / 2 - 3 + extra));
+            let events = reader_events(body.as_bytes());
+            if extra == 0 {
+                assert!(matches!(events.last(), Some(Event::Done { tool_calls: false })), "{events:?}");
+            } else {
+                assert_failed(&events);
+                assert!(matches!(events.last(), Some(Event::Failed(error)) if error.contains("事件过长")));
+            }
+        }
+        let body = format!("{}data: [DONE]\n\n", format!("data: {half}\n").repeat(3));
+        assert_failed(&reader_events(body.as_bytes()));
+    }
+
+    #[test]
+    fn sse_line_stream_and_output_event_limits_remain_enforced() {
+        let events = reader_events("x".repeat(MAX_LINE_BYTES as usize + 1).as_bytes());
+        assert_failed(&events);
+        assert!(matches!(events.last(), Some(Event::Failed(error)) if error.contains("行过长")));
+        let comment = format!(":{}\n", "x".repeat(1022));
+        let events = reader_events(comment.repeat(MAX_STREAM_BYTES / comment.len() + 1).as_bytes());
+        assert_failed(&events);
+        assert!(matches!(events.last(), Some(Event::Failed(error)) if error.contains("累计字节或事件数")));
+        let calls: Vec<_> = (0..MAX_TOOL_CALLS).map(|i|
+            serde_json::json!({"index":i,"function":{"arguments":" "}})
+        ).collect();
+        let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":calls}}]});
+        let body = format!("{}data: [DONE]\n\n",
+            format!("data: {chunk}\n\n").repeat(MAX_STREAM_EVENTS / (MAX_TOOL_CALLS + 1) + 1));
+        let events = reader_events(body.as_bytes());
+        assert_failed(&events);
+        assert!(matches!(events.last(), Some(Event::Failed(error)) if error.contains("累计超过预算")));
+    }
+
+    #[test]
+    fn sse_pending_event_is_not_dispatched_on_failure_disconnect_or_cancel() {
+        for end in [None, Some(LineEvent::Failed("mock reset".into()))] {
+            let (line_tx, line_rx) = mpsc::channel();
+            line_tx.send(LineEvent::Line("data: [DONE]\n".into())).unwrap();
+            if let Some(end) = end {
+                line_tx.send(end).unwrap();
+            }
+            drop(line_tx);
+            let (tx, rx) = mpsc::channel();
+            consume_lines(line_rx, &tx, &AtomicBool::new(false));
+            drop(tx);
+            assert_failed(&rx.into_iter().collect::<Vec<_>>());
+        }
+        let (line_tx, line_rx) = mpsc::channel();
+        line_tx.send(LineEvent::Line("data: [DONE]\n\n".into())).unwrap();
+        let (tx, rx) = mpsc::channel();
+        consume_lines(line_rx, &tx, &AtomicBool::new(true));
+        drop(tx);
+        assert!(rx.into_iter().next().is_none());
+    }
+
     #[test]
     fn reader_eof_without_terminator_fails() {
         for body in [
@@ -1839,6 +2041,36 @@ mod tests {
         }
         let unnamed = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n";
         assert_failed(&reader_events(&unnamed[..]));
+    }
+
+    #[test]
+    fn duplicate_tool_ids_never_emit_executable_done() {
+        for tail in ["data: [DONE]\n", "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n"] {
+            let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"dup","function":{"name":"read_file","arguments":"{}"}},
+                {"index":1,"id":"dup","function":{"name":"read_file","arguments":"{}"}}
+            ]}}]});
+            let events = reader_events(format!("data: {chunk}\n\n{tail}").as_bytes());
+            assert_failed(&events);
+            assert!(matches!(events.last(), Some(Event::Failed(error)) if error.contains("ID 重复")));
+        }
+    }
+
+    #[test]
+    fn missing_tool_ids_avoid_explicit_and_fallback_collisions() {
+        let args = "{ \"path\": \"a.txt\" }";
+        let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":[
+            {"index":3,"id":"call_1_1","function":{"name":"read_file","arguments":args}},
+            {"index":2,"function":{"name":"read_file","arguments":args}},
+            {"index":1,"function":{"name":"read_file","arguments":args}},
+            {"index":0,"id":"call_1","function":{"name":"read_file","arguments":args}}
+        ]}}]});
+        let events = reader_events(format!("data: {chunk}\n\ndata: [DONE]\n").as_bytes());
+        assert!(matches!(events.last(), Some(Event::Done { tool_calls: true })));
+        let frags: Vec<_> = events.into_iter().filter_map(|e| match e { Event::ToolCall(f) => Some(f), _ => None }).collect();
+        let calls = assemble(&frags);
+        assert_eq!(calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["call_1", "call_1_2", "call_2", "call_1_1"]);
+        assert!(calls.iter().all(|c| c.arguments == args));
     }
 
     #[test]

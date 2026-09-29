@@ -22,7 +22,7 @@ pub mod read_file;
 pub mod screen;
 pub mod screen_element_search;
 pub mod screen_elements;
-pub(crate) mod screen_uia;
+pub mod screen_uia;
 pub mod screenshot;
 pub mod screenshot_space;
 pub mod shell;

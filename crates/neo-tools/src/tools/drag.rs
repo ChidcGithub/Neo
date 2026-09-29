@@ -79,7 +79,7 @@ fn act(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     screen::ensure_dpi_aware();
     super::screen_uia::cache_invalidate();
     super::screenshot_space::invalidate();
-    screen::drag(from, to, button, duration_ms)?;
+    screen::drag_cancellable(from, to, button, duration_ms, || scope.is_cancelled())?;
 
     Ok(Outcome::ok(
         "drag",

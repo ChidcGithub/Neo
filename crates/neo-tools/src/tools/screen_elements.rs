@@ -91,7 +91,7 @@ pub(super) fn element_json(e: &screen_uia::ScreenElement) -> Value {
 /// 每次最多给模型 50 个元素，避免可访问树淹没上下文。
 const PAGE_SIZE: usize = 50;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PageCursor {
     key: String,
     next_start: usize,
@@ -115,6 +115,30 @@ struct ElementPage {
     truncated: bool,
 }
 
+fn publish_page<T>(scope: &Scope, generation: u64, key: &str, els: &[screen_uia::ScreenElement],
+    cursor: &mut PageCursor, build: impl FnOnce(&ElementPage) -> Result<T, ToolError>,
+) -> Result<(String, ElementPage, T), ToolError> {
+    screen_uia::cache_check(scope, generation)?;
+    let mut next = cursor.clone();
+    let reuse = screen_uia::cache_snapshot().filter(|(id, cached)|
+        next.key == key && next.snapshot_id == *id && cached == els && next.snapshot == els)
+        .map(|(id, _)| id);
+    if reuse.is_none() {
+        next.next_start = 0;
+        // 新 ID 尚未发布，先以最大宽度占位，保证最终 JSON 预算不变松。
+        next.snapshot_id = "4294967295-18446744073709551615-18446744073709551615".into();
+    }
+    let page = take_page(key, els, &mut next);
+    screen_uia::cache_check(scope, generation)?;
+    let built = build(&page)?;
+    let id = screen_uia::cache_publish_checked(els, scope, generation, reuse.as_deref())?;
+    next.snapshot_id = id.clone();
+    // 所有潜在失败操作完成且受检发布成功，才推进真实游标。
+    *cursor = next;
+    Ok((id, page, built))
+}
+
+#[cfg(test)]
 fn page_snapshot(key: &str, els: &[screen_uia::ScreenElement], cursor: &mut PageCursor) -> String {
     if let Some((id, cached)) = screen_uia::cache_snapshot() {
         if cursor.key == key && cursor.snapshot_id == id && cached == els && cursor.snapshot == els {
@@ -237,7 +261,9 @@ fn overview_data(windows: &[screen_uia::WindowSummary], incomplete: bool) -> Val
     data
 }
 
-fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
+fn act(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
+    let generation = screen_uia::cache_generation();
+    screen_uia::cache_check(scope, generation)?;
     let mode = args.opt_str("mode")?;
     if !matches!(mode.as_str(), "" | "elements" | "overview") {
         return Err(ToolError::bad_args("mode 只能是 elements 或 overview"));
@@ -247,7 +273,11 @@ fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
             || args.flag("annotate")? {
             return Err(ToolError::bad_args("overview 只返回全局窗口摘要，不接受元素过滤或 annotate"));
         }
-        let (windows, incomplete) = screen_uia::desktop_overview()?;
+        let _interaction = screen_uia::INTERACTION.lock().unwrap();
+        screen_uia::cache_check(scope, generation)?;
+        let result = screen_uia::desktop_overview();
+        screen_uia::cache_check(scope, generation)?;
+        let (windows, incomplete) = result?;
         return Ok(Outcome::ok("screen_elements", "全桌面顶层窗口概览", overview_data(&windows, incomplete)));
     }
     let region = query_region(args)?;
@@ -259,11 +289,14 @@ fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     let filter = Some(window.trim()).filter(|s| !s.is_empty());
     let all_windows = all || filter.is_some() || window_id.is_some();
     let _interaction = screen_uia::INTERACTION.lock().unwrap();
+    screen_uia::cache_check(scope, generation)?;
     let query = screen_uia::Query { window_id, keyword: keyword.trim(), region, ..Default::default() };
-    let els = screen_uia::enumerate_query(filter, all_windows, 600, 800, &query)
-        .inspect_err(|_| screen_uia::cache_invalidate())?;
+    // 单次 COM 调用无法硬中断；返回后先拒绝取消/旧代，不能清掉较新的缓存。
+    let result = screen_uia::enumerate_query(filter, all_windows, 600, 800, &query);
+    screen_uia::cache_check(scope, generation)?;
+    let els = result.inspect_err(|_| { let _ = screen_uia::cache_invalidate_checked(scope, generation); })?;
     if els.is_empty() {
-        screen_uia::cache_invalidate();
+        screen_uia::cache_invalidate_checked(scope, generation)?;
         return Err(
             ToolError::not_found("屏幕上没有枚举到可交互元素").with_hint(match filter {
                 Some(f) => {
@@ -278,26 +311,24 @@ fn act(_scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     // 范围用结构化键，避免标题/关键词中的分隔符让不同查询碰撞。
     let key = json!([all_windows, filter, window_id, keyword.trim(), region]).to_string();
     let mut cursor = PAGE_CURSOR.lock().unwrap();
-    let snapshot_id = page_snapshot(&key, &els, &mut cursor);
-    let page = take_page(&key, &els, &mut cursor);
-    drop(cursor);
-    let page_els = &els[page.start..page.end];
-    let has_more = page.end < els.len();
-
+    screen_uia::cache_check(scope, generation)?;
     let vs = screen::virtual_screen();
-    let data = page_data(&snapshot_id, els.len(), &page.items, page.page, page.pages, has_more,
+    let (snapshot_id, page, image) = publish_page(scope, generation, &key, &els, &mut cursor, |page| {
+        if !annotate { return Ok(None); }
+        screen_uia::cache_check(scope, generation)?;
+        let shot = screen::capture(vs)?;
+        screen_uia::cache_check(scope, generation)?;
+        let marked = annotate_shot(&shot, &els[page.start..page.end], (vs.x, vs.y))?;
+        let png = marked.to_png()?;
+        // 标注图超限就不附（32 MiB 是官方单图上限），清单仍可用。
+        Ok((png.len() <= super::limits::INLINE_IMAGE_BYTES)
+            .then(|| format!("data:image/png;base64,{}", b64(&png))))
+    })?;
+    drop(cursor);
+    let data = page_data(&snapshot_id, els.len(), &page.items, page.page, page.pages, page.end < els.len(),
         page.truncated, all_windows, vs, screen_uia::cache_remaining_seconds());
     let mut outcome = Outcome::ok("screen_elements", page_summary(els.len()), data);
-
-    if annotate {
-        // 标注图超限就不附（32 MiB 是官方单图上限），清单本身仍然完整可用。
-        let shot = screen::capture(vs)?;
-        let marked = annotate_shot(&shot, page_els, (vs.x, vs.y))?;
-        let png = marked.to_png()?;
-        if png.len() <= super::limits::INLINE_IMAGE_BYTES {
-            outcome = outcome.with_image(format!("data:image/png;base64,{}", b64(&png)));
-        }
-    }
+    if let Some(image) = image { outcome = outcome.with_image(image); }
     Ok(outcome)
 }
 
@@ -549,6 +580,98 @@ mod tests {
         assert!(parse_window_id("0").is_err());
         assert!(parse_window_id("abc").is_err());
         assert_eq!(parse_window_id("42").unwrap(), Some(42));
+    }
+
+    #[test]
+    fn cancelled_page_never_annotates_publishes_or_advances_cursor() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let _interaction = screen_uia::INTERACTION.lock().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let scope = Scope::new(std::env::temp_dir()).with_cancel(cancel.clone());
+        let els = elements(80, "按钮");
+        let mut cursor = PageCursor::default();
+        let (id, first, ()) = publish_page(&scope, screen_uia::cache_generation(), "scope", &els, &mut cursor, |_| Ok(())).unwrap();
+        let before = cursor.next_start;
+        assert_eq!(before, first.end);
+        cancel.store(true, Ordering::Release);
+        let result = publish_page(&scope, screen_uia::cache_generation(), "scope", &els, &mut cursor,
+            |_| -> Result<(), ToolError> { panic!("取消后不得标注/截图"); });
+        assert!(result.is_err());
+        assert_eq!(cursor.next_start, before);
+        assert_eq!(screen_uia::cache_snapshot().unwrap().0, id);
+        cancel.store(false, Ordering::Release);
+        let result = publish_page(&scope, screen_uia::cache_generation(), "scope", &els, &mut cursor, |_| {
+            cancel.store(true, Ordering::Release);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(cursor.next_start, before);
+        assert_eq!(screen_uia::cache_snapshot().unwrap().0, id);
+        cancel.store(false, Ordering::Release);
+        let result = publish_page(&scope, screen_uia::cache_generation(), "scope", &els, &mut cursor, |_| {
+            screen_uia::cache_invalidate();
+            screen_uia::cache_store(&elements(1, "较新观察"));
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(cursor.next_start, before);
+        assert_eq!(screen_uia::cache_snapshot().unwrap().1[0].label, "较新观察");
+        screen_uia::cache_invalidate();
+    }
+
+    #[test]
+    fn page_build_failure_keeps_cursor_and_success_reuses_snapshot() {
+        let _interaction = screen_uia::INTERACTION.lock().unwrap();
+        let scope = Scope::new(std::env::temp_dir());
+        let els = elements(80, "按钮");
+        let mut cursor = PageCursor::default();
+        let (id, first, ()) = publish_page(&scope, screen_uia::cache_generation(), "scope", &els, &mut cursor, |_| Ok(())).unwrap();
+        let generation = screen_uia::cache_generation();
+        let result = publish_page(&scope, generation, "scope", &els, &mut cursor,
+            |_| Err::<(), _>(ToolError::io("假标注失败")));
+        assert!(result.is_err());
+        assert_eq!(cursor.next_start, first.end);
+        let (second_id, second, ()) = publish_page(&scope, generation, "scope", &els, &mut cursor, |_| Ok(())).unwrap();
+        assert_eq!(second_id, id);
+        assert_eq!(second.start, first.end);
+        assert_eq!(screen_uia::cache_generation(), generation);
+        screen_uia::cache_invalidate();
+    }
+
+    #[test]
+    fn cancelled_elements_and_overview_stop_before_desktop_access() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let scope = Scope::new(std::env::temp_dir()).with_cancel(cancel);
+        let tool = crate::find("screen_elements").unwrap();
+        for value in [json!({"annotate": true}), json!({"mode": "overview"})] {
+            assert_eq!(act(&scope, &Args::new(tool, &value)).unwrap_err().kind, crate::cancelled_error().kind);
+        }
+    }
+
+    #[test]
+    fn waiting_uia_tools_cancel_without_desktop_access() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        for (name, value) in [("screen_elements", json!({"annotate": true})),
+            ("screen_elements", json!({"mode": "overview"})),
+            ("screen_element_search", json!({"refresh": true})),
+            ("screen_element_search", json!({"refresh": false}))] {
+            let interaction = screen_uia::INTERACTION.lock().unwrap();
+            let token = Arc::new(AtomicBool::new(false));
+            let scope = Scope::new(std::env::temp_dir()).with_cancel(token.clone());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let entered = barrier.clone();
+            let worker = std::thread::spawn(move || {
+                let tool = crate::find(name).unwrap();
+                entered.wait();
+                (tool.run)(&scope, &Args::new(tool, &value))
+            });
+            barrier.wait();
+            token.store(true, Ordering::Release);
+            drop(interaction);
+            let outcome = worker.join().unwrap();
+            assert_eq!(outcome.error.unwrap().kind, crate::cancelled_error().kind);
+            assert!(outcome.images.is_empty());
+        }
     }
 
     #[test]

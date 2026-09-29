@@ -60,6 +60,16 @@ impl UpdateChecker {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn request_controlled(&mut self, ctx: &egui::Context, result: Status) -> Box<dyn FnOnce() + Send> {
+        let mut pending = None;
+        self.start(ctx, move || result, |job| {
+            pending = Some(job);
+            Ok(())
+        });
+        pending.expect("controlled worker must acquire single flight")
+    }
+
     /// 非阻塞领取一次完成结果；无工作时不安排轮询或重绘。
     pub fn poll(&mut self) -> Option<Status> {
         if self.pending {

@@ -54,6 +54,7 @@ pub struct Button<'a> {
     enabled: bool,
     /// 加载态：显示转圈、点击无效。
     loading: bool,
+    touch_layout: bool,
     id_salt: Option<egui::Id>,
 }
 
@@ -67,6 +68,7 @@ impl<'a> Button<'a> {
             full_width: false,
             enabled: true,
             loading: false,
+            touch_layout: false,
             id_salt: None,
         }
     }
@@ -124,6 +126,12 @@ impl<'a> Button<'a> {
         self
     }
 
+    /// 显式让触控热区占据布局，旧消费端尺寸保持不变。
+    pub fn touch_layout(mut self) -> Self {
+        self.touch_layout = true;
+        self
+    }
+
     fn height(&self, d: &Design) -> f32 {
         let m = d.m();
         match self.size {
@@ -162,24 +170,31 @@ impl<'a> Button<'a> {
             content_w + m.s(16.0) * 2.0
         };
 
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, h), egui::Sense::hover());
+        let size = if self.touch_layout {
+            Vec2::new(m.hit_target(width).min(ui.max_rect().width()).max(0.0), m.hit_target(h))
+        } else { Vec2::new(width, h) };
+        let (slot, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let rect = Rect::from_center_size(slot.center(), Vec2::new(width.min(size.x), h));
         // 默认 Id 带上位置：只按标签区分时，同一个界面里两个同名按钮
         // （例如两处「保存」）会撞成一个 Id。
         let id = self.id_salt.unwrap_or_else(|| {
             ui.id()
                 .with(("btn", self.label, rect.left() as i32, rect.top() as i32))
         });
-        let interact_rect = Rect::from_center_size(
+        let interact_rect = if self.touch_layout { slot } else { Rect::from_center_size(
             rect.center(),
             Vec2::new(m.hit_target(width), m.hit_target(h)),
-        );
+        ) };
         // 禁用 / 加载态：只感知悬停（不注册点击），这样 `clicked()` 天然为 false。
         let actionable = self.enabled && !self.loading;
-        let resp = if actionable {
-            tap(ui, interact_rect, id)
-        } else {
-            crate::base::hover_area(ui, interact_rect, id)
-        };
+        let interact_rect = interact_rect.intersect(ui.clip_rect());
+        let mut resp = if actionable { tap(ui, interact_rect, id) }
+            else { crate::base::hover_area(ui, interact_rect, id) };
+        if !actionable {
+            resp.flags.remove(egui::response::Flags::ENABLED);
+            resp.surrender_focus();
+        }
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, resp.enabled(), self.label));
         let st = State::of(&resp);
         let st = State {
             enabled: actionable,
@@ -238,7 +253,8 @@ impl<'a> Button<'a> {
         };
 
         let radius = m.radius_chip().max(m.s(10.0));
-        let painter = ui.painter();
+        let clipped_painter = ui.painter().with_clip_rect(slot.intersect(ui.clip_rect()));
+        let painter = if self.touch_layout { &clipped_painter } else { ui.painter() };
         // 按下时轻微收缩（98%），大屏上"按到了"的反馈。
         let press_scale = if st.pressed && self.enabled {
             0.985
@@ -265,6 +281,10 @@ impl<'a> Button<'a> {
             painter.squircle_stroked(draw_rect, radius, egui::Stroke::new(1.0, stroke));
         }
 
+        if resp.has_focus() {
+            painter.squircle_stroked(draw_rect, radius, egui::Stroke::new(m.s(2.0), p.accent));
+        }
+
         // ---- 内容：图标 + 文本（或转圈） ----
         let mut cx = draw_rect.center().x - content_w * 0.5;
         if let Some(icon) = self.icon.filter(|_| !self.loading) {
@@ -285,10 +305,12 @@ impl<'a> Button<'a> {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(60));
         }
-        let text_rect = Rect::from_center_size(
+        let text_rect = if self.touch_layout && self.icon.is_none() && !self.loading {
+            draw_rect
+        } else { Rect::from_center_size(
             egui::pos2(cx + text_w * 0.5, draw_rect.center().y),
             Vec2::new(text_w, draw_rect.height()),
-        );
+        ) };
         // 省略预算按按钮实际分到的宽度倒推（文本实测宽恒不大于它本身，
         // 拿实测宽当预算是永远不会省略的死逻辑）。
         let text_budget =
@@ -304,6 +326,7 @@ impl<'a> Button<'a> {
 ///
 /// 视觉直径沿用上游 28/34px；命中区自动扩到触控下限。
 pub struct IconButton {
+    label: Option<String>,
     icon: Icon,
     style: IconButtonStyle,
     size: Size,
@@ -333,6 +356,7 @@ pub enum IconButtonStyle {
 impl IconButton {
     pub fn new(icon: Icon) -> Self {
         Self {
+            label: None,
             icon,
             style: IconButtonStyle::default(),
             size: Size::Md,
@@ -380,6 +404,23 @@ impl IconButton {
         self
     }
 
+    /// 图标的业务含义，由消费端提供完整可访问名称。
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// 实际热区参与布局，避免相邻动作相互覆盖。
+    pub fn show_touch(self, ui: &mut Ui, d: &Design) -> Response {
+        let size = d.m().hit_target(self.visual_d(d));
+        let width = size.min(ui.max_rect().width()).max(0.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, size), egui::Sense::hover());
+        ui.scope(|ui| {
+            ui.shrink_clip_rect(rect);
+            self.show_at(ui, d, rect.center())
+        }).inner
+    }
+
     fn visual_d(&self, d: &Design) -> f32 {
         match self.size {
             Size::Sm => d.m().s(24.0),
@@ -411,11 +452,19 @@ impl IconButton {
         let id = self
             .id_salt
             .unwrap_or_else(|| ui.id().with(("ibtn", center.x as i32, center.y as i32)));
-        let resp = if self.enabled {
-            tap(ui, Rect::from_center_size(center, Vec2::splat(hit)), id)
+        let hit_rect = Rect::from_center_size(center, Vec2::splat(hit)).intersect(ui.clip_rect());
+        let mut resp = if self.enabled {
+            tap(ui, hit_rect, id)
         } else {
-            crate::base::hover_area(ui, Rect::from_center_size(center, Vec2::splat(hit)), id)
+            crate::base::hover_area(ui, hit_rect, id)
         };
+        if !self.enabled {
+            resp.flags.remove(egui::response::Flags::ENABLED);
+            resp.surrender_focus();
+        }
+        if let Some(label) = &self.label {
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, resp.enabled(), label));
+        }
         let st = State::of(&resp);
 
         let (base, hover, glyph_idle, glyph_hover) = match self.style {
@@ -470,6 +519,9 @@ impl IconButton {
         let painter = ui.painter();
         // 正圆：完全圆形元素退出超椭圆（上游 `corner-shape: round`）。
         painter.circle_filled(center, visual_d * 0.5, fill);
+        if resp.has_focus() {
+            painter.circle_stroke(center, visual_d * 0.5, egui::Stroke::new(m.s(2.0), p.accent));
+        }
         self.icon.paint(
             painter,
             Rect::from_center_size(center, Vec2::splat(self.icon_d(d))),
@@ -713,6 +765,97 @@ impl<'a> Segmented<'a> {
 #[cfg(test)]
 mod id_tests {
     use super::*;
+
+    #[test]
+    fn disabled_and_loading_buttons_ignore_focused_keyboard_activation() {
+        for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
+            for scale in [0.85, 1.0, 1.75, 2.8] {
+                for key in [egui::Key::Enter, egui::Key::Space] {
+                    for kind in 0..3 {
+                        let ctx = egui::Context::default();
+                        neo_theme::fonts::install(&ctx);
+                        let theme = neo_theme::Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
+                        theme.apply(&ctx);
+                        let d = Design::new(theme);
+                        let mut id = None;
+                        for step in 0..3 {
+                            if let Some(id) = id { ctx.memory_mut(|m| m.request_focus(id)); }
+                            let mut output = ctx.run_ui(egui::RawInput {
+                                events: if step == 0 { vec![] } else { vec![egui::Event::Key {
+                                    key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                                }] }, ..Default::default()
+                            }, |ui| {
+                                let response = match kind {
+                                    0 => Button::new("删除").id_salt("disabled-key").enabled(step == 0).show(ui, &d),
+                                    1 => Button::new("提交").id_salt("disabled-key").loading(step != 0).show(ui, &d),
+                                    _ => IconButton::new(Icon::Trash).id_salt("disabled-key").enabled(step == 0).show_touch(ui, &d),
+                                };
+                                id = Some(response.id);
+                                if step > 0 {
+                                    assert!(!response.enabled());
+                                    assert!(!response.clicked(), "禁用键盘触发 {kind}/{key:?}/{scale}");
+                                    assert!(!response.has_focus());
+                                }
+                            });
+                            output.textures_delta.clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn touch_buttons_stay_inside_narrow_parent_clip() {
+        for scale in [0.85, 1.0, 1.75, 2.8] {
+            let ctx = egui::Context::default();
+            neo_theme::fonts::install(&ctx);
+            let d = Design::new(neo_theme::Theme::from_metrics(neo_theme::ThemeMode::Dark,
+                neo_theme::Metrics::from_scale(scale)));
+            for width in [40.0, 96.0, 180.0] {
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let parent = Rect::from_min_size(egui::pos2(40.0, 40.0), Vec2::new(width, 1000.0));
+                    crate::at(ui, parent, |ui| {
+                        ui.shrink_clip_rect(parent);
+                        let mut rects = Vec::new();
+                        ui.horizontal_wrapped(|ui| {
+                            rects.push(IconButton::new(Icon::Pen).show_touch(ui, &d).rect);
+                            rects.push(IconButton::new(Icon::Trash).show_touch(ui, &d).rect);
+                            rects.push(Button::new("完整的长操作名称").icon(Icon::Trash).touch_layout().show(ui, &d).rect);
+                        });
+                        for (i, rect) in rects.iter().enumerate() {
+                            assert!(parent.contains_rect(*rect), "热区越界 {width}/{scale}: {rect:?}");
+                            for other in &rects[i + 1..] { assert!(!rect.shrink(0.1).intersects(other.shrink(0.1))); }
+                        }
+                    });
+                });
+                output.textures_delta.clear();
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_buttons_keep_full_labels_and_disabled_state() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        neo_theme::fonts::install(&ctx);
+        let d = Design::new(neo_theme::Theme::from_metrics(neo_theme::ThemeMode::Light,
+            neo_theme::Metrics::from_scale(1.0)));
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let response = Button::new("完整删除说明").enabled(false).touch_layout().show(ui, &d);
+            assert!(!response.enabled());
+            assert!(!response.clicked());
+            let response = IconButton::new(Icon::Trash).label("删除记忆，需确认").enabled(false).show_touch(ui, &d);
+            assert!(!response.enabled());
+            assert!(!response.clicked());
+        });
+        output.textures_delta.clear();
+        let tree = output.platform_output.accesskit_update.unwrap();
+        for label in ["完整删除说明", "删除记忆，需确认"] {
+            let (_, node) = tree.nodes.iter().find(|(_, node)| node.label() == Some(label)).unwrap();
+            assert!(node.is_disabled());
+        }
+    }
 
     /// **回归测试**：同一面板里两组不同选项，在相同下标上不能拿到同一个 Id。
     ///

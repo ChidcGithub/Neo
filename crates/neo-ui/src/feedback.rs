@@ -15,6 +15,54 @@ use crate::icons::Icon;
 use crate::toasts::{Toast, ToastKind, Toasts};
 use crate::Design;
 
+/// 持久行内提示的语义色调。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoticeTone {
+    #[default]
+    Neutral,
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+/// 全文换行的行内反馈；生命周期由调用方控制，不自动消失。
+pub struct InlineNotice<'a> {
+    id: egui::Id,
+    text: &'a str,
+    tone: NoticeTone,
+}
+
+impl<'a> InlineNotice<'a> {
+    pub fn new(id: impl std::hash::Hash, text: &'a str) -> Self {
+        Self { id: crate::hash_id(id), text, tone: NoticeTone::Neutral }
+    }
+
+    pub fn tone(mut self, tone: NoticeTone) -> Self {
+        self.tone = tone;
+        self
+    }
+
+    pub fn show(self, ui: &mut Ui, d: &Design) -> egui::Response {
+        let color = match self.tone {
+            NoticeTone::Neutral => d.p().label_secondary,
+            NoticeTone::Info => d.p().accent,
+            NoticeTone::Success => d.c().success,
+            NoticeTone::Warning => d.c().warn_label,
+            NoticeTone::Error => d.c().error,
+        };
+        ui.push_id(self.id, |ui| {
+            egui::Frame::new()
+                .inner_margin(egui::Margin::same(d.m().s(8.0).round() as i8))
+                .fill(translucent(color, 0.08))
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(self.text)
+                        .font(d.font(d.t().caption)).color(color)).wrap())
+                }).inner
+        }).inner
+    }
+}
+
 /// 加载转圈。
 ///
 /// 转圈本身不持有"进度"，靠一帧一帧旋转来表达"在做"，
@@ -209,6 +257,40 @@ pub fn toasts(d: &Design) -> Toasts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_notice_wraps_full_text_and_keeps_id_across_resize() {
+        for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
+            for scale in [0.85, 1.0, 1.75, 2.8] {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                let theme = neo_theme::Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
+                theme.apply(&ctx);
+                let d = Design::new(theme);
+                let text = "完整错误与建议 LONG_UNBROKEN_TOKEN_\n".repeat(12);
+                let mut last_id = None;
+                for width in [240.0, 320.0, 560.0] {
+                    let mut response = None;
+                    let mut output = ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 6000.0))),
+                        ..Default::default()
+                    }, |ui| {
+                        ui.set_max_width(width - 16.0);
+                        response = Some(InlineNotice::new("persistent", &text).tone(NoticeTone::Error).show(ui, &d));
+                    });
+                    output.textures_delta.clear();
+                    let response = response.unwrap();
+                    assert!(response.rect.right() <= width);
+                    if let Some(id) = last_id { assert_eq!(id, response.id); }
+                    last_id = Some(response.id);
+                    let tree = output.platform_output.accesskit_update.as_ref().expect("AccessKit tree");
+                    assert!(tree.nodes.iter().any(|(_, node)| node.value() == Some(text.as_str())));
+                    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t)
+                        if t.galley.text() == text && !t.galley.elided && t.galley.rows.len() > 12)));
+                }
+            }
+        }
+    }
 
     #[test]
     fn toast_wrapped_long_text_is_bounded_and_stacks_without_overlap() {
