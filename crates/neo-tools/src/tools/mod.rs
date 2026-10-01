@@ -2,7 +2,7 @@
 //!
 //! 每个工具一个文件，导出 `PARAMS`（参数声明）、`preview`（给人看的摘要）
 //! 与 `run`（执行体），由 [`REGISTRY`] 汇总。
-//! 加工具 = 加一个文件 + 在 [`REGISTRY`] 里加一行 + 补 `docs/tools.md`。
+//! 加工具 = 加一个文件 + 在 [`REGISTRY`] 里加一行 + 补 `docs-pri/tools.md`。
 //!
 //! 两个 shell 工具只差方言和宿主，执行骨架共用 [`shell`]。
 

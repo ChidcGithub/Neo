@@ -424,7 +424,7 @@ fn finish_tool_worker(
         cancel_observed: Some(cancel.load(std::sync::atomic::Ordering::Acquire)),
         ..Details::outcome(&outcome)
     };
-    span.event(Phase::WorkerFinished, details);
+    span.event(Phase::WorkerFinished, details.clone());
     // 取消只表示请求停止；后台 shell 可能仍存活，不能报成已终止。
     if tx.send(outcome).is_err() {
         span.event(Phase::ResultDiscarded, details);
@@ -516,6 +516,8 @@ fn missing_tool_results(messages: &[ChatMessage], index: usize) -> Vec<Msg> {
 
 /// 把结果写进工具消息，保持卡片状态与回灌内容一致。
 fn store_outcome(msg: &mut ChatMessage, mut outcome: neo_tools::Outcome) {
+    // The bounded diagnostic ring owns details, never long-lived chat history.
+    if let Some(error) = &mut outcome.error { error.diagnostic = None; }
     crate::attachments::prepare_tool_images(&mut outcome);
 
     let content = bounded_tool_content(&outcome.to_model_json(usize::MAX));
@@ -994,6 +996,7 @@ impl AppState {
             Ok(_) => self.model_fetch = Some(rx),
             Err(error) => {
                 span.event(Phase::Failed, Details { failure: Some(Failure::Spawn), ..Details::default() });
+                diagnostics::record_error("model_list", "模型列表线程启动失败", &error);
                 self.model_fetch_diagnostic = None;
                 self.model_fetch_error = Some(format!("无法拉取模型列表：{error}"));
             }
@@ -1219,7 +1222,10 @@ impl AppState {
                 self.attachment_status = Some("正在选择附件…".into());
                 self.attachment_error = None;
             }
-            Err(e) => self.attachment_error = Some(format!("无法启动附件导入：{e}")),
+            Err(e) => {
+                diagnostics::record_error("attachments", "附件导入线程启动失败", &e);
+                self.attachment_error = Some(format!("无法启动附件导入：{e}"));
+            }
         }
     }
 
@@ -1740,8 +1746,9 @@ impl AppState {
                 let _ = tx.send(MemoryIoMsg::Imported(result));
                 repaint.request_repaint();
             });
-        if spawned.is_ok() {
-            self.memory_io_rx = Some(rx);
+        match spawned {
+            Ok(_) => self.memory_io_rx = Some(rx),
+            Err(error) => diagnostics::record_error("memory", "记忆导入线程启动失败", &error),
         }
     }
 
@@ -1766,8 +1773,9 @@ impl AppState {
                 let _ = tx.send(MemoryIoMsg::Exported(result));
                 repaint.request_repaint();
             });
-        if spawned.is_ok() {
-            self.memory_io_rx = Some(rx);
+        match spawned {
+            Ok(_) => self.memory_io_rx = Some(rx),
+            Err(error) => diagnostics::record_error("memory", "记忆导出线程启动失败", &error),
         }
     }
 
@@ -1926,7 +1934,7 @@ impl AppState {
             let args = call
                 .parse_arguments()
                 .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-            let meta = ToolMeta {
+            let mut meta = ToolMeta {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
                 title: tool.map(|t| t.title).unwrap_or("未知工具"),
@@ -1945,6 +1953,9 @@ impl AppState {
             };
             span.event(phase, meta.outcome.as_ref().map(Details::outcome)
                 .unwrap_or_else(|| Details::tool(&meta.name)));
+            if let Some(error) = meta.outcome.as_mut().and_then(|outcome| outcome.error.as_mut()) {
+                error.diagnostic = None;
+            }
             if meta.state.is_settled() { self.tool_diagnostics.remove(&self.messages.len()); }
             let content = match &meta.outcome {
                 Some(o) => {
@@ -2038,6 +2049,7 @@ impl AppState {
                 // 启动失败只能报告失败，绝不能在 UI 线程补执行副作用。
                 Err(error) => {
                     span.event(Phase::Failed, Details { failure: Some(Failure::Spawn), ..Details::tool(tool_name) });
+                    diagnostics::record_error("tool", "工具线程启动失败", &error);
                     self.tool_diagnostics.remove(&i);
                     cancel.store(true, std::sync::atomic::Ordering::Release);
                     let outcome = neo_tools::Outcome::fail(
@@ -2183,7 +2195,8 @@ impl AppState {
         }
         self.tool_diagnostic(index).event(if picked.is_some() { Phase::Answered } else { Phase::Skipped }, Details::tool("ask_user"));
         self.tool_diagnostics.remove(&index);
-        let outcome = neo_tools::tools::ask_user::answered(picked.as_deref());
+        let mut outcome = neo_tools::tools::ask_user::answered(picked.as_deref());
+        if let Some(error) = &mut outcome.error { error.diagnostic = None; }
         let content = outcome.to_model_json(usize::MAX);
         if let Some(msg) = self.messages.get_mut(index) {
             msg.meta = match &picked {
@@ -2207,14 +2220,15 @@ impl AppState {
             _ => return,
         };
         let tool_name = diagnostics::known_tool(&name);
-        self.tool_diagnostic(index).event(Phase::Denied, Details::tool(tool_name));
-        self.tool_diagnostics.remove(&index);
-        let outcome = neo_tools::Outcome::fail(
+        let mut outcome = neo_tools::Outcome::fail(
             tool_name,
             neo_tools::ToolError::not_allowed("用户拒绝了这次调用").with_hint(
                 "不要重复请求同一操作；先向用户说明你打算做什么，或改用只读方式获取信息",
             ),
         );
+        self.tool_diagnostic(index).event(Phase::Denied, Details::outcome(&outcome));
+        self.tool_diagnostics.remove(&index);
+        if let Some(error) = &mut outcome.error { error.diagnostic = None; }
         let content = outcome.to_model_json(usize::MAX);
         if let Some(msg) = self.messages.get_mut(index) {
             msg.meta = format!("{name} · 已拒绝");
@@ -2467,7 +2481,7 @@ impl AppState {
             if tool.state.is_settled() {
                 continue;
             }
-            let outcome = neo_tools::Outcome::fail(
+            let mut outcome = neo_tools::Outcome::fail(
                 neo_tools::find(&tool.name)
                     .map(|t| t.name)
                     .unwrap_or("unknown"),
@@ -2477,6 +2491,7 @@ impl AppState {
                 )
                 .with_hint("不要重复请求同一操作；用户已明确表示中止"),
             );
+            if let Some(error) = &mut outcome.error { error.diagnostic = None; }
             msg.content = outcome.to_model_json(usize::MAX);
             msg.meta = format!("{} · 已取消", tool.name);
             let meta = msg.tool.as_mut().expect("tool checked above");

@@ -578,7 +578,10 @@ impl NeoApp {
                 self.wake = Some(engine);
                 self.wake_rx = Some(ui_rx);
             }
-            Err(_) => self.fail_wake("无法启动唤醒事件转发线程".into()),
+            Err(error) => {
+                crate::diagnostics::record_error("wake", "唤醒转发线程启动失败", &error);
+                self.fail_wake("无法启动唤醒事件转发线程".into());
+            }
         }
     }
 
@@ -656,7 +659,7 @@ impl NeoApp {
                 self.stt_tx = Some(cmd_tx);
                 self.stt_rx = Some(out_rx);
             }
-            Err(_) => record(Level::Error, "stt", "语音转写启动失败"),
+            Err(error) => crate::diagnostics::record_error("stt", "语音转写启动失败", &error),
         }
     }
 
@@ -2396,7 +2399,7 @@ impl NeoApp {
                     self.workspace_picker = Some(rx);
                     ctx.request_repaint();
                 }
-                Err(_) => record(Level::Warn, "workspace", "工作区选择器启动失败"),
+                Err(error) => crate::diagnostics::record_error("workspace", "工作区选择器启动失败", &error),
             }
         }
         if sb.new_session || new_session {

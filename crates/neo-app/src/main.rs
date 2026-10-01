@@ -22,7 +22,7 @@
 //! | [`app`] | 一帧的编排与动作消费 |
 //!
 //! 工具集（读/写/改文件、看图、打开文件、执行命令）在 `neo-tools`，
-//! 逐工具的契约见 `docs/tools.md`；两个 shell 工具（Windows 与类 Unix）
+//! 逐工具的契约见 `docs-pri/tools.md`；两个 shell 工具（Windows 与类 Unix）
 //! 共用执行骨架，类 Unix 那一份走**随包提供的 Git Bash 运行时**
 //! （`tools/fetch_runtime.py` 下载，见 `tools/README.md`）。
 
@@ -71,6 +71,8 @@ fn main() {
         Ok(Some(guard)) => guard,
         Ok(None) => return,
         Err(_) => {
+            // startup::begin exposes only a string, not a concrete error chain.
+            diagnostics::record(diagnostics::Level::Error, "startup", "startup initialization failed");
             startup::fatal("instance", "startup initialization failed");
             return;
         }
@@ -100,7 +102,7 @@ fn main() {
         ..graphics::options(backend)
     };
 
-    if eframe::run_native(
+    if let Err(error) = eframe::run_native(
         "Neo",
         options,
         Box::new(move |cc| {
@@ -119,7 +121,8 @@ fn main() {
             app.start_tray();
             Ok(Box::new(selection.track(app)))
         }),
-    ).is_err() {
+    ) {
+        diagnostics::record_error("startup", "native window initialization failed", &error);
         // 不在可能已损坏的进程内重建渲染器；pending 让下次启动尝试后备。
         graphics::startup_failed("native window initialization failed");
     }

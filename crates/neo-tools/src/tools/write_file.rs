@@ -98,7 +98,7 @@ fn write(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| ToolError::io(format!("无法创建目录 {}：{e}", scope.display(parent))))?;
+                .map_err(|e| ToolError::io(format!("无法创建目录 {}：{e}", scope.display(parent))).with_source(&e))?;
             // 锁与编辑工具使用同一个真实路径，不能保留祖先目录的链接别名。
             scope.verify_existing(parent)?.join(path.file_name().unwrap())
         } else {
@@ -129,14 +129,17 @@ fn write(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     } else {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
-            .map_err(|e| if e.kind() == std::io::ErrorKind::AlreadyExists {
-                ToolError::new(ErrorKind::Conflict, "目标已存在，未允许覆盖")
-            } else { ToolError::io(format!("写入 {raw} 失败：{e}")) })?;
+            .map_err(|e| {
+                let error = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    ToolError::new(ErrorKind::Conflict, "目标已存在，未允许覆盖")
+                } else { ToolError::io(format!("写入 {raw} 失败：{e}")) };
+                error.with_source(&e)
+            })?;
         let result = file.write_all(content.as_bytes()).and_then(|_| file.sync_all());
         drop(file);
         if let Err(e) = result {
             let _ = std::fs::remove_file(&path);
-            return Err(ToolError::io(format!("写入 {raw} 失败：{e}")));
+            return Err(ToolError::io(format!("写入 {raw} 失败：{e}")).with_source(&e));
         }
     }
 

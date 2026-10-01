@@ -470,27 +470,27 @@ fn limits_are_enforced_and_documented() {
     assert_eq!(kind_of(&out), ErrorKind::BadArguments);
 }
 
-/// 本地文档审计：未纳入 Git 跟踪的 `docs/tools.md` 必须为每个工具留一节。
+/// 本地文档审计：未纳入 Git 跟踪的 `docs-pri/tools.md` 必须为每个工具留一节。
 ///
 /// 手动运行：
 /// `cargo test -p neo-tools --test tools every_tool_is_documented -- --ignored --exact`
 /// 缺少本地文档或内容不完整时仍报错，不静默跳过。
 #[test]
-#[ignore = "local docs/tools.md audit; docs is not tracked in Git"]
+#[ignore = "local docs-pri/tools.md audit; docs-pri is not tracked in Git"]
 fn every_tool_is_documented() {
-    let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/tools.md");
+    let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs-pri/tools.md");
     let text =
         std::fs::read_to_string(&doc).unwrap_or_else(|e| panic!("读不到 {}：{e}", doc.display()));
     for tool in neo_tools::registry() {
         assert!(
             text.contains(&format!("### {}. `{}`", 1, tool.name))
                 || text.contains(&format!("`{}`", tool.name)),
-            "docs/tools.md 缺少 `{}` 的说明",
+            "docs-pri/tools.md 缺少 `{}` 的说明",
             tool.name
         );
         assert!(
             text.contains(tool.title),
-            "docs/tools.md 缺少 `{}` 的中文名 `{}`",
+            "docs-pri/tools.md 缺少 `{}` 的中文名 `{}`",
             tool.name,
             tool.title
         );

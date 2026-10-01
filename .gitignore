@@ -8,8 +8,10 @@
 Thumbs.db
 desktop.ini
 
-# 本地文档与截图保留在工作区，不纳入版本控制
-/docs/
+# 仅公开 MOD 接口文档；其余文档与截图仅保留本地
+/docs/*
+!/docs/mod-api.md
+/docs-pri/
 
 # 本地临时文件
 /tmp/

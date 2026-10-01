@@ -226,6 +226,29 @@ fn idle_completion_waits_for_continuations_and_records_once_without_tray() {
 }
 
 #[test]
+fn string_only_app_failure_is_an_observation_without_invented_causes() {
+    use crate::diagnostics::{self, TraceKind};
+    if !diagnostics::isolated_detail_test("app::diagnostics_tests::string_only_app_failure_is_an_observation_without_invented_causes") { return; }
+    diagnostics::set_details_enabled(true);
+    let mut state = AppState::default();
+    state.begin_task();
+    state.attachment_error = Some("PRIVATE_UPSTREAM_STRING".into());
+    NeoApp::finish_idle_task_diagnostic(&mut state);
+    let view = diagnostics::snapshot();
+    let entry = view.entries.iter().find(|entry| entry.message.contains("event=failed")).unwrap();
+    let trace = entry.trace.as_ref().unwrap();
+    assert_eq!(trace.kind, TraceKind::Observation);
+    trace.inspect(|trace| {
+        let trace = trace.unwrap();
+        assert!(trace.causes.is_empty());
+        assert!(!trace.backtrace.is_empty());
+    });
+    assert!(!format!("{view:?}").contains("PRIVATE_UPSTREAM_STRING"));
+    diagnostics::set_details_enabled(false);
+    assert!(trace.inspect(|value| value.is_none()));
+}
+
+#[test]
 fn idle_failure_and_tool_limit_do_not_log_raw_error_or_false_completion() {
     let mut state = AppState::default();
     let view = capture_for_test(|| {

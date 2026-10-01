@@ -1,6 +1,94 @@
 
     use super::*;
 
+    use crate::diagnostic::{with_enabled_for_test, ErrorTrace, SourceLocation};
+
+    #[test]
+    fn diagnostic_constructors_report_call_sites() {
+        with_enabled_for_test(true, || {
+            macro_rules! check_site {
+                ($create:expr) => {{
+                    let expected_line = line!(); let error = $create;
+                    let trace = error.diagnostic.unwrap();
+                    assert_eq!(trace.location.file, file!());
+                    assert_eq!(trace.location.line, expected_line);
+                    assert!(trace.location.column > 0);
+                    if !trace.truncated { assert_eq!(trace.causes, ["public"]); }
+                }};
+            }
+            check_site!(ToolError::new(ErrorKind::Internal, "public"));
+            check_site!(ToolError::bad_args("public"));
+            check_site!(ToolError::not_found("public"));
+            check_site!(ToolError::not_allowed("public"));
+            check_site!(ToolError::io("public"));
+        });
+    }
+
+    #[test]
+    fn source_attachment_preserves_creation_trace_and_clones_share_arc() {
+        with_enabled_for_test(true, || {
+            let original = ToolError::io("public");
+            let cloned = original.clone();
+            assert!(Arc::ptr_eq(original.diagnostic.as_ref().unwrap(), cloned.diagnostic.as_ref().unwrap()));
+            let source = std::io::Error::other("first source");
+            let attached = cloned.with_source(&source);
+            let before = original.diagnostic.as_ref().unwrap();
+            let after = attached.diagnostic.as_ref().unwrap();
+            assert_eq!(after.location, before.location);
+            assert_eq!(after.backtrace, before.backtrace);
+            if !before.truncated { assert_eq!(before.causes, ["public"]); }
+            if !after.truncated {
+                assert_eq!(after.causes, ["first source"]);
+            }
+            let replaced = attached.with_source(&std::io::Error::other("replacement"));
+            let after = replaced.diagnostic.as_ref().unwrap();
+            assert_eq!(after.location, before.location);
+            assert_eq!(after.backtrace, before.backtrace);
+            if !after.truncated {
+                assert_eq!(after.causes, ["replacement"]);
+            }
+            assert_eq!(replaced.to_string(), "public");
+            assert!(Error::source(&replaced).is_none());
+        });
+    }
+
+    #[test]
+    fn source_attachment_does_not_capture_late_or_when_disabled() {
+        let absent = with_enabled_for_test(false, || ToolError::io("public"));
+        with_enabled_for_test(true, || {
+            assert!(absent.with_source(&std::io::Error::other("late")).diagnostic.is_none());
+        });
+        let captured = with_enabled_for_test(true, || ToolError::io("public"));
+        let original_trace = captured.diagnostic.clone().unwrap();
+        with_enabled_for_test(false, || {
+            let unchanged = captured.with_source(&std::io::Error::other("ignored"));
+            assert!(Arc::ptr_eq(&original_trace, unchanged.diagnostic.as_ref().unwrap()));
+        });
+    }
+
+    #[test]
+    fn diagnostic_sentinels_never_enter_model_json_or_tool_debug() {
+        let mut error = with_enabled_for_test(false, || ToolError::io("public").with_hint("action"));
+        error.diagnostic = Some(Arc::new(ErrorTrace {
+            location: SourceLocation { file: "PRIVATE_FILE_SENTINEL".into(), line: 1, column: 2 },
+            backtrace: "PRIVATE_STACK_SENTINEL\n  frame".into(),
+            causes: vec!["PRIVATE_CAUSE_SENTINEL".into()],
+            truncated: true,
+        }));
+        assert_eq!(error.to_json(), json!({"kind": "io", "message": "public", "hint": "action"}));
+        assert!(!format!("{error:?}").contains("PRIVATE_"));
+        assert!(!format!("{error:#?}").contains("PRIVATE_"));
+        let outcome = Outcome::fail("read_file", error);
+        assert!(!format!("{outcome:?}").contains("PRIVATE_"));
+        for limit in [0, 1, 2, 18, 64, 200, 4096, usize::MAX] {
+            let json = outcome.to_model_json(limit);
+            assert!(!json.contains("PRIVATE_"));
+            assert!(!json.contains("diagnostic"));
+            serde_json::from_str::<Value>(&json).unwrap();
+        }
+        assert!(!crate::to_model_message(&outcome).contains("PRIVATE_"));
+    }
+
     fn outcome_ok() -> Outcome {
         Outcome::ok("read_file", "读取 a.rs", json!({ "lines": 3 }))
     }

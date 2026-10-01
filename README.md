@@ -78,8 +78,9 @@ not upstream ports.
 
 ## Screenshots
 
-Offscreen render tests write snapshots to the local `docs/screens/` directory.
-The `docs/` directory is not tracked in Git; screenshots are not included in a clone.
+Offscreen render tests write snapshots to the local `docs-pri/screens/` directory.
+The `docs-pri/` directory is not tracked in Git; screenshots are not included in a clone.
+Only `docs/mod-api.md` is public documentation.
 
 ## The Voice Loop
 
@@ -145,7 +146,7 @@ written to `graphics-help.txt` in the startup log directory on failure.
 
 **0.1.0 is not released yet.** The workspace version is prepared as `0.1.0`.
 Maintainers keep outstanding gates in the local release acceptance checklist
-(`docs/release-0.1.0.md`, not tracked in Git or included in a clone).
+(`docs-pri/release-0.1.0.md`, not tracked in Git or included in a clone).
 Published versions, when available, are on the
 [Releases](https://github.com/ChidcGithub/Neo/releases) page with these artifact names:
 
@@ -195,7 +196,7 @@ install/upgrade/uninstall/reinstall acceptance has passed.
 
 ```bash
 cargo run --release   # release is strongly recommended: 60 fps at 4K
-cargo test            # unit tests + offscreen render snapshots (output: docs/screens/)
+cargo test            # unit tests + offscreen render snapshots (output: docs-pri/screens/)
 ```
 
 ### Model & runtime assets
@@ -340,7 +341,7 @@ Pushing a matching `v*` tag triggers the release pipeline after its check job.
 Manual dispatch requires that the version tag already exists and points to the
 selected commit; the workflow never implicitly creates a tag from the default branch.
 This automation does **not** replace local release acceptance, recorded by maintainers
-in `docs/release-0.1.0.md` (not tracked in Git): STT/MinGit hash pinning,
+in `docs-pri/release-0.1.0.md` (not tracked in Git): STT/MinGit hash pinning,
 third-party license review, full DLL dependency closure and clean Windows 10
 lifecycle validation remain pending. `tools/check_release.py` checks nonempty
 payload files and only a limited x64 PE / app-local CRT dependency scope.

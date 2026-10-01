@@ -2,6 +2,209 @@
     use super::*;
     use std::sync::Arc;
 
+    fn synthetic_trace(size: usize, line: u32) -> Arc<ErrorTrace> {
+        Arc::new(ErrorTrace {
+            location: neo_tools::diagnostic::SourceLocation { file: "src/worker.rs".into(), line, column: 1 },
+            backtrace: "frame\n".repeat(size / 6), causes: vec!["PRIVATE_CAUSE".into()], truncated: false,
+        })
+    }
+
+    #[test]
+    fn detail_ring_counts_bytes_revokes_evictions_and_keeps_multiline_frames() {
+        let mut buffer = Buffer::new(MAX_ENTRIES, MAX_BYTES, MAX_ENTRY_BYTES);
+        let trace = synthetic_trace(60 * 1024, 7);
+        buffer.push_event(Level::Error, "tool", "failed", 0, RecordLocation::default(),
+            Some((trace.clone(), TraceKind::Creation)));
+        let cached = buffer.snapshot();
+        assert!(cached.entries[0].trace.as_ref().unwrap().inspect(|value| value.unwrap().backtrace.len()) > MAX_ENTRY_BYTES);
+        for now in 1..100 {
+            buffer.push_event(Level::Error, "tool", "failed", now, RecordLocation::default(),
+                Some((trace.clone(), TraceKind::Creation)));
+            assert!(buffer.stats.trace_bytes <= MAX_TRACE_BYTES);
+            assert_eq!(buffer.stats.trace_bytes, buffer.traces.iter().map(|(_, _, bytes)| bytes).sum::<usize>());
+        }
+        assert_eq!(buffer.entries.len(), 100, "distinct detailed occurrences must not merge");
+        assert!(cached.entries[0].trace.as_ref().unwrap().inspect(|value| value.is_none()));
+        assert!(buffer.stats.traces_dropped > 0);
+        let last = buffer.snapshot();
+        buffer.purge_traces();
+        assert_eq!(buffer.stats.trace_bytes, 0);
+        assert!(last.entries.iter().filter_map(|entry| entry.trace.as_ref()).all(|trace| trace.inspect(|value| value.is_none())));
+        assert!(!format!("{last:?}").contains("PRIVATE_CAUSE"));
+    }
+
+    #[test]
+    fn detail_bounds_reject_oversize_and_summary_eviction_releases_trace() {
+        let mut buffer = Buffer::new(1, 100, 40);
+        buffer.push_event(Level::Error, "tool", "first", 0, RecordLocation::default(),
+            Some((synthetic_trace(MAX_TRACE_ENTRY_BYTES + 100, 1), TraceKind::Creation)));
+        assert!(buffer.entries[0].trace.is_none());
+        assert_eq!(buffer.stats.traces_dropped, 1);
+        buffer.push_event(Level::Error, "tool", "second", 1, RecordLocation::default(),
+            Some((synthetic_trace(8_000, 2), TraceKind::Creation)));
+        let old = buffer.snapshot();
+        buffer.push(Level::Info, "app", "third", 2);
+        assert_eq!(buffer.stats.trace_bytes, 0);
+        assert!(old.entries[0].trace.as_ref().unwrap().inspect(|value| value.is_none()));
+    }
+
+    #[test]
+    fn caller_locations_prevent_same_summary_merging_without_opt_in() {
+        let view = capture_for_test(|| {
+            record(Level::Info, "test", "same");
+            record(Level::Info, "test", "same");
+        });
+        assert_eq!(view.entries.len(), 2);
+        assert_ne!(view.entries[0].source.line, view.entries[1].source.line);
+        assert!(view.entries.iter().all(|entry| entry.source.file.ends_with("diagnostics_tests.rs")
+            && !entry.source.file.contains(':') && entry.trace.is_none()));
+        let mut buffer = Buffer::new(10, 1000, 100);
+        for line in [1, 2] {
+            buffer.push_event(Level::Error, "tool", "same", 0, RecordLocation::default(),
+                Some((synthetic_trace(100, line), TraceKind::Creation)));
+        }
+        assert_eq!(buffer.entries.len(), 2);
+        assert_eq!(buffer.stats.merged, 0);
+    }
+
+    #[test]
+    fn opt_in_observation_causes_and_generation_reject_late_traces() {
+        if !isolated_detail_test("diagnostics::tests::opt_in_observation_causes_and_generation_reject_late_traces") { return; }
+        struct MustNotFormat;
+        impl std::fmt::Debug for MustNotFormat {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { panic!("disabled error formatted") }
+        }
+        impl std::fmt::Display for MustNotFormat {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { panic!("disabled error formatted") }
+        }
+        impl Error for MustNotFormat {}
+        record_error("test", "safe", &MustNotFormat);
+        assert!(snapshot().entries[0].trace.is_none());
+        set_details_enabled(true);
+        let old = Span::new("tool", None);
+        let error = neo_tools::ToolError::io("safe tool error").with_source(&std::io::Error::other("PRIVATE_CAUSE"));
+        let trace = error.diagnostic.clone().unwrap();
+        let outcome = neo_tools::Outcome::fail("read_file", error);
+        old.event(Phase::WorkerFinished, Details::outcome(&outcome));
+        record_error("test", "safe io failure", &std::io::Error::other("PRIVATE_IO"));
+        record(Level::Error, "test", "string-only failure");
+        let before = snapshot();
+        let creation = before.entries.iter().find(|entry| entry.message.contains("worker_finished")).unwrap();
+        let retained = creation.trace.as_ref().unwrap();
+        assert_eq!(retained.kind, TraceKind::Creation);
+        retained.inspect(|captured| assert_eq!(captured.unwrap(), trace.as_ref()));
+        let observation = before.entries.iter().find(|entry| entry.message.as_ref() == "safe io failure").unwrap();
+        assert_eq!(observation.trace.as_ref().unwrap().kind, TraceKind::Observation);
+        observation.trace.as_ref().unwrap().inspect(|trace| assert_eq!(trace.unwrap().causes, ["PRIVATE_IO"]));
+        before.entries.last().unwrap().trace.as_ref().unwrap().inspect(|trace| assert!(trace.unwrap().causes.is_empty()));
+        set_details_enabled(false);
+        assert_eq!(snapshot().stats.trace_bytes, 0);
+        assert!(before.entries.iter().filter_map(|entry| entry.trace.as_ref()).all(|trace| trace.inspect(|value| value.is_none())));
+        old.event(Phase::Delivered, Details::outcome(&outcome));
+        assert!(snapshot().entries.last().unwrap().trace.is_none());
+        set_details_enabled(true);
+        old.event(Phase::ResultDiscarded, Details::outcome(&outcome));
+        assert!(snapshot().entries.last().unwrap().trace.is_none(), "off/on must reject old operation traces");
+        set_details_enabled(false);
+    }
+
+    #[test]
+    fn clear_rejects_queued_worker_traces_and_keeps_new_spans_enabled() {
+        if !isolated_detail_test("diagnostics::tests::clear_rejects_queued_worker_traces_and_keeps_new_spans_enabled") { return; }
+        clear();
+        assert!(!details_enabled() && !neo_tools::diagnostic::is_enabled());
+        set_details_enabled(true);
+        let old = Span::new("tool", None);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = neo_tools::dispatch(&neo_tools::Scope::new(std::env::temp_dir()),
+                "unknown_diagnostic_test_tool", &serde_json::json!({}));
+            old.event(Phase::WorkerFinished, Details::outcome(&outcome));
+            tx.send(outcome).unwrap();
+        });
+        worker.join().unwrap();
+        let before = snapshot();
+        let retained = before.entries[0].trace.as_ref().unwrap();
+        assert_eq!(retained.kind, TraceKind::Creation);
+        clear();
+        assert!(details_enabled() && neo_tools::diagnostic::is_enabled());
+        assert!(snapshot().entries.is_empty());
+        assert_eq!(snapshot().stats, Stats::default());
+        assert!(retained.inspect(|trace| trace.is_none()));
+        let outcome = rx.recv().unwrap();
+        assert!(outcome.error.as_ref().unwrap().diagnostic.is_some());
+        for phase in [Phase::Delivered, Phase::ResultDiscarded] {
+            old.event(phase, Details::outcome(&outcome));
+        }
+        let late = snapshot();
+        assert_eq!(late.entries.len(), 2);
+        assert!(late.entries.iter().all(|entry| entry.trace.is_none()));
+        assert_eq!(late.stats.trace_bytes, 0);
+        let fresh = Span::new("tool", None);
+        let outcome = neo_tools::Outcome::fail("read_file", neo_tools::ToolError::io("new failure"));
+        fresh.event(Phase::WorkerFinished, Details::outcome(&outcome));
+        assert_eq!(snapshot().entries.last().unwrap().trace.as_ref().unwrap().kind, TraceKind::Creation);
+        assert!(snapshot().stats.trace_bytes > 0);
+        set_details_enabled(false);
+    }
+
+    #[test]
+    fn clear_rejects_observation_captured_across_the_clear_barrier() {
+        if !isolated_detail_test("diagnostics::tests::clear_rejects_observation_captured_across_the_clear_barrier") { return; }
+        #[derive(Debug)]
+        struct PausedError {
+            entered: std::sync::mpsc::Sender<()>,
+            resume: Arc<std::sync::Barrier>,
+        }
+        impl std::fmt::Display for PausedError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.entered.send(()).unwrap();
+                self.resume.wait();
+                f.write_str("PRIVATE_PRE_CLEAR_CAUSE")
+            }
+        }
+        impl Error for PausedError {}
+        set_details_enabled(true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let error = PausedError { entered: tx, resume: resume.clone() };
+        let worker = std::thread::spawn(move || record_error("test", "paused failure", &error));
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        clear();
+        resume.wait();
+        worker.join().unwrap();
+        let late = snapshot();
+        assert!(details_enabled());
+        assert_eq!(late.entries.len(), 1);
+        assert_eq!(late.entries[0].message.as_ref(), "paused failure");
+        assert!(late.entries[0].trace.is_none());
+        assert_eq!(late.stats.trace_bytes, 0);
+        record_error("test", "new failure", &std::io::Error::other("new cause"));
+        assert_eq!(snapshot().entries.last().unwrap().trace.as_ref().unwrap().kind, TraceKind::Observation);
+        set_details_enabled(false);
+    }
+
+    #[test]
+    fn independent_traces_are_freed_despite_live_snapshot_handles() {
+        let mut buffer = Buffer::new(MAX_ENTRIES, MAX_BYTES, MAX_ENTRY_BYTES);
+        let mut weak = Vec::new();
+        let mut snapshots = Vec::new();
+        for line in 0..40 {
+            let trace = synthetic_trace(60 * 1024, line);
+            weak.push(Arc::downgrade(&trace));
+            buffer.push_event(Level::Error, "tool", "failed", u64::from(line), RecordLocation::default(),
+                Some((trace, TraceKind::Creation)));
+            snapshots.push(buffer.snapshot());
+        }
+        assert!(weak[0].upgrade().is_none(), "budget eviction must free the raw allocation");
+        assert!(weak.last().unwrap().upgrade().is_some());
+        buffer.clear();
+        assert!(weak.iter().all(|trace| trace.upgrade().is_none()));
+        assert!(snapshots.iter().flat_map(|view| view.entries.iter()).filter_map(|entry| entry.trace.as_ref())
+            .all(|trace| trace.inspect(|value| value.is_none())));
+        assert_eq!(buffer.stats.trace_bytes, 0);
+    }
+
     #[test]
     fn structured_events_allow_only_known_metadata_and_keep_distinct_ids() {
         let mut buffer = Buffer::new(10, MAX_BYTES, MAX_ENTRY_BYTES);
@@ -9,7 +212,7 @@
             let span = Span::new("tool", Some(42));
             let outcome = neo_tools::Outcome::fail("UNTRUSTED_TOOL", neo_tools::ToolError::io("PRIVATE_BODY"))
                 .with_image("PRIVATE_IMAGE");
-            let message = span.message(Phase::Failed, Details::outcome(&outcome));
+            let message = span.message(Phase::Failed, &Details::outcome(&outcome));
             assert!(message.contains("parent=42") && message.contains("tool=unknown") && message.contains("kind=io"));
             assert!(message.contains("elapsed_ms="));
             buffer.push(Level::Warn, "tool", &message, 1);
@@ -19,7 +222,7 @@
         assert!(!format!("{:?}", buffer.snapshot()).contains("UNTRUSTED"));
         let span = Span::new("PRIVATE_COMPONENT", None);
         assert_eq!(span.component, "diagnostic");
-        let message = span.message(Phase::Started, Details { tool: Some("PRIVATE_NAME"), ..Details::default() });
+        let message = span.message(Phase::Started, &Details { tool: Some("PRIVATE_NAME"), ..Details::default() });
         assert!(!message.contains("PRIVATE"));
     }
 
@@ -38,7 +241,7 @@
             ("接口返回 999：PRIVATE_BODY", "model_other"),
             ("接口返回 🦀：PRIVATE_BODY", "model_other"),
         ] {
-            let message = Span::new("model", None).message(Phase::Failed, Details {
+            let message = Span::new("model", None).message(Phase::Failed, &Details {
                 failure: Some(model_failure(error)), ..Details::default()
             });
             assert!(message.contains(&format!("kind={kind}")), "{message}");
@@ -54,7 +257,7 @@
                 "UIA 即时核验拒绝输入：provider_error (stage={stage}, HRESULT=0x80070005); PRIVATE_WINDOW；失败候选/检查数=1"
             )).with_hint("PRIVATE_COMMAND");
             let outcome = neo_tools::Outcome::fail("click", error);
-            let message = Span::new("tool", None).message(Phase::WorkerFinished, Details::outcome(&outcome));
+            let message = Span::new("tool", None).message(Phase::WorkerFinished, &Details::outcome(&outcome));
             assert!(message.contains(&format!("uia_stage={shown} hresult=0x80070005")));
             assert!(!message.contains("PRIVATE"));
             assert_eq!(&*sanitize(&message, MAX_ENTRY_BYTES).0, message);
@@ -138,7 +341,7 @@
             "stdout": "PRIVATE_BODY", "pid": 987654321, "executable": "PRIVATE_EXECUTABLE"
         }));
         let span = Span::new("tool", None);
-        let message = span.message(Phase::WorkerFinished, Details::outcome(&outcome));
+        let message = span.message(Phase::WorkerFinished, &Details::outcome(&outcome));
         assert!(message.contains("background=true"));
         assert!(!message.contains("PRIVATE") && !message.contains("987654321"));
         let mut poisoned = outcome.clone();

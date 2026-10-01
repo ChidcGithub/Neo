@@ -68,6 +68,47 @@
     }
 
     #[test]
+    fn diagnostics_real_worker_trace_survives_delivery_but_not_chat_or_model_json() {
+        use super::*;
+        if !diagnostics::isolated_detail_test("state::tests::diagnostics_real_worker_trace_survives_delivery_but_not_chat_or_model_json") { return; }
+        diagnostics::set_details_enabled(true);
+        let mut state = AppState::default();
+        {
+            let mut meta = ToolMeta::restored("PRIVATE_UNKNOWN_TOOL");
+            meta.state = ToolState::Running;
+            state.messages.push(ChatMessage::tool_result(meta, String::new()));
+            assert_eq!(state.spawn_ready_tools(&neo_tools::Scope::new(std::env::temp_dir())), 1);
+            assert!(state.wait_tool_jobs(std::time::Duration::from_secs(10)));
+        }
+        let view = diagnostics::snapshot();
+        let delivered = view.entries.iter().find(|entry| entry.message.contains("event=delivered")).unwrap();
+        let trace = delivered.trace.as_ref().expect("worker creation trace reaches delivery");
+        assert_eq!(trace.kind, diagnostics::TraceKind::Creation);
+        let workers = diagnostics::snapshot();
+        let worker = workers.entries.iter().find(|entry| entry.message.contains("event=worker_finished")).unwrap();
+        trace.inspect(|trace| {
+            let trace = trace.unwrap();
+            assert!(trace.location.file.contains("neo-tools"));
+            assert!(!trace.backtrace.is_empty());
+            worker.trace.as_ref().unwrap().inspect(|original| assert_eq!(original.unwrap(), trace));
+            let outcome = state.messages[0].tool.as_ref().unwrap().outcome.as_ref().unwrap();
+            assert!(outcome.error.as_ref().unwrap().diagnostic.is_none(), "chat must not own raw trace Arcs");
+            let json = outcome.to_model_json(usize::MAX);
+            assert!(!json.contains("backtrace") && !json.contains("diagnostic") && !json.contains(&trace.location.file));
+        });
+        state.classroom_safe = false;
+        let denied = diagnostic_call(&mut state, "powershell", r#"{"command":"PRIVATE_COMMAND"}"#);
+        state.deny_tool(denied);
+        diagnostic_call(&mut state, "powershell", r#"{"command":"PRIVATE_COMMAND"}"#);
+        state.cancel();
+        assert!(state.messages.iter().filter_map(|message| message.tool.as_ref())
+            .filter_map(|tool| tool.outcome.as_ref()).filter_map(|outcome| outcome.error.as_ref())
+            .all(|error| error.diagnostic.is_none()));
+        diagnostics::set_details_enabled(false);
+        assert!(trace.inspect(|value| value.is_none()));
+    }
+
+    #[test]
     fn diagnostics_record_actual_safe_worker_dispatch_and_disconnect() {
         use super::*;
         let mut state = AppState::default();

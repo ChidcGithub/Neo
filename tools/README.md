@@ -109,5 +109,5 @@ python -B -m unittest tools.test_installer tools.test_check_release tools.test_f
 ```
 
 这些测试不等同于实际安装验收。**0.1.0 尚未发布**，完整发布门禁和已知未验项由
-维护者记录在仓库根目录下的本地验收清单 `docs/release-0.1.0.md` 中；`docs/` 不纳入
-Git 跟踪，也不随克隆提供。
+维护者记录在仓库根目录下的本地验收清单 `docs-pri/release-0.1.0.md` 中；`docs-pri/` 不纳入
+Git 跟踪，也不随克隆提供。`docs/` 中仅 `mod-api.md` 公开。

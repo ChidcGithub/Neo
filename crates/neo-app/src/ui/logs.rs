@@ -1,4 +1,4 @@
-//! 本地诊断页：只读取脱敏日志，不依赖 AppState，不把日志送入模型上下文。
+//! 本地诊断页：默认脱敏概括，显式开启后查看敏感错误详情；不进入模型上下文。
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -17,6 +17,9 @@ pub struct LogViewState {
     pub keyword: String,
     pub follow: bool,
     filtered: Option<Arc<FilteredEntries>>,
+    selected: Option<u64>,
+    copy_details_confirmed: bool,
+    details_were_enabled: bool,
 }
 
 struct FilteredEntries {
@@ -33,6 +36,9 @@ impl Default for LogViewState {
             keyword: String::new(),
             follow: true,
             filtered: None,
+            selected: None,
+            copy_details_confirmed: false,
+            details_were_enabled: false,
         }
     }
 }
@@ -81,6 +87,11 @@ impl LogViewState {
     }
 
     fn draw_snapshot(&mut self, ui: &mut Ui, skin: &Skin<'_>, width: f32, mut view: Snapshot) {
+        let enabled = diagnostics::details_enabled();
+        if enabled != self.details_were_enabled {
+            self.reset_details();
+            self.details_were_enabled = enabled;
+        }
         let d = skin.d();
         let m = skin.m();
         let p = skin.p();
@@ -95,6 +106,19 @@ impl LogViewState {
             ui.add(egui::Label::new(RichText::new(
                 "id 为本次进程内操作编号，parent 关联任务；elapsed_ms 包含等待确认时间。cancel_requested 不代表已经终止；background=true 仅表示后台启动，不跟踪进程退出。"
             ).font(skin.prop(skin.t().caption)).color(p.label_secondary)).wrap());
+            let mut enabled = diagnostics::details_enabled();
+            let toggle = ui.checkbox(&mut enabled, "详细错误诊断（仅本次运行）");
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-logs-details-toggle"), toggle.rect));
+            ui.add(egui::Label::new(RichText::new(
+                "警告：详细堆栈、路径和错误原文可能含密钥或其他秘密。仅捕获开启后的新错误；关闭清除日志保留详情，但无法撤回已复制内容或擦除在途错误。不上传、不落盘、不发送给模型。"
+            ).font(skin.prop(skin.t().caption)).color(p.warn)).wrap());
+            if toggle.changed() {
+                diagnostics::set_details_enabled(enabled);
+                self.reset_details();
+                self.details_were_enabled = enabled;
+                view = diagnostics::snapshot();
+            }
             if let Some(dir) = crate::startup::log_dir() {
                 super::settings::kv_row(ui, skin, width, "启动日志目录", &dir.display().to_string());
             }
@@ -148,6 +172,7 @@ impl LogViewState {
                 }
                 if action("清空", "neo-logs-clear") {
                     diagnostics::clear();
+                    self.reset_details();
                     view = diagnostics::snapshot();
                 }
                 copy = action("复制筛选结果", "neo-logs-copy");
@@ -164,6 +189,9 @@ impl LogViewState {
                 view.max_bytes / 1024, view.max_entries, view.max_entry_bytes,
                 view.stats.received, view.stats.merged, view.stats.dropped, view.stats.truncated,
             )).font(skin.prop(skin.t().caption)).color(p.label_secondary)).wrap());
+            ui.label(format!("详情 {} / {} KiB · 单份上限 {} KiB · 已释放 {} 份",
+                view.stats.trace_bytes.div_ceil(1024), diagnostics::MAX_TRACE_BYTES / 1024,
+                diagnostics::MAX_TRACE_ENTRY_BYTES / 1024, view.stats.traces_dropped));
             if view.stats.dropped > 0 {
                 ui.add(egui::Label::new(RichText::new("容量已满，较旧记录已被丢弃；当前视图不是完整历史。")
                     .font(skin.prop(skin.t().caption)).color(p.warn)).wrap());
@@ -190,11 +218,56 @@ impl LogViewState {
                 ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-logs-scroll-probe"),
                     (scroll.state.offset.y, scroll.inner_rect, scroll.content_size.y, scroll.inner)));
             }
+            if let Some(entry) = self.selected.and_then(|id| view.entries.iter().find(|entry| entry.id == id)) {
+                self.draw_detail(ui, entry);
+            } else if self.selected.take().is_some() {
+                self.copy_details_confirmed = false;
+                ui.label("所选记录已被淘汰或清空。");
+            } else {
+                ui.label("选择一行查看记录位置与完整的已捕获堆栈。");
+            }
         });
     }
 
+    fn reset_details(&mut self) {
+        self.filtered = None;
+        self.selected = None;
+        self.copy_details_confirmed = false;
+    }
+
+    fn draw_detail(&mut self, ui: &mut Ui, entry: &Entry) {
+        ui.separator();
+        ui.label("错误详情 · 编译优化或缺少调试符号时，部分帧可能显示 unknown / <unknown>");
+        let enabled = diagnostics::details_enabled();
+        if enabled {
+            let consent = ui.checkbox(&mut self.copy_details_confirmed, "我理解详细报告可能含秘密，并会进入系统剪贴板");
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-logs-detail-consent"), consent.rect));
+            #[cfg(not(test))]
+            let _ = consent;
+            let copy = ui.add_enabled(self.copy_details_confirmed,
+                egui::Button::new("复制详细报告（含敏感原文）"));
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-logs-copy-detail"), copy.rect));
+            if copy.clicked() && diagnostics::details_enabled() {
+                ui.ctx().copy_text(detail_report(entry));
+            }
+        }
+        // No cached String or selected Arc: revocation clears every snapshot handle.
+        // Default label Copy/Cut bypasses consent; only the explicit button may export.
+        egui::ScrollArea::both().id_salt("neo-logs-detail-scroll")
+            .max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
+                let report = ui.add(egui::Label::new(RichText::new(detail_report(entry)).monospace())
+                    .selectable(false).extend());
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-logs-detail-text"), report.rect));
+                #[cfg(not(test))]
+                let _ = report;
+            });
+    }
+
     fn draw_entries(
-        &self,
+        &mut self,
         ui: &mut Ui,
         skin: &Skin<'_>,
         width: f32,
@@ -203,7 +276,8 @@ impl LogViewState {
     ) -> egui::scroll_area::ScrollAreaOutput<usize> {
         let entries = &filtered.indices;
         let font = skin.prop(skin.t().caption);
-        let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
+        let row_height = (ui.fonts_mut(|fonts| fonts.row_height(&font))
+            + 2.0 * ui.spacing().button_padding.y).max(ui.spacing().interact_size.y);
         let mut scroll = egui::ScrollArea::vertical()
             .id_salt("neo-logs-entries")
             .max_height(skin.m().s(300.0))
@@ -228,8 +302,15 @@ impl LogViewState {
                     Level::Debug => skin.p().label_secondary,
                 };
                 let text = format_entry(entry);
-                ui.add(egui::Label::new(RichText::new(&text).font(font.clone()).color(color))
-                    .truncate()).on_hover_text(text);
+                let response = ui.add(egui::Button::selectable(self.selected == Some(entry.id),
+                    RichText::new(&text).font(font.clone()).color(color)).truncate())
+                    .on_hover_text(text);
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("neo-logs-row", entry.id)), response.rect));
+                if response.clicked() {
+                    self.selected = Some(entry.id);
+                    self.copy_details_confirmed = false;
+                }
             }
             count
         })
@@ -252,6 +333,40 @@ fn format_entry(entry: &Entry) -> String {
     if entry.occurrences > 1 {
         let _ = write!(text, "  ×{}（首次 {}）", entry.occurrences, relative_time(entry.first_ms));
     }
+    text
+}
+
+fn detail_report(entry: &Entry) -> String {
+    let mut text = format!("{}\n记录位置（非上游错误源）: {}:{}:{}\n",
+        format_entry(entry), entry.source.file, entry.source.line, entry.source.column);
+    if !diagnostics::details_enabled() {
+        text.push_str("未捕获详情或详情已清除；详细诊断已关闭。\n");
+        return text;
+    }
+    let Some(retained) = &entry.trace else {
+        text.push_str("无已捕获堆栈：错误可能发生于开启前，或详情超过保留上限。\n");
+        return text;
+    };
+    retained.inspect(|trace| {
+        let Some(trace) = trace else {
+            text.push_str("详情已被容量淘汰、清空或关闭诊断移除。\n");
+            return;
+        };
+        let label = match retained.kind {
+            diagnostics::TraceKind::Creation => "错误创建位置 / creation stack（不是 OS 原始失败栈）",
+            diagnostics::TraceKind::Observation => "错误观察位置 / observation stack（上游真实源未知）",
+        };
+        let _ = writeln!(text, "{label}: {}:{}:{}", trace.location.file, trace.location.line, trace.location.column);
+        text.push_str("错误及 source 链（仅实际提供的错误）：\n");
+        if trace.causes.is_empty() { text.push_str("未提供 source 链；不从字符串推测上游原因。\n"); }
+        for (index, cause) in trace.causes.iter().enumerate() {
+            let _ = writeln!(text, "[{index}] {cause}");
+        }
+        text.push_str("已捕获的全部堆栈帧：\n");
+        if trace.backtrace.is_empty() { text.push_str("无可用堆栈 / unknown symbols\n"); }
+        else { text.push_str(&trace.backtrace); text.push('\n'); }
+        if trace.truncated { text.push_str("[已截断：64 KiB 总上限、原因链上限、循环或格式化失败；非完整堆栈报告]\n"); }
+    });
     text
 }
 

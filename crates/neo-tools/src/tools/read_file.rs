@@ -53,8 +53,8 @@ pub fn run(scope: &Scope, args: &Args) -> Outcome {
 
 pub(crate) fn read_bounded(path: &std::path::Path, limit: u64) -> Result<Vec<u8>, ToolError> {
     use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|e| ToolError::io(e.to_string()))?;
-    let meta = file.metadata().map_err(|e| ToolError::io(e.to_string()))?;
+    let file = std::fs::File::open(path).map_err(|e| ToolError::io(e.to_string()).with_source(&e))?;
+    let meta = file.metadata().map_err(|e| ToolError::io(e.to_string()).with_source(&e))?;
     if !meta.is_file() {
         return Err(ToolError::new(ErrorKind::Unsupported, "只支持普通文件"));
     }
@@ -63,7 +63,7 @@ pub(crate) fn read_bounded(path: &std::path::Path, limit: u64) -> Result<Vec<u8>
     }
     let mut bytes = Vec::new();
     file.take(limit.saturating_add(1)).read_to_end(&mut bytes)
-        .map_err(|e| ToolError::io(e.to_string()))?;
+        .map_err(|e| ToolError::io(e.to_string()).with_source(&e))?;
     if bytes.len() as u64 > limit {
         return Err(ToolError::new(ErrorKind::TooLarge, "文件读取期间超过上限"));
     }
@@ -76,10 +76,13 @@ fn read(scope: &Scope, args: &Args) -> Result<Outcome, ToolError> {
     let limit = args.opt_int("limit")? as usize;
 
     let path = scope.resolve(&raw)?;
-    let meta = std::fs::metadata(&path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => ToolError::not_found(format!("文件不存在：{raw}"))
-            .with_hint("先用 `bash` 跑 `ls` 看看目录里有什么；路径不要带工作区前缀"),
-        _ => ToolError::io(format!("无法访问 {raw}：{e}")),
+    let meta = std::fs::metadata(&path).map_err(|e| {
+        let error = match e.kind() {
+            std::io::ErrorKind::NotFound => ToolError::not_found(format!("文件不存在：{raw}"))
+                .with_hint("先用 `bash` 跑 `ls` 看看目录里有什么；路径不要带工作区前缀"),
+            _ => ToolError::io(format!("无法访问 {raw}：{e}")),
+        };
+        error.with_source(&e)
     })?;
     if meta.is_dir() {
         return Err(

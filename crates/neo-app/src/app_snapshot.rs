@@ -1,8 +1,8 @@
 
-    //! 离屏渲染：把主界面渲成 PNG，落到 `docs/screens/`。
+    //! 离屏渲染：把主界面渲成 PNG，落到 `docs-pri/screens/`。
     //!
     //! 这些不是"必须通过"的断言型测试 —— 它们的价值是**让人能看见界面**。
-    //! 跑 `cargo test -p neo-app -- --nocapture` 之后直接看 `docs/screens/*.png`。
+    //! 跑 `cargo test -p neo-app -- --nocapture` 之后直接看 `docs-pri/screens/*.png`。
     //!
     //! 之所以能这么做，是因为 [`NeoApp::install`] 只依赖 `egui::Context`：
     //! 测试与真机走完全相同的字体装配与主题构建路径。
@@ -33,10 +33,10 @@
     /// 一次性生效的初始化回调（只允许取用一次）。
     type Setup = Box<dyn FnOnce(&mut NeoApp)>;
 
-    /// 输出目录：`<workspace>/docs/screens`。
+    /// 输出目录：`<workspace>/docs-pri/screens`。
     fn out_dir() -> PathBuf {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/screens");
-        std::fs::create_dir_all(&dir).expect("无法创建 docs/screens");
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs-pri/screens");
+        std::fs::create_dir_all(&dir).expect("无法创建 docs-pri/screens");
         dir.canonicalize().unwrap_or(dir)
     }
 
@@ -1274,7 +1274,7 @@
                 ```rust\n\
                 fn main() {\n    println!(\"hello\");\n}\n\
                 ```\n\n\
-                更多内容请看 `docs/design-spec.md`。";
+                更多内容请看 `docs-pri/design-spec.md`。";
             app.state.start_generation(StreamSource::Demo {
                 text: rich.to_owned(),
                 cursor: 0,
@@ -1327,7 +1327,7 @@
     }
 
     /// 组件库陈列室：把 neo-ui 的全部控件渲到一张图上，
-    /// 作为设计接口的"一页速览"与回归基准（docs/design-kit.md 的配图）。
+    /// 作为设计接口的"一页速览"与回归基准（docs-pri/design-kit.md 的配图）。
     #[test]
     fn design_kit_gallery_1080p() {
         isolate_db();
@@ -1433,7 +1433,7 @@
     }
 
     // ------------------------------------------------------------------
-    // 设计接口陈列室（docs/design-kit.md 的配图）
+    // 设计接口陈列室（docs-pri/design-kit.md 的配图）
     // ------------------------------------------------------------------
 
     /// 把 neo-ui 的控件渲满一屏：按钮族 / 图标按钮 / Chip / 分段 / 表单 /

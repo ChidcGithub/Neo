@@ -3,6 +3,120 @@
     use crate::diagnostics::{Stats, MAX_BYTES, MAX_ENTRIES, MAX_ENTRY_BYTES};
 
     #[test]
+    fn interactive_details_select_copy_and_disable_revoke_cached_reports() {
+        use crate::ui::composer::ui_regression::{context, frame, pointer, probe};
+        if !diagnostics::isolated_detail_test("ui::logs::tests::interactive_details_select_copy_and_disable_revoke_cached_reports") { return; }
+        let ctx = context();
+        let size = egui::vec2(720.0, 1600.0);
+        let mut state = LogViewState::default();
+        let render = |state: &mut LogViewState, events| frame(&ctx, size, events,
+            |ui, skin| state.draw(ui, skin, 700.0));
+        render(&mut state, vec![]);
+        let toggle: egui::Rect = probe(&ctx, "neo-logs-details-toggle");
+        render(&mut state, pointer(toggle.center(), true));
+        render(&mut state, pointer(toggle.center(), false));
+        assert!(diagnostics::details_enabled());
+        let span = diagnostics::Span::new("tool", None);
+        let mut error = neo_tools::ToolError::io("safe summary");
+        let trace = Arc::make_mut(error.diagnostic.as_mut().unwrap());
+        trace.backtrace = format!("{}FINAL_FRAME <unknown>\n", "worker_frame\n".repeat(400));
+        trace.causes = vec!["PRIVATE_CAUSE\nsecond line".into()];
+        trace.truncated = true;
+        let outcome = neo_tools::Outcome::fail("read_file", error);
+        span.event(diagnostics::Phase::Delivered, diagnostics::Details::outcome(&outcome));
+        let view = diagnostics::snapshot();
+        let entry = view.entries.last().unwrap();
+        assert!(!export([entry]).contains("PRIVATE_CAUSE"));
+        assert!(!export([entry]).contains("FINAL_FRAME"));
+        for _ in 0..3 { render(&mut state, vec![]); }
+        let row: egui::Rect = ctx.data(|data| data.get_temp(egui::Id::new(("neo-logs-row", entry.id))).unwrap());
+        render(&mut state, pointer(row.center(), true));
+        render(&mut state, pointer(row.center(), false));
+        assert_eq!(state.selected, Some(entry.id));
+        let report = detail_report(entry);
+        assert!(report.contains("PRIVATE_CAUSE\nsecond line") && report.contains("FINAL_FRAME <unknown>"));
+        assert!(report.contains("已截断") && report.contains("creation stack") && report.contains("记录位置"));
+        let copy: egui::Rect = probe(&ctx, "neo-logs-copy-detail");
+        render(&mut state, pointer(copy.center(), true));
+        let output = render(&mut state, pointer(copy.center(), false));
+        assert!(output.platform_output.commands.is_empty(), "explicit copy warning must be acknowledged");
+        let consent: egui::Rect = probe(&ctx, "neo-logs-detail-consent");
+        render(&mut state, pointer(consent.center(), true));
+        render(&mut state, pointer(consent.center(), false));
+        assert!(state.copy_details_confirmed);
+        render(&mut state, pointer(copy.center(), true));
+        let output = render(&mut state, pointer(copy.center(), false));
+        assert!(output.platform_output.commands.iter().any(|command| matches!(command,
+            egui::OutputCommand::CopyText(text) if text == &report)));
+        let cached = state.filtered.clone().unwrap();
+        let toggle: egui::Rect = probe(&ctx, "neo-logs-details-toggle");
+        render(&mut state, pointer(toggle.center(), true));
+        let output = render(&mut state, pointer(toggle.center(), false));
+        assert!(!diagnostics::details_enabled());
+        assert!(state.selected.is_none() && !state.copy_details_confirmed);
+        assert!(output.platform_output.commands.is_empty());
+        assert_eq!(diagnostics::snapshot().stats.trace_bytes, 0);
+        assert!(cached.entries.iter().filter_map(|entry| entry.trace.as_ref()).all(|trace| trace.inspect(|value| value.is_none())));
+        assert!(!detail_report(entry).contains("PRIVATE_CAUSE"));
+        assert!(!detail_report(entry).contains("FINAL_FRAME"));
+        span.event(diagnostics::Phase::ResultDiscarded, diagnostics::Details::outcome(&outcome));
+        assert!(diagnostics::snapshot().entries.last().unwrap().trace.is_none());
+    }
+
+    #[test]
+    fn detail_label_copy_and_cut_cannot_bypass_consent() {
+        use crate::ui::composer::ui_regression::{context, frame, pointer, probe};
+        if !diagnostics::isolated_detail_test("ui::logs::tests::detail_label_copy_and_cut_cannot_bypass_consent") { return; }
+        diagnostics::set_details_enabled(true);
+        let mut error = neo_tools::ToolError::io("safe summary");
+        let trace = Arc::make_mut(error.diagnostic.as_mut().unwrap());
+        trace.location.file = "worker.rs".into();
+        trace.backtrace = "PRIVATE_STACK_SENTINEL\n".into();
+        trace.causes = vec!["PRIVATE_CAUSE_SENTINEL".into()];
+        diagnostics::Span::new("tool", None).event(diagnostics::Phase::Delivered,
+            diagnostics::Details::outcome(&neo_tools::Outcome::fail("read_file", error)));
+        let view = diagnostics::snapshot();
+        let entry = view.entries.last().unwrap();
+        // The selectable control proves these pointer gestures really select the
+        // sensitive text and Copy/Cut reach egui, rather than passing vacuously.
+        for selectable_control in [true, false] {
+            let ctx = context();
+            let mut state = LogViewState::default();
+            let render = |state: &mut LogViewState, events| frame(&ctx, egui::vec2(1000.0, 900.0), events, |ui, _| {
+                if selectable_control {
+                    let response = ui.add(egui::Label::new(RichText::new(detail_report(entry)).monospace())
+                        .selectable(true).extend());
+                    ctx.data_mut(|data| data.insert_temp(egui::Id::new("neo-logs-detail-text"), response.rect));
+                } else {
+                    state.draw_detail(ui, entry);
+                }
+            });
+            render(&mut state, vec![]);
+            let rect: egui::Rect = probe(&ctx, "neo-logs-detail-text");
+            let start = rect.left_top() + egui::vec2(1.0, 1.0);
+            let end = egui::pos2(rect.left() + 220.0, rect.bottom() - 2.0);
+            render(&mut state, pointer(start, true));
+            render(&mut state, vec![egui::Event::PointerMoved(end)]);
+            render(&mut state, pointer(end, false));
+            for event in [egui::Event::Copy, egui::Event::Cut] {
+                let output = render(&mut state, vec![event]);
+                let copied: Vec<_> = output.platform_output.commands.iter().filter_map(|command| match command {
+                    egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                    _ => None,
+                }).collect();
+                if selectable_control {
+                    assert!(copied.iter().any(|text| text.contains("PRIVATE_CAUSE_SENTINEL")
+                        && text.contains("PRIVATE_STACK_SENTINEL")), "control must copy actual selected details");
+                } else {
+                    assert!(copied.is_empty(), "ordinary Copy/Cut must not export details without consent");
+                    assert!(!state.copy_details_confirmed);
+                }
+            }
+        }
+        diagnostics::set_details_enabled(false);
+    }
+
+    #[test]
     fn readable_relative_time_and_single_event_format() {
         assert_eq!(relative_time(3_661_007), "+01:01:01.007");
         assert_eq!(relative_time(360_000_000), "+100:00:00.000");
@@ -21,6 +135,7 @@
         Snapshot {
             entries: Arc::new(vec![
                 Entry {
+                    id: 1, source: Default::default(), trace: None,
                     level: Level::Error,
                     component: "Tool".into(),
                     message: "执行失败：timeout".into(),
@@ -29,6 +144,7 @@
                     occurrences: 3,
                 },
                 Entry {
+                    id: 2, source: Default::default(), trace: None,
                     level: Level::Info,
                     component: "app".into(),
                     message: "[已脱敏]".into(),
@@ -43,6 +159,7 @@
                 dropped: 6,
                 truncated: 0,
                 bytes: 50,
+                ..Stats::default()
             },
             max_entries: MAX_ENTRIES,
             max_bytes: MAX_BYTES,
@@ -55,6 +172,7 @@
         let mut view = sample();
         view.entries = Arc::new((0..MAX_ENTRIES).map(|index| Entry {
             level: if index % 2 == 0 { Level::Info } else { Level::Error },
+            id: index as u64, source: Default::default(), trace: None,
             component: "Tool".into(), message: format!("安全事件 {index}").into_boxed_str(),
             first_ms: index as u64, last_ms: index as u64, occurrences: 1,
         }).collect());
@@ -142,7 +260,7 @@
         }
         let entries = Arc::new(entries);
         let mut state = LogViewState { follow: false, ..Default::default() };
-        let render = |state: &LogViewState, count: usize, resume: bool| {
+        let render = |state: &mut LogViewState, count: usize, resume: bool| {
             let mut scroll = None;
             let mut output = ctx.run_ui(egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(240.0, 700.0))),
@@ -161,16 +279,16 @@
             assert!(scroll.inner < 40, "不应排版全部 {count} 条日志");
             scroll
         };
-        let initial = render(&state, 500, false);
+        let initial = render(&mut state, 500, false);
         assert_eq!(initial.state.offset.y, 0.0);
-        let grown = render(&state, MAX_ENTRIES, false);
+        let grown = render(&mut state, MAX_ENTRIES, false);
         assert_eq!(grown.state.offset.y, 0.0);
         state.follow = true;
-        let resumed = render(&state, MAX_ENTRIES, true);
+        let resumed = render(&mut state, MAX_ENTRIES, true);
         assert!(resumed.state.offset.y > 0.0);
         assert!((resumed.state.offset.y - (resumed.content_size.y - resumed.inner_rect.height())).abs() < 1.0);
         state.follow = false;
-        let paused = render(&state, MAX_ENTRIES, false);
+        let paused = render(&mut state, MAX_ENTRIES, false);
         assert!((paused.state.offset.y - resumed.state.offset.y).abs() < 1.0);
     }
 
@@ -182,6 +300,7 @@
         let mut view = sample();
         view.entries = Arc::new((0..MAX_ENTRIES).map(|index| Entry {
             level: if index % 2 == 0 { Level::Info } else { Level::Error },
+            id: index as u64, source: Default::default(), trace: None,
             component: "safe-test".into(), message: format!("安全事件 {index}").into_boxed_str(),
             first_ms: index as u64, last_ms: index as u64, occurrences: 1,
         }).collect());

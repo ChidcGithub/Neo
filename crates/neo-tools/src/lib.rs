@@ -68,7 +68,9 @@
 
 pub mod classlog;
 pub mod dailylog;
+pub mod diagnostic;
 pub mod documents;
+pub mod mods;
 pub mod policy;
 pub mod present;
 pub mod result;

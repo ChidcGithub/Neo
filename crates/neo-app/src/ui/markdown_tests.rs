@@ -554,8 +554,8 @@
                 });
             harness.run_steps(4);
             let image = harness.render().unwrap();
-            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screens");
-            std::fs::create_dir_all(&dir).expect("无法创建 docs/screens");
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs-pri/screens");
+            std::fs::create_dir_all(&dir).expect("无法创建 docs-pri/screens");
             image.save(dir.join(format!("{name}.png"))).unwrap();
         }
     }

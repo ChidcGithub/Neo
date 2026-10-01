@@ -1,5 +1,5 @@
 //! UIA 树枚举 —— 屏幕上所有可交互元素（`screen_elements` 工具的实现，研究见
-//! `docs/screen-elements-research.md`）。
+//! `docs-pri/screen-elements-research.md`）。
 //!
 //! 三条来之不易的约定（都是本机实测踩出来的）：
 //!
