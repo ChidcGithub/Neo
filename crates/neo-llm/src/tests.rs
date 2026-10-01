@@ -40,9 +40,13 @@ fn context_compaction_input_keeps_previous_summary_and_every_history_record() {
 
 #[test]
 fn context_multiround_output_reserve_matches_wire_and_stays_bounded() {
-    const CONTEXT_TOKENS: usize = 32 * 1024;
-    let cfg = Config { context_tokens: CONTEXT_TOKENS, ..Config::deepseek("k") };
     let tools = neo_tools::tool_declarations();
+    let schema = serialized_size(&tools, MAX_REQUEST_BYTES).unwrap();
+    let fixed = PROTOCOL_TOKENS + TOOL_RESERVE.max(schema);
+    // Keep the message/output allowance stable as real tool descriptions grow.
+    // Four rounds fit, but must reduce output below the normal 4096-token cap.
+    let context_tokens = fixed + 12 * 1024;
+    let cfg = Config { context_tokens, ..Config::deepseek("k") };
     let mut messages = vec![Msg::new(Role::System, "s".repeat(2000)), Msg::new(Role::User, "original intent")];
     for round in 0..4 {
         let id = format!("c-{round}");
@@ -51,22 +55,27 @@ fn context_multiround_output_reserve_matches_wire_and_stays_bounded() {
         }]).with_reasoning("complete reasoning"));
         messages.push(Msg::tool_result(id, serde_json::json!({"ok":true, "tool":"read_file",
             "data":{"content":"x".repeat(1800), "offset":round, "next_offset":round+1, "truncated":true}}).to_string()));
-        budget_messages(&cfg, &mut messages, &tools).unwrap();
+        budget_messages(&cfg, &mut messages, &tools).unwrap_or_else(|error| {
+            panic!("round={round}, schema_bytes={}, required_budget={}: {error}",
+                serialized_size(&tools, MAX_REQUEST_BYTES).unwrap(),
+                context_usage(&cfg, &messages, &tools).unwrap());
+        });
         assert_eq!(messages.len(), 2 + (round + 1) * 2);
         let wire = build_wire(&cfg, &messages, tools.clone());
         let used: usize = messages.iter().map(|m| message_tokens(m, true).unwrap()).sum();
-        let fixed = PROTOCOL_TOKENS + TOOL_RESERVE.max(serialized_size(&tools, CONTEXT_TOKENS * 2).unwrap());
-        assert!(used + fixed + wire.max_tokens <= CONTEXT_TOKENS);
+        assert!(used + fixed + wire.max_tokens <= context_tokens);
         assert!((MIN_OUTPUT_TOKENS..=OUTPUT_TOKENS).contains(&wire.max_tokens));
+        if round == 0 { assert_eq!(wire.max_tokens, OUTPUT_TOKENS); }
         if round == 3 { assert!(wire.max_tokens < OUTPUT_TOKENS); }
     }
-    let schema = serialized_size(&tools, CONTEXT_TOKENS * 2).unwrap();
     let used: usize = messages.iter().map(|m| message_tokens(m, true).unwrap()).sum();
-    let spare = CONTEXT_TOKENS - PROTOCOL_TOKENS - TOOL_RESERVE.max(schema) - MIN_OUTPUT_TOKENS - used;
+    let spare = context_tokens - fixed - MIN_OUTPUT_TOKENS - used;
     messages[1].content.push_str(&"x".repeat(spare));
     budget_messages(&cfg, &mut messages, &tools).unwrap();
+    assert_eq!(context_usage(&cfg, &messages, &tools).unwrap(), context_tokens);
     assert_eq!(build_wire(&cfg, &messages, tools.clone()).max_tokens, MIN_OUTPUT_TOKENS);
     messages[1].content.push('x');
+    assert_eq!(context_usage(&cfg, &messages, &tools).unwrap(), context_tokens + 1);
     let before = request_body(&cfg, &messages, tools.clone());
     assert!(budget_messages(&cfg, &mut messages, &tools).is_err());
     assert_eq!(request_body(&cfg, &messages, tools), before);
