@@ -35,6 +35,7 @@ mod attachments;
 mod brand;
 mod class;
 mod diagnostics;
+mod graphics;
 mod notify;
 mod startup;
 mod state;
@@ -49,7 +50,23 @@ fn window_limits(supported: &eframe::wgpu::Limits) -> eframe::wgpu::Limits {
     limits
 }
 
+fn window_wgpu_setup() -> eframe::egui_wgpu::WgpuSetupCreateNew {
+    let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    // 与覆盖层统一使用 DX12；部分 Intel Vulkan 驱动在枚举时会访问违例，无法靠 Rust 错误回退。
+    setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+    setup.device_descriptor = std::sync::Arc::new(|adapter| eframe::wgpu::DeviceDescriptor {
+        label: Some("Neo window device"),
+        required_limits: window_limits(&adapter.limits()),
+        ..Default::default()
+    });
+    setup
+}
+
 fn main() {
+    // 探测必须早于单实例锁、splash 及任何业务线程。
+    if let Some(code) = graphics::probe_command() {
+        std::process::exit(code);
+    }
     let _startup = match startup::begin() {
         Ok(Some(guard)) => guard,
         Ok(None) => return,
@@ -58,19 +75,17 @@ fn main() {
             return;
         }
     };
+    let selection = match graphics::select(&_startup) {
+        Ok(selection) => selection,
+        Err(reason) => {
+            graphics::startup_failed(&reason.to_string());
+            return;
+        }
+    };
+    let backend = selection.backend;
     // 窗口图标与托盘图标共用同一张鲸鱼位图（品牌蓝、方形内接居中）。
     let (rgba, width, height) = brand::whale_rgba(64);
-    let mut wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
-    wgpu_setup.device_descriptor = std::sync::Arc::new(|adapter| eframe::wgpu::DeviceDescriptor {
-        label: Some("Neo window device"),
-        required_limits: window_limits(&adapter.limits()),
-        ..Default::default()
-    });
     let options = eframe::NativeOptions {
-        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            wgpu_setup: wgpu_setup.into(),
-            ..Default::default()
-        },
         viewport: egui::ViewportBuilder::default()
             .with_title("Neo — 教室大屏 AI 助手")
             .with_inner_size([1600.0, 1000.0])
@@ -82,34 +97,43 @@ fn main() {
                 width,
                 height,
             }),
-        ..Default::default()
+        ..graphics::options(backend)
     };
 
     if eframe::run_native(
         "Neo",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             let mut app = app::NeoApp::install(&cc.egui_ctx);
             // 语音唤醒（"Hi, Neo"）只进真实客户端：离屏测试不碰麦克风。
             // 模型还没训练好时引擎会回一条 Error，界面降级为无唤醒照常工作。
             app.start_wake(&cc.egui_ctx);
             // 全屏跑马灯（独立窗口线程，初始隐藏）与 STT 线程（预载模型）：
             // 唤醒后跑马灯亮起直接听写，主界面不露面。离屏测试两者都不起。
-            app.start_overlay();
+            if backend == graphics::Backend::Dx12 {
+                app.start_overlay();
+            }
             app.start_stt(&cc.egui_ctx);
             // 系统托盘：关窗转后台运行，托盘菜单提供「显示主界面 / 退出」。
             // 装配失败只打日志降级为无托盘，不挡启动。
             app.start_tray();
-            Ok(Box::new(app))
+            Ok(Box::new(selection.track(app)))
         }),
     ).is_err() {
-        startup::fatal("window", "native window initialization failed");
+        // 不在可能已损坏的进程内重建渲染器；pending 让下次启动尝试后备。
+        graphics::startup_failed("native window initialization failed");
     }
 }
 
 #[cfg(test)]
 mod graphics_tests {
     use super::*;
+
+    #[test]
+    fn window_setup_excludes_vulkan_before_adapter_enumeration() {
+        let setup = window_wgpu_setup();
+        assert_eq!(setup.instance_descriptor.backends, eframe::wgpu::Backends::DX12);
+    }
 
     #[test]
     fn window_limits_follow_adapter_without_8192_requirement() {

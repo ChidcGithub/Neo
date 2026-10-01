@@ -136,7 +136,7 @@ sequenceDiagram
 | Requirement | Notes |
 |---|---|
 | **Windows 10 2004 (20H1) or later** | Capture exclusion (`WDA_EXCLUDEFROMCAPTURE`) is available from 2004 onward. |
-| **DX12-capable GPU** | Required by the overlay's wgpu backend. |
+| **DX12 or OpenGL-capable GPU** | DX12 is preferred; OpenGL is the main-window fallback. The desktop-refraction overlay requires DX12. |
 | **Microphone** | For wake word & dictation. Everything else works without one. |
 | **Rust 1.95+** | Only for building from source. |
 
@@ -144,6 +144,22 @@ sequenceDiagram
 > On pre-2004 builds, or in remote sessions where capture exclusion fails, Neo still
 > runs — the overlay degrades to a halo-only mode (no desktop refraction), so the
 > marquee can never feed back into its own capture.
+
+### Automatic renderer selection
+
+On first launch (and after a version change), Neo tests **DX12 first, then OpenGL**
+inside separate, time-limited processes. Vulkan is deliberately excluded because
+some drivers crash during enumeration. The compact, square-cornered startup card
+shows an indeterminate progress bar flush with its bottom edge during initialization.
+
+The working renderer is cached in `%APPDATA%\Neo\graphics.json` (or
+`NEO_HOME/graphics.json`). If initialization crashes before the first main-window
+frame is confirmed, the **next launch** skips that backend. OpenGL mode uses the
+existing auxiliary-window fallback without the DX12 refraction overlay.
+
+After updating a faulty graphics driver, close Neo and run `neo.exe --reset-renderer`
+to probe again. The cache directory must be writable; initialization guidance is
+written to `graphics-help.txt` in the startup log directory on failure.
 
 ## Download & Install
 
@@ -279,9 +295,14 @@ the confirmation policy, and the docs are derived from that single declaration.
 | `exec` | powershell · bash · click · drag | on-screen confirmation |
 
 > [!WARNING]
-> `click` / `drag` synthesize real mouse input. While Neo is driving the pointer,
-> clicking anywhere pops an interrupt confirmation — and Neo's own synthetic clicks
-> are excluded from that detection so it can never interrupt itself.
+> While any Agent task is running — including text generation and non-mouse tools —
+> a screen click requests interrupt confirmation, in both foreground and background.
+> Starting/submitting a task and interacting with approval, question, or summary cards
+> do not count as interrupt requests. Neo cancels only after an explicit confirmation;
+> during an active desktop operation the request waits until the confirmation UI can
+> safely appear. A Windows mouse hook distinguishes physical clicks from injected
+> mouse input. If the hook is unavailable, conservative polling is used instead and
+> physical clicks within one second of injected input may be ignored.
 
 ## Safety & Privacy
 

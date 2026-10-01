@@ -213,6 +213,7 @@ impl DesktopWindows {
         if main.is_null() || unsafe { GetWindowThreadProcessId(main, std::ptr::null_mut()) != GetCurrentThreadId() } {
             return Err("无法确认 Neo 主窗口归属，拒绝派发桌面工具".into());
         }
+        neo_overlay::hide_interrupt_buttons()?;
         let windows = self.visible_windows()?;
         for hwnd in windows {
             if hwnd == self.main {
@@ -262,7 +263,7 @@ impl DesktopWindows {
         Ok(())
     }
 
-    fn restore(&mut self) {
+    fn restore_auxiliary(&mut self) {
         for _hwnd in self.hidden.drain(..) {
             #[cfg(all(windows, not(test)))]
             unsafe {
@@ -275,6 +276,10 @@ impl DesktopWindows {
                 }
             }
         }
+    }
+
+    fn restore(&mut self) {
+        self.restore_auxiliary();
         #[cfg(all(windows, not(test)))]
         if let Some(mut placement) = self.placement.take() {
             unsafe {
@@ -1720,9 +1725,13 @@ impl NeoApp {
         let round_busy = self.state.generating || self.state.tool_open || self.state.tool_round;
         let hold_main = self.desktop_windows.main_avoided && round_busy && !blocked
             && !self.desktop_restore_pending;
+        // 主窗可整轮暂避，但确认卡只在实际桌面租约/暂避验证期间挂起。
         let suspended = active && !self.desktop_cancels.is_empty()
-            || !self.desktop_pending.is_empty() || hold_main;
+            || !self.desktop_pending.is_empty();
         ctx.data_mut(|data| data.insert_temp(egui::Id::new("neo-desktop-suspended"), suspended));
+        if !active && self.desktop_pending.is_empty() {
+            self.desktop_windows.restore_auxiliary();
+        }
         if !active && self.desktop_pending.is_empty() && !hold_main {
             self.desktop_windows.restore();
             self.desktop_cancels.clear();
@@ -1904,7 +1913,7 @@ impl NeoApp {
         // 迷你窗：主窗藏起 + AI 在忙时贴屏幕角落（对话速览 / 截屏回避 / 打断确认）。
         // 打断判定要排除课堂总结弹窗的矩形：点它的「关闭」不是「打断 AI」。
         let classwin_rect = if self.class.presenting().is_some() {
-            let monitor = ui::miniwin::screen_geometry(&ctx, self.overlay_alive()).monitor;
+            let monitor = ui::miniwin::screen_geometry(&ctx, false).monitor;
             Some(ui::classwin::ClassWin::target_rect(self.theme, monitor))
         } else {
             None
@@ -1916,7 +1925,7 @@ impl NeoApp {
             &ctx,
             &mut self.state,
             self.theme,
-            self.hidden_to_tray,
+            self.hidden_to_tray || self.desktop_windows.main_avoided,
             classwin_rect,
             overlay,
         );
@@ -3480,6 +3489,7 @@ mod restore_tests {
         app.state.desktop_execution.as_ref().unwrap().active.store(0, std::sync::atomic::Ordering::Release);
         app.tick_desktop_barrier(&ctx);
         assert!(app.desktop_windows.main_avoided, "同轮观察与点击之间不恢复主窗");
+        assert!(!super::desktop_suspended(&ctx), "主窗暂避不能让打断确认整轮隐形");
         app.state.tool_open = false;
         ctx.begin_pass(egui::RawInput::default());
         app.tick_desktop_barrier(&ctx);
@@ -3489,6 +3499,58 @@ mod restore_tests {
         output.textures_delta.clear();
         assert!(output.viewport_output.values().flat_map(|v| &v.commands)
             .all(|c| !matches!(c, egui::ViewportCommand::Focus)));
+    }
+
+    #[test]
+    fn desktop_barrier_auxiliary_ui_resumes_between_leases_without_cancel_or_main_restore() {
+        use std::sync::atomic::Ordering;
+        let ctx = egui::Context::default();
+        let mut app = NeoApp::install(&ctx);
+        app.state.generating = true;
+        for _ in 0..2 {
+            let (cancel, rx) = desktop_request(&app, std::time::Instant::now() + std::time::Duration::from_secs(10));
+            app.tick_desktop_barrier(&ctx);
+            assert!(super::desktop_suspended(&ctx));
+            app.tick_desktop_barrier(&ctx);
+            assert!(rx.try_recv().unwrap().is_ok());
+            assert!(super::desktop_suspended(&ctx));
+            app.desktop_windows.hidden.push(123); // 测试后端不访问 HWND。
+            app.state.desktop_execution.as_ref().unwrap().active.store(0, Ordering::Release);
+            app.tick_desktop_barrier(&ctx);
+            assert!(!super::desktop_suspended(&ctx));
+            assert!(app.desktop_windows.hidden.is_empty());
+            assert!(app.desktop_windows.main_avoided);
+            assert!(!cancel.load(Ordering::Acquire));
+            assert!(!app.state.round_cancelled);
+            assert!(app.state.generating);
+        }
+        app.state.generating = false;
+        app.tick_desktop_barrier(&ctx);
+        assert!(!app.desktop_windows.main_avoided);
+    }
+
+    #[test]
+    fn desktop_barrier_auto_avoided_main_drives_miniwin_without_tray() {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let mut app = NeoApp::install(&ctx);
+        app.state.tool_open = true;
+        let (_, rx) = desktop_request(&app, std::time::Instant::now() + std::time::Duration::from_secs(10));
+        app.tick_desktop_barrier(&ctx);
+        app.tick_desktop_barrier(&ctx);
+        assert!(rx.try_recv().unwrap().is_ok());
+        app.state.desktop_execution.as_ref().unwrap().active.store(0, std::sync::atomic::Ordering::Release);
+        ctx.begin_pass(egui::RawInput::default());
+        app.tick(ctx.clone());
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+        assert!(!app.hidden_to_tray);
+        assert!(app.desktop_windows.main_avoided);
+        assert!(!super::desktop_suspended(&ctx));
+        let mini = &output.viewport_output[&egui::ViewportId::from_hash_of("neo-miniwin")];
+        assert!(mini.builder.inner_size.is_some_and(|size| size.x > 1.0 && size.y > 1.0),
+            "自动暂避与托盘隐藏都要开启迷你窗");
+        assert!(!app.state.round_cancelled);
     }
 
     #[test]

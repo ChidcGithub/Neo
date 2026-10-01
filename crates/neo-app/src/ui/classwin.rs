@@ -47,14 +47,11 @@ fn save_status(generated: bool, state: SaveState, close_blocked: bool) -> String
 pub struct ClassWin {
     /// 上一帧是否开着（沿检测用）。
     open: bool,
-    using_overlay: bool,
     /// 回调里点「关闭」置位，tick 里落到 `ClassMonitor::dismiss`。
     close_wanted: Arc<AtomicBool>,
     retry_wanted: Arc<AtomicBool>,
     /// 滑入起点（打开沿置位，回调读完动画进度）。
     open_since: Arc<Mutex<Option<Instant>>>,
-    /// 渲染层卡片的共享矩形（滑入动画由绘制闭包逐帧改写）。
-    layer_rect: Arc<Mutex<[f32; 4]>>,
 }
 
 impl ClassWin {
@@ -80,14 +77,7 @@ impl ClassWin {
         theme: Theme,
         overlay: Option<&neo_overlay::OverlayHandle>,
     ) {
-        let overlay = overlay.filter(|layer| layer.is_alive());
-        if self.using_overlay != overlay.is_some() {
-            self.using_overlay = overlay.is_some();
-            self.open = false;
-            if self.using_overlay {
-                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Close);
-            }
-        }
+        if let Some(layer) = overlay { layer.set_card(neo_overlay::card_id::CLASS, None); }
         // 1. 关闭回传先行：dismiss 后 presenting 转 None，本轮即走关闭沿。
         if self.retry_wanted.swap(false, Ordering::Relaxed) {
             monitor.retry_save();
@@ -100,7 +90,7 @@ impl ClassWin {
         // 2. 位置：屏幕上方居中。
         let rect = Self::target_rect(
             theme,
-            super::miniwin::screen_geometry(ctx, overlay.is_some()).monitor,
+            super::miniwin::screen_geometry(ctx, false).monitor,
         );
         let size = rect.size();
         let target = rect.min;
@@ -111,55 +101,7 @@ impl ClassWin {
                 save_status(r.generated, r.save_state, r.close_blocked), r.save_state != SaveState::Saved)
         });
 
-        // 4a. 渲染层：卡片注册；滑入动画由绘制闭包在层内 vsync 自驱
-        //     （改写共享矩形，层的 Area 定位与命中测试下一帧生效）。
-        if let Some(layer) = overlay {
-            if open {
-                if !self.open {
-                    // 露面沿：从屏幕顶外起滑。
-                    *self.layer_rect.lock().unwrap() = [target.x, -size.y, size.x, size.y];
-                    *self.open_since.lock().unwrap() = Some(Instant::now());
-                }
-                let close_wanted = Arc::clone(&self.close_wanted);
-                let retry_wanted = Arc::clone(&self.retry_wanted);
-                let open_since = Arc::clone(&self.open_since);
-                let rect_slot = Arc::clone(&self.layer_rect);
-                let card = neo_overlay::Card {
-                    rect: Arc::clone(&self.layer_rect),
-                    interactive: true,
-                    draw: Box::new(move |ui| {
-                        let Some((subject, summary, over_limit, date, status, retry)) = &snapshot else {
-                            return;
-                        };
-                        // 渲染层的 egui 上下文不管主题：同步一次（幂等、便宜）。
-                        theme.apply(ui.ctx());
-                        // 滑入：从顶外到目标位，ease-out；层内渲染连续，无需拉帧。
-                        let since = open_since.lock().unwrap();
-                        if let Some(t0) = *since {
-                            let t = (t0.elapsed().as_secs_f32() / SLIDE_SECS).clamp(0.0, 1.0);
-                            let eased = 1.0 - (1.0 - t).powi(3);
-                            let y = target.y * eased + (-size.y) * (1.0 - eased);
-                            *rect_slot.lock().unwrap() = [target.x, y, size.x, size.y];
-                        }
-                        drop(since);
-
-                        let whale = WhaleMark::cached(ui.ctx());
-                        let skin = Skin::new(theme, &whale);
-                        if paint(ui, &skin, subject, summary, *over_limit, date, status, *retry, &retry_wanted) {
-                            close_wanted.store(true, Ordering::Relaxed);
-                        }
-                    }),
-                };
-                layer.set_card(neo_overlay::card_id::CLASS, Some(card));
-            } else {
-                layer.set_card(neo_overlay::card_id::CLASS, None);
-                self.open_since.lock().unwrap().take();
-            }
-            self.open = open;
-            return;
-        }
-
-        // ---- 测试回退路径：独立视口（无渲染层时） ----
+        // 正文滚动、关闭和重试始终由独立交互视口处理。
         // 4b. 显隐沿：露面时提顶 + 记滑入起点；休眠缩 1x1 回 OFFSCREEN。
         if open != self.open {
             if open {
@@ -387,6 +329,27 @@ impl ClassDot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_uses_interactive_viewport_with_desktop_suspend() {
+        let ctx = Context::default();
+        ctx.set_embed_viewports(false);
+        let mut monitor = ClassMonitor::default();
+        monitor.seed_pending_summaries();
+        let mut win = ClassWin::default();
+        let theme = Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard);
+        for suspended in [false, true, false] {
+            ctx.begin_pass(egui::RawInput::default());
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("neo-desktop-suspended"), suspended));
+            win.tick(&ctx, &mut monitor, theme, None);
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+            let viewport = &output.viewport_output[&viewport_id()];
+            assert!(viewport.viewport_ui_cb.is_some());
+            assert_ne!(viewport.builder.mouse_passthrough, Some(true));
+            assert_eq!(viewport.builder.visible, Some(!suspended));
+        }
+    }
 
     #[test]
     fn failed_close_keeps_card_and_renders_explicit_retention() {

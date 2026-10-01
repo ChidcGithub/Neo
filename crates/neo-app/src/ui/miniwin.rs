@@ -4,7 +4,7 @@
 //! - AI 一截屏就暂时消失（`neo_tools::tools::screen::SCREENSHOT_AT` 置位），
 //!   截完带着一个轻微的淡入回来 —— 截图里永远不会有 Neo 自己的窗；
 //! - AI 的鼠标移进小窗区域时，小窗非线性躲到左上角，鼠标离开后弹回；
-//! - 本轮 AI 用过鼠标/键盘工具时，用户点击屏幕任意处弹出「打断确认」，
+//! - AI 执行期间，无论前后台或是否使用桌面工具，用户点击屏幕弹出「打断确认」，
 //!   确认即 [`AppState::cancel`]。
 //!
 //! 实现要点：
@@ -16,7 +16,7 @@
 //!   小窗视口自己的回调里自驱**（避让 / 淡入 / 边缘流光），主视口只管
 //!   10fps 的内容快照；窗口位置也由回调发 `OuterPosition`，builder 不碰。
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ use egui::{
     ViewportId, WindowLevel,
 };
 use neo_theme::{SquirclePaint, Theme};
-use neo_ui::{Button, Design};
+use neo_ui::Design;
 
 use crate::state::{AppState, Role, ToolState};
 
@@ -174,14 +174,29 @@ impl FallbackGeometry {
     }
 }
 
+fn fallback_position_settled(actual: Option<Rect>, expected: Pos2, ppp: f32) -> bool {
+    let Some(actual) = actual else { return false };
+    if !ppp.is_finite() || ppp <= 0.0 { return false; }
+    // egui-winit 的 OuterPosition 先乘 ppp（含 zoom），winit 再 round 为物理整数。
+    // 无边框视口的 inner/outer 原点相同，不能用点坐标距离拒绝合法像素取整。
+    let actual = actual.min * ppp;
+    let expected = expected * ppp;
+    actual.is_finite() && expected.is_finite()
+        && actual.x.round() == expected.x.round()
+        && actual.y.round() == expected.y.round()
+}
+
 /// 缓出三次方：避让与淡入共用这条「先快后慢」的曲线。
 fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
 }
 
+#[cfg(any(windows, test))]
+mod mouse_hook;
+
 /// 全局鼠标状态：光标位置（屏幕物理像素）+ 左键此刻是否按下。
 /// 主窗隐藏后 egui 拿不到任何输入，只能绕到系统 API 轮询。
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn global_cursor() -> Option<(Pos2, bool)> {
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
@@ -199,7 +214,7 @@ fn global_cursor() -> Option<(Pos2, bool)> {
 }
 
 /// 非 Windows 没有全局输入轮询（小窗退化为只读状态牌）。
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn global_cursor() -> Option<(Pos2, bool)> {
     None
 }
@@ -211,66 +226,44 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 全局输入单点采样（只写于视口回调，读于 tick）。
-///
-/// `GetAsyncKeyState` 的「自上次调用以来按过」位（0x0001）**按线程锁存、读后
-/// 即清**：回调（60fps）与 tick（托盘态 ~10fps）同线程抢读时，按下沿会先被
-/// 回调清掉，tick 侧只剩「此刻仍按着」——一次 30ms 的快速点按约一半概率漏检。
-/// 所以只有回调采样，结果经这三个槽位转发：光标每次采样刷新，按下沿记时刻。
-static CURSOR: Mutex<Option<(Pos2, bool)>> = Mutex::new(None);
-/// 最近一次左键按下沿的时刻（ms）；0 = 从未按过。
-static LMB_EDGE_MS: AtomicU64 = AtomicU64::new(0);
-/// 回调侧的上一帧按下态（沿检测用）。
-static PREV_DOWN: AtomicBool = AtomicBool::new(false);
+/// 回调（60fps）和 tick 共用采样器：GetAsyncKeyState 的低位不可靠且读后清除，
+/// 任一调用读到的沿都必须保留给 tick。即使截屏/桌面屏障暂停绘制，tick 仍采样。
+/// 命中检测使用按下时的位置，不能用消费时已移走的光标判断课堂卡点击。
+#[derive(Clone, Copy, Default)]
+struct GlobalInput {
+    cursor: Option<Pos2>,
+    down: bool,
+    edge: Option<(u64, Pos2)>,
+}
 
-/// 视口回调里每帧调用一次：采样全局输入，刷新 [`CURSOR`] / [`LMB_EDGE_MS`]。
-fn poll_global_input() {
-    match global_cursor() {
-        Some((pos, down)) => {
-            let prev = PREV_DOWN.swap(down, Ordering::Relaxed);
-            if down && !prev {
-                LMB_EDGE_MS.store(now_ms(), Ordering::Relaxed);
-            }
-            if let Ok(mut g) = CURSOR.lock() {
-                *g = Some((pos, down));
-            }
+impl GlobalInput {
+    fn sample(&mut self, sample: Option<(Pos2, bool)>, now: u64, synthetic_at: u64) {
+        let down = sample.is_some_and(|(_, down)| down);
+        if down && !self.down && !synthetic_click_at(now, synthetic_at) {
+            self.edge = sample.map(|(pos, _)| (now, pos));
         }
-        None => {
-            PREV_DOWN.store(false, Ordering::Relaxed);
-            if let Ok(mut g) = CURSOR.lock() {
-                *g = None;
-            }
-        }
+        // 合成按下也更新基线，避免窗口过期后把仍按住的拖动当成用户新点击。
+        self.down = down;
+        self.cursor = sample.map(|(pos, _)| pos);
     }
 }
 
-/// 最近一次 AI 合成输入（click/drag 工具的 SendInput 注入）是不是就发生在刚刚。
-///
-/// 合成点击与物理点击在系统里不可区分，只能靠工具层留的时间戳排除：
-/// 注入与采样跨线程，留 1s 窗口盖住「注入完成 → 下一帧采样」的间隔。
-/// 不排除的话，AI 操作鼠标时一次按下沿就会弹出「打断执行？」——
-/// 弹窗又恰好钉在最大化窗口的关闭按钮区，AI 可能自己把自己打断。
-fn synthetic_click_recent() -> bool {
-    let last = neo_tools::tools::screen::SYNTHETIC_INPUT_AT.load(Ordering::Relaxed);
-    if last == 0 {
-        return false;
-    }
-    now_ms().saturating_sub(last) < 1000
+static GLOBAL_INPUT: Mutex<GlobalInput> = Mutex::new(GlobalInput {
+    cursor: None, down: false, edge: None,
+});
+
+fn poll_global_input() -> GlobalInput {
+    let mut input = GLOBAL_INPUT.lock().unwrap_or_else(|p| p.into_inner());
+    let sample = global_cursor();
+    let synthetic_at = neo_tools::tools::screen::SYNTHETIC_INPUT_AT.load(Ordering::Relaxed);
+    input.sample(sample, now_ms(), synthetic_at);
+    *input
 }
 
-/// 本轮对话（自最后一条用户消息起）AI 是否动过鼠标/键盘。
-fn used_mouse_or_keyboard(state: &AppState) -> bool {
-    for msg in state.messages.iter().rev() {
-        if msg.role == Role::User {
-            break;
-        }
-        if let Some(tool) = &msg.tool {
-            if matches!(tool.name.as_str(), "click" | "drag") {
-                return true;
-            }
-        }
-    }
-    false
+/// GetAsyncKeyState 不区分注入来源；沿用工具层的 1s 保守排除窗口。
+/// 必须在采样时过滤，不能等 tick 时窗口已过期再把合成沿认作用户点击。
+fn synthetic_click_at(now: u64, last: u64) -> bool {
+    last != 0 && now.saturating_sub(last) < 1000
 }
 
 /// 留尾部 max 个字符（最新的内容），被裁就补个省略号。
@@ -442,6 +435,13 @@ impl Snapshot {
     }
 }
 
+fn interrupt_rects(inner: Rect, width: f32, height: f32, gap: f32) -> [Rect; 2] {
+    let width = width.min(((inner.width() - gap) * 0.5).max(0.0));
+    let height = height.min(inner.height().max(0.0));
+    let first = Rect::from_min_max(inner.max - Vec2::new(width, height), inner.max);
+    [first, first.translate(Vec2::new(-width - gap, 0.0))]
+}
+
 /// 画一帧小窗内容：工具流水 + 正文（markdown / LaTeX 渲染）。
 ///
 /// 正文用组件布局（不再是纯 painter 排版），量到的内容高写进 `measure`
@@ -490,23 +490,16 @@ fn paint(
             inner.width(),
         );
         painter.galley(Pos2::new(inner.left(), body_y), body, tint(p.label_secondary));
-        // 底部按钮行：右对齐 [继续][打断]。
-        let btn_h = m.s(34.0);
-        let footer =
-            Rect::from_min_max(Pos2::new(inner.left(), inner.bottom() - btn_h), inner.max);
-        let mut clicked: Option<bool> = None;
-        super::at(ui, footer, |ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if Button::new("打断").danger().show(ui, &d).clicked() {
-                    clicked = Some(true);
-                }
-                if Button::new("继续").ghost().show(ui, &d).clicked() {
-                    clicked = Some(false);
-                }
-            });
-        });
-        if let Some(yes) = clicked {
-            result.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
+        // 实绘与原生宿主共享这两个矩形，不使用组件扩大的触摸热区。
+        let buttons = interrupt_rects(inner, m.s(80.0), m.s(34.0), m.s(8.0));
+        for (index, button) in buttons.iter().enumerate() {
+            painter.rect_filled(*button, 0.0, tint(if index == 0 { p.error } else { p.bg_layer_1 }));
+            painter.text(button.center(), Align2::CENTER_CENTER,
+                if index == 0 { "打断" } else { "继续" }, d.font_bold(d.t().label),
+                tint(if index == 0 { Color32::WHITE } else { p.label_secondary }));
+        }
+        if fade >= 0.99 && result.load(Ordering::Acquire) == 0 {
+            neo_overlay::stage_interrupt_buttons(ui, buttons.map(|r| r.intersect(ui.clip_rect())), result.clone());
         }
         return;
     }
@@ -694,8 +687,19 @@ pub struct MiniWin {
     interrupt_open: bool,
     /// 打断确认结果（回调里写、tick 里读）：0 未决 / 1 打断 / 2 继续。
     interrupt_result: Arc<AtomicU8>,
+    session_epoch: u64,
     /// 已消费的左键按下沿时刻（同一沿在 250ms 窗口内不重复触发）。
     lmb_edge_consumed: u64,
+    /// 仅监听已经开始的执行；启动/审批点击不能成为打断请求。
+    input_armed: bool,
+    #[cfg(any(windows, test))]
+    mouse_hook: Option<mouse_hook::MouseHook>,
+    #[cfg(any(windows, test))]
+    hook_attempted: bool,
+    #[cfg(any(windows, test))]
+    physical_sequence: u64,
+    #[cfg(test)]
+    mock_clicks: Option<Arc<mouse_hook::ClickSlot>>,
     /// 忙完后的驻留截止时刻（忙时持续刷新，闲下来那一刻起算 5s）。
     linger_until: Option<Instant>,
     /// 淡出起点（驻留结束 → 播完才收窗）；回调里读它算透明度与上飘，
@@ -711,9 +715,102 @@ pub struct MiniWin {
     layer_rect: Arc<Mutex<[f32; 4]>>,
 }
 
+impl Drop for MiniWin {
+    fn drop(&mut self) {
+        self.interrupt_result.store(u8::MAX, Ordering::Release);
+        #[cfg(not(test))]
+        if let Err(error) = neo_overlay::hide_interrupt_buttons() { eprintln!("{error}"); }
+    }
+}
+
 impl MiniWin {
+    fn consume_click(&mut self, input: GlobalInput, now: u64) -> bool {
+        let Some((at, _)) = input.edge else { return false };
+        if at == 0 || at == self.lmb_edge_consumed {
+            return false;
+        }
+        // 不合格/过期的沿也消费，不能在确认卡关闭或下一轮开始后重放。
+        self.lmb_edge_consumed = at;
+        now.saturating_sub(at) < 250
+    }
+
+    fn arm_input(&mut self, state: &AppState) -> bool {
+        let eligible = (state.generating || state.tool_open || state.tool_round)
+            && state.awaiting_tool().is_none();
+        let armed = self.input_armed;
+        self.input_armed = eligible;
+        armed && eligible
+    }
+
+    fn task_click(&mut self, state: &AppState, input: GlobalInput, now: u64) -> bool {
+        let armed = self.arm_input(state);
+        // 启动前/首帧的沿照常消费，按住发送按钮也必须先松开才能再触发。
+        self.consume_click(input, now) && armed
+    }
+
+    #[cfg(any(windows, test))]
+    fn physical_click(&mut self, state: &AppState, click: Option<mouse_hook::Click>) -> bool {
+        let armed = self.arm_input(state);
+        let Some(click) = click else { return false };
+        if click.sequence == self.physical_sequence { return false; }
+        // 不使用毫秒时间戳/250ms过期窗口：UI 暂避或忙碌不能丢掉真实请求。
+        self.physical_sequence = click.sequence;
+        armed
+    }
+
+    /// 外层 None = hook 不可用；内层 None = 可用但尚无真实点击。
+    #[cfg(any(windows, test))]
+    fn hook_click(&mut self) -> Option<Option<mouse_hook::Click>> {
+        #[cfg(test)]
+        if let Some(slot) = &self.mock_clicks { return Some(slot.latest()); }
+        if !self.hook_attempted {
+            self.hook_attempted = true;
+            #[cfg(all(windows, not(test)))]
+            match mouse_hook::MouseHook::start() {
+                Ok(hook) => {
+                    self.mouse_hook = Some(hook);
+                    self.input_armed = false;
+                }
+                Err(error) => eprintln!("{error}；退回鼠标轮询（注入后 1s 内的真实点击可能被忽略）"),
+            }
+        }
+        if self.mouse_hook.as_ref().is_some_and(mouse_hook::MouseHook::finished) {
+            eprintln!("鼠标 hook 线程已退出；退回鼠标轮询（注入后 1s 内的真实点击可能被忽略）");
+            self.mouse_hook = None;
+            self.input_armed = false; // 切换输入源不能重放回退采样器的旧沿。
+        }
+        self.mouse_hook.as_ref().map(mouse_hook::MouseHook::latest)
+    }
+
+    fn poll_task_click(&mut self, state: &AppState) -> (Option<Pos2>, bool, bool) {
+        #[cfg(any(windows, test))]
+        if let Some(click) = self.hook_click() {
+            return (click.map(|c| c.position), self.physical_click(state, click), false);
+        }
+        let input = poll_global_input();
+        let synthetic = synthetic_click_at(now_ms(), neo_tools::tools::screen::SYNTHETIC_INPUT_AT.load(Ordering::Relaxed));
+        (input.edge.map(|(_, pos)| pos), self.task_click(state, input, now_ms()), synthetic)
+    }
+
+    fn request_interrupt(&mut self, state: &AppState, armed: bool, on_card: bool, synthetic: bool) {
+        if armed
+            && (state.generating || state.tool_open || state.tool_round)
+            && !self.interrupt_open
+            && state.awaiting_tool().is_none() // 包括 ask_user 提问卡。
+            && !on_card
+            && !synthetic
+        {
+            self.interrupt_open = true;
+            self.interrupt_result.store(u8::MAX, Ordering::Release);
+            self.interrupt_result = Arc::new(AtomicU8::new(0));
+        }
+    }
+
     fn switch_backend(&mut self, ctx: &Context, using_overlay: bool) {
         if self.using_overlay != using_overlay {
+            self.interrupt_result.store(u8::MAX, Ordering::Release);
+            #[cfg(not(test))]
+            if let Err(error) = neo_overlay::hide_interrupt_buttons() { eprintln!("{error}"); }
             self.using_overlay = using_overlay;
             self.shown = false;
             self.legacy_sent = Vec2::ZERO;
@@ -743,6 +840,7 @@ impl MiniWin {
             .with_active(false)
             // 透明：squircle 卡片四个角外不该是一块直角底色。
             .with_transparent(true)
+            .with_mouse_passthrough(true)
             .with_visible(true)
             .with_inner_size(if open { size } else { Vec2::new(1.0, 1.0) })
     }
@@ -750,6 +848,7 @@ impl MiniWin {
     /// 每帧驱动一次。放在 `tick()` 里而不是 `render()` 里：
     /// 主窗隐藏时渲染循环走 logic-only 路径，两者都经过 `tick()`。
     ///
+    /// `hidden_to_tray` 也包含桌面工具导致的主窗自动暂避。
     /// `classwin_rect`：课堂总结弹窗开着时的目标矩形 —— 点它的「关闭」
     /// 不该被当成「用户想打断 AI」。
     pub fn tick(
@@ -763,13 +862,19 @@ impl MiniWin {
     ) {
         let overlay = overlay.filter(|layer| layer.is_alive());
         self.switch_backend(ctx, overlay.is_some());
+        if self.session_epoch != state.session_epoch {
+            self.session_epoch = state.session_epoch;
+            self.input_armed = false;
+            self.interrupt_open = false;
+            self.interrupt_result.store(u8::MAX, Ordering::Release);
+        }
         let geometry = if overlay.is_some() {
             primary_geometry()
         } else {
             FallbackGeometry::screen(ctx)
         };
         // classwin_rect 仍由调用者按 screen_geometry 的坐标约定传入。
-        let class_geometry = screen_geometry(ctx, overlay.is_some());
+        let class_geometry = screen_geometry(ctx, false);
         // 1. 截屏信号：时间戳一变就进入短暂隐藏；隐藏结束后播淡入。
         let shot_at = neo_tools::tools::screen::SCREENSHOT_AT.load(Ordering::Relaxed);
         if shot_at != self.shot_seen {
@@ -787,7 +892,7 @@ impl MiniWin {
         }
         let shot_hiding = self.shot_hide_until.is_some();
 
-        // 2. 显隐目标：主窗已藏到托盘 且 AI 正在生成 / 执行工具。
+        // 2. 状态牌用于主窗隐藏时；打断确认在前后台都可展示。
         //    忙完后驻留 LINGER（5s）播完成态，驻留结束再播一段淡出才收窗。
         let busy = state.generating || state.tool_open || state.tool_round;
         if busy {
@@ -800,7 +905,7 @@ impl MiniWin {
             // 真正闲下来才收确认框 —— 只判 !busy 的话，流结束与下一轮工具
             // 启动之间的空档会把弹窗闪掉（用户正点着呢，框没了）。
             self.interrupt_open = false;
-            self.interrupt_result.store(0, Ordering::Relaxed);
+            self.interrupt_result.store(u8::MAX, Ordering::Release);
         }
         // 驻留结束 → 淡出（回调里播透明度 + 上飘），播完才真正收窗。
         // 只在「曾露过面」时起播：小窗没开过的静默期不该刷出一张淡出中的卡。
@@ -815,23 +920,11 @@ impl MiniWin {
             self.linger_until = None;
         }
         drop(fadeout);
-        let open = hidden_to_tray && (busy || lingering || (fading && !faded)) && !shot_hiding;
 
-        // 3. 全局输入（由视口回调单点采样转发，见 LMB_EDGE_MS 注释）：
-        //    全局物理光标 + 左键按下沿。沿带 250ms 窗口并记消费，托盘态
-        //    ~10fps 的 tick 不会漏掉两次 tick 之间的快速点按。
-        let cursor = CURSOR
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .map(|(physical, _)| physical);
-        let edge_ms = LMB_EDGE_MS.load(Ordering::Relaxed);
-        let lmb_edge = edge_ms != 0
-            && edge_ms != self.lmb_edge_consumed
-            && now_ms().saturating_sub(edge_ms) < 250;
-        if lmb_edge {
-            self.lmb_edge_consumed = edge_ms;
-        }
+
+        // 3. hook 记录真实按下的物理位置/序号，桌面工具注入期间也能触发。
+        //    安装失败才退回原采样；回调仍轮询光标用于避让，不负责打断来源。
+        let (cursor, lmb_edge, synthetic) = self.poll_task_click(state);
 
         // 4. 几何：常态贴右上、避让时躲左上。宽度固定；高度**自适应内容** ——
         //    paint 量到的内容高（上一帧）+ 边距，钳制后由回调朝它做缓动。
@@ -852,19 +945,12 @@ impl MiniWin {
         let home = Pos2::new((monitor.x - width - margin).max(margin), margin);
         let away = Pos2::new(margin, margin);
 
-        // 5. 打断确认：后台执行中 + 本轮动过鼠标/键盘 + 左键按下沿。
+        // 5. 打断确认：前后台执行中 + 用户左键按下沿，不依赖本轮工具种类。
         //    点在小窗自己身上不算（那是在点弹窗按钮）；有待确认的工具也不算 ——
         //    那一击多半是点在独立确认窗的按钮上，且等待权限时 AI 本就停着；
         //    点在课堂总结弹窗上不算；AI 自己注入的点击（click/drag）更不算。
-        if lmb_edge
-            && open
-            && busy // 驻留/淡出中不弹打断（已经做完了，没什么可打断的）
-            && !self.interrupt_open
-            && state.awaiting_tool().is_none()
-            && used_mouse_or_keyboard(state)
-            && !synthetic_click_recent()
-        {
-            let on_miniwin = cursor.is_some_and(|physical| {
+        if lmb_edge {
+            let on_miniwin = self.shown && cursor.is_some_and(|physical| {
                 if overlay.is_some() {
                     let c = geometry.point(physical);
                     let r = *self.layer_rect.lock().unwrap();
@@ -881,19 +967,30 @@ impl MiniWin {
             let on_classwin = cursor
                 .zip(classwin_rect)
                 .is_some_and(|(c, r)| r.contains(class_geometry.point(c)));
-            if !on_miniwin && !on_classwin {
-                self.interrupt_open = true;
-                self.interrupt_result.store(0, Ordering::Relaxed);
+            self.request_interrupt(state, true, on_miniwin || on_classwin, synthetic);
+        }
+        // 截屏/桌面屏障期间只记住请求；恢复可见后才提供确认按钮。
+        if busy {
+            ctx.request_repaint_after(POLL);
+        }
+        let can_show = !shot_hiding && !crate::app::desktop_suspended(ctx);
+        let buttons_live = can_show && self.interrupt_open && state.awaiting_tool().is_none();
+        if buttons_live {
+            match self.interrupt_result.load(Ordering::Acquire) {
+                1 => { state.cancel(); self.interrupt_open = false; }
+                2 => self.interrupt_open = false,
+                u8::MAX => self.interrupt_result = Arc::new(AtomicU8::new(0)),
+                _ => {}
             }
         }
-        match self.interrupt_result.swap(0, Ordering::Relaxed) {
-            1 => {
-                state.cancel();
-                self.interrupt_open = false;
-            }
-            2 => self.interrupt_open = false,
-            _ => {}
+        if !buttons_live || !self.interrupt_open {
+            self.interrupt_result.store(u8::MAX, Ordering::Release);
+            #[cfg(not(test))]
+            if let Err(error) = neo_overlay::hide_interrupt_buttons() { eprintln!("{error}"); }
         }
+
+        let open = can_show && ((hidden_to_tray && (busy || lingering || (fading && !faded)))
+            || (self.interrupt_open && state.awaiting_tool().is_none()));
 
         // 6. 显隐与内容。
         //
@@ -931,7 +1028,7 @@ impl MiniWin {
                 let measure = Arc::clone(&self.content_h);
                 let card = neo_overlay::Card {
                     rect: Arc::clone(&self.layer_rect),
-                    interactive: true,
+                    interactive: false,
                     draw: Box::new(move |ui| {
                         let ctx = ui.ctx().clone();
                         // 淡入：起点由 tick 写进共享槽，插值在这里现算。
@@ -974,16 +1071,7 @@ impl MiniWin {
                         let home =
                             Pos2::new((monitor.x - size.x - margin).max(margin), margin);
                         let away = Pos2::new(margin, margin);
-                        let cursor = {
-                            // 采样顺带刷新槽位（层内 vsync 单点采样，tick 的
-                            // 沿检测靠它喂 —— 见 LMB_EDGE_MS 注释）。
-                            poll_global_input();
-                            CURSOR
-                                .lock()
-                                .ok()
-                                .and_then(|g| *g)
-                                .map(|(p, _)| geometry.point(p))
-                        };
+                        let cursor = poll_global_input().cursor.map(|p| geometry.point(p));
                         let dodge = !snap.interrupt_open
                             && cursor
                                 .is_some_and(|c| Rect::from_min_size(home, size).contains(c));
@@ -1063,7 +1151,12 @@ impl MiniWin {
             viewport_id(),
             Self::builder(size, open).with_visible(!suspended),
             move |ui, _class| {
-                if crate::app::desktop_suspended(ui.ctx()) { return; }
+                if crate::app::desktop_suspended(ui.ctx()) || snapshot.is_none() {
+                    #[cfg(not(test))]
+                    if let Err(error) = neo_overlay::hide_interrupt_buttons() { eprintln!("{error}"); }
+                    return;
+                }
+                neo_overlay::begin_interrupt_frame();
                 let Some(snapshot) = &snapshot else { return };
                 let ctx = ui.ctx().clone();
                 // ---- 回调自驱的动画（主视口托盘态被 eframe 节流到 10fps，
@@ -1103,15 +1196,7 @@ impl MiniWin {
                 };
                 let home = Pos2::new((geometry.monitor.x - size.x - margin).max(margin), margin);
                 let away = Pos2::new(margin, margin);
-                let cursor = {
-                    // 采样顺带刷新槽位（60fps 单点，tick 的沿检测靠它喂）。
-                    poll_global_input();
-                    CURSOR
-                        .lock()
-                        .ok()
-                        .and_then(|g| *g)
-                        .map(|(p, _)| geometry.point(p))
-                };
+                let cursor = poll_global_input().cursor.map(|p| geometry.point(p));
                 let dodge = !snapshot.interrupt_open
                     && cursor.is_some_and(|c| Rect::from_min_size(home, size).contains(c));
                 let t = ctx.animate_value_with_time(
@@ -1126,6 +1211,12 @@ impl MiniWin {
                 let actual = ctx.input(|i| i.viewport().inner_rect);
                 FallbackGeometry::new(geometry, pos, size, home, away, actual).store(&ctx);
                 paint(ui, &snapshot, &result, fade, &measure);
+                // OuterPosition 尚未落地的动画帧只画，不留下上一位置的按钮命中。
+                if !fallback_position_settled(actual, pos, geometry.ppp) {
+                    neo_overlay::begin_interrupt_frame();
+                }
+                #[cfg(not(test))]
+                if let Err(error) = neo_overlay::commit_interrupt_buttons() { eprintln!("{error}"); }
                 // 本视口自驱 60fps：流光 / 避让 / 淡入淡出全靠它。
                 ctx.request_repaint_after(POLL);
             },
@@ -1154,6 +1245,396 @@ mod beam_tests {
             ..Default::default()
         });
         input
+    }
+
+    #[test]
+    fn interrupt_all_task_kinds_require_confirmation_before_cancel() {
+        use crate::state::{ChatMessage, ToolMeta};
+        for kind in ["text", "read_file", "click", "drag", "round"] {
+            for answer in [0, 2, 1] {
+                let ctx = Context::default();
+                ctx.set_embed_viewports(false);
+                let mut state = AppState::default();
+                state.generating = kind == "text";
+                state.tool_open = !matches!(kind, "text" | "round");
+                state.tool_round = kind == "round";
+                if state.tool_open {
+                    let mut meta = ToolMeta::restored(kind);
+                    meta.state = ToolState::Running;
+                    state.messages.push(ChatMessage::tool_result(meta, String::new()));
+                }
+                let mut mini = MiniWin::default();
+                mini.session_epoch = state.session_epoch;
+                mini.request_interrupt(&state, true, false, false);
+                assert!(mini.interrupt_open, "{kind}");
+                assert!(!state.round_cancelled);
+                assert!(state.generating || state.tool_open || state.tool_round);
+                mini.interrupt_result.store(answer, Ordering::Release);
+                ctx.begin_pass(egui::RawInput::default());
+                mini.tick(&ctx, &mut state,
+                    Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard),
+                    true, None, None);
+                let mut output = ctx.end_pass();
+                output.textures_delta.clear();
+                assert_eq!(state.round_cancelled, answer == 1, "{kind}: {answer}");
+                assert_eq!(mini.interrupt_open, answer == 0);
+                assert_eq!(state.generating || state.tool_open || state.tool_round, answer != 1);
+            }
+        }
+    }
+
+    #[test]
+    fn interrupt_suspended_keeps_request_without_cancelling() {
+        let ctx = Context::default();
+        ctx.set_embed_viewports(false);
+        let mut state = AppState::default();
+        state.tool_open = true;
+        let mut mini = MiniWin::default();
+        mini.session_epoch = state.session_epoch;
+        mini.request_interrupt(&state, true, false, false);
+        let old = mini.interrupt_result.clone();
+        old.store(1, Ordering::Release); // 暂避前的旧回执不得在恢复后取消任务。
+        for suspended in [true, false] {
+            ctx.begin_pass(egui::RawInput::default());
+            ctx.data_mut(|d| d.insert_temp(Id::new("neo-desktop-suspended"), suspended));
+            mini.tick(&ctx, &mut state,
+                Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard),
+                true, None, None);
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+            assert!(mini.interrupt_open);
+            assert_eq!(mini.shown, !suspended, "只在桌面安全时展示确认");
+            assert!(state.tool_open);
+            assert!(!state.round_cancelled);
+            assert_eq!(old.load(Ordering::Acquire), u8::MAX);
+        }
+        assert_eq!(mini.interrupt_result.load(Ordering::Acquire), 0);
+        assert!(!Arc::ptr_eq(&old, &mini.interrupt_result));
+    }
+
+    #[test]
+    fn interrupt_excludes_confirmation_question_cards_idle_and_synthetic() {
+        use crate::state::{ChatMessage, ToolMeta};
+        for name in ["write_file", "ask_user"] {
+            let mut state = AppState::default();
+            state.tool_open = true;
+            let mut meta = ToolMeta::restored(name);
+            meta.state = ToolState::AwaitingConfirm;
+            state.messages.push(ChatMessage::tool_result(meta, String::new()));
+            let mut mini = MiniWin::default();
+            mini.request_interrupt(&state, true, false, false);
+            assert!(!mini.interrupt_open, "{name}");
+        }
+        for (busy, armed, on_card, synthetic) in [
+            (false, true, false, false),
+            (true, false, false, false),
+            (true, true, true, false), // MiniWin / 课堂卡。
+            (true, true, false, true),
+        ] {
+            let mut state = AppState::default();
+            state.generating = busy;
+            let mut mini = MiniWin::default();
+            mini.request_interrupt(&state, armed, on_card, synthetic);
+            assert!(!mini.interrupt_open);
+            assert!(!state.round_cancelled);
+        }
+    }
+
+    #[test]
+    fn interrupt_sampling_keeps_click_position_and_consumes_ignored_edges() {
+        let card = Rect::from_min_size(Pos2::new(600.0, 20.0), Vec2::new(640.0, 460.0));
+        let mut input = GlobalInput::default();
+        input.sample(Some((card.center(), true)), 2000, 0);
+        input.sample(Some((Pos2::new(500.0, 900.0), false)), 2016, 0);
+        assert!(card.contains(input.edge.unwrap().1));
+        assert!(!card.contains(input.cursor.unwrap()));
+        let mut mini = MiniWin::default();
+        assert!(mini.consume_click(input, 2100));
+        assert!(!mini.consume_click(input, 2110));
+        input.sample(Some((Pos2::ZERO, true)), 2200, 0);
+        assert!(!mini.consume_click(input, 2450));
+        assert_eq!(mini.lmb_edge_consumed, 2200);
+    }
+
+    #[test]
+    fn interrupt_synthetic_edge_cannot_escape_window_during_delayed_tick_or_drag() {
+        let mut input = GlobalInput::default();
+        input.sample(Some((Pos2::ZERO, true)), 1999, 1000);
+        input.sample(Some((Pos2::ZERO, false)), 2010, 1000);
+        let mut mini = MiniWin::default();
+        assert!(!mini.consume_click(input, 2050));
+        assert!(input.edge.is_none());
+        input.sample(Some((Pos2::ZERO, true)), 2999, 2000);
+        input.sample(Some((Pos2::ZERO, true)), 3100, 2000);
+        assert!(input.edge.is_none(), "合成拖动不能在排除窗口过期后变成新沿");
+        input.sample(Some((Pos2::ZERO, false)), 3110, 2000);
+        input.sample(Some((Pos2::ZERO, true)), 3120, 2000);
+        assert!(mini.consume_click(input, 3200), "窗口外的真实新点击可确认打断");
+        assert!(!synthetic_click_at(1000, 0));
+        assert!(synthetic_click_at(1000, 1001));
+        assert!(!synthetic_click_at(2000, 1000));
+    }
+
+    #[test]
+    fn interrupt_foreground_text_shows_confirmation_and_only_explicit_yes_cancels() {
+        for answer in [0, 2, 1] {
+            let ctx = Context::default();
+            ctx.set_embed_viewports(false);
+            let mut state = AppState::default();
+            state.generating = true;
+            let mut mini = MiniWin::default();
+            mini.session_epoch = state.session_epoch;
+            let mut input = GlobalInput::default();
+            assert!(!mini.task_click(&state, input, 2000));
+            input.sample(Some((Pos2::new(900.0, 700.0), true)), 2010, 0);
+            let clicked = mini.task_click(&state, input, 2010);
+            assert!(clicked);
+            mini.request_interrupt(&state, clicked, false, false);
+            for result in [0, answer] {
+                mini.interrupt_result.store(result, Ordering::Release);
+                ctx.begin_pass(egui::RawInput::default());
+                mini.tick(&ctx, &mut state,
+                    Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard),
+                    false, None, None);
+                let mut output = ctx.end_pass();
+                output.textures_delta.clear();
+                assert_eq!(mini.shown, result == 0, "前台只显示未决确认，不显示后台状态牌");
+                assert_eq!(state.round_cancelled, result == 1);
+                assert_eq!(state.generating, result != 1);
+            }
+        }
+    }
+
+    #[test]
+    fn interrupt_start_and_approval_clicks_are_consumed_before_arming() {
+        use crate::state::{ChatMessage, ToolMeta};
+        let mut state = AppState::default();
+        let mut mini = MiniWin::default();
+        let mut input = GlobalInput::default();
+        input.sample(Some((Pos2::ZERO, true)), 1000, 0);
+        assert!(!mini.task_click(&state, input, 1000), "闲时点击不能触发");
+        state.generating = true;
+        assert!(!mini.task_click(&state, input, 1010), "发送点击不能在任务开始后重放");
+        assert!(!mini.task_click(&state, input, 1020));
+        input.sample(Some((Pos2::ZERO, false)), 1030, 0);
+        input.sample(Some((Pos2::ZERO, true)), 1040, 0);
+        assert!(mini.task_click(&state, input, 1040));
+
+        for name in ["write_file", "ask_user"] {
+            let mut meta = ToolMeta::restored(name);
+            meta.state = ToolState::AwaitingConfirm;
+            state.messages.push(ChatMessage::tool_result(meta, String::new()));
+            assert!(!mini.task_click(&state, input, 1050));
+            input.sample(Some((Pos2::ZERO, false)), 1060, 0);
+            input.sample(Some((Pos2::ZERO, true)), 1070, 0);
+            state.messages.clear();
+            assert!(!mini.task_click(&state, input, 1070), "审批/提问回答点击不能触发");
+            assert!(!mini.task_click(&state, input, 1080));
+        }
+        // 首次采样已在任务开始后，也必须丢弃启动沿。
+        let mut fresh = MiniWin::default();
+        assert!(!fresh.task_click(&state, input, 1080));
+    }
+
+    #[test]
+    fn interrupt_hook_real_click_during_injection_waits_for_safe_confirmation() {
+        let ctx = Context::default();
+        ctx.set_embed_viewports(false);
+        let mut state = AppState::default();
+        state.tool_open = true;
+        let slot = Arc::new(mouse_hook::ClickSlot::default());
+        let mut mini = MiniWin::default();
+        mini.session_epoch = state.session_epoch;
+        mini.mock_clicks = Some(slot.clone());
+        assert_eq!(mini.poll_task_click(&state), (None, false, false));
+        slot.mock_down(1, 0, 50, 50); // 模型按下不触发、不占序号。
+        assert_eq!(mini.poll_task_click(&state), (None, false, false));
+        slot.mock_down(0, 0, 900, 700); // 无需等注入后 1s，也无需松开模型拖动。
+        slot.mock_down(1, 0, 50, 50); // 后续注入不能覆盖真实事件位置。
+        assert_eq!(slot.latest().unwrap().sequence, 1);
+        let theme = Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard);
+        for suspended in [true, false] {
+            ctx.begin_pass(egui::RawInput::default());
+            ctx.data_mut(|d| d.insert_temp(Id::new("neo-desktop-suspended"), suspended));
+            mini.tick(&ctx, &mut state, theme, false, None, None);
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+            assert!(mini.interrupt_open);
+            assert_eq!(mini.shown, !suspended);
+            assert!(state.tool_open);
+            assert!(!state.round_cancelled);
+        }
+        assert_eq!(mini.physical_sequence, 1);
+        let (_, repeated, synthetic) = mini.poll_task_click(&state);
+        assert!(!repeated);
+        assert!(!synthetic, "hook 路径不能再套用 1s 时间戳屏蔽");
+    }
+
+    #[test]
+    fn interrupt_hook_sequences_exclude_send_approval_and_question_clicks() {
+        use crate::state::{ChatMessage, ToolMeta};
+        let mut state = AppState::default();
+        let slot = Arc::new(mouse_hook::ClickSlot::default());
+        let mut mini = MiniWin::default();
+        mini.mock_clicks = Some(slot.clone());
+        slot.mock_down(0, 0, 10, 20);
+        assert!(!mini.poll_task_click(&state).1);
+        state.generating = true;
+        assert!(!mini.poll_task_click(&state).1, "发送沿已经消费");
+        for name in ["write_file", "ask_user"] {
+            let mut meta = ToolMeta::restored(name);
+            meta.state = ToolState::AwaitingConfirm;
+            state.messages.push(ChatMessage::tool_result(meta, String::new()));
+            slot.mock_down(0, 0, 10, 20);
+            assert!(!mini.poll_task_click(&state).1);
+            state.messages.clear();
+            slot.mock_down(0, 0, 10, 20);
+            assert!(!mini.poll_task_click(&state).1, "恢复首帧消费审批/回答点击");
+            assert!(!mini.poll_task_click(&state).1);
+            slot.mock_down(0, 0, 10, 20);
+            assert!(mini.poll_task_click(&state).1, "同毫秒/同位置的新真实点击靠序号区分");
+        }
+        mini.input_armed = false; // 切会话时重置监听；旧事件仍不可重放。
+        assert!(!mini.poll_task_click(&state).1);
+        assert!(!mini.poll_task_click(&state).1);
+    }
+
+    #[test]
+    fn interrupt_hook_unavailable_uses_fallback_without_installing_in_tests() {
+        let mut mini = MiniWin::default();
+        assert!(mini.hook_click().is_none());
+        assert!(mini.hook_attempted);
+        assert!(mini.mouse_hook.is_none(), "测试构建绝不能安装真实 hook");
+        assert!(mini.hook_click().is_none());
+        let mut state = AppState::default();
+        state.generating = true;
+        let mut input = GlobalInput::default();
+        assert!(!mini.task_click(&state, input, 1000));
+        input.sample(Some((Pos2::ZERO, true)), 1010, 1000);
+        assert!(!mini.task_click(&state, input, 1010));
+        input.sample(Some((Pos2::ZERO, false)), 2010, 1000);
+        input.sample(Some((Pos2::ZERO, true)), 2020, 1000);
+        assert!(mini.task_click(&state, input, 2020), "fallback sampling remains available");
+    }
+
+    #[test]
+    fn interrupt_hook_class_card_consumes_event_at_original_position() {
+        let ctx = Context::default();
+        ctx.set_embed_viewports(false);
+        let mut state = AppState::default();
+        state.generating = true;
+        let slot = Arc::new(mouse_hook::ClickSlot::default());
+        let mut mini = MiniWin::default();
+        mini.session_epoch = state.session_epoch;
+        mini.mock_clicks = Some(slot.clone());
+        mini.poll_task_click(&state);
+        slot.mock_down(0, 0, 100, 100);
+        let theme = Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard);
+        for card in [Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0))), None] {
+            ctx.begin_pass(egui::RawInput::default());
+            mini.tick(&ctx, &mut state, theme, false, card, None);
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+            assert!(!mini.interrupt_open, "关闭课堂卡后不能重放卡片点击");
+        }
+        assert_eq!(mini.physical_sequence, 1);
+    }
+
+    #[test]
+    fn interrupt_buttons_are_bounded_separate_and_body_always_passive() {
+        for scale in [0.75, 1.0, 1.5, 2.0, 3.0] {
+            let inner = Rect::from_min_size(Pos2::new(-500.0, -120.0), Vec2::new(344.0, 244.0) * scale);
+            let buttons = interrupt_rects(inner, 80.0 * scale, 34.0 * scale, 8.0 * scale);
+            for button in buttons {
+                assert!(inner.contains_rect(button));
+                assert!(button.contains(button.center()));
+                assert!(!button.contains(inner.min));
+            }
+            assert!(!buttons[0].intersects(buttons[1]));
+            let gap = Pos2::new((buttons[1].right() + buttons[0].left()) * 0.5, buttons[0].center().y);
+            assert!(buttons.iter().all(|r| !r.contains(gap)));
+            for open in [false, true] {
+                let builder = MiniWin::builder(inner.size(), open);
+                assert_eq!(builder.mouse_passthrough, Some(true));
+                assert_eq!(builder.active, Some(false));
+            }
+        }
+    }
+
+    #[test]
+    fn interrupt_hidden_closed_and_session_change_invalidate_old_results() {
+        for mode in 0..3 {
+            let ctx = Context::default();
+            ctx.set_embed_viewports(false);
+            let mut state = AppState::default();
+            state.generating = true;
+            let mut mini = MiniWin::default();
+            mini.session_epoch = state.session_epoch;
+            mini.interrupt_open = true;
+            let old = mini.interrupt_result.clone();
+            old.store(1, Ordering::Release);
+            if mode == 0 { mini.shot_hide_until = Some(Instant::now() + SHOT_HIDE); }
+            if mode == 1 { state.session_epoch += 1; }
+            ctx.begin_pass(egui::RawInput::default());
+            if mode == 2 { ctx.data_mut(|d| d.insert_temp(Id::new("neo-desktop-suspended"), true)); }
+            mini.tick(&ctx, &mut state, Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard), mode != 0, None, None);
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+            assert_eq!(old.load(Ordering::Acquire), u8::MAX);
+            assert!(old.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err());
+            assert!(state.generating);
+        }
+    }
+
+    #[test]
+    fn fallback_position_rounding_keeps_buttons_at_1366x768_scale085() {
+        let monitor = Vec2::new(1366.0, 768.0);
+        let scale = 0.85;
+        let size = Vec2::new(380.0, 280.0) * scale;
+        let margin = 16.0 * scale;
+        let expected = Pos2::new(monitor.x - size.x - margin, margin);
+        assert_eq!(expected, Pos2::new(1029.4, 13.6));
+        let actual = Rect::from_min_size(Pos2::new(1029.0, 14.0), size);
+        assert!((actual.min - expected).length() > 0.5, "旧点距离判定会永久清空按钮宿主");
+        assert!(fallback_position_settled(Some(actual), expected, 1.0));
+        assert!(!fallback_position_settled(Some(actual.translate(Vec2::X)), expected, 1.0));
+        assert!(!fallback_position_settled(None, expected, 1.0));
+    }
+
+    #[test]
+    fn fallback_position_rounding_uses_child_fractional_dpi_and_zoom() {
+        for native in [1.25, 1.5, 1.75, 2.5] {
+            for zoom in [0.85, 1.0, 1.1, 1.5] {
+                let ctx = Context::default();
+                ctx.set_zoom_factor(zoom);
+                let mut input = fallback_input(3.0, native);
+                input.viewport_id = viewport_id();
+                ctx.begin_pass(input);
+                let ppp = ctx.pixels_per_point();
+                assert!((ppp - native * zoom).abs() < 0.0001);
+                for physical in [Pos2::new(1029.4, 13.6), Pos2::new(-1029.4, -13.6),
+                    Pos2::new(10.5, -10.5)] {
+                    let expected = physical / ppp;
+                    let rounded = Pos2::new((expected.x * ppp).round(), (expected.y * ppp).round());
+                    let actual = Rect::from_min_size(rounded / ppp, Vec2::splat(100.0));
+                    assert!(fallback_position_settled(Some(actual), expected, ppp),
+                        "native={native}, zoom={zoom}, physical={physical:?}");
+                    for offset in [Vec2::X, -Vec2::X, Vec2::Y, -Vec2::Y] {
+                        let shifted = actual.translate(offset / ppp);
+                        assert!(!fallback_position_settled(Some(shifted), expected, ppp),
+                            "one physical pixel mismatch must disable button hosts");
+                    }
+                }
+                let mut output = ctx.end_pass();
+                output.textures_delta.clear();
+            }
+        }
+        let half = Pos2::new(10.5, -10.5);
+        let rounded = Rect::from_min_size(Pos2::new(11.0, -11.0), Vec2::splat(100.0));
+        assert!(fallback_position_settled(Some(rounded), half, 1.0));
+        for ppp in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(!fallback_position_settled(Some(rounded), half, ppp));
+        }
     }
 
     #[test]

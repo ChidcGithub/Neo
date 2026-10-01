@@ -322,7 +322,7 @@ mod native {
         Foundation::*,
         Graphics::Gdi::*,
         Security::{*, Authorization::ConvertSidToStringSidW},
-        System::{LibraryLoader::{GetModuleHandleW, GetProcAddress}, Threading::*},
+        System::{LibraryLoader::GetModuleHandleW, Threading::*},
         UI::{HiDpi::*, WindowsAndMessaging::*},
     };
 
@@ -439,92 +439,123 @@ mod native {
         failed: std::cell::Cell<bool>,
     }
 
-    struct Layout { width: i32, height: i32, diameter: i32, brand: RECT, caption: RECT, progress: RECT }
-    fn layout(duplicate: bool, scale: f32) -> Layout {
+    struct Layout {
+        width: i32, height: i32,
+        brand: RECT, caption: RECT, progress: RECT,
+    }
+    fn layout(scale: f32) -> Layout {
         let px = |n: f32| (n * scale).round() as i32;
         let rect = |l, t, r, b| RECT { left: px(l), top: px(t), right: px(r), bottom: px(b) };
-        if duplicate {
-            Layout { width: px(288.), height: px(154.), diameter: px(16.),
-                brand: rect(0., 18., 288., 69.), caption: rect(0., 73., 288., 103.),
-                progress: rect(32., 126., 256., 130.) }
-        } else {
-            Layout { width: px(420.), height: px(128.), diameter: px(16.),
-                brand: rect(28., 25., 128., 79.), caption: rect(150., 35., 392., 69.),
-                progress: rect(28., 99., 392., 102.) }
-        }
+        let (width, height) = (px(220.), px(112.));
+        Layout { width, height,
+            brand: rect(16., 16., 204., 58.), caption: rect(16., 66., 204., 90.),
+            // 从底边反推上边，分数 DPI 下也保持贴边且厚度一致。
+            progress: RECT { left: 0, top: height - px(3.), right: width, bottom: height } }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq)]
-    enum Backdrop { Blur, Opaque }
-    fn backdrop_choice(allowed: bool, accent_succeeded: bool) -> Backdrop {
-        if allowed && accent_succeeded { Backdrop::Blur } else { Backdrop::Opaque }
-    }
-    impl Backdrop {
-        fn alpha(self) -> u8 { if self == Self::Blur { 190 } else { 255 } }
+    enum Backdrop { Opaque, HighContrast }
+    fn backdrop_choice(settings_read: bool, high_contrast: bool) -> Backdrop {
+        if !settings_read || high_contrast { Backdrop::HighContrast } else { Backdrop::Opaque }
     }
 
-    #[repr(C)]
-    struct AccentPolicy { state: i32, flags: u32, color: u32, animation: u32 }
-    #[repr(C)]
-    struct CompositionData { attribute: i32, data: *mut std::ffi::c_void, size: usize }
-
-    unsafe fn accent(hwnd: HWND, enabled: bool) -> bool {
-        // user32 已由窗口系统加载；不从工作目录加载 DLL，也不静态依赖未公开的 accent 接口。
-        let module = GetModuleHandleW(wide("user32.dll").as_ptr());
-        if module.is_null() { return false; }
-        let Some(proc) = GetProcAddress(module, c"SetWindowCompositionAttribute".as_ptr().cast()) else { return false };
-        let set: unsafe extern "system" fn(HWND, *const CompositionData) -> i32 = std::mem::transmute(proc);
-        // WCA_ACCENT_POLICY=19，ACCENT_ENABLE_BLURBEHIND=3。着色由前景 DIB 负责。
-        // 不使用 Win11 专属 backdrop，也不把 Win8 后无模糊效果的 DwmEnableBlurBehindWindow 当成成功。
-        let mut policy = AccentPolicy { state: if enabled { 3 } else { 0 }, flags: 0, color: 0, animation: 0 };
-        let data = CompositionData { attribute: 19, data: (&mut policy as *mut AccentPolicy).cast(),
-            size: std::mem::size_of::<AccentPolicy>() };
-        set(hwnd, &data) != 0
-    }
-
-    unsafe fn configure_backdrop(hwnd: HWND, card: &Card) {
-        // HIGHCONTRASTW 的 ABI；无需为一次系统设置查询扩充依赖 feature。
+    unsafe fn configure_backdrop(card: &Card) {
         #[repr(C)]
         struct HighContrast { size: u32, flags: u32, scheme: *mut u16 }
         let mut contrast = HighContrast { size: std::mem::size_of::<HighContrast>() as u32,
             flags: 0, scheme: null_mut() };
         let readable = SystemParametersInfoW(SPI_GETHIGHCONTRAST, contrast.size,
-            (&mut contrast as *mut HighContrast).cast(), 0) != 0 && contrast.flags & 1 == 0;
-        let allowed = card.layered.get() && readable && GetSystemMetrics(SM_REMOTESESSION) == 0;
-        let mode = backdrop_choice(allowed, allowed && accent(hwnd, true));
-        if mode == Backdrop::Opaque { accent(hwnd, false); }
-        // 接口接受请求不保证系统策略一定显示模糊；系统可自行关闭特效，文字仍保持可读。
-        card.backdrop.set(mode);
+            (&mut contrast as *mut HighContrast).cast(), 0) != 0;
+        // 保持不透明底色，不依赖系统模糊特效；高对比度使用系统配色。
+        card.backdrop.set(backdrop_choice(readable, contrast.flags & 1 != 0));
+    }
+
+    struct Palette { body: [u8; 3], brand: [u8; 3], caption: [u8; 3], track: [u8; 3] }
+    impl Palette {
+        fn light() -> Self {
+            Self { body: [248, 250, 255], brand: [77, 107, 254], caption: [70, 80, 103], track: [174, 188, 229] }
+        }
+        unsafe fn for_backdrop(mode: Backdrop) -> Self {
+            if mode == Backdrop::Opaque { return Self::light(); }
+            let color = |index| {
+                let value = GetSysColor(index);
+                [value as u8, (value >> 8) as u8, (value >> 16) as u8]
+            };
+            let body = color(COLOR_WINDOW);
+            let ink = color(COLOR_WINDOWTEXT);
+            let track = std::array::from_fn(|i| ((body[i] as u16 + ink[i] as u16) / 2) as u8);
+            Self { body, brand: ink, caption: ink, track }
+        }
     }
 
     fn rgb(r: u8, g: u8, b: u8) -> u32 { r as u32 | ((g as u32) << 8) | ((b as u32) << 16) }
 
-    fn composed_pixel(coverage: u8, color: [u8; 3], background_alpha: u8) -> u32 {
-        // 灰度字形覆盖率叠到半透明浅底上；文字实心处 alpha=255，不会随底色一起变淡。
-        let coverage = coverage as u32;
-        let remaining = (background_alpha as u32 * (255 - coverage) + 127) / 255;
-        let alpha = coverage + remaining;
-        let channel = |foreground: u8, background: u32| (foreground as u32 * coverage + background * remaining + 127) / 255;
-        (alpha << 24) | (channel(color[0], 248) << 16) | (channel(color[1], 250) << 8) | channel(color[2], 255)
+    fn premultiplied(color: [u8; 3], coverage: f32) -> u32 {
+        let alpha = (coverage.clamp(0., 1.) * 255.).round() as u32;
+        let channel = |c: u8| (c as u32 * alpha + 127) / 255;
+        (alpha << 24) | (channel(color[0]) << 16) | (channel(color[1]) << 8) | channel(color[2])
     }
 
-    unsafe fn text(dc: HDC, value: &str, rect: RECT, height: i32, weight: i32, color: u32) {
+    fn animation_phase(elapsed: f32, duplicate: bool) -> f32 {
+        if duplicate { 0. } else { (elapsed * 2.2).rem_euclid(std::f32::consts::TAU) }
+    }
+
+    fn progress_segment(geometry: &Layout, phase: f32) -> RECT {
+        let track = geometry.progress;
+        let width = ((track.right - track.left) / 4).max(1);
+        // 定长色块往返表示等待，不把初始化时间伪装成完成百分比。
+        let offset = ((1. - phase.cos()) * 0.5 * (track.right - track.left - width) as f32).round() as i32;
+        RECT { left: track.left + offset, right: track.left + offset + width, ..track }
+    }
+
+    fn card_pixel(geometry: &Layout, x: i32, y: i32, glyph: u8, segment: &RECT,
+        duplicate: bool, palette: &Palette) -> u32 {
+        if x < 0 || x >= geometry.width || y < 0 || y >= geometry.height { return 0; }
+        let contains = |r: &RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+        if contains(&geometry.progress) {
+            let color = if !duplicate && contains(segment) { palette.brand } else { palette.track };
+            return premultiplied(color, 1.);
+        }
+        let ink = if contains(&geometry.caption) { palette.caption } else { palette.brand };
+        let channel = |i: usize| ((ink[i] as u32 * glyph as u32
+            + palette.body[i] as u32 * (255 - glyph as u32) + 127) / 255) as u8;
+        premultiplied([channel(0), channel(1), channel(2)], 1.)
+    }
+
+    unsafe fn fallback_region(geometry: &Layout) -> HRGN {
+        CreateRectRgn(0, 0, geometry.width, geometry.height)
+    }
+
+    fn opaque_pixel(pixel: u32, background: [u8; 3]) -> u32 {
+        let missing = 255 - (pixel >> 24);
+        let channel = |shift: u32, color: u8| ((pixel >> shift) & 255) + (color as u32 * missing + 127) / 255;
+        0xff000000 | (channel(16, background[0]) << 16) | (channel(8, background[1]) << 8) | channel(0, background[2])
+    }
+
+    unsafe fn text(dc: HDC, value: &str, rect: RECT, height: i32, weight: i32, color: u32) -> bool {
         let font = CreateFontW(-height, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET as u32,
             0, 0, ANTIALIASED_QUALITY as u32, 0, wide("Segoe UI").as_ptr());
+        if font.is_null() { return false; }
         let old = SelectObject(dc, font);
+        if old.is_null() || old as isize == GDI_ERROR as isize {
+            DeleteObject(font);
+            return false;
+        }
         SetTextColor(dc, color);
         SetBkMode(dc, TRANSPARENT as i32);
         let value = wide(value);
         let mut rect = rect;
-        DrawTextW(dc, value.as_ptr(), (value.len() - 1) as i32, &mut rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        let drawn = DrawTextW(dc, value.as_ptr(), (value.len() - 1) as i32, &mut rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE) != 0;
         SelectObject(dc, old);
         DeleteObject(font);
+        drawn
     }
 
     unsafe fn paint(hwnd: HWND, card: &Card) {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
         let target = BeginPaint(hwnd, &mut ps);
-        let geometry = layout(card.duplicate, card.scale);
+        let geometry = layout(card.scale);
         let (width, height) = (geometry.width, geometry.height);
         let dc = CreateCompatibleDC(target);
         let mut info: BITMAPINFO = std::mem::zeroed();
@@ -541,38 +572,28 @@ mod native {
             return;
         }
         let old_bitmap = SelectObject(dc, bitmap);
+        if old_bitmap.is_null() || old_bitmap as isize == GDI_ERROR as isize {
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            EndPaint(hwnd, &ps);
+            card.failed.set(true);
+            return;
+        }
         let pixels = std::slice::from_raw_parts_mut(bits.cast::<u32>(), (width * height) as usize);
         pixels.fill(0);
         let px = |n: f32| (n * card.scale).round() as i32;
         // GDI 只生成白字黑底的灰度覆盖率，不依赖其未定义的 alpha 字节，也不用色键抠字。
-        text(dc, "Neo", geometry.brand, px(36.), 650, rgb(255, 255, 255));
-        text(dc, if card.duplicate { "Neo 已经在运行" } else { "正在准备你的课堂助手" },
-            geometry.caption, px(14.), 400, rgb(255, 255, 255));
-        if !card.duplicate {
-            let track = CreateSolidBrush(rgb(36, 36, 36));
-            let fill = CreateSolidBrush(rgb(255, 255, 255));
-            let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-            let old_brush = SelectObject(dc, track);
-            let r = geometry.progress;
-            RoundRect(dc, r.left, r.top, r.right, r.bottom, px(3.), px(3.));
-            SelectObject(dc, fill);
-            let phase = card.started.elapsed().as_secs_f32() * 2.2;
-            let offset = ((phase.sin() + 1.) * 0.5 * (r.right - r.left - px(68.)) as f32) as i32;
-            RoundRect(dc, r.left + offset, r.top, r.left + offset + px(68.), r.bottom, px(3.), px(3.));
-            SelectObject(dc, old_brush);
-            SelectObject(dc, old_pen);
-            DeleteObject(track);
-            DeleteObject(fill);
-        }
-        // CPU 读取 DIB 前等待 GDI 批处理完成。浅底保留透光，文字和进度实心部分完全不透明。
-        GdiFlush();
+        let drawn = text(dc, "Neo", geometry.brand, px(32.), 650, rgb(255, 255, 255))
+            && text(dc, if card.duplicate { "Neo 已经在运行" } else { "正在启动" },
+                geometry.caption, px(14.), 400, rgb(255, 255, 255));
+        // CPU 读取 DIB 前等待 GDI 批处理完成；字形覆盖率合成到不透明矩形底色。
+        if GdiFlush() == 0 || !drawn { card.failed.set(true); }
+        let palette = Palette::for_backdrop(card.backdrop.get());
+        let phase = animation_phase(card.started.elapsed().as_secs_f32(), card.duplicate);
+        let segment = progress_segment(&geometry, phase);
         for (index, pixel) in pixels.iter_mut().enumerate() {
-            let x = index as i32 % width;
-            let y = index as i32 / width;
-            let r = geometry.caption;
-            let color = if x >= r.left && x < r.right && y >= r.top && y < r.bottom { [70, 80, 103] }
-                else { [77, 107, 254] };
-            *pixel = composed_pixel((*pixel & 255) as u8, color, card.backdrop.get().alpha());
+            *pixel = card_pixel(&geometry, index as i32 % width, index as i32 / width,
+                (*pixel & 255) as u8, &segment, card.duplicate, &palette);
         }
         if card.layered.get() {
             let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0,
@@ -580,21 +601,23 @@ mod native {
             let size = SIZE { cx: width, cy: height };
             let origin = POINT { x: 0, y: 0 };
             if UpdateLayeredWindow(hwnd, null_mut(), null(), &size, dc, &origin, 0, &blend, ULW_ALPHA) == 0 {
-                // 分层提交失败就关闭 accent 和 layered，回到普通 GDI；不循环重试特效。
-                accent(hwnd, false);
-                card.backdrop.set(Backdrop::Opaque);
-                card.layered.set(false);
-                let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & !(WS_EX_LAYERED as isize));
-                for pixel in pixels.iter_mut() {
-                    let missing = 255 - (*pixel >> 24);
-                    let channel = |shift: u32, background: u32| ((*pixel >> shift) & 255) + (background * missing + 127) / 255;
-                    *pixel = 0xff000000 | (channel(16, 248) << 16) | (channel(8, 250) << 8) | channel(0, 255);
+                // 普通 GDI 降级路径使用同尺寸直角矩形，保留底边的完整进度条。
+                let region = fallback_region(&geometry);
+                if region.is_null() || SetWindowRgn(hwnd, region, 0) == 0 {
+                    if !region.is_null() { DeleteObject(region); }
+                    card.failed.set(true);
+                } else {
+                    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & !(WS_EX_LAYERED as isize));
+                    card.layered.set(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED as isize != 0);
+                    if card.layered.get() { card.failed.set(true); }
                 }
             }
         }
-        if !card.layered.get() && BitBlt(target, 0, 0, width, height, dc, 0, 0, SRCCOPY) == 0 {
-            card.failed.set(true);
+        if !card.layered.get() && !card.failed.get() {
+            // 保留降级路径的逐帧不透明合成保护。
+            for pixel in pixels.iter_mut() { *pixel = opaque_pixel(*pixel, palette.body); }
+            if BitBlt(target, 0, 0, width, height, dc, 0, 0, SRCCOPY) == 0 { card.failed.set(true); }
         }
         SelectObject(dc, old_bitmap);
         DeleteObject(bitmap);
@@ -620,11 +643,13 @@ mod native {
             WM_SETTINGCHANGE | WM_DWMCOMPOSITIONCHANGED | WM_THEMECHANGED => {
                 let card = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Card;
                 if !card.is_null() {
-                    configure_backdrop(hwnd, &*card);
+                    configure_backdrop(&*card);
                     InvalidateRect(hwnd, null(), 0);
                 }
                 0
             }
+            // 仅展示窗口穿透；error_dialog 使用独立的系统对话框，不受此过程影响。
+            WM_NCHITTEST => HTTRANSPARENT as isize,
             WM_MOUSEACTIVATE => MA_NOACTIVATE as isize,
             WM_ERASEBKGND => 1,
             WM_PAINT => {
@@ -650,7 +675,7 @@ mod native {
             let (mut xdpi, mut ydpi) = (96, 96);
             GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut xdpi, &mut ydpi);
             let scale = xdpi as f32 / 96.;
-            let geometry = layout(duplicate, scale);
+            let geometry = layout(scale);
             let (width, height) = (geometry.width, geometry.height);
             let instance = GetModuleHandleW(null());
             let class = wide("Neo.Startup.Card.v1");
@@ -664,7 +689,7 @@ mod native {
                 backdrop: std::cell::Cell::new(Backdrop::Opaque), layered: std::cell::Cell::new(true),
                 failed: std::cell::Cell::new(false) };
             let area = info.rcWork;
-            let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED,
+            let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT,
                 class.as_ptr(), wide("Neo").as_ptr(), WS_POPUP,
                 area.left + (area.right - area.left - width) / 2,
                 area.top + (area.bottom - area.top - height) / 2, width, height,
@@ -674,9 +699,7 @@ mod native {
                 if !previous.is_null() { SetThreadDpiAwarenessContext(previous); }
                 return false;
             }
-            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, geometry.diameter, geometry.diameter);
-            if SetWindowRgn(hwnd, region, 0) == 0 { DeleteObject(region); }
-            configure_backdrop(hwnd, &card);
+            configure_backdrop(&card);
             // 首帧先提交位图，再显示；避免 layered 窗口没有有效表面时短暂空白。
             InvalidateRect(hwnd, null(), 0);
             paint(hwnd, &card);
@@ -709,45 +732,165 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
-        #[test]
-        fn elongated_layout_scales_without_overlap() {
-            for scale in [1., 1.25, 1.5, 2., 3.] {
-                let card = layout(false, scale);
-                assert_eq!(card.width, (420. * scale).round() as i32);
-                assert_eq!(card.height, (128. * scale).round() as i32);
-                assert_eq!(card.diameter, (16. * scale).round() as i32);
-                assert!(card.width > card.height * 3);
-                assert!(card.brand.right < card.caption.left);
-                assert!(card.brand.bottom < card.progress.top);
-                assert!(card.caption.bottom < card.progress.top);
-                for r in [card.brand, card.caption, card.progress] {
-                    assert!(r.left >= 0 && r.top >= 0 && r.right <= card.width && r.bottom <= card.height);
-                    assert!(r.left < r.right && r.top < r.bottom);
+        // 几何、动画和像素测试为纯逻辑；降级区域测试只创建内存 GDI 区域，不创建窗口。
+        mod rectangular {
+            use super::*;
+
+            #[test]
+            fn layout_scales_without_overlap() {
+                for scale in [1., 1.25, 1.5, 2., 3.] {
+                    let card = layout(scale);
+                    assert_eq!(card.width, (220. * scale).round() as i32);
+                    assert_eq!(card.height, (112. * scale).round() as i32);
+                    assert!(card.width > card.height);
+                    assert!(card.width * card.height < (236. * scale).powi(2) as i32 / 2);
+                    assert!(card.brand.bottom < card.caption.top);
+                    assert!(card.caption.bottom < card.progress.top);
+                    assert_eq!((card.progress.left, card.progress.right, card.progress.bottom),
+                        (0, card.width, card.height));
+                    assert_eq!(card.progress.bottom - card.progress.top, (3. * scale).round() as i32);
+                    for r in [card.brand, card.caption, card.progress] {
+                        assert!(r.left >= 0 && r.top >= 0 && r.right <= card.width && r.bottom <= card.height);
+                        assert!(r.left < r.right && r.top < r.bottom);
+                    }
                 }
             }
-            let toast = layout(true, 1.);
-            assert_eq!((toast.width, toast.height), (288, 154));
-        }
-        #[test]
-        fn blur_failure_or_policy_denial_is_opaque() {
-            assert_eq!(backdrop_choice(true, true), Backdrop::Blur);
-            for (allowed, success) in [(false, false), (false, true), (true, false)] {
-                let mode = backdrop_choice(allowed, success);
-                assert_eq!(mode, Backdrop::Opaque);
-                assert_eq!(mode.alpha(), 255);
+
+            #[test]
+            fn backdrop_uses_system_colors_when_required() {
+                assert_eq!(backdrop_choice(true, false), Backdrop::Opaque);
+                for (readable, contrast) in [(false, false), (false, true), (true, true)] {
+                    assert_eq!(backdrop_choice(readable, contrast), Backdrop::HighContrast);
+                }
             }
-        }
-        #[test]
-        fn coverage_produces_premultiplied_alpha_without_fading_text() {
-            for mode in [Backdrop::Blur, Backdrop::Opaque] {
+
+            #[test]
+            fn square_corners_and_full_width_bottom_track_are_opaque() {
+                let palette = Palette::light();
+                for scale in [1., 1.25, 1.5, 2., 3.] {
+                    let g = layout(scale);
+                    let segment = progress_segment(&g, 0.);
+                    for duplicate in [false, true] {
+                        let pixel = |x, y| card_pixel(&g, x, y, 0, &segment, duplicate, &palette);
+                        for x in [0, g.width - 1] {
+                            for y in [0, g.height - 1] { assert_eq!(pixel(x, y) >> 24, 255); }
+                        }
+                        assert_eq!(pixel(g.width / 2, g.height / 2), 0xfff8faff);
+                        for (x, y) in [(-1, 0), (0, -1), (g.width, 0), (0, g.height)] {
+                            assert_eq!(pixel(x, y), 0);
+                        }
+                        for y in 0..g.height {
+                            for x in 0..g.width {
+                                let value = pixel(x, y);
+                                assert_eq!(value >> 24, 255);
+                                let color = if y < g.progress.top { palette.body }
+                                    else if !duplicate && x < segment.right { palette.brand }
+                                    else { palette.track };
+                                assert_eq!(value, premultiplied(color, 1.));
+                                assert_eq!(opaque_pixel(value, palette.body), value);
+                            }
+                        }
+
+                    }
+                }
+            }
+
+            #[test]
+            fn glyph_coverage_is_clear_and_premultiplied() {
+                let g = layout(1.);
+                let palette = Palette::light();
+                let segment = progress_segment(&g, 0.);
                 for coverage in 0..=255 {
-                    let pixel = composed_pixel(coverage, [77, 107, 254], mode.alpha());
-                    let alpha = pixel >> 24;
-                    for shift in [0, 8, 16] { assert!((pixel >> shift) & 255 <= alpha); }
-                    if mode == Backdrop::Opaque { assert_eq!(alpha, 255); }
+                    for (x, y, ink) in [(110, 37, palette.brand), (110, 78, palette.caption)] {
+                        let value = card_pixel(&g, x, y, coverage, &segment, false, &palette);
+                        for (shift, index) in [(16, 0), (8, 1), (0, 2)] {
+                            let expected = (ink[index] as u32 * coverage as u32
+                                + palette.body[index] as u32 * (255 - coverage as u32) + 127) / 255;
+                            assert_eq!((value >> shift) & 255, expected);
+                        }
+                        assert_eq!(value >> 24, 255);
+                    }
+                    for alpha in 0..=255 {
+                        let value = premultiplied([coverage, 107, 254], alpha as f32 / 255.);
+                        assert_eq!(value >> 24, alpha);
+                        for shift in [0, 8, 16] { assert!((value >> shift) & 255 <= alpha); }
+                    }
                 }
-                assert_eq!(composed_pixel(255, [77, 107, 254], mode.alpha()), 0xff4d6bfe);
-                assert_eq!(composed_pixel(0, [77, 107, 254], mode.alpha()) >> 24, mode.alpha() as u32);
+                assert_eq!(card_pixel(&g, 110, 37, 255, &segment, false, &palette), 0xff4d6bfe);
+                assert_eq!(card_pixel(&g, 110, 78, 255, &segment, false, &palette), 0xff465067);
+                assert_eq!(opaque_pixel(0, palette.body), 0xfff8faff);
+            }
+
+            #[test]
+            fn animation_changes_only_bottom_bar_and_duplicate_is_static() {
+                for elapsed in [0., 0.04, 1., 100., 100000.] {
+                    let phase = animation_phase(elapsed, false);
+                    assert!((0. ..std::f32::consts::TAU).contains(&phase));
+                    assert_eq!(animation_phase(elapsed, true), 0.);
+                }
+                let palette = Palette::light();
+                for scale in [1., 1.25, 1.5, 2., 3.] {
+                    let g = layout(scale);
+                    let first_segment = progress_segment(&g, 0.);
+                    let next_segment = progress_segment(&g, animation_phase(0.5, false));
+                    let mut changed = 0;
+                    for y in 0..g.height {
+                        for x in 0..g.width {
+                            let first = card_pixel(&g, x, y, 0, &first_segment, false, &palette);
+                            let next = card_pixel(&g, x, y, 0, &next_segment, false, &palette);
+                            assert_eq!(first >> 24, next >> 24);
+                            if first != next {
+                                changed += 1;
+                                assert!(y >= g.progress.top && y < g.progress.bottom);
+                            }
+                            assert_eq!(card_pixel(&g, x, y, 0, &first_segment, true, &palette),
+                                card_pixel(&g, x, y, 0, &next_segment, true, &palette));
+                        }
+                    }
+                    assert!(changed > 0 && changed <= g.width * (g.progress.bottom - g.progress.top));
+                }
+            }
+
+            #[test]
+            fn progress_segment_stays_bounded_and_reaches_both_edges() {
+                for scale in [1., 1.25, 1.5, 2., 3.] {
+                    let g = layout(scale);
+                    let first = progress_segment(&g, 0.);
+                    assert_eq!(first.left, 0);
+                    assert_eq!(progress_segment(&g, std::f32::consts::PI).right, g.width);
+                    assert_eq!(progress_segment(&g, std::f32::consts::TAU).left, 0);
+                    for step in 0..=1000 {
+                        let segment = progress_segment(&g, animation_phase(step as f32 * 0.04, false));
+                        assert!(segment.left >= 0 && segment.right <= g.width);
+                        assert_eq!(segment.right - segment.left, first.right - first.left);
+                        assert_eq!((segment.top, segment.bottom), (g.progress.top, g.height));
+                    }
+                }
+            }
+
+            #[test]
+            fn fallback_region_is_a_full_rectangle() {
+                for scale in [1., 1.25, 1.5, 2., 3.] {
+                    let g = layout(scale);
+                    unsafe {
+                        let region = fallback_region(&g);
+                        assert!(!region.is_null());
+                        let cx = g.width / 2;
+                        let cy = g.height / 2;
+                        assert_ne!(PtInRegion(region, cx, cy), 0);
+                        for (x, y) in [(-1, cy), (g.width, cy), (cx, -1), (cx, g.height)] {
+                            assert_eq!(PtInRegion(region, x, y), 0);
+                        }
+                        for x in [0, g.width - 1] {
+                            for y in [0, g.height - 1] { assert_ne!(PtInRegion(region, x, y), 0); }
+                        }
+                        let mut bounds: RECT = std::mem::zeroed();
+                        assert_eq!(GetRgnBox(region, &mut bounds), SIMPLEREGION);
+                        assert_eq!((bounds.left, bounds.top, bounds.right, bounds.bottom),
+                            (0, 0, g.width, g.height));
+                        assert_ne!(DeleteObject(region), 0);
+                    }
+                }
             }
         }
         #[test]

@@ -91,21 +91,18 @@ impl ConfirmWin {
         theme: Theme,
         overlay: Option<&neo_overlay::OverlayHandle>,
     ) {
-        let overlay = overlay.filter(|layer| layer.is_alive());
-        if self.using_overlay != overlay.is_some() {
+        if let Some(layer) = overlay { layer.set_card(CARD_ID, None); }
+        if self.using_overlay {
             self.answer.store(CLOSED, Ordering::Release);
             self.answer = Arc::new(AtomicU8::new(0));
             self.open = false;
-            self.using_overlay = overlay.is_some();
-            if self.using_overlay {
-                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Close);
-            }
+            self.using_overlay = false;
         }
         self.consume(state);
         let pending = state.awaiting_tool();
         let open = pending.is_some();
         let m = theme.metrics;
-        let monitor = super::miniwin::screen_geometry(ctx, overlay.is_some()).monitor;
+        let monitor = super::miniwin::screen_geometry(ctx, false).monitor;
         let size = Vec2::new(m.s(560.0), m.s(420.0))
             .min(monitor - egui::vec2(m.s(32.0), m.s(32.0)))
             .max(egui::vec2(m.s(280.0), m.s(180.0)));
@@ -151,21 +148,6 @@ impl ConfirmWin {
                 }
             }
         };
-        if let Some(layer) = overlay {
-            layer.set_card(
-                CARD_ID,
-                if open {
-                    Some(neo_overlay::Card::interactive(
-                        [center.x, center.y, size.x, size.y],
-                        draw,
-                    ))
-                } else {
-                    None
-                },
-            );
-            self.open = open;
-            return;
-        }
         if open != self.open {
             ctx.send_viewport_cmd_to(
                 viewport_id(),
@@ -240,6 +222,7 @@ mod tests {
         assert!(!win.using_overlay && win.open);
         let viewport = output.viewport_output.get(&viewport_id()).unwrap();
         assert!(viewport.viewport_ui_cb.is_some());
+        assert_ne!(viewport.builder.mouse_passthrough, Some(true));
         assert_ne!(viewport.builder.position, Some(OFFSCREEN));
         assert!(!viewport.commands.iter().any(|cmd| matches!(cmd, ViewportCommand::Close)));
         assert!(old.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err());

@@ -61,7 +61,13 @@ jobs:
       - name: App overlay fallback tests (no GUI or audio)
         shell: pwsh
         run: |
-          cargo test --locked -p neo-app --bin neo graphics_tests:: --target x86_64-pc-windows-msvc
+          cargo test --locked -p neo-app --bin neo graphics --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo startup:: --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo ui::miniwin:: --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo desktop_barrier --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p neo-app --bin neo safety_overlay_loss_reopens_fallback_and_invalidates_old_answer --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -10,9 +10,8 @@
 //! 关键点：
 //! - DX12 透明交换链必须用 `Dx12SwapchainKind::DxgiFromVisual`（默认 DxgiFromHwnd 只有 Opaque alpha）
 //! - `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` 让抓屏拍不到自己，从而能持续抓桌面做实时折射
-//! - 输入路由：无卡时 `WS_EX_TRANSPARENT` 整窗穿透；有卡时清掉它、
-//!   靠 `WM_NCHITTEST` 命中卡矩形外返回 `HTTRANSPARENT` —— 卡片收点击、
-//!   桌面其余区域照常穿透（Rainmeter 式做法）
+//! - 绘制 HWND 永久 `WS_EX_TRANSPARENT` + `HTTRANSPARENT`；只有打断确认的
+//!   两个按钮使用精确矩形的独立原生宿主，授权和课堂总结使用应用交互视口。
 //! - `WS_EX_NOACTIVATE` + `SW_SHOWNA` 永不抢焦点；卡片全是纯鼠标交互，无需键盘
 //! - 窗口每次露面（含卡片首次出现）都先离屏渲好一帧再 `SW_SHOWNA` ——
 //!   用户看到的第一个画面就是成品，没有黑帧
@@ -40,9 +39,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, LoadCursorW, PeekMessageW, PostThreadMessageW, RegisterClassExW,
     SetCursor, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GWLP_USERDATA, HCURSOR,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HCURSOR,
     HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE,
-    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WDA_EXCLUDEFROMCAPTURE, WM_APP,
+    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WDA_EXCLUDEFROMCAPTURE, WM_APP,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_QUIT,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSEXW, WS_EX_NOACTIVATE,
@@ -57,6 +56,7 @@ const RENDER_SCALE: f32 = 0.6;
 /// 线程消息：命令队列里有货，唤醒睡眠中的消息循环。
 const WM_NEO_CMD: u32 = WM_APP + 1;
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+const DRAW_EX_STYLE: u32 = WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
 /// 桌面纹理独立限频；不降低光带、淡出或卡片输入的显示帧率。
 const CAPTURE_INTERVAL: Duration = Duration::from_millis(50);
 static ENGINE_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -266,6 +266,7 @@ impl DesktopBounds {
         })
     }
 
+    #[cfg(test)]
     fn client_point(self, screen: (i32, i32)) -> (i32, i32) {
         (screen.0 - self.origin.0, screen.1 - self.origin.1)
     }
@@ -333,7 +334,7 @@ fn fade_complete(fading: bool, intensity: f32) -> bool {
 ///   层内会换算成窗口客户区像素）。**共享槽**：层的 Area 定位与命中测试
 ///   每帧都重读它 —— 应用线程（10fps 内容节拍）与绘制闭包（层内 vsync
 ///   自驱动画，如迷你窗的避让滑动）都可以随时改写；
-/// - `interactive`：false 的卡（截屏闪光）只画不收点击，也不进命中矩形；
+/// - `interactive`：保留旧调用接口；绘制宿主始终穿透，不再按此字段打开输入；
 /// - `draw`：每帧在**窗口线程**的 egui Ui 里执行（Ui 已钉在卡片矩形内，
 ///   按「填满整个矩形」画即可，与旧视口回调的体感一致）。只准画，不准
 ///   阻塞；需要的数据捕获进闭包（沿用旧视口的 `Arc<AtomicU8>` 回答案
@@ -670,7 +671,7 @@ fn msg_loop(
                         let _ = ack.send(Err("过期桌面请求，未隐藏浮层".into()));
                         continue;
                     }
-                    let result = hide_for_desktop(hwnd);
+                    let result = hide_interrupt_buttons().and_then(|()| hide_for_desktop(hwnd));
                     shown = false;
                     visible.store(false, Ordering::Release);
                     let _ = ack.send(result);
@@ -684,11 +685,6 @@ fn msg_loop(
         }
 
         let have_cards = gfx.has_cards();
-        // 输入路由随卡片有无切换（改 WS_EX_TRANSPARENT 必须 FRAMECHANGED 才生效）。
-        let interactive = gfx.cards.lock()
-            .map(|cards| cards.values().any(|card| card.interactive))
-            .unwrap_or(false);
-        gfx.set_hit_testable(hwnd, interactive);
 
         if desktop_can_show(&suspended) && ripple.active(have_cards) {
             // 非阻塞泵消息：线程消息不需要分发，系统消息（含鼠标输入）要处理
@@ -748,6 +744,7 @@ fn msg_loop(
                 }
             }
         } else {
+            let _ = hide_interrupt_buttons();
             if shown {
                 // 防御：正常路径在淡出分支里已隐藏；命令乱序时这里兜底。
                 unsafe {
@@ -769,6 +766,7 @@ fn msg_loop(
             }
         }
     }
+    let _ = hide_interrupt_buttons();
     stop.store(true, Ordering::Release);
     visible.store(false, Ordering::Relaxed);
     gfx.slot.lock().unwrap_or_else(|p| p.into_inner()).set_enabled(false);
@@ -783,7 +781,7 @@ struct WndState {
     ppp: AtomicU32,
     /// 命中矩形（客户区物理像素 x,y,w,h）。
     hit_rects: Mutex<Vec<[i32; 4]>>,
-    /// 排队给 egui 的输入事件。
+    /// 拓扑切换时清理 egui 指针状态；绘制 HWND 不收鼠标输入。
     events: Mutex<Vec<egui::Event>>,
     /// 最近的指针位置（egui 需要持续 hover 态；wheel 事件也要带位置）。
     pointer: Mutex<egui::Pos2>,
@@ -807,6 +805,12 @@ unsafe extern "system" fn overlay_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_NCHITTEST {
+        return HTTRANSPARENT as LRESULT;
+    }
+    if msg == windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEACTIVATE {
+        return windows_sys::Win32::UI::WindowsAndMessaging::MA_NOACTIVATE as LRESULT;
+    }
     let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WndState;
     // SAFETY: userdata 在 CreateWindowExW 成功后立即设置、DestroyWindow 时才回收。
     let state = unsafe { ptr.as_ref() };
@@ -818,31 +822,6 @@ unsafe extern "system" fn overlay_wnd_proc(
         WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
             st.display_dirty.store(true, Ordering::Relaxed);
             return 0;
-        }
-        WM_NCHITTEST => {
-            // 屏幕坐标（符号 16 位对）→ 客户区
-            let (sx, sy) = unpack_client(lparam);
-            let (cx, cy) = st.bounds.lock().unwrap().client_point((sx, sy));
-            let hit = st
-                .hit_rects
-                .lock()
-                .map(|rects| {
-                    rects
-                        .iter()
-                        .any(|[x, y, w, h]| cx >= *x && cx < x + w && cy >= *y && cy < y + h)
-                })
-                .unwrap_or(false);
-            // 离开沿：通知 egui 指针消失，卡片上的 hover 高亮才不会卡死。
-            if st.inside.swap(hit, Ordering::Relaxed) && !hit {
-                if let Ok(mut evs) = st.events.lock() {
-                    evs.push(egui::Event::PointerGone);
-                }
-            }
-            return if hit {
-                HTCLIENT as LRESULT
-            } else {
-                HTTRANSPARENT as LRESULT
-            };
         }
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP => {
             let (x, y) = unpack_client(lparam);
@@ -894,6 +873,238 @@ unsafe extern "system" fn overlay_wnd_proc(
         _ => {}
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// 两个输入宿主仅覆盖按钮内部；绘制窗口不参与原生命中。
+#[derive(Clone)]
+struct ButtonFrame {
+    rects: [[i32; 4]; 2],
+    answer: Arc<std::sync::atomic::AtomicU8>,
+    at: Instant,
+}
+
+impl ButtonFrame {
+    fn live(&self) -> bool {
+        self.answer.load(Ordering::Acquire) == 0 && self.at.elapsed() < Duration::from_millis(250)
+    }
+}
+
+fn button_pixels(rect: egui::Rect, ppp: f32, origin: egui::Pos2) -> Option<[i32; 4]> {
+    let rect = rect * ppp;
+    let min = rect.min + origin.to_vec2();
+    let max = rect.max + origin.to_vec2();
+    if !min.is_finite() || !max.is_finite() || !ppp.is_finite() || ppp <= 0.0 { return None; }
+    let (x, y, right, bottom) = (min.x.ceil() as i32, min.y.ceil() as i32, max.x.floor() as i32, max.y.floor() as i32);
+    let (w, h) = (right.checked_sub(x)?, bottom.checked_sub(y)?);
+    (w > 0 && h > 0 && w <= 4096 && h <= 4096).then_some([x, y, w, h])
+}
+
+fn button_contains(rect: [i32; 4], point: (i32, i32)) -> bool {
+    let [x, y, w, h] = rect;
+    point.0 >= x && point.1 >= y && point.0 < x.saturating_add(w) && point.1 < y.saturating_add(h)
+}
+
+struct ButtonInput {
+    frame: Option<ButtonFrame>,
+    index: usize,
+    pressed: bool,
+}
+
+// 与全局采样相同的保守窗口，不是输入来源认证；也检查消息产生时间，
+// 防止 UI 线程延迟处理时，已排队的模型点击逃过 1s 窗口。
+fn synthetic_button_at(now: u64, message_age: u64, last: u64) -> bool {
+    last != 0 && now.saturating_sub(message_age).saturating_sub(last) < 1000
+}
+
+fn synthetic_button_message() -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64).unwrap_or(0);
+    let age = unsafe {
+        windows_sys::Win32::System::SystemInformation::GetTickCount()
+            .wrapping_sub(windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime() as u32)
+    };
+    synthetic_button_at(now, u64::from(age), neo_tools::tools::screen::SYNTHETIC_INPUT_AT.load(Ordering::Relaxed))
+}
+
+impl ButtonInput {
+    fn press(&mut self, synthetic: bool) {
+        self.pressed = !synthetic && self.frame.as_ref().is_some_and(ButtonFrame::live);
+    }
+
+    fn release(&mut self, point: (i32, i32), synthetic: bool) {
+        let pressed = std::mem::take(&mut self.pressed);
+        if let Some(frame) = &self.frame {
+            if pressed && !synthetic && frame.live() && button_contains(frame.rects[self.index], point) {
+                let _ = frame.answer.compare_exchange(0, self.index as u8 + 1, Ordering::AcqRel, Ordering::Acquire);
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn button_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetCapture, ReleaseCapture, GetCapture};
+    if msg == WM_MOUSEACTIVATE { return MA_NOACTIVATE as LRESULT; }
+    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Mutex<ButtonInput>;
+    if let Some(slot) = unsafe { ptr.as_ref() } {
+        let mut input = slot.lock().unwrap_or_else(|p| p.into_inner());
+        match msg {
+            WM_NCHITTEST => return HTCLIENT as LRESULT,
+            WM_LBUTTONDOWN => {
+                input.press(synthetic_button_message());
+                drop(input);
+                // 即使这一帧刚失效，也吞掉完整手势，不把 mouse-up 泄漏给桌面。
+                unsafe { SetCapture(hwnd); }
+                return 0;
+            }
+            WM_LBUTTONUP => {
+                let (x, y) = unpack_client(lp);
+                if let Some(frame) = &input.frame {
+                    let r = frame.rects[input.index];
+                    input.release((r[0].saturating_add(x), r[1].saturating_add(y)), synthetic_button_message());
+                }
+                input.pressed = false;
+                drop(input);
+                if unsafe { GetCapture() } == hwnd { unsafe { ReleaseCapture(); } }
+                return 0;
+            }
+            WM_CAPTURECHANGED | WM_CANCELMODE => {
+                input.pressed = false;
+                drop(input);
+                if msg == WM_CANCELMODE && unsafe { GetCapture() } == hwnd { unsafe { ReleaseCapture(); } }
+                return 0;
+            }
+            WM_SHOWWINDOW if wp == 0 => {
+                input.pressed = false;
+                input.frame = None;
+                drop(input);
+                if unsafe { GetCapture() } == hwnd { unsafe { ReleaseCapture(); } }
+            }
+            _ => { drop(input); }
+        }
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+#[derive(Default)]
+struct ButtonHosts {
+    windows: Vec<(HWND, Box<Mutex<ButtonInput>>)>,
+    pending: Option<ButtonFrame>,
+}
+
+impl ButtonHosts {
+    fn hide(&mut self) {
+        self.pending = None;
+        for (hwnd, slot) in &self.windows {
+            {
+                let mut input = slot.lock().unwrap_or_else(|p| p.into_inner());
+                input.pressed = false;
+                input.frame = None;
+            }
+            unsafe {
+                use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture};
+                if GetCapture() == *hwnd { ReleaseCapture(); }
+                ShowWindow(*hwnd, SW_HIDE);
+            }
+        }
+    }
+
+    fn commit(&mut self) -> Result<(), String> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        let Some(frame) = self.pending.take().filter(ButtonFrame::live) else {
+            self.hide();
+            return Ok(());
+        };
+        if self.windows.is_empty() {
+            let class: Vec<u16> = "neo-interrupt-input\0".encode_utf16().collect();
+            let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+            let wc = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(button_wnd_proc), hInstance: instance, lpszClassName: class.as_ptr(),
+                hCursor: unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
+                hbrBackground: 6usize as _, ..Default::default() };
+            if unsafe { RegisterClassExW(&wc) } == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
+                return Err("打断按钮输入宿主注册失败".into());
+            }
+            for index in 0..2 {
+                let hwnd = unsafe { CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                    class.as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 1, 1,
+                    std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null()) };
+                if hwnd.is_null() {
+                    self.destroy();
+                    return Err("打断按钮输入宿主创建失败".into());
+                }
+                let input = Box::new(Mutex::new(ButtonInput { frame: None, index, pressed: false }));
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, &*input as *const Mutex<ButtonInput> as isize); }
+                self.windows.push((hwnd, input));
+                // alpha=0 会由系统穿透；1/255 保留原生命中，下面的 egui 负责按钮画面。
+                if unsafe { SetLayeredWindowAttributes(hwnd, 0, 1, LWA_ALPHA) } == 0 {
+                    self.destroy();
+                    return Err("打断按钮透明输入宿主初始化失败".into());
+                }
+            }
+        }
+        for (hwnd, slot) in &self.windows {
+            let r = {
+                let mut input = slot.lock().unwrap_or_else(|p| p.into_inner());
+                let r = frame.rects[input.index];
+                if input.frame.as_ref().is_none_or(|old| !Arc::ptr_eq(&old.answer, &frame.answer) || old.rects != frame.rects) {
+                    input.pressed = false;
+                }
+                input.frame = Some(frame.clone());
+                r
+            };
+            if unsafe { SetWindowPos(*hwnd, HWND_TOPMOST, r[0], r[1], r[2], r[3], SWP_NOACTIVATE) } == 0 {
+                self.hide();
+                return Err("打断按钮定位失败，已隐藏输入宿主".into());
+            }
+            unsafe { ShowWindow(*hwnd, SW_SHOWNA); }
+        }
+        Ok(())
+    }
+
+    fn destroy(&mut self) {
+        self.hide();
+        for (hwnd, _slot) in self.windows.drain(..) {
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0); DestroyWindow(hwnd); }
+        }
+    }
+}
+
+impl Drop for ButtonHosts {
+    fn drop(&mut self) { self.destroy(); }
+}
+
+thread_local! {
+    static BUTTON_HOSTS: std::cell::RefCell<ButtonHosts> = std::cell::RefCell::new(ButtonHosts::default());
+}
+
+/// 当前帧实绘矩形，物理坐标向内取整，绝不扩大触摸热区。
+pub fn stage_interrupt_buttons(ui: &egui::Ui, rects: [egui::Rect; 2], answer: Arc<std::sync::atomic::AtomicU8>) {
+    let ctx = ui.ctx();
+    let overlay_origin = ctx.data(|d| d.get_temp::<egui::Pos2>(egui::Id::new("neo-overlay-physical-origin")));
+    let origin = overlay_origin.or_else(|| ctx.input(|i| i.viewport().inner_rect.map(|r| r.min * ctx.pixels_per_point())));
+    let frame = origin.and_then(|origin| Some(ButtonFrame {
+        rects: [button_pixels(rects[0], ctx.pixels_per_point(), origin)?, button_pixels(rects[1], ctx.pixels_per_point(), origin)?], answer, at: Instant::now(),
+    }));
+    BUTTON_HOSTS.with(|hosts| hosts.borrow_mut().pending = frame);
+}
+
+pub fn begin_interrupt_frame() {
+    BUTTON_HOSTS.with(|hosts| hosts.borrow_mut().pending = None);
+}
+
+/// 只由拥有这些 HWND 的窗口线程调用；测试仅测几何/派发，不创建宿主。
+pub fn commit_interrupt_buttons() -> Result<(), String> {
+    BUTTON_HOSTS.with(|hosts| hosts.borrow_mut().commit())
+}
+
+pub fn hide_interrupt_buttons() -> Result<(), String> {
+    BUTTON_HOSTS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        hosts.hide();
+        for (hwnd, _) in &hosts.windows { hide_for_desktop(*hwnd)?; }
+        Ok(())
+    })
 }
 
 /// 桌面折射纹理。
@@ -978,8 +1189,6 @@ struct Gfx {
     egui_start: Instant,
     /// 窗口过程共享状态（命中矩形 / 输入队列 / ppp / 原点）。
     wnd: Arc<WndState>,
-    /// 当前是否收鼠标（WS_EX_TRANSPARENT 是否已清掉）。
-    hit_testable: bool,
     display_checked: Instant,
 }
 
@@ -1103,7 +1312,7 @@ impl Gfx {
         }
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                DRAW_EX_STYLE,
                 class_name.as_ptr(),
                 std::ptr::null(),
                 WS_POPUP,
@@ -1355,7 +1564,6 @@ impl Gfx {
             egui_renderer,
             egui_start: Instant::now(),
             wnd,
-            hit_testable: false,
             display_checked: Instant::now(),
         })
     }
@@ -1438,40 +1646,6 @@ impl Gfx {
         self.cards.lock().map(|c| !c.is_empty()).unwrap_or(false)
     }
 
-    /// 输入路由切换：有卡片时清掉 WS_EX_TRANSPARENT（改样式必须
-    /// SWP_FRAMECHANGED 才生效），靠 WM_NCHITTEST 穿透卡片外区域；
-    /// 无卡片时恢复整窗穿透（连 NCHITTEST 都不来，零开销）。
-    fn set_hit_testable(&mut self, hwnd: HWND, on: bool) {
-        if self.hit_testable == on {
-            return;
-        }
-        self.hit_testable = on;
-        unsafe {
-            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let ex = if on {
-                ex & !(WS_EX_TRANSPARENT as isize)
-            } else {
-                ex | (WS_EX_TRANSPARENT as isize)
-            };
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
-            SetWindowPos(
-                hwnd,
-                std::ptr::null_mut(),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-            );
-        }
-        if !on {
-            // 回穿透模式：告知 egui 指针已走，hover 不残留。
-            if let Ok(mut evs) = self.wnd.events.lock() {
-                evs.push(egui::Event::PointerGone);
-            }
-        }
-    }
-
     /// 跑一帧卡片 UI：排水输入事件 → egui 步进 → 命中矩形刷新。
     /// 返回 tessellation 结果与纹理增量（None = 没有卡片）。
     fn egui_frame(
@@ -1481,6 +1655,7 @@ impl Gfx {
         egui::TexturesDelta,
         egui_wgpu::ScreenDescriptor,
     )> {
+        begin_interrupt_frame();
         let ppp = f32::from_bits(self.wnd.ppp.load(Ordering::Relaxed));
         let (vx, vy) = self.wnd.bounds.lock().unwrap().origin;
         let (ox, oy) = (vx as f32 / ppp, vy as f32 / ppp);
@@ -1519,6 +1694,7 @@ impl Gfx {
         // 主屏点 → 层内点：减窗口原点（虚拟屏原点可为负）。
         // 注意：draw 闭包内不得调用 set_card（锁重入会死锁）。
         // egui 0.36 独立用法：begin_pass/end_pass（Context::run 只留给 runner）。
+        self.egui_ctx.data_mut(|d| d.insert_temp(egui::Id::new("neo-overlay-physical-origin"), egui::pos2(vx as f32, vy as f32)));
         self.egui_ctx.set_pixels_per_point(ppp);
         self.egui_ctx.begin_pass(input);
         {
@@ -1526,7 +1702,7 @@ impl Gfx {
             for (id, card) in cards.iter_mut() {
                 let [x, y, w, h] = *card.rect.lock().unwrap_or_else(|p| p.into_inner());
                 let pos = egui::pos2(x - ox, y - oy);
-                card_area(*id, pos, card.interactive)
+                card_area(*id, pos, false)
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
                         ui.set_width(w);
@@ -1537,22 +1713,8 @@ impl Gfx {
         }
         let full = self.egui_ctx.end_pass();
 
-        // 命中矩形（客户区物理像素）：层内点 × ppp；只收交互卡。
-        if let Ok(mut rects) = self.wnd.hit_rects.lock() {
-            *rects = cards
-                .values()
-                .filter(|c| c.interactive)
-                .map(|c| {
-                    let r = *c.rect.lock().unwrap_or_else(|p| p.into_inner());
-                    [
-                        ((r[0] - ox) * ppp) as i32,
-                        ((r[1] - oy) * ppp) as i32,
-                        (r[2] * ppp) as i32,
-                        (r[3] * ppp) as i32,
-                    ]
-                })
-                .collect();
-        }
+        // 全屏绘制不再有卡片级命中区。
+        self.wnd.hit_rects.lock().unwrap().clear();
 
         let jobs = self
             .egui_ctx
@@ -1760,6 +1922,7 @@ impl Gfx {
         let draw_ripple = self.cur_i > 0.004 || self.tgt.0 > 0.0;
         let egui = self.egui_frame();
         if !draw_ripple && egui.is_none() {
+            hide_interrupt_buttons()?;
             return Ok(()); // 无事可画（正常不会走到：active 前提是波纹或卡片在）
         }
 
@@ -1787,12 +1950,14 @@ impl Gfx {
                 f
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                let _ = hide_interrupt_buttons();
                 // 锁屏 / UAC 安全桌面期间拿不到 surface：直接 return 会让消息
                 // 循环在活跃分支里 100% 空转一个核。睡 50ms 降频等系统回来。
                 std::thread::sleep(Duration::from_millis(50));
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                let _ = hide_interrupt_buttons();
                 return self.refresh_display(true);
             }
             wgpu::CurrentSurfaceTexture::Validation => return Err("overlay surface 校验失败".into()),
@@ -1897,6 +2062,7 @@ impl Gfx {
             self.queue.submit(std::iter::once(enc.finish()));
         }
         self.queue.present(frame);
+        commit_interrupt_buttons()?;
         Ok(())
     }
 }
@@ -1904,6 +2070,83 @@ impl Gfx {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    #[test]
+    fn drawing_style_and_hit_are_always_passive() {
+        assert_ne!(DRAW_EX_STYLE & WS_EX_TRANSPARENT, 0);
+        assert_ne!(DRAW_EX_STYLE & WS_EX_NOACTIVATE, 0);
+        // 入口在任何 HWND/userdata 访问之前返回，无 GUI 或真实输入。
+        for point in [0, -1, (200 << 16) | 450] {
+            assert_eq!(unsafe { overlay_wnd_proc(std::ptr::null_mut(), WM_NCHITTEST, 0, point) }, HTTRANSPARENT as isize);
+        }
+    }
+
+    #[test]
+    fn button_geometry_scales_inwards_and_preserves_negative_origin_and_gap() {
+        for ppp in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            let origin = egui::pos2(-1920.0, -240.0);
+            let rects = [egui::Rect::from_min_size(egui::pos2(10.2, 20.3), egui::vec2(80.0, 34.0)),
+                egui::Rect::from_min_size(egui::pos2(98.2, 20.3), egui::vec2(80.0, 34.0))];
+            let pixels = rects.map(|r| button_pixels(r, ppp, origin).unwrap());
+            for (r, px) in rects.into_iter().zip(pixels) {
+                let [x, y, w, h] = px;
+                assert!(x as f32 >= r.min.x * ppp + origin.x);
+                assert!((x + w) as f32 <= r.max.x * ppp + origin.x);
+                assert!(button_contains(px, (x, y)));
+                assert!(button_contains(px, (x + w - 1, y + h - 1)));
+                for point in [(x - 1, y), (x + w, y), (x, y - 1), (x, y + h)] { assert!(!button_contains(px, point)); }
+            }
+            let gap = (pixels[0][0] + pixels[0][2], pixels[0][1]);
+            assert!(pixels.iter().all(|r| !button_contains(*r, gap)));
+        }
+        assert!(button_pixels(egui::Rect::NOTHING, 1.0, egui::Pos2::ZERO).is_none());
+        assert!(button_pixels(egui::Rect::EVERYTHING, 1.0, egui::Pos2::ZERO).is_none());
+    }
+
+    #[test]
+    fn button_dispatch_requires_live_frame_press_inside_and_rejects_closed_hidden_stale() {
+        for index in 0..2 {
+            for mode in 0..6 {
+                let answer = Arc::new(std::sync::atomic::AtomicU8::new(0));
+                let frame = ButtonFrame { rects: [[-100, -50, 40, 20], [-50, -50, 40, 20]], answer: answer.clone(),
+                    at: Instant::now() - if mode == 3 { Duration::from_secs(1) } else { Duration::ZERO } };
+                let mut input = ButtonInput { frame: Some(frame), index, pressed: mode != 1 };
+                if mode == 2 { answer.store(u8::MAX, Ordering::Release); }
+                if mode == 4 { input.frame = None; }
+                let point = if mode == 5 { (-55, -40) } else { (-90 + index as i32 * 50, -40) };
+                input.release(point, false);
+                assert!(!input.pressed);
+                assert_eq!(answer.load(Ordering::Acquire), if mode == 0 { index as u8 + 1 } else if mode == 2 { u8::MAX } else { 0 });
+                input.release(point, false);
+            }
+        }
+        let mut hosts = ButtonHosts::default();
+        hosts.pending = Some(ButtonFrame { rects: [[0, 0, 1, 1]; 2], answer: Arc::new(std::sync::atomic::AtomicU8::new(0)), at: Instant::now() });
+        hosts.hide(); // 没有 HWND 的纯状态 Suspend/close 路径。
+        assert!(hosts.pending.is_none());
+    }
+
+    #[test]
+    fn button_synthetic_down_up_and_delayed_messages_never_answer() {
+        for index in 0..2 {
+            for (down, up) in [(true, false), (false, true), (true, true), (false, false)] {
+                let answer = Arc::new(std::sync::atomic::AtomicU8::new(0));
+                let frame = ButtonFrame { rects: [[0, 0, 40, 20]; 2], answer: answer.clone(), at: Instant::now() };
+                let mut input = ButtonInput { frame: Some(frame), index, pressed: false };
+                input.press(down);
+                input.release((10, 10), up);
+                assert!(!input.pressed);
+                assert_eq!(answer.load(Ordering::Acquire), if down || up { 0 } else { index as u8 + 1 });
+                input.release((10, 10), false);
+                assert_eq!(answer.load(Ordering::Acquire), if down || up { 0 } else { index as u8 + 1 });
+            }
+        }
+        assert!(!synthetic_button_at(1500, 0, 0));
+        assert!(synthetic_button_at(1500, 0, 1000));
+        assert!(!synthetic_button_at(2500, 0, 1000));
+        assert!(synthetic_button_at(2500, 1001, 1000), "延迟派发仍按消息产生时刻过滤");
+        assert!(synthetic_button_at(1000, 0, 1001));
+    }
 
     // #region debug-point A: opt-in HTTP evidence, test builds only
     fn routing_debug_event(message: &str, data: &str) {
@@ -1930,7 +2173,7 @@ mod regression_tests {
         use windows_sys::Win32::Foundation::POINT;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             SendMessageTimeoutW, WindowFromPoint, WS_EX_NOREDIRECTIONBITMAP,
-            SMTO_ABORTIFHUNG, UnregisterClassW,
+            SMTO_ABORTIFHUNG, UnregisterClassW, GWL_EXSTYLE, SWP_FRAMECHANGED,
         };
         // These desktop APIs are test-only; avoid adding production dependency features.
         #[link(name = "user32")]

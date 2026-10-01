@@ -32,7 +32,7 @@ ratex-types = { workspace = true }
 ratex-layout = { workspace = true }
 ratex-parser = { workspace = true }
 egui_commonmark = { version = "0.25.0", default-features = false, features = ["pulldown_cmark", "better_syntax_highlighting"] }
-eframe = { workspace = true, features = ["wgpu"] }
+eframe = { workspace = true, features = ["wgpu", "glow"] }
 egui = { workspace = true }
 # flexbox 布局与 toast 都走 neo-ui 的 re-export（vendor 版），不直接依赖
 
