@@ -8,6 +8,9 @@
 Thumbs.db
 desktop.ini
 
+# 本地文档与截图保留在工作区，不纳入版本控制
+/docs/
+
 # 本地临时文件
 /tmp/
 /.tmp/
