@@ -1,20 +1,19 @@
-//! neo-overlay：统一渲染层 —— 全屏流光跑马灯 + 所有辅助卡片窗口。
+//! neo-overlay：被动渲染层 —— 全屏流光跑马灯 + 非交互辅助卡片。
 //!
 //! 架构：独立窗口线程 + 专属 wgpu/Dx12 渲染 + 内嵌独立 egui 上下文，
 //! 与 egui 主界面（eframe 占着进程级 winit EventLoop 单例）完全解耦。
 //!
-//! **一个窗口画所有东西**：迷你窗、确认窗、课堂总结窗不再各自创建原生
-//! 窗口（新建窗口在首个 wgpu 帧落地前会闪黑 1~3 帧），而是作为「卡片」
-//! 画进这个常驻层 —— 没有新建窗口就没有闪黑，且与波纹同一条渲染管线。
+//! 非交互卡片与波纹共用常驻绘图层；所有交互由应用的独立原生视口负责。
 //!
 //! 关键点：
 //! - DX12 透明交换链必须用 `Dx12SwapchainKind::DxgiFromVisual`（默认 DxgiFromHwnd 只有 Opaque alpha）
 //! - `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` 让抓屏拍不到自己，从而能持续抓桌面做实时折射
-//! - 绘制 HWND 永久 `WS_EX_TRANSPARENT` + `HTTRANSPARENT`；只有打断确认的
-//!   两个按钮使用精确矩形的独立原生宿主，授权和课堂总结使用应用交互视口。
-//! - `WS_EX_NOACTIVATE` + `SW_SHOWNA` 永不抢焦点；卡片全是纯鼠标交互，无需键盘
+//! - 绘制 HWND 永久 `WS_EX_LAYERED | WS_EX_TRANSPARENT`，跨线程穿透；
+//!   `HTTRANSPARENT` 仅作同线程兜底，不是跨线程路由保证。
+//! - `WS_EX_NOACTIVATE` + `SW_SHOWNA` 永不抢焦点；卡片只画，不收输入
+//! - 首次显示前设置 `NonRudeHWND`，退出 Shell 全屏检测，不干预任务栏设置
 //! - 窗口每次露面（含卡片首次出现）都先离屏渲好一帧再 `SW_SHOWNA` ——
-//!   用户看到的第一个画面就是成品，没有黑帧
+//!   只在当前 surface 帧提交后露面（不等同于 DWM 已完成合成）
 //! - 抓屏线程最多 20fps 把桌面帧喂给渲染线程，光带动画仍随交换链 vsync
 //! - 控制命令走 mpsc + `PostThreadMessageW` 唤醒（消息循环在隐藏时整块睡眠）
 //! - 视觉为 VCC edgeglow v2 移植：0.6x 离屏渲染光环 + 线性放大 blit 上屏（低频内容几乎无损，省 ~65% GPU）
@@ -28,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use neo_tools::tools::screen::{self, Shot};
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM, POINT, SIZE,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
@@ -37,14 +36,13 @@ use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, LoadCursorW, PeekMessageW, PostThreadMessageW, RegisterClassExW,
-    SetCursor, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HCURSOR,
-    HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE,
+    GetWindowLongPtrW, PeekMessageW, PostThreadMessageW, RegisterClassExW, RemovePropW, SetPropW,
+    UpdateLayeredWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+    HTTRANSPARENT, HWND_TOPMOST, ULW_ALPHA, MSG, PM_REMOVE, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WDA_EXCLUDEFROMCAPTURE, WM_APP,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_QUIT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
@@ -56,8 +54,99 @@ const RENDER_SCALE: f32 = 0.6;
 /// 线程消息：命令队列里有货，唤醒睡眠中的消息循环。
 const WM_NEO_CMD: u32 = WM_APP + 1;
 const START_TIMEOUT: Duration = Duration::from_secs(5);
-const DRAW_EX_STYLE: u32 = WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
-/// 桌面纹理独立限频；不降低光带、淡出或卡片输入的显示帧率。
+const DRAW_EX_STYLE: u32 = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+const NON_RUDE_HWND: windows_sys::core::PCWSTR = windows_sys::w!("NonRudeHWND");
+
+/// Layered + transparent 忽略窗口形状，把鼠标命中交给底层（不限同线程）。
+/// https://learn.microsoft.com/en-us/windows/win32/winmsg/window-features#layered-windows
+fn initialize_passive_window(hwnd: HWND, size: (u32, u32)) -> Result<(), String> {
+    // MarkFullscreenWindow(false) 仍会回退到 Shell 自动检测；不是「永不全屏」。
+    // 官方指定在显示前设置 NonRudeHWND=TRUE，避免全屏 popup 使任务栏降低 Z-order。
+    // 属性属于 HWND，跨 hide/resize 保留；WM_NCDESTROY 负责移除。失败不允许露面。
+    // https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-itaskbarlist2-markfullscreenwindow
+    if unsafe { SetPropW(hwnd, NON_RUDE_HWND, 1usize as _) } == 0 {
+        return Err(format!("SetPropW(NonRudeHWND) 失败，拒绝显示绘图层: {}", unsafe { GetLastError() }));
+    }
+    // DComp 在 HWND 自身内容之上合成；交换链 Clear 不能清掉 HWND 底图。
+    // 用逐像素透明 DIB 初始化底层，绝不通过全局 alpha=0 隐藏整棵 visual。
+    // 不调用 SetLayeredWindowAttributes：它会使后续 ULW 失败，除非切换 layered 位。
+    // 依据与验证边界见本 crate 的 TRANSPARENCY.md。
+    layered_backing(hwnd, size, 0)
+}
+
+fn layered_backing(hwnd: HWND, size: (u32, u32), pixel: u32) -> Result<(), String> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
+        AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    };
+    let (w, h) = size;
+    let bytes = (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4))
+        .filter(|n| *n <= isize::MAX as usize)
+        .ok_or("overlay 底图尺寸溢出")?;
+    if w == 0 || h == 0 || w > i32::MAX as u32 || h > i32::MAX as u32 {
+        return Err("overlay 底图尺寸无效".into());
+    }
+    struct BitmapDc { dc: HDC, bitmap: HBITMAP, old: HGDIOBJ }
+    impl Drop for BitmapDc {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.old.is_null() { SelectObject(self.dc, self.old); }
+                if !self.bitmap.is_null() { DeleteObject(self.bitmap); }
+                DeleteDC(self.dc);
+            }
+        }
+    }
+    let dc = unsafe { CreateCompatibleDC(std::ptr::null_mut()) };
+    if dc.is_null() { return Err(format!("CreateCompatibleDC: {}", unsafe { GetLastError() })); }
+    let mut backing = BitmapDc { dc, bitmap: std::ptr::null_mut(), old: std::ptr::null_mut() };
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w as i32, biHeight: -(h as i32), biPlanes: 1,
+            biBitCount: 32, biCompression: BI_RGB, ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    backing.bitmap = unsafe { CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0) };
+    if backing.bitmap.is_null() { return Err(format!("CreateDIBSection: {}", unsafe { GetLastError() })); }
+    // DIB owns bytes until BitmapDc drops; 32bpp rows need no extra padding.
+    unsafe { std::slice::from_raw_parts_mut(bits.cast::<u32>(), bytes / 4).fill(pixel); }
+    backing.old = unsafe { SelectObject(dc, backing.bitmap) };
+    if backing.old.is_null() || backing.old as isize == -1 {
+        backing.old = std::ptr::null_mut();
+        return Err(format!("SelectObject: {}", unsafe { GetLastError() }));
+    }
+    let size = SIZE { cx: w as i32, cy: h as i32 };
+    let source = POINT { x: 0, y: 0 };
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8, BlendFlags: 0,
+        SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    if unsafe { UpdateLayeredWindow(hwnd, std::ptr::null_mut(), std::ptr::null(), &size,
+        dc, &source, 0, &blend, ULW_ALPHA) } == 0 {
+        return Err(format!("UpdateLayeredWindow 失败，拒绝显示绘图层: {}", unsafe { GetLastError() }));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderOutcome { Skipped, Presented }
+
+#[derive(Default)]
+struct Presentation {
+    ready: bool,
+    shown: bool,
+}
+
+impl Presentation {
+    fn invalidate(&mut self) { self.ready = false; self.shown = false; }
+    fn can_show(&self, outcome: RenderOutcome) -> bool {
+        self.ready && !self.shown && outcome == RenderOutcome::Presented
+    }
+}
+/// 桌面纹理独立限频；不降低光带、淡出或卡片动画的显示帧率。
 const CAPTURE_INTERVAL: Duration = Duration::from_millis(50);
 static ENGINE_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -331,46 +420,33 @@ fn fade_complete(fading: bool, intensity: f32) -> bool {
 /// 一张画进渲染层的卡片（替代过去的独立原生子窗口）。
 ///
 /// - `rect`：主显示器坐标系的 egui 点（主屏原点 = 虚拟屏原点 (0,0)，
-///   层内会换算成窗口客户区像素）。**共享槽**：层的 Area 定位与命中测试
+///   层内会换算成窗口客户区像素）。**共享槽**：层的 Area 定位
 ///   每帧都重读它 —— 应用线程（10fps 内容节拍）与绘制闭包（层内 vsync
 ///   自驱动画，如迷你窗的避让滑动）都可以随时改写；
-/// - `interactive`：保留旧调用接口；绘制宿主始终穿透，不再按此字段打开输入；
 /// - `draw`：每帧在**窗口线程**的 egui Ui 里执行（Ui 已钉在卡片矩形内，
 ///   按「填满整个矩形」画即可，与旧视口回调的体感一致）。只准画，不准
-///   阻塞；需要的数据捕获进闭包（沿用旧视口的 `Arc<AtomicU8>` 回答案
-///   的模式）。**闭包内不得调用 `set_card`（卡片锁正被持着，会死锁）**。
+///   阻塞或处理输入。**闭包内不得调用 `set_card`（卡片锁正被持着，会死锁）**。
 pub struct Card {
     pub rect: Arc<Mutex<[f32; 4]>>,
-    pub interactive: bool,
     pub draw: Box<dyn FnMut(&mut egui::Ui) + Send>,
 }
 
 impl Card {
-    /// 交互卡的便捷构造。
-    pub fn interactive(rect: [f32; 4], draw: impl FnMut(&mut egui::Ui) + Send + 'static) -> Self {
-        Self {
-            rect: Arc::new(Mutex::new(rect)),
-            interactive: true,
-            draw: Box::new(draw),
-        }
-    }
-
     /// 只画不收点击的卡（截屏闪光这类纯视觉反馈）。
     pub fn passive(rect: [f32; 4], draw: impl FnMut(&mut egui::Ui) + Send + 'static) -> Self {
         Self {
             rect: Arc::new(Mutex::new(rect)),
-            interactive: false,
             draw: Box::new(draw),
         }
     }
 }
 
-fn card_area(id: u8, pos: egui::Pos2, interactive: bool) -> egui::Area {
+fn card_area(id: u8, pos: egui::Pos2) -> egui::Area {
     egui::Area::new(egui::Id::new(("neo-layer-card", id)))
         .fixed_pos(pos)
         .movable(false)
-        .interactable(interactive)
-        .sense(if interactive { egui::Sense::click() } else { egui::Sense::hover() })
+        .interactable(false)
+        .sense(egui::Sense::hover())
 }
 
 /// 卡片槽：应用线程每帧按需覆写，渲染线程每帧读最新。
@@ -442,7 +518,7 @@ impl OverlayHandle {
     }
 
     /// 注册/更新/撤下一张卡片（`None` = 撤下）。窗口线程被唤醒后
-    /// 下一帧生效：卡片出现会露面窗口、打开输入路由；最后一张撤下且
+    /// 下一帧生效：卡片出现会露面窗口，但始终穿透；最后一张撤下且
     /// 波纹已停时窗口回到隐藏睡眠。
     pub fn set_card(&self, id: u8, card: Option<Card>) {
         if !self.is_alive() {
@@ -459,7 +535,7 @@ impl OverlayHandle {
         } else {
             false
         };
-        // 锁已释放；最后一张撤下也要唤醒，让窗口隐藏并恢复穿透。
+        // 锁已释放；最后一张撤下也要唤醒，让窗口隐藏。
         if changed {
             self.wake_thread();
         }
@@ -649,7 +725,6 @@ fn msg_loop(
 ) {
     let hwnd = gfx.hwnd;
     let mut ripple = RippleState::default();
-    let mut shown = false; // 窗口当前是否可见
     let mut shutdown = false;
     while !shutdown && !stop.load(Ordering::Acquire) {
         // 先排空命令队列（PostThreadMessage 只负责唤醒，命令本体在 channel 里）
@@ -662,7 +737,7 @@ fn msg_loop(
                 }
                 Cmd::Hide => {
                     // 采集门已由调用线程同步关闭。这里只淡出已有桌面纹理，
-                    // 不因窗口仍在渲染或卡片可交互而重新采集。
+                    // 不因窗口仍在渲染或卡片在册而重新采集。
                     ripple.hide();
                     gfx.tgt = PH_IDLE;
                 }
@@ -671,8 +746,8 @@ fn msg_loop(
                         let _ = ack.send(Err("过期桌面请求，未隐藏浮层".into()));
                         continue;
                     }
-                    let result = hide_interrupt_buttons().and_then(|()| hide_for_desktop(hwnd));
-                    shown = false;
+                    let result = hide_for_desktop(hwnd);
+                    gfx.presentation.invalidate();
                     visible.store(false, Ordering::Release);
                     let _ = ack.send(result);
                 }
@@ -699,18 +774,28 @@ fn msg_loop(
                     DispatchMessageW(&msg);
                 }
             }
-            if !shown {
+            if shutdown || stop.load(Ordering::Acquire) { break; }
+            if !gfx.presentation.shown {
                 gfx.wnd.display_dirty.store(true, Ordering::Relaxed);
             }
-            if let Err(error) = gfx.refresh_display(false).and_then(|()| gfx.render(&level)) {
+            if let Err(error) = gfx.refresh_display(false) {
                 eprintln!("neo-overlay 已停止，交回辅助窗口 fallback: {error}");
                 break;
             }
-            // 露面时机：先离屏渲好一帧再 SW_SHOWNA —— 用户看到的第一个
-            // 画面就是成品，新建窗口的黑帧在这套结构里不存在。
-            if !shown {
-                shown = true;
-                visible.store(true, Ordering::Relaxed);
+            visible.store(gfx.presentation.shown, Ordering::Release);
+            let outcome = match gfx.render(&level) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    eprintln!("neo-overlay 已停止，交回辅助窗口 fallback: {error}");
+                    break;
+                }
+            };
+            visible.store(gfx.presentation.shown, Ordering::Release);
+            // 仅本轮真正提交当前 surface 帧才允许露面；成功重配不是 present。
+            if gfx.presentation.can_show(outcome) && desktop_can_show(&suspended)
+                && !stop.load(Ordering::Acquire) {
+                gfx.presentation.shown = true;
+                visible.store(true, Ordering::Release);
                 unsafe {
                     ShowWindow(hwnd, SW_SHOWNA);
                     // 每次露面都抢回最前：后到的 topmost 窗口会把它压下去。
@@ -739,18 +824,17 @@ fn msg_loop(
                     unsafe {
                         ShowWindow(hwnd, SW_HIDE);
                     }
-                    shown = false;
+                    gfx.presentation.invalidate();
                     visible.store(false, Ordering::Relaxed);
                 }
             }
         } else {
-            let _ = hide_interrupt_buttons();
-            if shown {
+            if gfx.presentation.shown {
                 // 防御：正常路径在淡出分支里已隐藏；命令乱序时这里兜底。
                 unsafe {
                     ShowWindow(hwnd, SW_HIDE);
                 }
-                shown = false;
+                gfx.presentation.invalidate();
                 visible.store(false, Ordering::Relaxed);
             }
             // 隐藏期整块睡眠，WM_NEO_CMD 到达即醒
@@ -766,345 +850,46 @@ fn msg_loop(
             }
         }
     }
-    let _ = hide_interrupt_buttons();
     stop.store(true, Ordering::Release);
     visible.store(false, Ordering::Relaxed);
     gfx.slot.lock().unwrap_or_else(|p| p.into_inner()).set_enabled(false);
 }
 
-/// 窗口线程与窗口过程共享的状态（命中矩形 + 输入事件队列）。
+/// 窗口线程与窗口过程共享的显示状态；绘图层没有输入状态。
 struct WndState {
     /// 虚拟桌面物理边界；显示拓扑变化时与窗口一起更新。
     bounds: Mutex<DesktopBounds>,
     display_dirty: AtomicBool,
-    /// 像素/点（f32 位模式）。物理像素 ↔ egui 点的换算系数。
+    /// 像素/点（f32 位模式）。
     ppp: AtomicU32,
-    /// 命中矩形（客户区物理像素 x,y,w,h）。
-    hit_rects: Mutex<Vec<[i32; 4]>>,
-    /// 拓扑切换时清理 egui 指针状态；绘制 HWND 不收鼠标输入。
-    events: Mutex<Vec<egui::Event>>,
-    /// 最近的指针位置（egui 需要持续 hover 态；wheel 事件也要带位置）。
-    pointer: Mutex<egui::Pos2>,
-    /// 指针上一帧是否在任一卡片内（离开沿补 PointerGone，否则 hover 卡住）。
-    inside: AtomicBool,
 }
 
-/// 客户区坐标拆包（WM_MOUSE* 的 lparam 是符号 16 位对）。
-fn unpack_client(lparam: LPARAM) -> (i32, i32) {
-    let v = lparam as usize;
-    (
-        (v & 0xFFFF) as u16 as i16 as i32,
-        ((v >> 16) & 0xFFFF) as u16 as i16 as i32,
-    )
-}
-
-/// 窗口过程：命中路由（卡矩形外 HTTRANSPARENT 穿透）+ 输入事件入队。
+/// HTTRANSPARENT 只作同线程兜底；跨线程穿透靠永久 layered + transparent。
 unsafe extern "system" fn overlay_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_NCDESTROY {
+        // SetPropW 合约要求在 WM_NCDESTROY 返回前移除本应用添加的属性。
+        unsafe { RemovePropW(hwnd, NON_RUDE_HWND); }
+    }
     if msg == WM_NCHITTEST {
         return HTTRANSPARENT as LRESULT;
     }
     if msg == windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEACTIVATE {
         return windows_sys::Win32::UI::WindowsAndMessaging::MA_NOACTIVATE as LRESULT;
     }
-    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WndState;
-    // SAFETY: userdata 在 CreateWindowExW 成功后立即设置、DestroyWindow 时才回收。
-    let state = unsafe { ptr.as_ref() };
-    let Some(st) = state else {
-        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
-    };
-    let ppp = f32::from_bits(st.ppp.load(Ordering::Relaxed));
-    match msg {
-        WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
-            st.display_dirty.store(true, Ordering::Relaxed);
-            return 0;
+    if matches!(msg, WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE) {
+        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WndState;
+        // SAFETY: userdata 的 Arc 由 HWND guard / Gfx::drop 在销毁时回收。
+        if let Some(state) = unsafe { ptr.as_ref() } {
+            state.display_dirty.store(true, Ordering::Relaxed);
         }
-        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP => {
-            let (x, y) = unpack_client(lparam);
-            let pos = egui::pos2(x as f32 / ppp, y as f32 / ppp);
-            if let Ok(mut p) = st.pointer.lock() {
-                *p = pos;
-            }
-            let ev = match msg {
-                WM_MOUSEMOVE => egui::Event::PointerMoved(pos),
-                _ => egui::Event::PointerButton {
-                    pos,
-                    button: match msg {
-                        WM_LBUTTONDOWN | WM_LBUTTONUP => egui::PointerButton::Primary,
-                        _ => egui::PointerButton::Secondary,
-                    },
-                    pressed: matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN),
-                    modifiers: egui::Modifiers::default(),
-                },
-            };
-            if let Ok(mut evs) = st.events.lock() {
-                evs.push(ev);
-            }
-            return 0;
-        }
-        WM_MOUSEWHEEL => {
-            // 高位是有符号的 120 分度增量；本层只有纵向滚动（课堂总结）。
-            let delta = ((wparam >> 16) as u16 as i16) as f32 / 120.0;
-            if let Ok(mut evs) = st.events.lock() {
-                evs.push(egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Line,
-                    delta: egui::vec2(0.0, delta),
-                    modifiers: egui::Modifiers::default(),
-                    phase: egui::TouchPhase::Move,
-                });
-            }
-            return 0;
-        }
-        WM_SETCURSOR => {
-            // 只有命中区内才轮到我们设光标（区外 HTTRANSPARENT 早穿透了）；
-            // 类没注册 hCursor，不设就是「无光标」闪烁。
-            if (lparam & 0xFFFF) as i32 == HTCLIENT as i32 {
-                unsafe {
-                    let arrow: HCURSOR = LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
-                    SetCursor(arrow);
-                }
-                return 1;
-            }
-        }
-        _ => {}
+        return 0;
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-}
-
-/// 两个输入宿主仅覆盖按钮内部；绘制窗口不参与原生命中。
-#[derive(Clone)]
-struct ButtonFrame {
-    rects: [[i32; 4]; 2],
-    answer: Arc<std::sync::atomic::AtomicU8>,
-    at: Instant,
-}
-
-impl ButtonFrame {
-    fn live(&self) -> bool {
-        self.answer.load(Ordering::Acquire) == 0 && self.at.elapsed() < Duration::from_millis(250)
-    }
-}
-
-fn button_pixels(rect: egui::Rect, ppp: f32, origin: egui::Pos2) -> Option<[i32; 4]> {
-    let rect = rect * ppp;
-    let min = rect.min + origin.to_vec2();
-    let max = rect.max + origin.to_vec2();
-    if !min.is_finite() || !max.is_finite() || !ppp.is_finite() || ppp <= 0.0 { return None; }
-    let (x, y, right, bottom) = (min.x.ceil() as i32, min.y.ceil() as i32, max.x.floor() as i32, max.y.floor() as i32);
-    let (w, h) = (right.checked_sub(x)?, bottom.checked_sub(y)?);
-    (w > 0 && h > 0 && w <= 4096 && h <= 4096).then_some([x, y, w, h])
-}
-
-fn button_contains(rect: [i32; 4], point: (i32, i32)) -> bool {
-    let [x, y, w, h] = rect;
-    point.0 >= x && point.1 >= y && point.0 < x.saturating_add(w) && point.1 < y.saturating_add(h)
-}
-
-struct ButtonInput {
-    frame: Option<ButtonFrame>,
-    index: usize,
-    pressed: bool,
-}
-
-// 与全局采样相同的保守窗口，不是输入来源认证；也检查消息产生时间，
-// 防止 UI 线程延迟处理时，已排队的模型点击逃过 1s 窗口。
-fn synthetic_button_at(now: u64, message_age: u64, last: u64) -> bool {
-    last != 0 && now.saturating_sub(message_age).saturating_sub(last) < 1000
-}
-
-fn synthetic_button_message() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64).unwrap_or(0);
-    let age = unsafe {
-        windows_sys::Win32::System::SystemInformation::GetTickCount()
-            .wrapping_sub(windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime() as u32)
-    };
-    synthetic_button_at(now, u64::from(age), neo_tools::tools::screen::SYNTHETIC_INPUT_AT.load(Ordering::Relaxed))
-}
-
-impl ButtonInput {
-    fn press(&mut self, synthetic: bool) {
-        self.pressed = !synthetic && self.frame.as_ref().is_some_and(ButtonFrame::live);
-    }
-
-    fn release(&mut self, point: (i32, i32), synthetic: bool) {
-        let pressed = std::mem::take(&mut self.pressed);
-        if let Some(frame) = &self.frame {
-            if pressed && !synthetic && frame.live() && button_contains(frame.rects[self.index], point) {
-                let _ = frame.answer.compare_exchange(0, self.index as u8 + 1, Ordering::AcqRel, Ordering::Acquire);
-            }
-        }
-    }
-}
-
-unsafe extern "system" fn button_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    use windows_sys::Win32::UI::WindowsAndMessaging::*;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetCapture, ReleaseCapture, GetCapture};
-    if msg == WM_MOUSEACTIVATE { return MA_NOACTIVATE as LRESULT; }
-    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Mutex<ButtonInput>;
-    if let Some(slot) = unsafe { ptr.as_ref() } {
-        let mut input = slot.lock().unwrap_or_else(|p| p.into_inner());
-        match msg {
-            WM_NCHITTEST => return HTCLIENT as LRESULT,
-            WM_LBUTTONDOWN => {
-                input.press(synthetic_button_message());
-                drop(input);
-                // 即使这一帧刚失效，也吞掉完整手势，不把 mouse-up 泄漏给桌面。
-                unsafe { SetCapture(hwnd); }
-                return 0;
-            }
-            WM_LBUTTONUP => {
-                let (x, y) = unpack_client(lp);
-                if let Some(frame) = &input.frame {
-                    let r = frame.rects[input.index];
-                    input.release((r[0].saturating_add(x), r[1].saturating_add(y)), synthetic_button_message());
-                }
-                input.pressed = false;
-                drop(input);
-                if unsafe { GetCapture() } == hwnd { unsafe { ReleaseCapture(); } }
-                return 0;
-            }
-            WM_CAPTURECHANGED | WM_CANCELMODE => {
-                input.pressed = false;
-                drop(input);
-                if msg == WM_CANCELMODE && unsafe { GetCapture() } == hwnd { unsafe { ReleaseCapture(); } }
-                return 0;
-            }
-            WM_SHOWWINDOW if wp == 0 => {
-                input.pressed = false;
-                input.frame = None;
-                drop(input);
-                if unsafe { GetCapture() } == hwnd { unsafe { ReleaseCapture(); } }
-            }
-            _ => { drop(input); }
-        }
-    }
-    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
-}
-
-#[derive(Default)]
-struct ButtonHosts {
-    windows: Vec<(HWND, Box<Mutex<ButtonInput>>)>,
-    pending: Option<ButtonFrame>,
-}
-
-impl ButtonHosts {
-    fn hide(&mut self) {
-        self.pending = None;
-        for (hwnd, slot) in &self.windows {
-            {
-                let mut input = slot.lock().unwrap_or_else(|p| p.into_inner());
-                input.pressed = false;
-                input.frame = None;
-            }
-            unsafe {
-                use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture};
-                if GetCapture() == *hwnd { ReleaseCapture(); }
-                ShowWindow(*hwnd, SW_HIDE);
-            }
-        }
-    }
-
-    fn commit(&mut self) -> Result<(), String> {
-        use windows_sys::Win32::UI::WindowsAndMessaging::*;
-        let Some(frame) = self.pending.take().filter(ButtonFrame::live) else {
-            self.hide();
-            return Ok(());
-        };
-        if self.windows.is_empty() {
-            let class: Vec<u16> = "neo-interrupt-input\0".encode_utf16().collect();
-            let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
-            let wc = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                lpfnWndProc: Some(button_wnd_proc), hInstance: instance, lpszClassName: class.as_ptr(),
-                hCursor: unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
-                hbrBackground: 6usize as _, ..Default::default() };
-            if unsafe { RegisterClassExW(&wc) } == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
-                return Err("打断按钮输入宿主注册失败".into());
-            }
-            for index in 0..2 {
-                let hwnd = unsafe { CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-                    class.as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 1, 1,
-                    std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null()) };
-                if hwnd.is_null() {
-                    self.destroy();
-                    return Err("打断按钮输入宿主创建失败".into());
-                }
-                let input = Box::new(Mutex::new(ButtonInput { frame: None, index, pressed: false }));
-                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, &*input as *const Mutex<ButtonInput> as isize); }
-                self.windows.push((hwnd, input));
-                // alpha=0 会由系统穿透；1/255 保留原生命中，下面的 egui 负责按钮画面。
-                if unsafe { SetLayeredWindowAttributes(hwnd, 0, 1, LWA_ALPHA) } == 0 {
-                    self.destroy();
-                    return Err("打断按钮透明输入宿主初始化失败".into());
-                }
-            }
-        }
-        for (hwnd, slot) in &self.windows {
-            let r = {
-                let mut input = slot.lock().unwrap_or_else(|p| p.into_inner());
-                let r = frame.rects[input.index];
-                if input.frame.as_ref().is_none_or(|old| !Arc::ptr_eq(&old.answer, &frame.answer) || old.rects != frame.rects) {
-                    input.pressed = false;
-                }
-                input.frame = Some(frame.clone());
-                r
-            };
-            if unsafe { SetWindowPos(*hwnd, HWND_TOPMOST, r[0], r[1], r[2], r[3], SWP_NOACTIVATE) } == 0 {
-                self.hide();
-                return Err("打断按钮定位失败，已隐藏输入宿主".into());
-            }
-            unsafe { ShowWindow(*hwnd, SW_SHOWNA); }
-        }
-        Ok(())
-    }
-
-    fn destroy(&mut self) {
-        self.hide();
-        for (hwnd, _slot) in self.windows.drain(..) {
-            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0); DestroyWindow(hwnd); }
-        }
-    }
-}
-
-impl Drop for ButtonHosts {
-    fn drop(&mut self) { self.destroy(); }
-}
-
-thread_local! {
-    static BUTTON_HOSTS: std::cell::RefCell<ButtonHosts> = std::cell::RefCell::new(ButtonHosts::default());
-}
-
-/// 当前帧实绘矩形，物理坐标向内取整，绝不扩大触摸热区。
-pub fn stage_interrupt_buttons(ui: &egui::Ui, rects: [egui::Rect; 2], answer: Arc<std::sync::atomic::AtomicU8>) {
-    let ctx = ui.ctx();
-    let overlay_origin = ctx.data(|d| d.get_temp::<egui::Pos2>(egui::Id::new("neo-overlay-physical-origin")));
-    let origin = overlay_origin.or_else(|| ctx.input(|i| i.viewport().inner_rect.map(|r| r.min * ctx.pixels_per_point())));
-    let frame = origin.and_then(|origin| Some(ButtonFrame {
-        rects: [button_pixels(rects[0], ctx.pixels_per_point(), origin)?, button_pixels(rects[1], ctx.pixels_per_point(), origin)?], answer, at: Instant::now(),
-    }));
-    BUTTON_HOSTS.with(|hosts| hosts.borrow_mut().pending = frame);
-}
-
-pub fn begin_interrupt_frame() {
-    BUTTON_HOSTS.with(|hosts| hosts.borrow_mut().pending = None);
-}
-
-/// 只由拥有这些 HWND 的窗口线程调用；测试仅测几何/派发，不创建宿主。
-pub fn commit_interrupt_buttons() -> Result<(), String> {
-    BUTTON_HOSTS.with(|hosts| hosts.borrow_mut().commit())
-}
-
-pub fn hide_interrupt_buttons() -> Result<(), String> {
-    BUTTON_HOSTS.with(|hosts| {
-        let mut hosts = hosts.borrow_mut();
-        hosts.hide();
-        for (hwnd, _) in &hosts.windows { hide_for_desktop(*hwnd)?; }
-        Ok(())
-    })
 }
 
 /// 桌面折射纹理。
@@ -1187,9 +972,10 @@ struct Gfx {
     egui_renderer: egui_wgpu::Renderer,
     /// egui 时钟起点（RawInput.time）。
     egui_start: Instant,
-    /// 窗口过程共享状态（命中矩形 / 输入队列 / ppp / 原点）。
+    /// 窗口过程共享状态（显示拓扑 / ppp / 原点）。
     wnd: Arc<WndState>,
     display_checked: Instant,
+    presentation: Presentation,
 }
 
 impl Drop for Gfx {
@@ -1289,7 +1075,7 @@ impl Gfx {
         let (width, height) = bounds.size;
 
         // 覆盖整个虚拟桌面（可多显示器、原点可为负）的全屏无边框置顶窗口。
-        // WS_EX_TRANSPARENT = 鼠标穿透；WS_EX_NOACTIVATE = 永不抢焦点；
+        // WS_EX_LAYERED | WS_EX_TRANSPARENT = 跨线程鼠标穿透；NOACTIVATE = 不抢焦点；
         // WS_EX_TOOLWINDOW = 不进任务栏与 Alt+Tab。
         let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
         let class_name: Vec<u16> = "neo-overlay\0".encode_utf16().collect();
@@ -1335,10 +1121,6 @@ impl Gfx {
             bounds: Mutex::new(bounds),
             display_dirty: AtomicBool::new(false),
             ppp: AtomicU32::new(((unsafe { GetDpiForSystem() } as f32) / 96.0).to_bits()),
-            hit_rects: Mutex::new(Vec::new()),
-            events: Mutex::new(Vec::new()),
-            pointer: Mutex::new(egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY)),
-            inside: AtomicBool::new(false),
         });
         unsafe {
             // 所有权随窗口生命周期；Gfx::drop 在销毁窗口时回收。
@@ -1360,6 +1142,8 @@ impl Gfx {
             }
         }
         let hwnd_guard = HwndGuard(hwnd);
+        // 必须在 guard 后、surface 前：失败则销毁隐藏窗口，绝不降级为拦截输入的层。
+        initialize_passive_window(hwnd, bounds.size)?;
         // 让窗口对截屏不可见（抓屏线程才能拍到干净的桌面做折射）。
         // 旧系统可能成功返回却仅按 WDA_MONITOR 处理（抓屏黑块），不能只看 BOOL。
         // 版本未知/低于 19041 或 API 失败时，只画光环，不给抓屏线程许可。
@@ -1367,7 +1151,9 @@ impl Gfx {
             && unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } != 0;
         slot.lock().unwrap().set_exclude_ok(exclude_ok);
 
-        // 强制 DX12 + DirectComposition 交换链（否则窗口不支持透明）
+        // 强制 DX12 + DirectComposition 交换链（否则窗口不支持透明）。
+        // DComp 明确允许 layered HWND：
+        // https://learn.microsoft.com/en-us/windows/win32/api/dcomp/nf-dcomp-idcompositiondevice-createtargetforhwnd
         let desc = wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
             backend_options: wgpu::BackendOptions {
@@ -1565,6 +1351,7 @@ impl Gfx {
             egui_start: Instant::now(),
             wnd,
             display_checked: Instant::now(),
+            presentation: Presentation::default(),
         })
     }
 
@@ -1646,7 +1433,7 @@ impl Gfx {
         self.cards.lock().map(|c| !c.is_empty()).unwrap_or(false)
     }
 
-    /// 跑一帧卡片 UI：排水输入事件 → egui 步进 → 命中矩形刷新。
+    /// 跑一帧被动卡片 UI：无指针/键盘输入，不维护命中矩形。
     /// 返回 tessellation 结果与纹理增量（None = 没有卡片）。
     fn egui_frame(
         &mut self,
@@ -1655,17 +1442,10 @@ impl Gfx {
         egui::TexturesDelta,
         egui_wgpu::ScreenDescriptor,
     )> {
-        begin_interrupt_frame();
         let ppp = f32::from_bits(self.wnd.ppp.load(Ordering::Relaxed));
         let (vx, vy) = self.wnd.bounds.lock().unwrap().origin;
         let (ox, oy) = (vx as f32 / ppp, vy as f32 / ppp);
 
-        let events = self
-            .wnd
-            .events
-            .lock()
-            .map(|mut e| std::mem::take(&mut *e))
-            .unwrap_or_default();
         let screen_pts = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(
@@ -1676,25 +1456,18 @@ impl Gfx {
         let input = egui::RawInput {
             screen_rect: Some(screen_pts),
             time: Some(self.egui_start.elapsed().as_secs_f64()),
-            events,
-            // 本层永不抢键盘焦点（WS_EX_NOACTIVATE），但有焦点标记的控件
-            // （如按钮 hover/按下）需要它才正常响应指针事件。
-            focused: true,
+            focused: false,
             ..Default::default()
         };
 
         let mut cards = self.cards.lock().ok()?;
         if cards.is_empty() {
-            if let Ok(mut rects) = self.wnd.hit_rects.lock() {
-                rects.clear();
-            }
             return None;
         }
 
         // 主屏点 → 层内点：减窗口原点（虚拟屏原点可为负）。
         // 注意：draw 闭包内不得调用 set_card（锁重入会死锁）。
         // egui 0.36 独立用法：begin_pass/end_pass（Context::run 只留给 runner）。
-        self.egui_ctx.data_mut(|d| d.insert_temp(egui::Id::new("neo-overlay-physical-origin"), egui::pos2(vx as f32, vy as f32)));
         self.egui_ctx.set_pixels_per_point(ppp);
         self.egui_ctx.begin_pass(input);
         {
@@ -1702,7 +1475,7 @@ impl Gfx {
             for (id, card) in cards.iter_mut() {
                 let [x, y, w, h] = *card.rect.lock().unwrap_or_else(|p| p.into_inner());
                 let pos = egui::pos2(x - ox, y - oy);
-                card_area(*id, pos, false)
+                card_area(*id, pos)
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
                         ui.set_width(w);
@@ -1712,9 +1485,6 @@ impl Gfx {
             }
         }
         let full = self.egui_ctx.end_pass();
-
-        // 全屏绘制不再有卡片级命中区。
-        self.wnd.hit_rects.lock().unwrap().clear();
 
         let jobs = self
             .egui_ctx
@@ -1853,16 +1623,12 @@ impl Gfx {
         let old = *self.wnd.bounds.lock().unwrap();
         let ppp = screen::dpi_scale_at(0, 0).unwrap_or(1.0) as f32;
         let old_ppp = f32::from_bits(self.wnd.ppp.load(Ordering::Relaxed));
+        if bounds != old || ppp != old_ppp || force {
+            self.invalidate_presentation();
+        }
         if bounds != old || ppp != old_ppp || dirty {
             *self.wnd.bounds.lock().unwrap() = bounds;
             self.wnd.ppp.store(ppp.to_bits(), Ordering::Relaxed);
-            self.wnd.hit_rects.lock().unwrap().clear();
-            self.wnd.inside.store(false, Ordering::Relaxed);
-            *self.wnd.pointer.lock().unwrap() = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
-            let mut events = self.wnd.events.lock().unwrap();
-            events.clear();
-            events.push(egui::Event::PointerGone);
-            drop(events);
             // SetWindowPos 会重入窗口过程，不能持有任何 WndState 锁。
             unsafe {
                 SetWindowPos(self.hwnd, HWND_TOPMOST, bounds.origin.0, bounds.origin.1,
@@ -1871,6 +1637,9 @@ impl Gfx {
             self.slot.lock().unwrap().invalidate();
             self.desktop = Self::placeholder_desktop(&self.device, &self.queue,
                 &self.bind_layout, &self.uniform_buf, &self.sampler);
+        }
+        if bounds.size != old.size {
+            initialize_passive_window(self.hwnd, bounds.size)?;
         }
         if bounds.size != old.size || force {
             self.config.width = bounds.size.0;
@@ -1886,7 +1655,21 @@ impl Gfx {
         Ok(())
     }
 
-    fn render(&mut self, level: &AtomicU32) -> Result<(), String> {
+    fn invalidate_presentation(&mut self) {
+        // 必须在 resize/configure 前隐藏旧 surface，重配失败也不能露出未定义底图。
+        unsafe { ShowWindow(self.hwnd, SW_HIDE); }
+        self.presentation.invalidate();
+    }
+
+    fn render(&mut self, level: &AtomicU32) -> Result<RenderOutcome, String> {
+        self.render_with_acquire(level, |surface| surface.get_current_texture())
+    }
+
+    fn render_with_acquire(
+        &mut self,
+        level: &AtomicU32,
+        acquire: impl FnOnce(&wgpu::Surface<'_>) -> wgpu::CurrentSurfaceTexture,
+    ) -> Result<RenderOutcome, String> {
         // 只取当前许可下的帧；Hide 后保留已上传纹理淡出，不再接收迟到帧。
         let current = *self.wnd.bounds.lock().unwrap();
         let shot = self.slot.lock().ok().and_then(|mut g| g.take(current));
@@ -1920,10 +1703,8 @@ impl Gfx {
 
         // 波纹全停（只有卡片在）时跳过整条光环管线，两趟全屏 pass 全省。
         let draw_ripple = self.cur_i > 0.004 || self.tgt.0 > 0.0;
-        let egui = self.egui_frame();
-        if !draw_ripple && egui.is_none() {
-            hide_interrupt_buttons()?;
-            return Ok(()); // 无事可画（正常不会走到：active 前提是波纹或卡片在）
+        if !draw_ripple && !self.has_cards() {
+            return Ok(RenderOutcome::Skipped);
         }
 
         if draw_ripple {
@@ -1945,23 +1726,28 @@ impl Gfx {
                 .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&uni));
         }
 
-        let frame = match self.surface.get_current_texture() {
+        let frame = match acquire(&self.surface) {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
                 f
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                let _ = hide_interrupt_buttons();
                 // 锁屏 / UAC 安全桌面期间拿不到 surface：直接 return 会让消息
                 // 循环在活跃分支里 100% 空转一个核。睡 50ms 降频等系统回来。
                 std::thread::sleep(Duration::from_millis(50));
-                return Ok(());
+                return Ok(RenderOutcome::Skipped);
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                let _ = hide_interrupt_buttons();
-                return self.refresh_display(true);
+                self.refresh_display(true)?;
+                std::thread::sleep(Duration::from_millis(50));
+                return Ok(RenderOutcome::Skipped);
             }
             wgpu::CurrentSurfaceTexture::Validation => return Err("overlay surface 校验失败".into()),
         };
+        // 获取帧之前不跑 egui：end_pass 会取走 textures_delta，失败重试不能丢字体/图片。
+        let egui = self.egui_frame();
+        if !draw_ripple && egui.is_none() {
+            return Ok(RenderOutcome::Skipped); // 卡片可能在获取帧期间被撤销。
+        }
         let view = frame.texture.create_view(&Default::default());
         let mut enc = self
             .device
@@ -2016,7 +1802,7 @@ impl Gfx {
         }
         // pass 3：卡片（egui tessellation → 交换链）。波纹在时 Load 保底层，
         // 只有卡片时自己 Clear 出全透明底。
-        if let Some((jobs, delta, sd)) = egui {
+        if let Some((jobs, mut delta, sd)) = egui {
             for (id, deltas) in &delta.set {
                 for image_delta in deltas.iter() {
                     self.egui_renderer
@@ -2058,1228 +1844,26 @@ impl Gfx {
             for id in &delta.free {
                 self.egui_renderer.free_texture(id);
             }
+            // egui 0.36 的 Drop 校验要求显式确认已消费；此处上传/释放均已完成。
+            delta.clear();
         } else {
             self.queue.submit(std::iter::once(enc.finish()));
         }
+        // wgpu 30 的 present 返回 ()；这里的 ready 表示提交调用已返回，
+        // 不是 DXGI HRESULT / GPU fence / DWM 合成完成的证明。
         self.queue.present(frame);
-        commit_interrupt_buttons()?;
-        Ok(())
+        self.presentation.ready = true;
+        Ok(RenderOutcome::Presented)
     }
 }
 
 #[cfg(test)]
-mod regression_tests {
-    use super::*;
-
-    #[test]
-    fn drawing_style_and_hit_are_always_passive() {
-        assert_ne!(DRAW_EX_STYLE & WS_EX_TRANSPARENT, 0);
-        assert_ne!(DRAW_EX_STYLE & WS_EX_NOACTIVATE, 0);
-        // 入口在任何 HWND/userdata 访问之前返回，无 GUI 或真实输入。
-        for point in [0, -1, (200 << 16) | 450] {
-            assert_eq!(unsafe { overlay_wnd_proc(std::ptr::null_mut(), WM_NCHITTEST, 0, point) }, HTTRANSPARENT as isize);
-        }
-    }
-
-    #[test]
-    fn button_geometry_scales_inwards_and_preserves_negative_origin_and_gap() {
-        for ppp in [1.0, 1.25, 1.5, 2.0, 3.0] {
-            let origin = egui::pos2(-1920.0, -240.0);
-            let rects = [egui::Rect::from_min_size(egui::pos2(10.2, 20.3), egui::vec2(80.0, 34.0)),
-                egui::Rect::from_min_size(egui::pos2(98.2, 20.3), egui::vec2(80.0, 34.0))];
-            let pixels = rects.map(|r| button_pixels(r, ppp, origin).unwrap());
-            for (r, px) in rects.into_iter().zip(pixels) {
-                let [x, y, w, h] = px;
-                assert!(x as f32 >= r.min.x * ppp + origin.x);
-                assert!((x + w) as f32 <= r.max.x * ppp + origin.x);
-                assert!(button_contains(px, (x, y)));
-                assert!(button_contains(px, (x + w - 1, y + h - 1)));
-                for point in [(x - 1, y), (x + w, y), (x, y - 1), (x, y + h)] { assert!(!button_contains(px, point)); }
-            }
-            let gap = (pixels[0][0] + pixels[0][2], pixels[0][1]);
-            assert!(pixels.iter().all(|r| !button_contains(*r, gap)));
-        }
-        assert!(button_pixels(egui::Rect::NOTHING, 1.0, egui::Pos2::ZERO).is_none());
-        assert!(button_pixels(egui::Rect::EVERYTHING, 1.0, egui::Pos2::ZERO).is_none());
-    }
-
-    #[test]
-    fn button_dispatch_requires_live_frame_press_inside_and_rejects_closed_hidden_stale() {
-        for index in 0..2 {
-            for mode in 0..6 {
-                let answer = Arc::new(std::sync::atomic::AtomicU8::new(0));
-                let frame = ButtonFrame { rects: [[-100, -50, 40, 20], [-50, -50, 40, 20]], answer: answer.clone(),
-                    at: Instant::now() - if mode == 3 { Duration::from_secs(1) } else { Duration::ZERO } };
-                let mut input = ButtonInput { frame: Some(frame), index, pressed: mode != 1 };
-                if mode == 2 { answer.store(u8::MAX, Ordering::Release); }
-                if mode == 4 { input.frame = None; }
-                let point = if mode == 5 { (-55, -40) } else { (-90 + index as i32 * 50, -40) };
-                input.release(point, false);
-                assert!(!input.pressed);
-                assert_eq!(answer.load(Ordering::Acquire), if mode == 0 { index as u8 + 1 } else if mode == 2 { u8::MAX } else { 0 });
-                input.release(point, false);
-            }
-        }
-        let mut hosts = ButtonHosts::default();
-        hosts.pending = Some(ButtonFrame { rects: [[0, 0, 1, 1]; 2], answer: Arc::new(std::sync::atomic::AtomicU8::new(0)), at: Instant::now() });
-        hosts.hide(); // 没有 HWND 的纯状态 Suspend/close 路径。
-        assert!(hosts.pending.is_none());
-    }
-
-    #[test]
-    fn button_synthetic_down_up_and_delayed_messages_never_answer() {
-        for index in 0..2 {
-            for (down, up) in [(true, false), (false, true), (true, true), (false, false)] {
-                let answer = Arc::new(std::sync::atomic::AtomicU8::new(0));
-                let frame = ButtonFrame { rects: [[0, 0, 40, 20]; 2], answer: answer.clone(), at: Instant::now() };
-                let mut input = ButtonInput { frame: Some(frame), index, pressed: false };
-                input.press(down);
-                input.release((10, 10), up);
-                assert!(!input.pressed);
-                assert_eq!(answer.load(Ordering::Acquire), if down || up { 0 } else { index as u8 + 1 });
-                input.release((10, 10), false);
-                assert_eq!(answer.load(Ordering::Acquire), if down || up { 0 } else { index as u8 + 1 });
-            }
-        }
-        assert!(!synthetic_button_at(1500, 0, 0));
-        assert!(synthetic_button_at(1500, 0, 1000));
-        assert!(!synthetic_button_at(2500, 0, 1000));
-        assert!(synthetic_button_at(2500, 1001, 1000), "延迟派发仍按消息产生时刻过滤");
-        assert!(synthetic_button_at(1000, 0, 1001));
-    }
-
-    // #region debug-point A: opt-in HTTP evidence, test builds only
-    fn routing_debug_event(message: &str, data: &str) {
-        use std::io::{Read, Write};
-        use std::net::TcpStream;
-        assert_eq!(std::env::var("DEBUG_SESSION_ID").as_deref(), Ok("agent-click-routing"));
-        assert_eq!(std::env::var("DEBUG_SERVER_URL").as_deref(), Ok("http://127.0.0.1:7777/event"));
-        let timeout = Duration::from_millis(800);
-        let mut stream = TcpStream::connect_timeout(&"127.0.0.1:7777".parse().unwrap(), timeout).unwrap();
-        stream.set_read_timeout(Some(timeout)).unwrap();
-        stream.set_write_timeout(Some(timeout)).unwrap();
-        let body = format!(r#"{{"sessionId":"agent-click-routing","runId":"isolated-post-{}","hypothesisId":"A","location":"neo-overlay/src/lib.rs:regression_tests","message":"{message}","data":{data}}}"#, std::process::id());
-        write!(stream, "POST /event HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        assert!(response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200"));
-    }
-
-    #[test]
-    #[ignore = "explicit isolated desktop diagnostic; requires local HTTP collector"]
-    fn isolated_click_routing_probe() {
-        routing_debug_event("pre_probe", r#"{"business_logic_changed":true,"production_hide_helper":true,"real_input":false,"desktop_switch":false}"#);
-        // #region debug-point B: controlled windows on a never-activated desktop
-        use windows_sys::Win32::Foundation::POINT;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            SendMessageTimeoutW, WindowFromPoint, WS_EX_NOREDIRECTIONBITMAP,
-            SMTO_ABORTIFHUNG, UnregisterClassW, GWL_EXSTYLE, SWP_FRAMECHANGED,
-        };
-        // These desktop APIs are test-only; avoid adding production dependency features.
-        #[link(name = "user32")]
-        extern "system" {
-            fn CreateDesktopW(name: *const u16, device: *const u16, mode: *const std::ffi::c_void,
-                flags: u32, access: u32, security: *const std::ffi::c_void) -> *mut std::ffi::c_void;
-            fn SetThreadDesktop(desktop: *mut std::ffi::c_void) -> i32;
-            fn CloseDesktop(desktop: *mut std::ffi::c_void) -> i32;
-        }
-        const QUERY_POINT: u32 = WM_APP + 91;
-        static OVERLAY_HITS: AtomicU32 = AtomicU32::new(0);
-        static BASE_BUTTONS: AtomicU32 = AtomicU32::new(0);
-        unsafe extern "system" fn base_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-            match msg {
-                QUERY_POINT => {
-                    let (x, y) = unpack_client(lp);
-                    unsafe { WindowFromPoint(POINT { x, y }) as LRESULT }
-                }
-                WM_NCHITTEST => HTCLIENT as LRESULT,
-                WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP => {
-                    BASE_BUTTONS.fetch_add(1, Ordering::Relaxed);
-                    0
-                }
-                _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
-            }
-        }
-        unsafe extern "system" fn probe_overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-            if msg == WM_NCHITTEST {
-                OVERLAY_HITS.fetch_add(1, Ordering::Relaxed);
-            }
-            unsafe { overlay_wnd_proc(hwnd, msg, wp, lp) }
-        }
-        struct Desktop(*mut std::ffi::c_void);
-        impl Drop for Desktop {
-            fn drop(&mut self) { unsafe { CloseDesktop(self.0); } }
-        }
-        struct Window(HWND);
-        impl Drop for Window {
-            fn drop(&mut self) {
-                unsafe {
-                    SetWindowLongPtrW(self.0, GWLP_USERDATA, 0);
-                    DestroyWindow(self.0);
-                }
-            }
-        }
-        struct Worker(Arc<AtomicBool>, Option<JoinHandle<()>>);
-        impl Drop for Worker {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
-                if let Some(thread) = self.1.take() { let _ = thread.join(); }
-            }
-        }
-        fn send(hwnd: HWND, msg: u32, lp: LPARAM) -> LRESULT {
-            let mut result = 0;
-            assert_ne!(unsafe { SendMessageTimeoutW(hwnd, msg, 0, lp, SMTO_ABORTIFHUNG, 1000, &mut result) }, 0,
-                "controlled SendMessageTimeoutW failed: {}", unsafe { GetLastError() });
-            result as LRESULT
-        }
-        let name: Vec<u16> = format!("neo-routing-probe-{}\0", std::process::id()).encode_utf16().collect();
-        // Access deliberately excludes DESKTOP_SWITCHDESKTOP. No input APIs are used.
-        let desktop = Desktop(unsafe { CreateDesktopW(name.as_ptr(), std::ptr::null(),
-            std::ptr::null(), 0, 0x0083, std::ptr::null()) });
-        routing_debug_event("desktop_created", &format!(r#"{{"ok":{},"error":{},"switch_access":false}}"#,
-            !desktop.0.is_null(), unsafe { GetLastError() }));
-        assert!(!desktop.0.is_null());
-        let desk = desktop.0 as usize;
-        let result = std::thread::spawn(move || {
-            assert_ne!(unsafe { SetThreadDesktop(desk as _) }, 0);
-            let base_name: Vec<u16> = "neo-routing-probe-base\0".encode_utf16().collect();
-            let overlay_name: Vec<u16> = "neo-routing-probe-overlay\0".encode_utf16().collect();
-            let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
-            for (name, proc) in [(&base_name, base_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
-                (&overlay_name, probe_overlay_proc)] {
-                let wc = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                    lpfnWndProc: Some(proc), hInstance: instance, lpszClassName: name.as_ptr(), ..Default::default() };
-                assert_ne!(unsafe { RegisterClassExW(&wc) }, 0);
-            }
-            let create = |name: &[u16], ex| {
-                let hwnd = unsafe { CreateWindowExW(ex, name.as_ptr(), std::ptr::null(), WS_POPUP,
-                    0, 0, 640, 480, std::ptr::null_mut(), std::ptr::null_mut(),
-                    GetModuleHandleW(std::ptr::null()), std::ptr::null()) };
-                assert!(!hwnd.is_null());
-                Window(hwnd)
-            };
-            let stop = Arc::new(AtomicBool::new(false));
-            let worker_stop = stop.clone();
-            let (tx, rx) = channel();
-            let worker_name = base_name.clone();
-            let worker = Worker(stop, Some(std::thread::spawn(move || {
-                assert_ne!(unsafe { SetThreadDesktop(desk as _) }, 0);
-                let base = create(&worker_name, WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
-                unsafe { ShowWindow(base.0, SW_SHOWNA); }
-                tx.send((base.0 as usize, unsafe { GetCurrentThreadId() })).unwrap();
-                while !worker_stop.load(Ordering::Acquire) {
-                    let mut msg = MSG::default();
-                    unsafe {
-                        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-                            TranslateMessage(&msg);
-                            DispatchMessageW(&msg);
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            })));
-            let (foreign, foreign_tid) = rx.recv_timeout(Duration::from_secs(3)).unwrap();
-            let foreign = foreign as HWND;
-            let same = create(&base_name, WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
-            let state = Box::new(WndState {
-                bounds: Mutex::new(DesktopBounds { origin: (0, 0), size: (640, 480) }),
-                display_dirty: AtomicBool::new(false), ppp: AtomicU32::new(1.0f32.to_bits()),
-                hit_rects: Mutex::new(vec![[400, 300, 100, 100]]), events: Mutex::new(Vec::new()),
-                pointer: Mutex::new(egui::Pos2::ZERO), inside: AtomicBool::new(false),
-            });
-            let ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP;
-            let overlay = create(&overlay_name, ex);
-            unsafe {
-                SetWindowLongPtrW(overlay.0, GWLP_USERDATA, &*state as *const WndState as isize);
-                ShowWindow(overlay.0, SW_SHOWNA);
-                SetWindowPos(overlay.0, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            }
-            routing_debug_event("windows_ready", &format!(r#"{{"owner_tid":{},"target_tid":{},"overlay":{},"foreign_base":{},"same_base":{},"exstyle":{},"card":[400,300,100,100]}}"#,
-                unsafe { GetCurrentThreadId() }, foreign_tid, overlay.0 as usize, foreign as usize,
-                same.0 as usize, unsafe { GetWindowLongPtrW(overlay.0, GWL_EXSTYLE) }));
-            let observe = |case: &str, x: i32, y: i32| {
-                let lp = ((y as u32) << 16 | x as u32) as LPARAM;
-                let before = OVERLAY_HITS.load(Ordering::Relaxed);
-                let owner_found = unsafe { WindowFromPoint(POINT { x, y }) };
-                let owner_calls = OVERLAY_HITS.load(Ordering::Relaxed) - before;
-                let before = OVERLAY_HITS.load(Ordering::Relaxed);
-                let foreign_found = send(foreign, QUERY_POINT, lp) as HWND;
-                let foreign_calls = OVERLAY_HITS.load(Ordering::Relaxed) - before;
-                let direct_hit = send(overlay.0, WM_NCHITTEST, lp);
-                routing_debug_event("hit_observation", &format!(r#"{{"case":"{case}","point":[{x},{y}],"exstyle":{},"owner_found":{},"foreign_found":{},"owner_hit_calls":{owner_calls},"foreign_hit_calls":{foreign_calls},"explicit_overlay_hit":{direct_hit}}}"#,
-                    unsafe { GetWindowLongPtrW(overlay.0, GWL_EXSTYLE) }, owner_found as usize, foreign_found as usize));
-                foreign_found
-            };
-            observe("cross_thread_card_inside", 450, 350);
-            let found = observe("cross_thread_card_outside", 100, 100);
-            // Explicit delivery to the queried controlled HWND is not hardware-input routing.
-            assert!(found == overlay.0 || found == foreign || found == same.0);
-            state.events.lock().unwrap().clear();
-            BASE_BUTTONS.store(0, Ordering::Relaxed);
-            for msg in [WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP] {
-                send(found, msg, (100 << 16) | 100);
-            }
-            routing_debug_event("controlled_delivery_only", &format!(r#"{{"selected":{},"overlay_events":{},"base_buttons":{},"hardware_routing_proven":false}}"#,
-                found as usize, state.events.lock().unwrap().len(), BASE_BUTTONS.load(Ordering::Relaxed)));
-            unsafe { ShowWindow(foreign, SW_HIDE); ShowWindow(same.0, SW_SHOWNA); }
-            observe("same_thread_card_outside", 100, 100);
-            unsafe {
-                ShowWindow(same.0, SW_HIDE); ShowWindow(foreign, SW_SHOWNA);
-                SetWindowLongPtrW(overlay.0, GWL_EXSTYLE, (ex | WS_EX_TRANSPARENT) as isize);
-                SetWindowPos(overlay.0, HWND_TOPMOST, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-            }
-            observe("cross_thread_transparent_style", 100, 100);
-            hide_for_desktop(overlay.0).unwrap();
-            let hidden_hit = observe("overlay_hidden_control", 100, 100);
-            assert_eq!(hidden_hit, foreign);
-            routing_debug_event("barrier_hide_verified", r#"{"production_hide_helper":true,"root_matches_target":true,"real_input":false}"#);
-            drop(overlay);
-            drop(same);
-            drop(worker);
-            unsafe { UnregisterClassW(overlay_name.as_ptr(), instance); UnregisterClassW(base_name.as_ptr(), instance); }
-        }).join();
-        drop(desktop);
-        routing_debug_event("post_probe", &format!(r#"{{"completed":{},"real_input":false,"desktop_switch":false}}"#, result.is_ok()));
-        result.unwrap();
-        // #endregion debug-point B
-    }
-    // #endregion debug-point A
-
-    #[test]
-    fn dimensions_request_adapter_capacity_and_reject_insufficient_limits() {
-        let supported = wgpu::Limits { max_texture_dimension_2d: 16384, ..wgpu::Limits::default() };
-        let requested = overlay_limits(&supported, (11520, 2160)).unwrap();
-        assert_eq!(requested.max_texture_dimension_2d, 16384);
-        assert!(requested.check_limits(&supported));
-        let limited = wgpu::Limits { max_texture_dimension_2d: 4096, ..supported.clone() };
-        assert!(overlay_limits(&limited, (3840, 2160)).is_ok());
-        assert!(overlay_limits(&limited, (11520, 2160)).is_err());
-        let insufficient = wgpu::Limits { max_bind_groups: 0, ..supported };
-        assert!(overlay_limits(&insufficient, (1920, 1080)).is_err());
-    }
-
-    #[test]
-    fn dimensions_hotplug_checks_device_limit_before_reconfiguration() {
-        let supported = wgpu::Limits { max_texture_dimension_2d: 16384, ..wgpu::Limits::default() };
-        let device = overlay_limits(&supported, (1920, 1080)).unwrap();
-        for size in [(11520, 2160), (16384, 2160), (2160, 16384)] {
-            assert!(validate_dimensions(size, device.max_texture_dimension_2d).is_ok());
-        }
-        for size in [(16385, 2160), (2160, 16385), (0, 2160), (1920, 0)] {
-            assert!(validate_dimensions(size, device.max_texture_dimension_2d).is_err());
-        }
-        for (width, height) in [(0, 1080), (1920, 0), (-1, 1080), (1920, -1)] {
-            assert!(DesktopBounds::from_rect(screen::Rect { x: -1920, y: 0, width, height }).is_err());
-        }
-    }
-
-    #[test]
-    fn dimensions_upload_rejects_zero_oversize_and_malformed_frames() {
-        assert!(valid_upload((11520, 2160), 11520 * 2160 * 4, 16384));
-        assert!(!valid_upload((11520, 2160), 11520 * 2160 * 4, 8192));
-        assert!(!valid_upload((0, 0), 0, 16384));
-        assert!(!valid_upload((2, 2), 15, 16384));
-        assert!(!valid_upload((u32::MAX, u32::MAX), 0, u32::MAX));
-    }
-
-    #[test]
-    fn capture_exclusion_requires_19041_and_successful_affinity() {
-        for (version, supported) in [
-            (None, false), (Some((6, 3, 9600)), false),
-            (Some((10, 0, 19040)), false), (Some((10, 0, 19041)), true),
-            (Some((10, 0, 19045)), true), (Some((10, 0, 22000)), true),
-        ] {
-            assert_eq!(supports_capture_exclusion(version), supported);
-            for affinity_ok in [false, true] {
-                let mut state = CaptureState::default();
-                state.set_enabled(true);
-                state.set_exclude_ok(supports_capture_exclusion(version) && affinity_ok);
-                assert_eq!(state.begin().is_some(), supported && affinity_ok);
-            }
-        }
-    }
-
-    #[test]
-    fn transparency_never_falls_back_to_opaque_or_wrong_alpha_convention() {
-        use wgpu::CompositeAlphaMode::*;
-        for modes in [vec![], vec![Opaque], vec![Auto, Inherit], vec![PostMultiplied]] {
-            assert!(transparent_alpha(&modes).is_err());
-        }
-        assert_eq!(transparent_alpha(&[Opaque, PreMultiplied]).unwrap(), PreMultiplied);
-    }
-
-    fn safe_capture() -> CaptureState {
-        let mut state = CaptureState::default();
-        state.set_exclude_ok(true);
-        state
-    }
-
-    #[test]
-    fn capture_safety_blocks_work_even_after_show_and_topology_changes() {
-        let mut state = CaptureState::default();
-        for _ in 0..100 {
-            state.set_enabled(true);
-            state.invalidate();
-            assert!(state.begin().is_none());
-        }
-        state.set_exclude_ok(true);
-        let old = state.begin().unwrap();
-        state.publish(old, bounds(), shot(1));
-        state.set_exclude_ok(false);
-        state.publish(old, bounds(), shot(2));
-        assert!(state.take(bounds()).is_none());
-        state.set_enabled(false);
-        state.set_exclude_ok(true);
-        assert!(state.begin().is_none(), "安全许可不能覆盖 Hide");
-        state.set_enabled(true);
-        state.publish(old, bounds(), shot(3));
-        assert!(state.take(bounds()).is_none());
-    }
-
-    #[test]
-    fn capture_cadence_is_at_most_twenty_hz_without_catch_up() {
-        for millis in [0, 5, 17, 33, 50, 100, 1000] {
-            let elapsed = Duration::from_millis(millis);
-            let cycle = elapsed + capture_rest(elapsed);
-            assert!(cycle >= CAPTURE_INTERVAL);
-            assert!(cycle >= elapsed + Duration::from_millis(33));
-        }
-        let cycles = |rest: Duration| (0..1000).step_by(rest.as_millis() as usize).count();
-        assert_eq!(cycles(Duration::from_millis(33)), 31);
-        assert_eq!(cycles(capture_rest(Duration::ZERO)), 20);
-        eprintln!("合成 1s 零耗时采集：旧 31 次，新 20 次；慢采集不加速");
-    }
-
-    fn fake_handle() -> (OverlayHandle, Receiver<Cmd>, Sender<()>, Receiver<()>) {
-        let (tx, rx) = channel();
-        let (release, wait) = channel();
-        let (done, finished) = channel();
-        let thread = std::thread::spawn(move || {
-            let _ = wait.recv_timeout(Duration::from_secs(2));
-            let _ = done.send(());
-        });
-        (OverlayHandle {
-            tx, tid: 0,
-            level: Arc::new(AtomicU32::new(0)),
-            visible: Arc::new(AtomicBool::new(true)),
-            stop: Arc::new(AtomicBool::new(false)),
-            capture: Arc::new(Mutex::new(safe_capture())),
-            cards: Arc::new(Mutex::new(BTreeMap::new())),
-            suspended: Arc::new(AtomicU32::new(0)),
-            thread: Some(thread),
-            wake_count: Some(AtomicU32::new(0)),
-        }, rx, release, finished)
-    }
-
-    fn wake_count(handle: &OverlayHandle) -> u32 {
-        handle.wake_count.as_ref().unwrap().load(Ordering::Relaxed)
-    }
-
-    #[test]
-    fn desktop_barrier_ack_then_thread_exit_and_cancel_fail_closed() {
-        let (handle, commands, release, finished) = fake_handle();
-        let gate = handle.desktop_gate();
-        let cancel = AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            let waiting = scope.spawn(|| gate.acquire(&cancel, Duration::from_secs(1)));
-            let Cmd::Suspend(ack, deadline, live) = commands.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!("必须先申请隐藏") };
-            assert!(desktop_request_live(deadline, &live));
-            assert!(!desktop_can_show(&gate.count));
-            ack.send(Ok(())).unwrap();
-            let guard = waiting.join().unwrap().unwrap();
-            assert!(!desktop_can_show(&gate.count));
-            drop(guard);
-            assert!(desktop_can_show(&gate.count));
-        });
-        while commands.try_recv().is_ok() {}
-        std::thread::scope(|scope| {
-            let waiting = scope.spawn(|| gate.acquire(&cancel, Duration::from_secs(1)));
-            let Cmd::Suspend(ack, _, _) = commands.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!("必须先申请隐藏") };
-            gate.stop.store(true, Ordering::Release);
-            let _ = ack.send(Ok(()));
-            assert!(waiting.join().unwrap().is_err());
-        });
-        assert!(desktop_can_show(&gate.count));
-        release.send(()).unwrap();
-        finished.recv_timeout(Duration::from_secs(1)).unwrap();
-    }
-
-    #[test]
-    fn desktop_barrier_timeout_and_last_guard_restore() {
-        let (handle, commands, release, finished) = fake_handle();
-        let gate = handle.desktop_gate();
-        let cancel = AtomicBool::new(false);
-        let started = Instant::now();
-        assert!(gate.acquire(&cancel, Duration::from_millis(15)).is_err());
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(gate.count.load(Ordering::Acquire), 0);
-        let Cmd::Suspend(_, deadline, live) = commands.recv().unwrap() else { panic!("缺少过期请求") };
-        assert!(!desktop_request_live(deadline, &live), "迟到请求不能隐藏窗口");
-        assert!(!desktop_request_live(Instant::now(), &AtomicBool::new(true)));
-        while commands.try_recv().is_ok() {}
-        let first = gate.reserve();
-        let second = gate.reserve();
-        handle.show();
-        handle.set_card(card_id::MINI, Some(Card::interactive([0.0; 4], |_| {})));
-        assert!(!desktop_can_show(&gate.count));
-        drop(first);
-        assert!(!desktop_can_show(&gate.count));
-        drop(second);
-        assert!(desktop_can_show(&gate.count));
-        cancel.store(true, Ordering::Release);
-        assert!(gate.acquire(&cancel, Duration::from_secs(1)).is_err());
-        assert_eq!(gate.count.load(Ordering::Acquire), 0);
-        release.send(()).unwrap();
-        finished.recv_timeout(Duration::from_secs(1)).unwrap();
-    }
-
-    #[test]
-    fn toast_passive_card_never_opens_capture_or_posts_show_hide() {
-        let (handle, commands, release, finished) = fake_handle();
-        handle.set_card(card_id::TOAST, Some(Card::passive([10.0, 20.0, 300.0, 100.0], |_| {})));
-        assert!(!handle.cards.lock().unwrap().values().any(|card| card.interactive));
-        assert!(handle.capture.lock().unwrap().begin().is_none());
-        assert!(commands.try_recv().is_err());
-        assert_eq!(wake_count(&handle), 1);
-        handle.set_card(card_id::TOAST, None);
-        handle.set_card(card_id::TOAST, None);
-        assert!(handle.cards.lock().unwrap().is_empty());
-        assert_eq!(wake_count(&handle), 2);
-        assert!(commands.try_recv().is_err());
-        release.send(()).unwrap();
-        finished.recv_timeout(Duration::from_secs(1)).unwrap();
-    }
-
-    #[test]
-    fn toast_passive_area_allows_click_through_to_underlying_card() {
-        let ctx = egui::Context::default();
-        let target = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(300.0, 100.0));
-        let point = target.center();
-        let mut clicked = false;
-        for frame in 0..5 {
-            let events = if frame >= 3 {
-                vec![egui::Event::PointerMoved(point), egui::Event::PointerButton {
-                    pos: point, button: egui::PointerButton::Primary,
-                    pressed: frame == 3, modifiers: egui::Modifiers::default(),
-                }]
-            } else { vec![] };
-            ctx.begin_pass(egui::RawInput { events, ..Default::default() });
-            card_area(card_id::CONFIRM, target.min, true).order(egui::Order::Foreground).show(&ctx, |ui| {
-                clicked |= ui.allocate_exact_size(target.size(), egui::Sense::click()).1.clicked();
-            });
-            card_area(card_id::TOAST, target.min, false).order(egui::Order::Foreground).show(&ctx, |ui| {
-                ui.allocate_exact_size(target.size(), egui::Sense::hover());
-            });
-            let mut output = ctx.end_pass();
-            output.textures_delta.clear();
-        }
-        assert!(clicked, "被动 toast Area 不得挡住底层确认卡");
-    }
-
-    #[test]
-    fn card_repeated_empty_removals_do_not_notify() {
-        let (handle, _commands, release, finished) = fake_handle();
-        for _ in 0..5 {
-            for id in [card_id::CONFIRM, card_id::MINI, card_id::CLASS, card_id::FLASH, card_id::DOT, card_id::TOAST] {
-                handle.set_card(id, None);
-            }
-        }
-        assert!(handle.cards.lock().unwrap().is_empty());
-        assert_eq!(wake_count(&handle), 0, "5Hz × 6 张空卡不应产生 30 次通知");
-        release.send(()).unwrap();
-        finished.recv_timeout(Duration::from_secs(1)).unwrap();
-    }
-
-    #[test]
-    fn card_updates_and_last_removal_notify_without_changing_ripple() {
-        for showing in [false, true] {
-            let (handle, _commands, release, finished) = fake_handle();
-            let mut ripple = RippleState::default();
-            if showing {
-                ripple.show();
-            }
-            handle.set_card(card_id::MINI, Some(Card::interactive([0.0; 4], |_| {})));
-            assert_eq!(wake_count(&handle), 1);
-            let replacement = Card::passive([0.0; 4], |_| {});
-            let rect = replacement.rect.clone();
-            handle.set_card(card_id::MINI, Some(replacement));
-            assert_eq!(wake_count(&handle), 2);
-            {
-                let cards = handle.cards.lock().unwrap();
-                assert_eq!(cards.len(), 1);
-                assert!(Arc::ptr_eq(&cards[&card_id::MINI].rect, &rect));
-                assert!(!cards[&card_id::MINI].interactive);
-            }
-            handle.set_card(card_id::DOT, Some(Card::passive([0.0; 4], |_| {})));
-            assert_eq!(wake_count(&handle), 3);
-            handle.set_card(card_id::FLASH, None);
-            assert_eq!(wake_count(&handle), 3);
-            handle.set_card(card_id::MINI, None);
-            assert_eq!(wake_count(&handle), 4);
-            assert!(ripple.active(!handle.cards.lock().unwrap().is_empty()));
-            handle.set_card(card_id::DOT, None);
-            assert_eq!(wake_count(&handle), 5);
-            assert!(handle.cards.lock().unwrap().is_empty());
-            assert_eq!(ripple.active(false), showing);
-            handle.set_card(card_id::DOT, None);
-            assert_eq!(wake_count(&handle), 5);
-            release.send(()).unwrap();
-            finished.recv_timeout(Duration::from_secs(1)).unwrap();
-        }
-    }
-
-    #[test]
-    fn card_poisoned_lock_does_not_notify_or_mutate() {
-        let (handle, _commands, release, finished) = fake_handle();
-        handle.set_card(card_id::MINI, Some(Card::interactive([0.0; 4], |_| {})));
-        let cards = handle.cards.clone();
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = cards.lock().unwrap();
-            panic!("fake poisoned card slot");
-        })).is_err());
-        handle.set_card(card_id::MINI, None);
-        handle.set_card(card_id::DOT, Some(Card::passive([0.0; 4], |_| {})));
-        assert_eq!(wake_count(&handle), 1);
-        let cards = handle.cards.lock().unwrap_or_else(|p| p.into_inner());
-        assert_eq!(cards.len(), 1);
-        assert!(cards.contains_key(&card_id::MINI));
-        drop(cards);
-        release.send(()).unwrap();
-        finished.recv_timeout(Duration::from_secs(1)).unwrap();
-    }
-
-    #[test]
-    fn card_shutdown_handle_does_not_notify_or_mutate() {
-        let (mut handle, _commands, release, finished) = fake_handle();
-        handle.set_card(card_id::MINI, Some(Card::interactive([0.0; 4], |_| {})));
-        handle.shutdown();
-        let before = wake_count(&handle);
-        handle.set_card(card_id::MINI, None);
-        handle.set_card(card_id::DOT, Some(Card::passive([0.0; 4], |_| {})));
-        assert_eq!(wake_count(&handle), before);
-        let cards = handle.cards.lock().unwrap();
-        assert_eq!(cards.len(), 1);
-        assert!(cards.contains_key(&card_id::MINI));
-        drop(cards);
-        release.send(()).unwrap();
-        finished.recv_timeout(Duration::from_secs(1)).unwrap();
-    }
-
-    #[test]
-    fn lifecycle_shutdown_and_drop_do_not_wait_for_stalled_thread() {
-        let (mut handle, commands, release, finished) = fake_handle();
-        assert!(handle.is_alive());
-        handle.show();
-        assert!(matches!(commands.try_recv(), Ok(Cmd::Show)));
-        let capture = handle.capture.clone();
-        let generation = capture.lock().unwrap().begin().unwrap();
-        let start = Instant::now();
-        handle.shutdown();
-        assert!(start.elapsed() < Duration::from_millis(500));
-        assert!(!handle.is_alive());
-        assert!(!handle.is_visible());
-        assert!(matches!(commands.try_recv(), Ok(Cmd::Shutdown)));
-        handle.show();
-        let mut state = capture.lock().unwrap();
-        state.publish(generation, bounds(), shot(1));
-        assert!(state.begin().is_none());
-        assert!(state.take(bounds()).is_none());
-        drop(state);
-        drop(handle);
-        assert!(finished.try_recv().is_err());
-        release.send(()).unwrap();
-        finished.recv_timeout(Duration::from_secs(1)).unwrap();
-    }
-
-    #[test]
-    fn lifecycle_drop_closes_gate_without_waiting_for_worker() {
-        let (handle, _commands, release, finished) = fake_handle();
-        handle.show();
-        let capture = handle.capture.clone();
-        let stop = handle.stop.clone();
-        let start = Instant::now();
-        drop(handle);
-        assert!(start.elapsed() < Duration::from_millis(500));
-        assert!(stop.load(Ordering::Acquire));
-        assert!(capture.lock().unwrap().begin().is_none());
-        assert!(finished.try_recv().is_err());
-        release.send(()).unwrap();
-        finished.recv_timeout(Duration::from_secs(1)).unwrap();
-    }
-
-    #[test]
-    fn lifecycle_ready_timeout_error_disconnect_and_success() {
-        for outcome in 0..4 {
-            let (handle, _commands, release, finished) = fake_handle();
-            let stop = handle.stop.clone();
-            let capture = handle.capture.clone();
-            capture.lock().unwrap().set_enabled(true);
-            let (ready, rx) = channel();
-            match outcome {
-                0 => {},
-                1 => ready.send(Err("fake initialization failure".into())).unwrap(),
-                2 => {},
-                _ => ready.send(Ok(0)).unwrap(),
-            }
-            let ready = if outcome == 2 { drop(ready); None } else { Some(ready) };
-            let start = Instant::now();
-            let result = handle.await_ready(rx, Duration::from_millis(10));
-            assert!(start.elapsed() < Duration::from_millis(500));
-            assert_eq!(result.is_ok(), outcome == 3);
-            if outcome != 3 {
-                assert!(stop.load(Ordering::Acquire));
-                assert!(capture.lock().unwrap().begin().is_none());
-                if let Some(ready) = ready {
-                    assert!(ready.send(Ok(0)).is_err());
-                }
-            }
-            drop(result);
-            release.send(()).unwrap();
-            finished.recv_timeout(Duration::from_secs(1)).unwrap();
-        }
-    }
-
-    #[test]
-    fn lifecycle_stalled_initialization_keeps_single_engine_lease() {
-        static RUNNING: AtomicBool = AtomicBool::new(false);
-        let lease = EngineLease::acquire(&RUNNING).unwrap();
-        let (release, wait) = channel();
-        let worker = std::thread::spawn(move || {
-            let _lease = lease;
-            let _ = wait.recv_timeout(Duration::from_secs(2));
-        });
-        for _ in 0..100 {
-            assert!(EngineLease::acquire(&RUNNING).is_err());
-        }
-        release.send(()).unwrap();
-        worker.join().unwrap();
-        assert!(EngineLease::acquire(&RUNNING).is_ok());
-    }
-
-    #[test]
-    fn lifecycle_finished_thread_is_not_alive_even_without_stop_signal() {
-        let (mut handle, _commands, release, finished) = fake_handle();
-        handle.set_card(card_id::MINI, Some(Card::interactive([0.0; 4], |_| {})));
-        release.send(()).unwrap();
-        finished.recv_timeout(Duration::from_secs(1)).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !handle.thread.as_ref().unwrap().is_finished() && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(!handle.stop.load(Ordering::Acquire));
-        assert!(!handle.is_alive());
-        assert!(!handle.is_visible());
-        let before = wake_count(&handle);
-        handle.set_card(card_id::MINI, None);
-        handle.set_card(card_id::DOT, Some(Card::passive([0.0; 4], |_| {})));
-        assert_eq!(wake_count(&handle), before);
-        let cards = handle.cards.lock().unwrap();
-        assert_eq!(cards.len(), 1);
-        assert!(cards.contains_key(&card_id::MINI));
-        drop(cards);
-        handle.show();
-        assert!(handle.capture.lock().unwrap().begin().is_none());
-        handle.shutdown();
-    }
-
-    fn bounds() -> DesktopBounds {
-        DesktopBounds { origin: (0, 0), size: (2, 2) }
-    }
-
-    fn shot(value: u8) -> Shot {
-        Shot { width: 2, height: 2, rgba: vec![value; 16] }
-    }
-
-    #[test]
-    fn hide_stops_capture_before_fade_with_or_without_cards() {
-        for have_cards in [false, true] {
-            let mut capture = safe_capture();
-            let mut ripple = RippleState::default();
-            assert!(capture.begin().is_none());
-            assert_eq!(ripple.active(have_cards), have_cards);
-            capture.set_enabled(true);
-            ripple.show();
-            let in_flight = capture.begin().unwrap();
-            capture.publish(in_flight, bounds(), shot(1));
-            let frozen = capture.take(bounds()).unwrap();
-            capture.publish(in_flight, bounds(), shot(2));
-
-            capture.set_enabled(false);
-            ripple.hide();
-            assert!(ripple.active(have_cards));
-            assert!(!ripple.finish_fade(0.5));
-            assert!(capture.begin().is_none());
-            assert!(capture.take(bounds()).is_none());
-            // 在途系统调用不能撤销，但返回后不能再更新淡出画面。
-            capture.publish(in_flight, bounds(), shot(3));
-            assert!(capture.take(bounds()).is_none());
-            assert_eq!(frozen.rgba, vec![1; 16]);
-            for _ in 0..40 {
-                assert!(capture.begin().is_none());
-            }
-            assert!(ripple.finish_fade(0.01));
-            assert_eq!(ripple.active(have_cards), have_cards);
-            assert!(!ripple.finish_fade(0.0));
-            assert!(capture.begin().is_none());
-        }
-    }
-
-    #[test]
-    fn reshow_rejects_old_in_flight_and_queued_frames() {
-        let mut capture = safe_capture();
-        let mut ripple = RippleState::default();
-        capture.set_enabled(true);
-        ripple.show();
-        let old = capture.begin().unwrap();
-        capture.publish(old, bounds(), shot(1));
-        capture.set_enabled(false);
-        ripple.hide();
-        capture.set_enabled(true);
-        ripple.show();
-        let new = capture.begin().unwrap();
-        assert_ne!(old, new);
-        assert!(capture.take(bounds()).is_none());
-        capture.publish(old, bounds(), shot(2));
-        assert!(capture.take(bounds()).is_none());
-        capture.publish(new, bounds(), shot(3));
-        // 迟到旧帧也不能覆盖本轮已发布的新帧。
-        capture.publish(old, bounds(), shot(4));
-        assert_eq!(capture.take(bounds()).unwrap().rgba, vec![3; 16]);
-        assert!(!ripple.finish_fade(0.0));
-        assert!(ripple.active(false));
-    }
-
-    #[test]
-    fn queued_show_cannot_reopen_gate_after_hide() {
-        let mut capture = safe_capture();
-        let mut ripple = RippleState::default();
-        // 模拟窗口线程尚未排空命令时调用线程已连续 Show/Hide。
-        capture.set_enabled(true);
-        capture.set_enabled(false);
-        ripple.show();
-        assert!(capture.begin().is_none());
-        ripple.hide();
-        assert!(capture.begin().is_none());
-        // 淡出收尾也不得关掉已经投递的下一轮 Show 许可。
-        capture.set_enabled(true);
-        let new = capture.begin().unwrap();
-        assert!(ripple.finish_fade(0.0));
-        assert_eq!(capture.begin(), Some(new));
-        ripple.show();
-        assert!(ripple.active(false));
-    }
-
-    #[test]
-    fn repeated_hide_and_show_invalidate_previous_work() {
-        let mut capture = safe_capture();
-        let mut ripple = RippleState::default();
-        for _ in 0..2 {
-            capture.set_enabled(false);
-            ripple.hide();
-            assert!(!ripple.active(false));
-            assert!(!ripple.finish_fade(0.0));
-            assert!(capture.begin().is_none());
-        }
-        capture.set_enabled(true);
-        let old = capture.begin().unwrap();
-        capture.set_enabled(true);
-        capture.publish(old, bounds(), shot(1));
-        assert!(capture.take(bounds()).is_none());
-        let current = capture.begin().unwrap();
-        capture.publish(current, bounds(), shot(2));
-        assert!(capture.take(bounds()).is_some());
-    }
-
-    #[test]
-    fn topology_invalidation_rejects_in_flight_even_if_bounds_return() {
-        let mut capture = safe_capture();
-        capture.set_enabled(true);
-        let old = capture.begin().unwrap();
-        capture.invalidate();
-        capture.publish(old, bounds(), shot(1));
-        assert!(capture.take(bounds()).is_none());
-        let current = capture.begin().unwrap();
-        let shifted = DesktopBounds { origin: (-2, 0), ..bounds() };
-        capture.publish(current, shifted, shot(2));
-        assert!(capture.take(bounds()).is_none());
-        let mut wrong_size = shot(3);
-        wrong_size.width = 1;
-        capture.publish(current, bounds(), wrong_size);
-        assert!(capture.take(bounds()).is_none());
-        capture.publish(current, bounds(), shot(4));
-        assert!(capture.take(bounds()).is_some());
-        capture.set_enabled(false);
-        capture.invalidate();
-        assert!(capture.begin().is_none());
-        capture.publish(current, bounds(), shot(5));
-        assert!(capture.take(bounds()).is_none());
-    }
-
-    #[test]
-    fn topology_change_updates_negative_origin_and_size() {
-        let old = DesktopBounds::from_rect(screen::Rect { x: 0, y: 0, width: 1920, height: 1080 }).unwrap();
-        let new = DesktopBounds::from_rect(screen::Rect { x: -1280, y: -200, width: 3200, height: 1440 }).unwrap();
-        assert_ne!(old, new);
-        assert_eq!(new.size, (3200, 1440));
-        assert_eq!(new.client_point((50, 60)), (1330, 260));
-        let shifted = DesktopBounds { origin: (0, 0), ..new };
-        assert_ne!(shifted, new);
-        assert_eq!(shifted.size, new.size);
-        assert!(DesktopBounds::from_rect(screen::Rect { x: 0, y: 0, width: 0, height: 0 }).is_err());
-    }
-}
+mod native_tests;
 
 #[cfg(test)]
-mod tests {
-    /// shader.wgsl 的任何语法/类型错误都会在窗口线程启动时才炸（wgpu 在
-    /// create_shader_module 报 naga 错）。把它前移到单测：解析 + 校验。
-    #[test]
-    fn shader_parses_and_validates() {
-        let src = include_str!("shader.wgsl");
-        let module = naga::front::wgsl::parse_str(src).expect("shader.wgsl 解析失败");
-        let mut validator = naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        );
-        validator
-            .validate(&module)
-            .expect("shader.wgsl 校验失败");
-    }
+#[path = "regression_tests.rs"]
+mod regression_tests;
 
-    /// 用透镜管线离屏渲一帧：「桌面」RGBA 图 (tex_w×tex_h)，渲染到 out_w×out_h。
-    /// 返回 premultiplied 像素。无 GPU 的环境返回 None（调用方自行决定跳过还是失败）。
-    fn render_lens_frame(
-        img: &[u8],
-        tex_w: u32,
-        tex_h: u32,
-        out_w: u32,
-        out_h: u32,
-    ) -> Option<Vec<u8>> {
-        render_lens_source(img, tex_w, tex_h, out_w, out_h, include_str!("shader.wgsl"))
-    }
-
-    fn render_lens_source(
-        img: &[u8], tex_w: u32, tex_h: u32, out_w: u32, out_h: u32, source: &str,
-    ) -> Option<Vec<u8>> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).ok()?;
-
-        let desktop_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("test-desktop"),
-            size: wgpu::Extent3d { width: tex_w, height: tex_h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &desktop_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            img,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * tex_w),
-                rows_per_image: Some(tex_h),
-            },
-            wgpu::Extent3d { width: tex_w, height: tex_h, depth_or_array_layers: 1 },
-        );
-
-        let (pipeline, bind_layout) = super::Gfx::lens_pipeline_source(&device, source);
-
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test-uniform"),
-            size: 48,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        // time=1.7, level=0, intensity=1, spin=0.05, refr=1, pad×3, res（渲染）, tex（桌面）
-        let uni: [f32; 12] = [
-            1.7,
-            0.0,
-            1.0,
-            0.05,
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            out_w as f32,
-            out_h as f32,
-            tex_w as f32,
-            tex_h as f32,
-        ];
-        queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&uni));
-
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let desktop_view = desktop_tex.create_view(&Default::default());
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("test-bind"),
-            layout: &bind_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&desktop_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("test-target"),
-            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let target_view = target.create_view(&Default::default());
-
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test-enc"),
-        });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("test-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.draw(0..3, 0..1);
-        }
-
-        // 读回（out_w*4 必须是 256 的倍数：调用方选尺寸时注意）
-        assert_eq!((out_w * 4) % 256, 0, "读回行宽需 256 对齐");
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test-readback"),
-            size: (out_w * out_h * 4) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * out_w),
-                    rows_per_image: Some(out_h),
-                },
-            },
-            wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
-        );
-        queue.submit(std::iter::once(enc.finish()));
-
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| ());
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        let data = slice.get_mapped_range().unwrap();
-        Some(data.to_vec())
-    }
-
-    /// 离屏渲染验证透镜真的在扭曲「桌面」：灰度棋盘纹理进管线、读回像素断言 ——
-    /// 1. 屏幕中心完全透明（早退区不画）；
-    /// 2. 透镜带内 alpha 接近不透明（折射区要显示扭曲桌面）；
-    /// 3. 带内存在与原图错位的像素（折射确实发生了位移）；
-    /// 4. 色度有界：彩色流光是设计（颜色是「光」），但必须是粉彩渐变
-    ///    级别，不能出现通道错接式的爆色。
-    #[test]
-    fn lens_refracts_desktop_offscreen() {
-        const W: u32 = 960;
-        const H: u32 = 540; // 假想 1600x900 的 0.6x 离屏
-
-        // 合成桌面：16px 灰度棋盘（高对比，折射错位一眼可辨；灰度便于查「无色」）
-        let mut img = vec![0u8; (W * H * 4) as usize];
-        for y in 0..H {
-            for x in 0..W {
-                let v = if ((x / 16) + (y / 16)) % 2 == 0 { 40u8 } else { 215u8 };
-                let i = ((y * W + x) * 4) as usize;
-                img[i] = v;
-                img[i + 1] = v;
-                img[i + 2] = v;
-                img[i + 3] = 255;
-            }
-        }
-
-        let Some(data) = render_lens_frame(&img, W, H, W, H) else {
-            eprintln!("无 GPU adapter，跳过离屏渲染测试");
-            return;
-        };
-
-        // 恢复优化前的无条件采样，逐像素确认薄裙裁剪不损失画质。
-        let source = include_str!("shader.wgsl");
-        assert_eq!(source.matches("if (vis > 0.0)").count(), 1);
-        let reference_source = source.replace("if (vis > 0.0)", "if (true)");
-        let reference = render_lens_source(&img, W, H, W, H, &reference_source)
-            .expect("首次离屏渲染已成功，参考渲染不应失败");
-        let max_delta = data.iter().zip(&reference).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
-        assert!(max_delta <= 1, "优化前后像素最大差 {max_delta} 超过 1 LSB");
-        eprintln!("合成棋盘 GPU 验收：{} 像素，优化前后最大通道差 {max_delta} LSB", W * H);
-
-        let px = |x: u32, y: u32| -> [u8; 4] {
-            let i = ((y * W + x) * 4) as usize;
-            [data[i], data[i + 1], data[i + 2], data[i + 3]]
-        };
-
-        // 1. 屏幕中心完全透明（早退区）
-        let center = px(W / 2, H / 2);
-        assert_eq!(center[3], 0, "屏幕中心应完全透明, got {center:?}");
-
-        // 2. 左缘透镜带中点 alpha 接近不透明
-        //    （inset 12 + 透镜脊 d≈-22 → x≈34，y 取垂直中点避开圆角）
-        let band = px(34, H / 2);
-        assert!(
-            band[3] >= 180,
-            "透镜带内应接近不透明, got alpha={} at (34, {})",
-            band[3],
-            H / 2
-        );
-
-        // 3 & 4. 左缘竖带扫描：折射错位存在性 + 平均色度
-        let mut shifted = 0u64;
-        let mut chroma_sum = 0u64;
-        let mut count = 0u64;
-        for y in (H / 4)..(H * 3 / 4) {
-            for x in 12..64 {
-                let p = px(x, y);
-                if p[3] < 128 {
-                    continue; // 只看透镜带内不透明像素
-                }
-                count += 1;
-                let si = ((y * W + x) * 4) as usize;
-                if p[0] != img[si] {
-                    shifted += 1;
-                }
-                let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
-                chroma_sum += (r - g).unsigned_abs() as u64 + (g - b).unsigned_abs() as u64;
-            }
-        }
-        assert!(count > 1000, "透镜带覆盖像素太少: {count}");
-        assert!(
-            shifted > count / 4,
-            "折射错位像素过少（{shifted}/{count}），透镜没在扭曲桌面"
-        );
-        let mean_chroma = chroma_sum as f64 / count as f64;
-        // 灰度棋盘 + 粉彩流光：每像素 |r-g|+|g-b| 的量级应在「彩色但温和」
-        // 区间；超过 150 意味着通道错接 / 爆色之类的管线事故。
-        assert!(
-            mean_chroma > 1.0 && mean_chroma < 150.0,
-            "平均色度 {mean_chroma:.1} 异常：流光滑失（≈0）或爆色（>150）"
-        );
-    }
-
-    /// 手动预览：拟真桌面（壁纸渐变 + 窗口块 + 文字行 + 任务栏），按真实管线
-    /// 0.6x 离屏渲一帧再线性放大回全尺寸，落盘 target/lens-preview.png 供人工调参。
-    /// `cargo test -p neo-overlay -- --ignored`
-    #[test]
-    #[ignore]
-    fn lens_preview() {
-        const W: u32 = 1280;
-        const H: u32 = 720;
-        const RW: u32 = 768; // 0.6x 离屏（与生产 RENDER_SCALE 一致）
-        const RH: u32 = 432;
-
-        // 拟真桌面：竖向**亮**色渐变壁纸（教室场景多是亮底 PPT，暗底会
-        // 掩盖雾感误判）+ 左侧一个白「窗口」（含横线文字带）+ 底部任务栏
-        let mut img = vec![0u8; (W * H * 4) as usize];
-        for y in 0..H {
-            for x in 0..W {
-                let g = 150.0 + 60.0 * (y as f32 / H as f32);
-                let (mut r, mut gg, mut b) = (g * 0.96, g * 0.98, g * 1.04);
-                // 白窗口：x 160..760, y 120..500
-                if (160..760).contains(&x) && (120..500).contains(&y) {
-                    r = 248.0;
-                    gg = 250.0;
-                    b = 252.0;
-                    // 文字行：每 22px 一条 6px 灰带
-                    if y > 150 && (y % 22) < 6 && x > 190 && x < 730 {
-                        r = 150.0;
-                        gg = 152.0;
-                        b = 156.0;
-                    }
-                }
-                // 任务栏
-                if y >= H - 44 {
-                    r = 226.0;
-                    gg = 229.0;
-                    b = 234.0;
-                    // 任务栏图标格
-                    if x > 60 && x < 600 && (x % 52) < 36 && y > H - 38 && y < H - 8 {
-                        r = 90.0;
-                        gg = 140.0;
-                        b = 200.0;
-                    }
-                }
-                let i = ((y * W + x) * 4) as usize;
-                img[i] = r as u8;
-                img[i + 1] = gg as u8;
-                img[i + 2] = b as u8;
-                img[i + 3] = 255;
-            }
-        }
-
-        let Some(data) = render_lens_frame(&img, W, H, RW, RH) else {
-            eprintln!("无 GPU adapter，无法生成预览");
-            return;
-        };
-        // 模拟生产 blit：0.6x 离屏线性放大回全尺寸，再按 premultiplied
-        // alpha over 合成回原桌面 —— 这才是用户视角的最终效果
-        // （直接存 RGBA 的话，查看器会把透明区显示成白，看不清透镜扭曲）。
-        let frame = image::RgbaImage::from_vec(RW, RH, data).expect("帧尺寸不符");
-        let up = image::imageops::resize(&frame, W, H, image::imageops::FilterType::Triangle);
-        let mut composed = img.clone();
-        for (dst, src) in composed.chunks_exact_mut(4).zip(up.chunks_exact(4)) {
-            let a = src[3] as u16;
-            let inv = 255 - a;
-            for c in 0..3 {
-                // premultiplied over：out = src.rgb + dst.rgb × (1 - src.a)
-                dst[c] = (src[c] as u16 + dst[c] as u16 * inv / 255).min(255) as u8;
-            }
-            dst[3] = 255;
-        }
-        let out =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/lens-preview.png");
-        image::save_buffer(&out, &composed, W, H, image::ColorType::Rgba8).expect("预览图落盘失败");
-        eprintln!("预览图 → {}", out.display());
-    }
-}
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

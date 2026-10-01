@@ -55,8 +55,32 @@ pub struct ClassWin {
 }
 
 impl ClassWin {
-    /// 打开时的目标矩形（屏幕上方居中）。打断判定（miniwin）也用它排除
-    /// 「点在课堂总结窗上」的点击。
+    /// 最近一次原生视口采样的可见客户区，使用全局物理像素。
+    /// 不用目标位置推测窗口是否已创建/移到位，也不借用 ROOT 的 DPI。
+    /// 这不是 hook 点击瞬间的窗口归属；移动/显隐与采样之间仍有延迟。
+    pub fn visible_rect_physical(&self, ctx: &Context) -> Option<Rect> {
+        if !self.open || crate::app::desktop_suspended(ctx) {
+            return None;
+        }
+        let zoom = ctx.zoom_factor();
+        ctx.input(|input| {
+            let viewport = input.raw.viewports.get(&viewport_id())?;
+            if viewport.visible() == Some(false) {
+                return None;
+            }
+            let rect = viewport.inner_rect?;
+            let ppp = viewport.native_pixels_per_point? * zoom;
+            if !ppp.is_finite() || ppp <= 0.0 || !rect.is_finite() {
+                return None;
+            }
+            let physical = Rect::from_min_max(rect.min * ppp, rect.max * ppp);
+            // 常驻休眠 HWND 仍会报告 1x1 客户区；打开命令尚未落地时也不能排除。
+            (physical.is_finite() && physical.width() > 1.0 && physical.height() > 1.0
+                && rect.width() > 1.0 && rect.height() > 1.0).then_some(physical)
+        })
+    }
+
+    /// 打开时的布局目标矩形（屏幕上方居中），不能用于实际点击排除。
     pub fn target_rect(theme: Theme, monitor_size: Vec2) -> Rect {
         let m = theme.metrics;
         // 尺寸随显示器收窄（钳左上不钳右下，窗口比屏大时关闭钮会画出屏外）。
@@ -137,7 +161,9 @@ impl ClassWin {
                 .with_always_on_top()
                 // 不抢焦点：老师可能正在操作电脑；关闭靠鼠标点。
                 .with_active(false)
-                .with_transparent(true)
+                // 正文、留白和圆角都属于不可穿透的交互客户区。
+                .with_transparent(false)
+                .with_mouse_passthrough(false)
                 .with_visible(!suspended)
                 .with_inner_size(if open { size } else { Vec2::new(1.0, 1.0) })
                 .with_position(if open { target } else { OFFSCREEN }),
@@ -147,17 +173,20 @@ impl ClassWin {
                     return;
                 };
                 // 滑入：从顶外到目标位，ease-out；动画期间自驱 60fps。
-                let since = open_since.lock().unwrap();
+                let mut since = open_since.lock().unwrap();
                 if let Some(t0) = *since {
                     let t = (t0.elapsed().as_secs_f32() / SLIDE_SECS).clamp(0.0, 1.0);
                     let eased = 1.0 - (1.0 - t).powi(3);
                     let y = target.y * eased + (-size.y) * (1.0 - eased);
+                    // 即使两帧间停顿跨过终点，也要显式落到最终位置。
+                    ui.ctx().send_viewport_cmd_to(
+                        viewport_id(),
+                        ViewportCommand::OuterPosition(if t < 1.0 { Pos2::new(target.x, y) } else { target }),
+                    );
                     if t < 1.0 {
-                        ui.ctx().send_viewport_cmd_to(
-                            viewport_id(),
-                            ViewportCommand::OuterPosition(Pos2::new(target.x, y)),
-                        );
                         ui.ctx().request_repaint_after(POLL);
+                    } else {
+                        *since = None;
                     }
                 }
                 drop(since);
@@ -166,6 +195,7 @@ impl ClassWin {
                 let skin = Skin::new(theme, &whale);
                 if paint(ui, &skin, subject, summary, *over_limit, date, status, *retry, &retry_wanted) {
                     close_wanted.store(true, Ordering::Relaxed);
+                    ui.ctx().request_repaint_of(ViewportId::ROOT);
                 }
             },
         );
@@ -211,8 +241,10 @@ fn paint(
     let close = IconButton::new(Icon::Close)
         .ghost()
         .id_salt("neo-classwin-close")
-        .show_at(ui, &d, close_center)
-        .clicked();
+        .show_at(ui, &d, close_center);
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-classwin-close-probe"), close.rect));
+    let close = close.clicked();
 
     let title = if date.is_empty() {
         format!("课堂总结 · {subject}")
@@ -238,7 +270,7 @@ fn paint(
         text_left(
             ui.painter(),
             warn_rect,
-            "总结超过建议的 1500 字（仍受安全预算限制）",
+            "总结超过建议的 1500 字",
             skin.prop(skin.t().caption),
             p.label_tertiary,
         );
@@ -267,6 +299,7 @@ fn paint(
             ui.label(egui::RichText::new(status).color(if retry { p.error } else { p.label_tertiary }));
             if retry && ui.button("重试保存 / 索引").clicked() {
                 retry_wanted.store(true, Ordering::Relaxed);
+                ui.ctx().request_repaint_of(ViewportId::ROOT);
             }
             ui.separator();
             markdown::render(ui, skin, summary, false);
@@ -327,58 +360,5 @@ impl ClassDot {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn summary_uses_interactive_viewport_with_desktop_suspend() {
-        let ctx = Context::default();
-        ctx.set_embed_viewports(false);
-        let mut monitor = ClassMonitor::default();
-        monitor.seed_pending_summaries();
-        let mut win = ClassWin::default();
-        let theme = Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard);
-        for suspended in [false, true, false] {
-            ctx.begin_pass(egui::RawInput::default());
-            ctx.data_mut(|d| d.insert_temp(egui::Id::new("neo-desktop-suspended"), suspended));
-            win.tick(&ctx, &mut monitor, theme, None);
-            let mut output = ctx.end_pass();
-            output.textures_delta.clear();
-            let viewport = &output.viewport_output[&viewport_id()];
-            assert!(viewport.viewport_ui_cb.is_some());
-            assert_ne!(viewport.builder.mouse_passthrough, Some(true));
-            assert_eq!(viewport.builder.visible, Some(!suspended));
-        }
-    }
-
-    #[test]
-    fn failed_close_keeps_card_and_renders_explicit_retention() {
-        let ctx = Context::default();
-        neo_theme::fonts::install(&ctx);
-        let theme = Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard);
-        theme.apply(&ctx);
-        let whale = WhaleMark::load(&ctx);
-        let skin = Skin::new(theme, &whale);
-        let mut monitor = ClassMonitor::default();
-        monitor.seed_pending_summaries();
-        monitor.dismiss();
-        let ready = monitor.presenting().unwrap();
-        assert!(ready.close_blocked);
-        assert_eq!(monitor.pending_saves(), 4);
-        for state in [SaveState::Unsaved, SaveState::IndexFailed] {
-            let status = save_status(true, state, ready.close_blocked);
-            let mut output = ctx.run_ui(egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(640.0, 460.0))),
-                ..Default::default()
-            }, |ui| {
-                paint(ui, &skin, "数学", "保留正文", false, "2026-09-28", &status, true, &AtomicBool::new(false));
-            });
-            output.textures_delta.clear();
-            for needle in ["已保留卡片，未关闭", "重试保存 / 索引"] {
-                assert!(output.shapes.iter().any(|shape| {
-                    matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains(needle))
-                }), "缺少可见提示：{needle}");
-            }
-        }
-    }
-}
+#[path = "classwin_tests.rs"]
+mod tests;

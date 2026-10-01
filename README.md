@@ -67,7 +67,7 @@ not upstream ports.
 | 🎙️ **On-device wake word** | Re-implementation of the `livekit-wakeword` inference chain (mel → speaker embedding → wake classifier) on local ONNX models. 16 kHz input, 80 ms frames, 2 s sliding window. |
 | 🗣️ **Offline speech-to-text** | Silero VAD endpointing + SenseVoice-Small (int8) via in-process sherpa-onnx. Zero network dependency. |
 | 🌊 **Liquid-glass marquee** | Fullscreen transparent overlay on DX12 + DirectComposition: live desktop capture drives real-time **refraction with chromatic dispersion, Fresnel rim light, and roughness blur**, wrapped in a seven-color pastel band that hugs the screen edges — corners included. Breathes with the mic level. |
-| 🪟 **Unified render layer** | Mini window, confirmation cards, class summaries and effect flashes are all *cards on one persistent overlay* — no auxiliary windows are ever created, so none of them can flash black. Cards hit-test precisely; clicks fall through everywhere else. |
+| 🪟 **Separate visual and input layers** | Passive status cards and effects share a persistent, click-through overlay. Confirmation, question and classroom dialogs use independent opaque windows that receive input; the visual overlay never takes focus. |
 | 💬 **Streaming conversation** | OpenAI-compatible `/chat/completions` client (DeepSeek by default) with CommonMark + KaTeX rendering (a Rust port of KaTeX's layout). Cancellable at any moment — even mid-tool-execution. |
 | 🛠️ **Gated local tools** | 20 tools: files, documents, shell (PowerShell + bundled Git Bash), screenshots, UIA automation, web search, memory. Write/exec actions require on-screen confirmation first. |
 | ❓ **Ask-the-user tool** | When the model is unsure, `ask_user` pops a question card with tappable options instead of guessing. |
@@ -78,30 +78,8 @@ not upstream ports.
 
 ## Screenshots
 
-| Conversation · dark · 1080p | Generating (stoppable) |
-|:---:|:---:|
-| ![hero dark](docs/screens/01-hero-dark-1080p.png) | ![generating](docs/screens/08-generating-1080p.png) |
-
-| Tool cards | Math rendering (KaTeX port) | Mini window (done state) |
-|:---:|:---:|:---:|
-| ![tool cards](docs/screens/14-tool-cards-1080p.png) | ![math](docs/screens/16-math-1080p.png) | ![miniwin](docs/screens/30-miniwin-done-1080p.png) |
-
-<details>
-<summary><b>More snapshots</b> — light theme, 4K far-view, confirmation dialogs, settings</summary>
-<br>
-
-The full gallery lives in [`docs/screens/`](docs/screens/), including:
-
-- Light theme & 4K far-view states
-- Tool confirmation dialogs (normal / long-content / scrolled)
-- Settings panels (appearance, model, display)
-- Attachment chips & CommonMark edge cases (tables, nested lists, reference links)
-- Session action sheets & reasoning traces
-
-All snapshots are produced by the offscreen render tests (`cargo test`), so they never
-drift far from what the app actually draws.
-
-</details>
+Offscreen render tests write snapshots to the local `docs/screens/` directory.
+The `docs/` directory is not tracked in Git; screenshots are not included in a clone.
 
 ## The Voice Loop
 
@@ -135,15 +113,17 @@ sequenceDiagram
 
 | Requirement | Notes |
 |---|---|
-| **Windows 10 2004 (20H1) or later** | Capture exclusion (`WDA_EXCLUDEFROMCAPTURE`) is available from 2004 onward. |
+| **Windows 10 2004 (20H1), build 19041, or later** | Minimum supported OS, including Windows 11. Capture exclusion (`WDA_EXCLUDEFROMCAPTURE`) requires 2004+. |
+| **Native x64 (AMD64) Windows** | 32-bit Windows and ARM64 (including x64 emulation) are unsupported. The installer rejects them before unpacking. |
 | **DX12 or OpenGL-capable GPU** | DX12 is preferred; OpenGL is the main-window fallback. The desktop-refraction overlay requires DX12. |
 | **Microphone** | For wake word & dictation. Everything else works without one. |
 | **Rust 1.95+** | Only for building from source. |
 
 > [!NOTE]
-> On pre-2004 builds, or in remote sessions where capture exclusion fails, Neo still
-> runs — the overlay degrades to a halo-only mode (no desktop refraction), so the
-> marquee can never feed back into its own capture.
+> Windows builds older than 19041 are unsupported; halo-only rendering does not
+> lower the OS requirement. On supported systems where capture exclusion fails
+> (for example, some remote sessions), the overlay falls back to halo-only mode
+> without desktop refraction to avoid capture feedback.
 
 ### Automatic renderer selection
 
@@ -163,8 +143,11 @@ written to `graphics-help.txt` in the startup log directory on failure.
 
 ## Download & Install
 
-Pre-built artifacts are published on the
-[Releases](https://github.com/ChidcGithub/Neo/releases) page:
+**0.1.0 is not released yet.** The workspace version is prepared as `0.1.0`.
+Maintainers keep outstanding gates in the local release acceptance checklist
+(`docs/release-0.1.0.md`, not tracked in Git or included in a clone).
+Published versions, when available, are on the
+[Releases](https://github.com/ChidcGithub/Neo/releases) page with these artifact names:
 
 | Artifact | Shape | Pick it if… |
 |---|---|---|
@@ -175,8 +158,38 @@ Both bundles contain the same payload: `neo.exe`, wake-word models, STT models
 (SenseVoice int8 + Silero VAD), and a portable Git Bash runtime for the Bash tool.
 
 > [!TIP]
-> The installer is unsigned for now — SmartScreen will warn once. User data
-> (database, memories) lives in `%APPDATA%\Neo` and survives uninstalls.
+> The installer is unsigned for now — Windows may show a SmartScreen warning.
+> User data (database, memories) lives in `%APPDATA%\Neo` by default and survives
+> uninstalls. The portable bundle also uses this data location by default.
+
+### Updates, backups & removal
+
+- **Update checks only read public GitHub release metadata.** Automatic checking
+  can be disabled in settings; Neo does not automatically download or install
+  updates. Open the release page and download the chosen package yourself.
+- **Before upgrading**, exit Neo and back up `%APPDATA%\Neo` (or your `NEO_HOME`)
+  and any custom installation resources. The installer stages the new payload,
+  then swaps directories; it attempts rollback on failure. After a successful
+  upgrade, the complete old directory is retained at the backup path printed in
+  the installation details. Custom resources remain in that backup, not merged
+  into the new installation. Inspect it before manually cleaning it up; do not
+  delete a backup needed for recovery.
+- **Uninstall preserves resources:** without a per-file ownership manifest, only
+  known top-level program files, shortcuts and the uninstall registration are
+  removed. Nonempty `assets/`, `assets-stt/`, `runtime/` and unknown files remain,
+  as does user data. Review and back up these leftovers before manual removal.
+- **Reinstall:** the current uninstaller records the retained directory's identity
+  in HKCU so the installer can recognize it for the same user. If an older
+  uninstaller left a nonempty directory without this record, rename that directory
+  to preserve it, then install at the original path (or use a new empty directory).
+  Do not delete custom files or fabricate a residue record to bypass the check.
+- **App-local MSVC CRT servicing belongs to the distributor.** Required CRT DLLs
+  are collected from licensed Visual Studio redistributables. Security fixes to
+  these bundled copies require Neo to be rebuilt/repackaged and reissued; updating
+  a machine-wide VC++ runtime does not replace them. Windows supplies UCRT/API sets.
+
+These are the current installer policies, not a claim that clean Windows 10
+install/upgrade/uninstall/reinstall acceptance has passed.
 
 ## Build from Source
 
@@ -307,7 +320,9 @@ the confirmation policy, and the docs are derived from that single declaration.
 ## Safety & Privacy
 
 - **Voice stays on the machine.** Wake word and STT are fully offline ONNX models.
-- **The LLM is the only network dependency** (plus `web_search`, only when invoked).
+- **Network use:** configured model endpoints, `web_search` when invoked, and
+  GitHub release metadata for update checks. Update checks send no application
+  data or API credentials and do not download release assets.
 - **The overlay excludes itself from capture** (`WDA_EXCLUDEFROMCAPTURE`), so lesson
   screenshots, recordings, and meeting shares never contain the marquee or the cards.
 - **No admin rights, ever.** Per-user install, per-user data, per-user registry hive.
@@ -321,7 +336,16 @@ The single source of truth is `[workspace.package].version` in the root
 [`Cargo.toml`](Cargo.toml); every crate inherits it, and the UI reads it via
 `env!("CARGO_PKG_VERSION")`.
 
-Pushing a `v*` tag triggers the release pipeline:
+Pushing a matching `v*` tag triggers the release pipeline after its check job.
+Manual dispatch requires that the version tag already exists and points to the
+selected commit; the workflow never implicitly creates a tag from the default branch.
+This automation does **not** replace local release acceptance, recorded by maintainers
+in `docs/release-0.1.0.md` (not tracked in Git): STT/MinGit hash pinning,
+third-party license review, full DLL dependency closure and clean Windows 10
+lifecycle validation remain pending. `tools/check_release.py` checks nonempty
+payload files and only a limited x64 PE / app-local CRT dependency scope.
+
+Pipeline overview:
 
 ```mermaid
 flowchart LR
@@ -358,4 +382,6 @@ flowchart LR
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — Copyright (c) 2026 Chidc (the workspace author).
+Third-party code, models, fonts and runtimes retain their own licenses; the
+bundled third-party LICENSE/notice review is still pending for 0.1.0.

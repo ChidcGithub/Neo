@@ -1,7 +1,7 @@
-# tools —— 上游素材抽取 + 随包运行时
+# tools —— 上游素材抽取 + 随包运行时与发布检查
 
-Neo 的视觉是"复刻 DeepSeek Harness"，所以**图形几何不靠手绘，靠抽取**。
-这里放着抽取脚本；产物直接进源码。
+这里保留上游素材抽取、运行时获取和发行包辅助工具。
+当前 UI 图标使用 Phosphor 字体；上游 bundle 抽取仅供参考，不是构建必需步骤。
 
 ## 上游包从哪来
 
@@ -29,20 +29,17 @@ Neo 目前对齐的版本与用到的包：
 > 所以脚本是"从 bundle 里按模式抓结构"，不是解析真正的源码。改上游版本后
 > **必须重跑 + 看一次产物 diff**，别假设格式没变。
 
-## 两步流水线
+## 现存的素材抽取工具
 
 ```bash
-# ① 从 bundle 抽出全部图标的几何 → icons.json（67 个）
+# 从上游 bundle 抽取几何，输出到脚本 OUT 指定的 icons.json
 python tools/extract_icons.py
-
-# ② 按映射表生成 Rust 常量 → crates/neo-ui/src/icons/paths.rs
-python tools/gen_icons.py
 ```
 
-两个脚本里的路径是**绝对路径**（指向本机参考副本），换机器要改。
-`gen_icons.py` 负责把 SVG `transform="translate(...)"` **烘焙进坐标**——
-上游有 5 个图标靠 transform 把图案摆进 viewBox，漏掉它字形就会偏移
-（`FolderClose` 会偏出左上角，是个很容易踩的坑）。
+`extract_icons.py` 的 `SRC` / `OUT` 是指向本机参考副本的**绝对路径**，
+换机器需先调整。脚本保留 SVG 的 `transform` 字段，不负责烘焙变换或生成 Rust 常量。
+旧 SVG 图标生成流程已退役；当前映射在 `crates/neo-ui/src/icons.rs`，
+字体由 `neo-theme` 内嵌。不要把参考 JSON 当作当前 UI 的自动生成输入。
 
 ## 为什么不能只抄"看起来像"的形状
 
@@ -50,19 +47,18 @@ python tools/gen_icons.py
 （外轮廓 + 内轮廓）填出来，不是一笔描边。手绘同类线条时，粗细、端点、圆角
 必然差一截 —— 而且改不动：上游换个尺寸，你就得重画一遍。
 
-因此渲染侧也配套做了改动：`neo_theme::svg` 用扫描线 + 填充规则做带洞填充
-（`epaint` 的 `fill_closed_path` 是三角扇，只能填凸多边形），图标先光栅化成
-白色 alpha 纹理、绘制时 `tint` 上色。
+对抽取出的 SVG 做比对时，仍需保留填充规则与变换，不能只比较路径字符串。
+这不代表当前 Phosphor 字体图标仍走旧的逐图标 SVG 纹理管线。
 
 ## 校验手法
 
-改完一定要**看**，而且不能只看缩略图：
+当前图标映射可用现有纯逻辑测试检查（不生成截图）：
 
-- `cargo test -p neo-ui dump_glyphs -- --ignored --nocapture`
-  把字形打成 ASCII 字符画 —— 挖空、朝向、偏移一眼可见；
-- `cargo test -p neo-ui` 里的 `rasterized_ink_matches_path_bounds`
-  用"墨迹包围盒 == 路径几何包围盒"守住翻转/缩放/漏 transform 这类静默错误；
-- 快照（`docs/screens/`）+ `tools/` 之外的临时脚本可以按像素采样核对位置。
+```bash
+cargo test --locked -p neo-ui --lib every_icon_maps_to_a_single_pua_char
+```
+
+该测试只验证每个映射是单个私有使用区字符，不证明字形视觉正确或完成第三方许可审查。
 
 ---
 
@@ -79,6 +75,10 @@ python tools/fetch_runtime.py --force         # 重下
 产物落 `runtime/gitbash/`（**不进版本库**），工具按
 `NEO_GIT_BASH` → `runtime/gitbash/` → PATH → 系统安装 的顺序挑宿主。
 
+下载有大小/时间预算、解压路径检查和暂存验证；这些**不等于完整性 hash pin**。
+当前发布工作流未固定 MinGit 版本，STT 与 MinGit 下载均仍待补充可信预期哈希并审计
+第三方 LICENSE/notice；指定 `--version` 或使用 HTTPS 也不能代替完整性校验。
+
 两个实测踩到的坑，都写进脚本了：
 
 1. **GitHub 的 release 资产在国内下不动**（直接 `TimeoutError`）。
@@ -87,3 +87,27 @@ python tools/fetch_runtime.py --force         # 重下
 2. **镜像上的资产名和 tag 不一样**：tag 是 `v2.55.0.windows.5`，
    资产叫 `MinGit-2.55.0.5-64-bit.zip`（少一段 `.windows`）。
    所以必须先问 API 拿文件名再拼地址 —— 从 tag 拼出来的地址是 404。
+
+## 发行辅助工具
+
+- `make_installer_art.py`：从 `crates/neo-app/src/brand/whale_path.rs` 生成 NSIS
+  图标、位图及预览，依赖 Pillow；工作流使用
+  `python tools/make_installer_art.py --out build/installer-art`。
+- `installer.nsi`：每用户免提权安装器；最低 Windows 10 2004 / build 19041，
+  仅原生 AMD64，不支持 ARM64 仿真。升级保留完整旧目录备份，卸载保留非空资源目录；
+  旧版无可信卸载残留记录时应先将原目录改名保留，再安装到原路径。
+  详见[安装、备份与卸载说明](../README.md#updates-backups--removal)。
+- `check_release.py`：检查必需载荷非空，审计 `neo.exe`、`assets/*.dll` 及递归导入的
+  白名单 CRT 的 x64 PE；**不覆盖完整第三方 DLL 闭包、MinGit PE/依赖或模型有效性**。
+  `--redist-dir` 仅接受获授权 Visual Studio 的 x64 CRT Redist 目录，不从 System32
+  收集 DLL。app-local CRT 的安全更新须由发行方更新载荷并重发 Neo。
+
+不下载、不安装的定向检查：
+
+```bash
+python -B -m unittest tools.test_installer tools.test_check_release tools.test_fetch_runtime tools.test_release_workflow -v
+```
+
+这些测试不等同于实际安装验收。**0.1.0 尚未发布**，完整发布门禁和已知未验项由
+维护者记录在仓库根目录下的本地验收清单 `docs/release-0.1.0.md` 中；`docs/` 不纳入
+Git 跟踪，也不随克隆提供。

@@ -1,4 +1,8 @@
-"""核验发行包的 x64 PE 导入，仅收集依赖所需且获授权的 MSVC CRT DLL。"""
+"""检查发行必需载荷非空，核验有限范围的 x64 PE 导入并收集获授权的 MSVC CRT。
+
+PE 范围仅为 neo.exe、assets/*.dll 及其递归导入的白名单 CRT；
+不验证完整第三方 DLL 依赖闭包、模型有效性或 MinGit 运行能力。
+"""
 import argparse
 from pathlib import Path
 import re
@@ -14,6 +18,31 @@ CRT_NAMES = (
 CRT_NAME = re.compile("(?:" + "|".join(re.escape(name) for name in CRT_NAMES) + ")", re.I)
 CRT_FAMILY = re.compile(r"(?:vcruntime|msvcp|msvcr|concrt|vccorlib).*\.dll", re.I)
 MODELS = ("melspectrogram.onnx", "embedding_model.onnx", "hi_neo.onnx")
+REQUIRED_FILES = (
+    "neo.exe", *(f"assets/{name}" for name in MODELS), "assets/onnxruntime.dll",
+    "assets-stt/sense-voice/model.int8.onnx", "assets-stt/sense-voice/tokens.txt",
+    "assets-stt/vad/silero_vad.onnx", "LICENSE", "README.md",
+)
+# fetch_runtime.ensure_bash_named 将 MinGit 的 usr/bin/sh.exe 补名为 usr/bin/bash.exe；
+# find_bash 也接受 bin/bash.exe，不能按脚本顶端的布局示意只检查 bin/。
+BASH_PATHS = ("runtime/gitbash/bin/bash.exe", "runtime/gitbash/usr/bin/bash.exe")
+
+
+def require_nonempty_file(path):
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ValueError(f"Required release resource missing/empty: {path}")
+
+
+def validate_payload(package):
+    for name in REQUIRED_FILES:
+        require_nonempty_file(package / name)
+    candidates = [package / name for name in BASH_PATHS]
+    present = [path for path in candidates if path.exists() or path.is_symlink()]
+    if not present:
+        raise ValueError("Required release resource missing/empty: " + " or ".join(map(str, candidates)))
+    # 两种布局可共存，但不能让空的优先候选遮蔽另一个可用的 bash。
+    for path in present:
+        require_nonempty_file(path)
 
 
 def parse_pe_report(report):
@@ -54,11 +83,11 @@ def validate_redist_dir(directory):
 def check_package(package, dumpbin, redist_dir=None):
     package = Path(package)
     assets = package / "assets"
-    for path in [package / "neo.exe", *(assets / name for name in MODELS), assets / "onnxruntime.dll"]:
-        if not path.is_file() or path.stat().st_size == 0:
-            raise ValueError(f"Required release resource missing/empty: {path}")
-    redist = validate_redist_dir(Path(redist_dir)) if redist_dir else None
+    validate_payload(package)
     pending = [package / "neo.exe", *sorted(assets.glob("*.dll"))]
+    for binary in pending:
+        require_nonempty_file(binary)
+    redist = validate_redist_dir(Path(redist_dir)) if redist_dir else None
     inspected = set()
     required = set()
     while pending:
@@ -74,17 +103,20 @@ def check_package(package, dumpbin, redist_dir=None):
             target = package / name
             if redist:
                 source = redist / name
-                if not source.is_file():
-                    raise ValueError(f"Required CRT is absent from licensed redistributables: {source}")
+                if not source.is_file() or source.stat().st_size == 0:
+                    raise ValueError(f"Required CRT is absent from licensed redistributables or empty: {source}")
                 if target not in inspected:
                     shutil.copy2(source, target)
                     print(f"App-local CRT: {source} -> {target}")
-            elif not target.is_file():
-                raise ValueError(f"Missing app-local CRT: {target}; supply licensed VS redistributables")
+            elif not target.is_file() or target.stat().st_size == 0:
+                raise ValueError(f"Missing app-local CRT or empty file: {target}; supply licensed VS redistributables")
             pending.append(target)
-    print("Verified x64 PE images:", len(inspected))
+    print("Required release payload files exist and are non-empty (including bundled Bash).")
+    print("Verified x64 PE images (neo.exe, assets/*.dll and imported allowlisted CRT only):", len(inspected))
     print("Required app-local CRT:", ", ".join(sorted(required)) or "none")
-    print("Static PE/import audit only; Windows 10 19041 runtime validation is still required.")
+    print("Full third-party DLL dependency closure is NOT audited; MinGit PE images/dependencies "
+          "and model validity are NOT audited.")
+    print("Static checks only; Windows 10 19041 runtime validation is still required.")
     return required
 
 

@@ -5,6 +5,8 @@
 //! 混淆或没有标记的秘密，不能把任意输入变成安全日志。
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
@@ -198,7 +200,216 @@ fn logger() -> &'static Logger {
 
 /// 只记录安全概括；禁止把原始错误的 Display/Debug 结果传进来。
 pub fn record(level: Level, component: &str, message: &str) {
+    #[cfg(test)]
+    if TEST_BUFFER.with(|slot| {
+        if let Some(buffer) = slot.borrow_mut().as_mut() {
+            buffer.push(level, component, message, 0);
+            true
+        } else { false }
+    }) { return; }
     logger().record(level, component, message);
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BUFFER: std::cell::RefCell<Option<Buffer>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 调用点测试隔离日志，避免并行 UI 清空日志导致偶发失败；不接管其它线程。
+#[cfg(test)]
+pub(crate) fn capture_for_test(run: impl FnOnce()) -> Snapshot {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) { TEST_BUFFER.with(|slot| *slot.borrow_mut() = None); }
+    }
+    TEST_BUFFER.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Buffer::new(MAX_ENTRIES, MAX_BYTES, MAX_ENTRY_BYTES));
+    });
+    let _reset = Reset;
+    run();
+    TEST_BUFFER.with(|slot| slot.borrow_mut().as_mut().unwrap().snapshot())
+}
+
+/// 仅本进程分配的关联 ID；不能使用模型 call_id、数据库 ID 或原文指纹。
+#[derive(Clone, Copy, Debug)]
+pub struct Span {
+    pub id: u64,
+    parent: Option<u64>,
+    component: &'static str,
+    started: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Started, Ready, AwaitingConfirm, Approved, Denied, Answered, Skipped,
+    Dispatched, WorkerFinished, Delivered, ResultDiscarded, CancelRequested,
+    Completed, Failed, Rejected, Abandoned,
+}
+
+impl Phase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Started => "started", Self::Ready => "ready",
+            Self::AwaitingConfirm => "awaiting_confirm", Self::Approved => "approved",
+            Self::Denied => "denied", Self::Answered => "answered", Self::Skipped => "skipped",
+            Self::Dispatched => "dispatched", Self::WorkerFinished => "worker_finished",
+            Self::Delivered => "delivered", Self::ResultDiscarded => "result_discarded",
+            Self::CancelRequested => "cancel_requested", Self::Completed => "completed",
+            Self::Failed => "failed", Self::Rejected => "rejected", Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// 非结构化错误只允许映射到固定类别，不能把原文作为字段传入。
+#[derive(Clone, Copy, Debug)]
+pub enum Failure {
+    Tool(neo_tools::ErrorKind),
+    HttpClient, HttpServer, HttpOther, Transport, ModelOther,
+    Spawn, Disconnected, Budget, ToolLimit, Storage, Configuration,
+}
+
+impl Failure {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tool(kind) => kind.as_str(),
+            Self::HttpClient => "http_4xx", Self::HttpServer => "http_5xx",
+            Self::HttpOther => "http_other", Self::Transport => "transport",
+            Self::ModelOther => "model_other", Self::Spawn => "thread_spawn",
+            Self::Disconnected => "channel_disconnected", Self::Budget => "budget",
+            Self::ToolLimit => "tool_limit", Self::Storage => "storage",
+            Self::Configuration => "configuration",
+        }
+    }
+}
+
+/// 只识别 neo-llm 固定前缀后的三位状态码，不扫描 URL、响应正文或任意数字。
+pub fn model_failure(error: &str) -> Failure {
+    let status = error.strip_prefix("接口返回 ")
+        .or_else(|| error.strip_prefix("模型列表接口返回 HTTP "));
+    if let Some(status) = status {
+        let bytes = status.as_bytes();
+        if bytes.len() > 3 && bytes[..3].iter().all(u8::is_ascii_digit)
+            && (status[3..].starts_with(' ') || status[3..].starts_with('，') || status[3..].starts_with('：'))
+        {
+            return match bytes[0] {
+                b'4' => Failure::HttpClient, b'5' => Failure::HttpServer,
+                b'1'..=b'3' => Failure::HttpOther, _ => Failure::ModelOther,
+            };
+        }
+    }
+    if error.starts_with("请求失败：") || error == "模型列表请求失败，请检查接口地址、密钥或网络" {
+        Failure::Transport
+    } else {
+        Failure::ModelOther
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct UiaFailure {
+    stage: &'static str,
+    hresult: u32,
+}
+
+/// 只读受控 UIA 错误封套中的第一个已知 stage/HRESULT 对；不保留 hint/窗口名。
+/// 未知格式降级为 ErrorKind，不尝试泛化解析 Windows Display 文本。
+fn uia_failure(tool: &str, error: &neo_tools::ToolError) -> Option<UiaFailure> {
+    if !matches!(tool, "click" | "screen_elements" | "screen_element_search")
+        || error.message.len() > MAX_INPUT_BYTES
+        || !error.message.starts_with("UIA 即时核验拒绝输入：")
+    { return None; }
+    const STAGES: &[&str] = &[
+        "ElementFromHandle", "window.GetRuntimeId", "ElementFromPoint", "CurrentIsPassword",
+        "CurrentControlType", "CurrentName", "window.CurrentName", "CurrentBoundingRectangle",
+        "hit.identity", "CurrentIsEnabled", "CurrentIsOffscreen", "CurrentIsKeyboardFocusable",
+        "GetCurrentPattern", "GetCurrentPattern(Invoke)", "GetCurrentPattern(Toggle)",
+        "GetCurrentPattern(SelectionItem)", "GetCurrentPattern(ExpandCollapse)",
+        "passive_hit", "passive_hit.CurrentControlType", "passive_hit.CurrentIsKeyboardFocusable",
+        "passive_hit.CurrentIsPassword", "RawViewWalker.GetParentElement", "CoInitializeEx",
+        "CoCreateInstance", "RawViewWalker", "DwmGetWindowAttribute", "EnumDisplayMonitors", "CompareElements",
+    ];
+    for part in error.message.split("stage=").skip(1).take(16) {
+        let Some((stage, rest)) = part.split_once(", HRESULT=0x") else { continue; };
+        let Some(&stage) = STAGES.iter().find(|&&known| known == stage) else { continue; };
+        let hex = rest.as_bytes().get(..8)?;
+        if !hex.iter().all(u8::is_ascii_hexdigit)
+            || !rest[8..].starts_with(')')
+        { continue; }
+        // 原 API 名含凭据标记，映射安全别名，避免纵深脱敏隐藏整条事件。
+        let stage = match stage {
+            "CurrentIsPassword" => "sensitive_field_check",
+            "passive_hit.CurrentIsPassword" => "passive_hit.sensitive_field_check",
+            _ => stage,
+        };
+        return Some(UiaFailure { stage, hresult: u32::from_str_radix(&rest[..8], 16).ok()? });
+    }
+    None
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Details {
+    pub tool: Option<&'static str>,
+    pub failure: Option<Failure>,
+    pub background: Option<bool>,
+    pub cancel_observed: Option<bool>,
+    pub count: Option<usize>,
+    pub uia: Option<UiaFailure>,
+}
+
+pub fn known_tool(name: &str) -> &'static str {
+    neo_tools::find(name).map(|tool| tool.name).unwrap_or("unknown")
+}
+
+impl Details {
+    pub fn tool(name: &str) -> Self {
+        Self { tool: Some(known_tool(name)), ..Self::default() }
+    }
+
+    pub fn outcome(outcome: &neo_tools::Outcome) -> Self {
+        let mut details = Self::tool(outcome.tool);
+        if let Some(error) = &outcome.error {
+            details.failure = Some(Failure::Tool(error.kind));
+            details.uia = uia_failure(outcome.tool, error);
+        }
+        if outcome.is_ok() && matches!(outcome.tool, "powershell" | "bash") {
+            // 只接受 JSON bool；不记录 PID、command、cwd、stdout 或任意其它 data。
+            details.background = outcome.data.get("background").and_then(serde_json::Value::as_bool);
+        }
+        details
+    }
+}
+
+impl Span {
+    pub fn new(component: &'static str, parent: Option<u64>) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let component = match component {
+            "task" | "tool" | "model" | "demo" | "model_list" | "compaction" => component,
+            _ => "diagnostic",
+        };
+        let id = NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("diagnostic id exhausted");
+        Self { id, parent, component, started: Instant::now() }
+    }
+
+    fn message(self, phase: Phase, details: Details) -> String {
+        let elapsed = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let mut message = format!("event={} id={} elapsed_ms={elapsed}", phase.label(), self.id);
+        if let Some(parent) = self.parent { let _ = write!(message, " parent={parent}"); }
+        if let Some(tool) = details.tool { let _ = write!(message, " tool={}", known_tool(tool)); }
+        if let Some(failure) = details.failure { let _ = write!(message, " kind={}", failure.label()); }
+        if let Some(value) = details.background { let _ = write!(message, " background={value}"); }
+        if let Some(value) = details.cancel_observed { let _ = write!(message, " cancel_observed={value}"); }
+        if let Some(count) = details.count { let _ = write!(message, " count={count}"); }
+        if let Some(uia) = details.uia { let _ = write!(message, " uia_stage={} hresult=0x{:08X}", uia.stage, uia.hresult); }
+        message
+    }
+
+    pub fn event(self, phase: Phase, details: Details) {
+        let level = if details.failure.is_some() || matches!(phase, Phase::Failed | Phase::Rejected) {
+            Level::Warn
+        } else { Level::Info };
+        record(level, self.component, &self.message(phase, details));
+    }
 }
 
 /// 获取共享的有界脱敏视图；仅变更后首次读取复制条目，UI/剪贴板不持记录锁。
@@ -287,277 +498,5 @@ fn clip(text: &str, limit: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    #[test]
-    fn unchanged_thousand_entry_snapshots_avoid_repeated_string_copies() {
-        let mut buffer = Buffer::new(MAX_ENTRIES, MAX_BYTES, MAX_ENTRY_BYTES);
-        for index in 0..MAX_ENTRIES {
-            buffer.push(Level::Info, "test", &format!("安全事件 {index}"), index as u64);
-        }
-        let view = buffer.snapshot();
-        assert_eq!(view.entries.len(), MAX_ENTRIES);
-        assert!(view.entries.iter().zip(&buffer.entries).all(|(copy, original)| {
-            copy.component.as_ptr() != original.component.as_ptr()
-                && copy.message.as_ptr() != original.message.as_ptr()
-        }));
-        for repeats in [4, 60] {
-            let mut legacy_copies = 0;
-            let mut cached_copies = 0;
-            let mut rebuilt = 0;
-            for _ in 0..repeats {
-                // 与优化前相同的 collect/cloned 路径，活跃分配地址不可重用。
-                let legacy: Vec<_> = buffer.entries.iter().cloned().collect();
-                legacy_copies += legacy.iter().zip(&buffer.entries).map(|(a, b)| {
-                    usize::from(a.component.as_ptr() != b.component.as_ptr())
-                        + usize::from(a.message.as_ptr() != b.message.as_ptr())
-                }).sum::<usize>();
-                let next = buffer.snapshot();
-                rebuilt += usize::from(!Arc::ptr_eq(&view.entries, &next.entries));
-                cached_copies += next.entries.iter().zip(view.entries.iter()).map(|(a, b)| {
-                    usize::from(a.component.as_ptr() != b.component.as_ptr())
-                        + usize::from(a.message.as_ptr() != b.message.as_ptr())
-                }).sum::<usize>();
-            }
-            assert_eq!(legacy_copies, repeats * MAX_ENTRIES * 2);
-            assert_eq!((cached_copies, rebuilt), (0, 0));
-            println!("1000项，预热后{repeats}次读取：旧路径Box字符串复制={legacy_copies}，缓存复制={cached_copies}，缓存重建={rebuilt}");
-        }
-    }
-
-    #[test]
-    fn record_merge_eviction_and_clear_refresh_only_the_latest_snapshot() {
-        let logger = Logger {
-            started: Instant::now(),
-            buffer: Mutex::new(Buffer::new(1, 100, 40)),
-        };
-        let empty = logger.lock().snapshot();
-        logger.record(Level::Info, "test", "first");
-        let first = logger.lock().snapshot();
-        assert!(!Arc::ptr_eq(&empty.entries, &first.entries));
-        let old = Arc::downgrade(&first.entries);
-        logger.record(Level::Info, "test", "first");
-        let merged = logger.lock().snapshot();
-        assert!(!Arc::ptr_eq(&first.entries, &merged.entries));
-        assert_eq!(first.entries[0].occurrences, 1);
-        assert_eq!(merged.entries[0].occurrences, 2);
-        assert_eq!(merged.stats.merged, 1);
-        assert!(merged.entries[0].last_ms >= first.entries[0].last_ms);
-        drop(first);
-        assert!(old.upgrade().is_none(), "缓存不能累积历史快照");
-        logger.record(Level::Error, "test", "second");
-        let evicted = logger.lock().snapshot();
-        assert!(!Arc::ptr_eq(&merged.entries, &evicted.entries));
-        assert_eq!(evicted.stats.dropped, 2);
-        assert_eq!(&*evicted.entries[0].message, "second");
-        logger.lock().clear();
-        let cleared = logger.lock().snapshot();
-        assert!(!Arc::ptr_eq(&evicted.entries, &cleared.entries));
-        assert!(cleared.entries.is_empty());
-        assert_eq!(cleared.stats, Stats::default());
-        assert!(Arc::ptr_eq(&cleared.entries, &logger.lock().snapshot().entries));
-        logger.record(Level::Info, "test", "new");
-        assert_eq!(logger.lock().snapshot().stats.received, 1);
-    }
-
-    #[test]
-    fn dropped_and_truncated_records_invalidate_even_without_new_entries() {
-        for (count, bytes) in [(0, 100), (3, 1)] {
-            let mut buffer = Buffer::new(count, bytes, 20);
-            let before = buffer.snapshot();
-            buffer.push(Level::Warn, "test", &"长".repeat(100), 1);
-            let after = buffer.snapshot();
-            assert!(!Arc::ptr_eq(&before.entries, &after.entries));
-            assert!(after.entries.is_empty());
-            assert_eq!(after.stats.received, 1);
-            assert_eq!(after.stats.dropped, 1);
-            assert_eq!(after.stats.truncated, 1);
-            assert_eq!(before.stats, Stats::default());
-        }
-    }
-
-    #[test]
-    fn count_and_byte_limits_evict_oldest() {
-        let mut buffer = Buffer::new(2, 5, 20);
-        buffer.push(Level::Info, "c", "aa", 0);
-        buffer.push(Level::Info, "c", "bb", 1);
-        assert_eq!(buffer.entries.len(), 1);
-        assert_eq!(buffer.stats.bytes, 3);
-        assert_eq!(buffer.stats.dropped, 1);
-        let mut buffer = Buffer::new(2, 100, 20);
-        for message in ["a", "b", "c"] {
-            buffer.push(Level::Info, "c", message, 0);
-        }
-        assert_eq!(buffer.entries.len(), 2);
-        assert_eq!(&*buffer.entries[0].message, "b");
-        assert_eq!(buffer.stats.dropped, 1);
-    }
-
-    #[test]
-    fn oversized_entry_is_dropped_and_zero_capacity_is_safe() {
-        for (count, bytes) in [(0, 100), (3, 1)] {
-            let mut buffer = Buffer::new(count, bytes, 20);
-            buffer.push(Level::Info, "c", "aa", 0);
-            assert!(buffer.entries.is_empty());
-            assert_eq!(buffer.stats.dropped, 1);
-            assert_eq!(buffer.stats.bytes, 0);
-        }
-    }
-
-    #[test]
-    fn unicode_truncation_and_controls_stay_bounded() {
-        for limit in 0..40 {
-            let mut buffer = Buffer::new(10, 100, limit);
-            buffer.push(Level::Info, "组件", &"你好🦀".repeat(10), 0);
-            assert!(buffer.entries[0].bytes() <= limit);
-            assert_eq!(buffer.stats.truncated, 1);
-        }
-        assert_eq!(&*sanitize("你好\n警告\u{202e}", 100).0, "你好 警告 ");
-        assert_eq!(
-            &*sanitize("一\u{2028}二\u{2029}三\u{061c}\u{200e}\u{200f}", 100).0,
-            "一 二 三   "
-        );
-        assert!(sanitize(&"中".repeat(10_000), 100).0.contains("省略"));
-    }
-
-    #[test]
-    fn secrets_and_urls_are_not_retained() {
-        for text in [
-            "Authorization: Bearer TOPSECRET",
-            "{\"api_key\":\"TOPSECRET\"}",
-            "API-KEY = TOPSECRET",
-            "api key: TOPSECRET",
-            "access_token = TOPSECRET",
-            "password=\"TOPSECRET other words\"",
-            "Bearer TOPSECRET",
-            "Basic TOPSECRET",
-            "Basic\tTOPSECRET",
-            "Basic\nTOPSECRET",
-            "Basic\u{00a0}TOPSECRET",
-            "sk-TOPSECRET",
-            "ghp_TOPSECRET",
-            "github_pat_TOPSECRET",
-            "AIzaTOPSECRET",
-            "eyJhbGciOiJIUzI1NiJ9.TOPSECRET.signature",
-            "cookie: TOPSECRET",
-            "https://user:TOPSECRET@example.org/path?value=TOPSECRET#fragment",
-            "/models?value=TOPSECRET",
-            "TOKEN:\nTOPSECRET",
-            "组件 apiKey TOPSECRET",
-        ] {
-            assert_eq!(&*sanitize(text, 100).0, REDACTED, "{text}");
-            let mut buffer = Buffer::new(10, 100, 100);
-            buffer.push(Level::Error, text, text, 0);
-            let view = buffer.snapshot();
-            assert!(!format!("{view:?}").contains("TOPSECRET"));
-        }
-        assert_eq!(
-            &*sanitize("工具执行失败：timeout", 100).0,
-            "工具执行失败：timeout"
-        );
-    }
-
-    #[test]
-    fn interleaved_duplicates_are_aggregated_and_counted_on_eviction() {
-        let mut buffer = Buffer::new(2, 100, 40);
-        buffer.push(Level::Error, "tool", "失败", 1);
-        buffer.push(Level::Info, "app", "启动", 2);
-        buffer.push(Level::Error, "tool", "失败", 3);
-        assert_eq!(buffer.entries.len(), 2);
-        let entry = &buffer.entries[1];
-        assert_eq!(
-            (entry.first_ms, entry.last_ms, entry.occurrences),
-            (1, 3, 2)
-        );
-        assert_eq!(buffer.stats.merged, 1);
-        buffer.push(Level::Warn, "app", "警告", 4);
-        buffer.push(Level::Debug, "app", "调试", 5);
-        assert_eq!(buffer.stats.dropped, 3);
-        assert_eq!(buffer.stats.received, 5);
-    }
-
-    #[test]
-    fn clear_resets_all_counts_and_does_not_mutate_snapshots() {
-        let mut buffer = Buffer::new(1, 100, 12);
-        for message in ["a", "a", "很长很长很长很长很长"] {
-            buffer.push(Level::Error, "c", message, 0);
-        }
-        let before = buffer.snapshot();
-        assert!(before.stats.merged > 0 && before.stats.dropped > 0 && before.stats.truncated > 0);
-        buffer.clear();
-        assert!(buffer.entries.is_empty());
-        assert_eq!(buffer.stats, Stats::default());
-        assert_eq!(before.entries.len(), 1);
-        buffer.push(Level::Info, "c", "新", 1);
-        assert_eq!(buffer.stats.received, 1);
-    }
-
-    #[test]
-    fn parallel_eviction_clear_and_snapshot_preserve_invariants() {
-        let logger = Arc::new(Logger::new());
-        std::thread::scope(|scope| {
-            for worker in 0..4 {
-                let logger = &logger;
-                scope.spawn(move || {
-                    for index in 0..600 {
-                        logger.record(Level::Info, "test", &format!("安全事件 {worker}-{index}"));
-                        if worker == 0 && index % 100 == 0 {
-                            logger.lock().clear();
-                        }
-                        let view = logger.lock().snapshot();
-                        assert!(view.entries.len() <= MAX_ENTRIES);
-                        assert!(view.stats.bytes <= MAX_BYTES);
-                        assert_eq!(view.stats.bytes, view.entries.iter().map(Entry::bytes).sum::<usize>());
-                        assert_eq!(view.stats.received, view.stats.dropped + view.entries.iter().map(|entry| entry.occurrences).sum::<u64>());
-                        assert!(view.entries.windows(2).all(|pair| pair[0].last_ms <= pair[1].last_ms));
-                        assert!(view.entries.iter().all(|entry| entry.first_ms <= entry.last_ms));
-                    }
-                });
-            }
-        });
-    }
-
-    #[test]
-    fn poisoned_lock_does_not_disable_safe_logging() {
-        let logger = Arc::new(Logger::new());
-        let worker = Arc::clone(&logger);
-        assert!(std::thread::spawn(move || {
-            let _guard = worker.lock();
-            panic!("合成锁中毒");
-        }).join().is_err());
-        logger.record(Level::Warn, "test", "安全事件");
-        assert_eq!(logger.lock().snapshot().stats.received, 1);
-        logger.lock().clear();
-        assert_eq!(logger.lock().snapshot().stats, Stats::default());
-    }
-
-    #[test]
-    fn parallel_record_and_snapshot_are_consistent() {
-        let logger = Arc::new(Logger::new());
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let logger = Arc::clone(&logger);
-                std::thread::spawn(move || {
-                    for _ in 0..500 {
-                        logger.record(Level::Error, "tool", "执行失败：timeout");
-                        let view = logger.lock().snapshot();
-                        assert_eq!(
-                            view.stats.bytes,
-                            view.entries.iter().map(Entry::bytes).sum::<usize>()
-                        );
-                        assert!(view.entries.len() <= MAX_ENTRIES);
-                    }
-                })
-            })
-            .collect();
-        for thread in threads {
-            thread.join().unwrap();
-        }
-        let view = logger.lock().snapshot();
-        assert_eq!(view.stats.received, 4_000);
-        assert_eq!(view.stats.merged, 3_999);
-        assert_eq!(view.entries[0].occurrences, 4_000);
-    }
-}
+#[path = "diagnostics_tests.rs"]
+mod tests;

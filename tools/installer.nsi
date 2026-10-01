@@ -66,8 +66,10 @@ Var RegistrySaved
 Var DesktopSaved
 Var StartSaved
 Var UninstallSaved
+Var ResidueKey
 
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Neo"
+!define RESIDUE_KEY "Software\Neo\InstallerResidue"
 
 !define MUI_CUSTOMFUNCTION_ABORT InstallAbort
 !define MUI_ABORTWARNING
@@ -208,6 +210,78 @@ path_failed:
   SetErrors
   Return
 path_ok:
+  ClearErrors
+FunctionEnd
+
+Function ${PREFIX}GetResidueKey
+  ; 路径本身不够：旧目录被删除/替换后，不能把同名的未知目录当作安装残留。
+  ; 只查询目录身份，不跟随重解析点；调用者仍须先执行 CheckInstallPath。
+  StrCpy $ResidueKey ""
+  System::Call 'kernel32::CreateFileW(w "$INSTDIR", i 0, i 7, p 0, i 3, i 0x02200000, p 0) p .r0'
+  StrCmp $0 -1 residue_identity_failed
+  System::Alloc 52
+  Pop $1
+  StrCmp $1 0 residue_close_failed
+  System::Call 'kernel32::GetFileInformationByHandle(p r0, p r1) i .r2'
+  StrCmp $2 0 residue_free_failed
+  ; BY_HANDLE_FILE_INFORMATION: attributes, 3 FILETIMEs, volume, size, links, file ID.
+  System::Call '*$1(i .r2, i .r6, i .r7, i, i, i, i, i .r3, i, i, i, i .r4, i .r5)'
+  IntOp $2 $2 & 0x410
+  IntCmp $2 0x10 0 residue_free_failed residue_free_failed
+  ; 不支持稳定文件 ID 的文件系统失败关闭；创建时间同时防止删除后的 ID 复用。
+  StrCmp $4 0 0 residue_identity_ok
+  StrCmp $5 0 residue_free_failed
+residue_identity_ok:
+  StrCpy $ResidueKey "${RESIDUE_KEY}\$3-$4-$5-$6-$7"
+  System::Free $1
+  System::Call 'kernel32::CloseHandle(p r0)'
+  ClearErrors
+  Return
+residue_free_failed:
+  System::Free $1
+residue_close_failed:
+  System::Call 'kernel32::CloseHandle(p r0)'
+residue_identity_failed:
+  SetErrors
+FunctionEnd
+
+Function ${PREFIX}CheckInstallTarget
+  Call ${PREFIX}CheckInstallPath
+  IfErrors target_failed
+  IfFileExists "$INSTDIR\*.*" 0 target_ok
+  ; IfFileExists 也接受同名目录；两个入口必须是普通文件，缺失才回退到残留认证。
+  StrCpy $2 "0"
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\neo.exe") i .r0 ?e'
+  Pop $1
+  IntCmp $0 -1 target_app_missing
+  IntOp $0 $0 & 0x410
+  IntCmp $0 0 target_uninstaller target_failed target_failed
+target_app_missing:
+  StrCmp $1 2 target_app_absent
+  StrCmp $1 3 0 target_failed
+target_app_absent:
+  StrCpy $2 "1"
+target_uninstaller:
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\uninstall.exe") i .r0 ?e'
+  Pop $1
+  IntCmp $0 -1 target_uninstaller_missing
+  IntOp $0 $0 & 0x410
+  IntCmp $0 0 target_files_checked target_failed target_failed
+target_uninstaller_missing:
+  StrCmp $1 2 target_residue
+  StrCmp $1 3 target_residue target_failed
+target_files_checked:
+  StrCmp $2 "0" target_ok
+target_residue:
+  Call ${PREFIX}GetResidueKey
+  IfErrors target_failed
+  ReadRegStr $0 HKCU "$ResidueKey" "Path"
+  IfErrors target_failed
+  StrCmp $0 $INSTDIR target_ok
+target_failed:
+  SetErrors
+  Return
+target_ok:
   ClearErrors
 FunctionEnd
 !macroend
@@ -398,10 +472,10 @@ backup_checked:
   Rename "$BackupDir" "$INSTDIR"
   IfErrors backup_pending
 check_target:
-  IfFileExists "$INSTDIR\*.*" 0 create_stage
-  IfFileExists "$INSTDIR\neo.exe" 0 install_failed
-  IfFileExists "$INSTDIR\uninstall.exe" 0 install_failed
+  Call CheckInstallTarget
+  IfErrors target_rejected
 create_stage:
+  ${GetParent} "$INSTDIR" $2
   ; 同卷唯一暂存目录，解包/取消时旧安装完全不动。
   ClearErrors
   CreateDirectory "$2"
@@ -426,8 +500,8 @@ create_stage:
   IfFileExists "$StageDir\neo.exe" 0 install_failed
   Call CheckRunning
   IfErrors install_failed
-  Call CheckInstallPath
-  IfErrors install_failed
+  Call CheckInstallTarget
+  IfErrors target_rejected
   Call SaveShellState
   IfErrors install_failed
   SetOutPath "$TEMP"
@@ -488,6 +562,9 @@ committed:
   StrCpy $ShellDirty "0"
   StrCpy $StageDir ""
   Goto install_end
+target_rejected:
+  MessageBox MB_OK|MB_ICONSTOP "该非空目录不是可确认的 Neo 安装或卸载残留。旧版卸载没有可信残留记录时，请先将原目录改名保留，再安装到原路径；不要删除其中的自定义文件。"
+  Goto install_failed
 backup_pending:
   MessageBox MB_OK|MB_ICONSTOP "检测到上次保留的备份 $BackupDir。请先确认或恢复该备份；本次不会覆盖它。"
 install_failed:
@@ -501,7 +578,8 @@ SectionEnd
 Section "Uninstall"
   Call un.CheckRunning
   IfErrors uninstall_failed
-  Call un.CheckInstallPath
+  ; 不能仅凭一份复制来的卸载器，为任意非空目录创建可信残留记录。
+  Call un.CheckInstallTarget
   IfErrors uninstall_failed
   Push "$DESKTOP\Neo.lnk"
   Call un.CheckShellPath
@@ -512,6 +590,17 @@ Section "Uninstall"
   Push "$SMPROGRAMS\Neo\卸载 Neo.lnk"
   Call un.CheckShellPath
   IfErrors uninstall_failed
+  ; 在任何删除之前持久化并读回目录身份，失败则保留完整安装。
+  ; 单独的 HKCU 记录不随卸载注册项删除，也不信任目录内的标识文件。
+  ; 这是同一用户安装历史的证据，不是抵御该用户主动篡改注册表的安全边界。
+  Call un.GetResidueKey
+  IfErrors uninstall_failed
+  ClearErrors
+  WriteRegStr HKCU "$ResidueKey" "Path" "$INSTDIR"
+  IfErrors uninstall_failed
+  ReadRegStr $0 HKCU "$ResidueKey" "Path"
+  IfErrors uninstall_failed
+  StrCmp $0 $INSTDIR 0 uninstall_failed
   ClearErrors
   ; 主程序删除失败时不先破坏快捷方式、资源和注册项。
   Delete "$INSTDIR\neo.exe"
@@ -552,7 +641,12 @@ uninstall_registry_removed:
   RMDir "$INSTDIR\assets"
   RMDir "$INSTDIR\assets-stt"
   RMDir "$INSTDIR\runtime"
+  ClearErrors
   RMDir "$INSTDIR"
+  ; 非空目录和绑定它的记录一起保留；只有确实删除空目录才移除记录。
+  IfErrors uninstall_residue_kept
+  DeleteRegKey HKCU "$ResidueKey"
+uninstall_residue_kept:
 
   ; 用户数据 %APPDATA%\Neo（数据库/记忆）保留，不再需要可手动删除
   Goto uninstall_end

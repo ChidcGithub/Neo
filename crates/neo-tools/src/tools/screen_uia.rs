@@ -7,7 +7,7 @@
 //!    （窗口非激活时整棵树被判 offscreen），第一次原型就把 WorkBuddy 整个窗口弄丢了。
 //!    可见性过滤放到**叶子级**：用 bbox 与虚拟桌面求交判断（见 [`finalize`]）。
 //! 2. **坐标是物理像素**（与 `screenshot`/`click`/`drag` 同一坐标系）——
-//!    前提是进程已设 `PER_MONITOR_AWARE_V2`（见 [`super::screen`]）。
+//!    枚举和核验入口用线程级 `PER_MONITOR_AWARE_V2` guard（见 [`super::screen`]）。
 //! 3. **数据要节流**：全屏 144 个元素 ≈ 2.5K tokens 是舒适区，
 //!    所以有预算制（每窗 ≤600、总 ≤800、8 秒协作式时间预算；无法中断单次 COM 调用）。
 //!
@@ -305,23 +305,33 @@ pub fn validate_target(element: &ScreenElement) -> Result<(i32, i32), ToolError>
     }
     let _dpi = super::screen::physical_pixels()?;
     let started = Instant::now();
-    let result = imp::validate(element).map_err(|e| ToolError::bad_args(format!("目标已变化、被遮挡或无法验证：{}", e.message))
-        .with_hint("重新运行 screen_elements 获取 snapshot_id 和 element_id；不要重试旧坐标"))?;
+    let result = imp::validate(element)?;
     if started.elapsed() > Duration::from_secs(2) {
-        return Err(ToolError::bad_args("即时核验耗时过长，已拒绝输入")
+        return Err(ToolError::new(crate::result::ErrorKind::Timeout, "[validation_timeout] 即时核验耗时过长，已拒绝输入")
             .with_hint("重新运行 screen_elements；不要使用旧坐标"));
     }
     Ok(result)
 }
 
+fn target_mismatch(expected: &ScreenElement, current: &ScreenElement, enabled: bool, offscreen: bool) -> Option<&'static str> {
+    let (a, b) = (&expected.identity, &current.identity);
+    if !expected.identity_verifiable() || !current.identity_verifiable() { Some("unverifiable_identity") }
+    else if !enabled { Some("element_disabled") }
+    else if offscreen { Some("element_offscreen") }
+    else if a.hwnd != b.hwnd { Some("window_handle_changed") }
+    else if a.process_id != b.process_id || a.process_started != b.process_started { Some("element_process_changed") }
+    else if a.window_process_id != b.window_process_id || a.window_process_started != b.window_process_started { Some("window_process_changed") }
+    else if a.window_runtime_id != b.window_runtime_id { Some("window_runtime_id_changed") }
+    else if a.runtime_id != b.runtime_id { Some("element_runtime_id_mismatch") }
+    else if expected.rect != current.rect { Some("element_rect_changed") }
+    else if expected.role != current.role { Some("element_role_changed") }
+    else if expected.name != current.name { Some("element_name_changed") }
+    else if expected.window != current.window { Some("window_title_changed") }
+    else { None }
+}
+
 fn same_target(expected: &ScreenElement, current: &ScreenElement, enabled: bool, offscreen: bool) -> bool {
-    enabled && !offscreen && expected.identity.hwnd != 0
-        && expected.identity.process_id > 0 && expected.identity.process_started != 0
-        && expected.identity.window_process_id != 0 && expected.identity.window_process_started != 0
-        && !expected.identity.runtime_id.is_empty() && !expected.identity.window_runtime_id.is_empty()
-        && expected.identity == current.identity && expected.rect == current.rect
-        && expected.name == current.name && expected.role == current.role
-        && expected.window == current.window
+    target_mismatch(expected, current, enabled, offscreen).is_none()
 }
 
 /// 纯几何过滤使用宽整数，允许负坐标及跨显示器区域。
@@ -347,12 +357,82 @@ fn visible_on_monitors(rect: [i32; 4], monitors: &[[i32; 4]]) -> bool {
     monitors.iter().any(|monitor| intersects(rect, *monitor))
 }
 
-fn verified_candidate<E>(points: Vec<(i32, i32)>, mut verify: impl FnMut((i32, i32)) -> Result<bool, E>) -> Option<(i32, i32)> {
-    points.into_iter().find(|point| verify(*point).unwrap_or(false))
+// 保留失败证据，但单点 provider 故障仍允许尝试其它经过完整核验的候选点。
+fn verified_candidate<E>(points: Vec<(i32, i32)>, mut verify: impl FnMut((i32, i32)) -> Result<(), E>) -> Result<(i32, i32), Vec<E>> {
+    let mut failures = Vec::new();
+    for point in points {
+        match verify(point) {
+            Ok(()) => return Ok(point),
+            Err(error) => failures.push(error),
+        }
+    }
+    Err(failures)
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug)]
+struct ValidationFailure {
+    code: &'static str,
+    kind: crate::result::ErrorKind,
+    detail: String,
+}
+
+#[cfg(any(windows, test))]
+impl ValidationFailure {
+    fn rejected(code: &'static str) -> Self {
+        Self { code, kind: crate::result::ErrorKind::Conflict, detail: String::new() }
+    }
+
+    fn provider(stage: &'static str, hresult: u32) -> Self {
+        use crate::result::ErrorKind;
+        let (code, kind) = match hresult {
+            0x80070005 => ("access_denied", ErrorKind::NotAllowed),
+            0x80040201 => ("element_unavailable", ErrorKind::NotFound),
+            0x80131505 | 0x800705B4 => ("provider_timeout", ErrorKind::Timeout),
+            _ => ("provider_error", ErrorKind::Io),
+        };
+        Self { code, kind, detail: format!("stage={stage}, HRESULT=0x{hresult:08X}") }
+    }
+
+    fn timeout() -> Self {
+        Self { code: "validation_timeout", kind: crate::result::ErrorKind::Timeout, detail: String::new() }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn validation_error(mut failures: Vec<ValidationFailure>) -> ToolError {
+    use crate::result::ErrorKind;
+    // 高优先级故障先展示，避免诊断条数上限把权限/超时证据挤掉；同级保持原序。
+    let priority = |kind| match kind {
+        ErrorKind::NotAllowed => 5, ErrorKind::Timeout => 4, ErrorKind::Io => 3,
+        ErrorKind::NotFound => 2, _ => 1,
+    };
+    failures.sort_by_key(|f| std::cmp::Reverse(priority(f.kind)));
+    let kind = failures.first().map(|f| f.kind).unwrap_or(ErrorKind::Conflict);
+    let mut reasons = Vec::new();
+    for failure in &failures {
+        if reasons.iter().any(|(prior, _): &(&ValidationFailure, String)|
+            prior.code == failure.code && prior.kind == failure.kind && prior.detail == failure.detail) { continue; }
+        if reasons.len() == 8 { break; }
+        reasons.push((failure, if failure.detail.is_empty() { failure.code.to_owned() }
+            else { format!("{} ({})", failure.code, failure.detail) }));
+    }
+    let details = if reasons.is_empty() { "no_visible_candidate".to_owned() }
+        else { reasons.into_iter().map(|(_, text)| text).collect::<Vec<_>>().join("; ") };
+    ToolError::new(kind, format!("UIA 即时核验拒绝输入：{details}；失败候选/检查数={}", failures.len()))
+        .with_hint("确认前台窗口及遮挡后重新运行 screen_elements；若新快照仍失败，请保留上述分类和 HRESULT 排查 provider/权限。不会自动激活窗口、调用 Invoke 或退回坐标")
 }
 
 fn passive_content(role: &str, action: bool, focusable: bool, password: bool) -> bool {
     matches!(role, "Text" | "Image") && !action && !focusable && !password
+}
+
+#[cfg(any(windows, test))]
+fn passive_content_result<E>(role: &str, action: impl FnOnce() -> Result<bool, E>, properties: impl FnOnce() -> Result<(bool, bool), E>) -> Result<bool, E> {
+    if !matches!(role, "Text" | "Image") { return Ok(false); }
+    let action = action()?;
+    let (focusable, password) = properties()?;
+    Ok(passive_content(role, action, focusable, password))
 }
 
 fn label_node_allowed(role: &str, action: bool, focusable: bool, password: bool, depth: usize, visits: usize) -> bool {
@@ -479,7 +559,7 @@ mod imp {
 
     use std::time::{Duration, Instant};
 
-    use windows::core::Result as WinResult;
+    use windows::core::{Interface, IUnknown, Result as WinResult};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::System::Com::{
@@ -608,25 +688,53 @@ mod imp {
         Ok(out)
     }
 
-    fn action_pattern_state(el: &IUIAutomationElement) -> Option<bool> {
+    fn current_pattern(el: &IUIAutomationElement, id: windows::Win32::UI::Accessibility::UIA_PATTERN_ID) -> WinResult<Option<IUnknown>> {
+        // windows 0.62.2 GetCurrentPattern uses Type::from_abi: S_OK + null becomes
+        // Error::empty() (code 0), losing the distinction from an actual COM failure.
+        // UIA's GetPatternProvider contract allows null for unsupported patterns:
+        // https://learn.microsoft.com/windows/win32/api/uiautomationcore/nf-uiautomationcore-irawelementprovidersimple-getpatternprovider
+        unsafe {
+            let mut result = core::ptr::null_mut();
+            let hr = (el.vtable().GetCurrentPattern)(el.as_raw(), id, &mut result);
+            // Adopt the returned reference exactly once, including a valid non-null
+            // output on failure. RAII releases it on every early return; never invoke it.
+            let pattern = if result.is_null() { None } else { Some(IUnknown::from_raw(result)) };
+            hr.ok()?;
+            Ok(pattern)
+        }
+    }
+
+    fn action_pattern_result(el: &IUIAutomationElement) -> Result<bool, ValidationFailure> {
         use windows::Win32::UI::Accessibility::{UIA_InvokePatternId, UIA_TogglePatternId, UIA_SelectionItemPatternId, UIA_ExpandCollapsePatternId};
-        let mut known = true;
-        for id in [UIA_InvokePatternId, UIA_TogglePatternId, UIA_SelectionItemPatternId, UIA_ExpandCollapsePatternId] {
-            match unsafe { el.GetCurrentPattern(id) } {
-                Ok(_) => return Some(true), // 仅查询接口，绝不调用 Invoke/Toggle。
-                Err(e) if matches!(e.code().0 as u32, 0x80004002 | 0x80004003 | 0x80040204) => {},
-                Err(_) => known = false,
+        for (id, stage) in [
+            (UIA_InvokePatternId, "GetCurrentPattern(Invoke)"),
+            (UIA_TogglePatternId, "GetCurrentPattern(Toggle)"),
+            (UIA_SelectionItemPatternId, "GetCurrentPattern(SelectionItem)"),
+            (UIA_ExpandCollapsePatternId, "GetCurrentPattern(ExpandCollapse)"),
+        ] {
+            match current_pattern(el, id) {
+                Ok(Some(_)) => return Ok(true), // 仅查询接口，绝不调用 Invoke/Toggle。
+                Ok(None) => {},
+                Err(e) if matches!(e.code().0 as u32, 0x80004002 | 0x80040204) => {},
+                // E_POINTER is a real failure, not evidence of an absent pattern.
+                // Do not let a later supported pattern hide permission/timeout errors.
+                Err(e) => return Err(ValidationFailure::provider(stage, e.code().0 as u32)),
             }
         }
-        known.then_some(false)
+        Ok(false)
     }
+
+    fn action_pattern_state(el: &IUIAutomationElement) -> Option<bool> { action_pattern_result(el).ok() }
 
     fn action_pattern(el: &IUIAutomationElement) -> bool { action_pattern_state(el) == Some(true) }
 
-    fn passive(el: &IUIAutomationElement) -> WinResult<bool> {
+    fn passive(el: &IUIAutomationElement) -> Result<bool, ValidationFailure> {
         unsafe {
-            let role = match el.CurrentControlType()?.0 { 50020 => "Text", 50006 => "Image", _ => "" };
-            Ok(super::passive_content(role, action_pattern_state(el) != Some(false), el.CurrentIsKeyboardFocusable()?.as_bool(), el.CurrentIsPassword()?.as_bool()))
+            let role = match probe("passive_hit.CurrentControlType", el.CurrentControlType())?.0 { 50020 => "Text", 50006 => "Image", _ => "" };
+            super::passive_content_result(role, || action_pattern_result(el), || {
+                Ok((probe("passive_hit.CurrentIsKeyboardFocusable", el.CurrentIsKeyboardFocusable())?.as_bool(),
+                    probe("passive_hit.CurrentIsPassword", el.CurrentIsPassword())?.as_bool()))
+            })
         }
     }
 
@@ -676,32 +784,63 @@ mod imp {
         }
     }
 
-    fn resolve_hit(uia: &IUIAutomation, walker: &IUIAutomationTreeWalker, expected: &ScreenElement, point: (i32, i32)) -> WinResult<Option<IUIAutomationElement>> {
+    #[cfg(test)]
+    mod pattern_tests {
+        include!("screen_uia_pattern_tests.rs");
+    }
+
+    #[cfg(test)]
+    mod titlebar_probe {
+        include!("screen_uia_titlebar_probe_tests.rs");
+    }
+
+    use super::ValidationFailure;
+
+    fn probe<T>(stage: &'static str, result: WinResult<T>) -> Result<T, ValidationFailure> {
+        result.map_err(|e| ValidationFailure::provider(stage, e.code().0 as u32))
+    }
+
+    fn resolve_hit(uia: &IUIAutomation, walker: &IUIAutomationTreeWalker, expected: &ScreenElement, point: (i32, i32)) -> Result<IUIAutomationElement, ValidationFailure> {
         unsafe {
-            let top = uia.ElementFromHandle(HWND(expected.identity.hwnd as _))?;
-            let top_id = runtime_id(&top)?;
-            let mut el = uia.ElementFromPoint(windows::Win32::Foundation::POINT { x: point.0, y: point.1 })?;
+            let top = probe("ElementFromHandle", uia.ElementFromHandle(HWND(expected.identity.hwnd as _)))?;
+            let top_id = probe("window.GetRuntimeId", runtime_id(&top))?;
+            let mut el = probe("ElementFromPoint", uia.ElementFromPoint(windows::Win32::Foundation::POINT { x: point.0, y: point.1 }))?;
             for depth in 0..=super::HIT_ANCESTORS {
-                if el.CurrentIsPassword()?.as_bool() { return Ok(None); }
+                if probe("CurrentIsPassword", el.CurrentIsPassword())?.as_bool() {
+                    return Err(ValidationFailure::rejected("password_hit"));
+                }
+                let control_type = probe("CurrentControlType", el.CurrentControlType())?.0;
                 let current = ScreenElement {
-                    role: role_of(el.CurrentControlType()?.0).unwrap_or(""),
-                    name: el.CurrentName()?.to_string(), window: top.CurrentName()?.to_string(),
-                    rect: rect_values(el.CurrentBoundingRectangle()?)?,
-                    identity: identity(&el, expected.identity.hwnd, top_id.clone())?,
+                    role: role_of(control_type).unwrap_or(""),
+                    name: probe("CurrentName", el.CurrentName())?.to_string(),
+                    window: probe("window.CurrentName", top.CurrentName())?.to_string(),
+                    rect: probe("CurrentBoundingRectangle", el.CurrentBoundingRectangle().and_then(rect_values))?,
+                    identity: probe("hit.identity", identity(&el, expected.identity.hwnd, top_id.clone()))?,
                     ..Default::default()
                 };
-                if !current.identity_verifiable() { return Ok(None); }
-                let enabled = el.CurrentIsEnabled()?.as_bool();
-                let offscreen = el.CurrentIsOffscreen()?.as_bool();
-                if super::same_target(expected, &current, enabled, offscreen) {
-                    return Ok(actionable(&el, current.role).then_some(el));
-                }
+                if !current.identity_verifiable() { return Err(ValidationFailure::rejected("unverifiable_identity")); }
+                let enabled = probe("CurrentIsEnabled", el.CurrentIsEnabled())?.as_bool();
+                let offscreen = probe("CurrentIsOffscreen", el.CurrentIsOffscreen())?.as_bool();
+                let Some(mismatch) = super::target_mismatch(expected, &current, enabled, offscreen) else {
+                    if action_pattern_result(&el)? { return Ok(el); }
+                    if current.role == "Edit" && probe("CurrentIsKeyboardFocusable", el.CurrentIsKeyboardFocusable())?.as_bool() { return Ok(el); }
+                    return Err(ValidationFailure::rejected("no_click_action"));
+                };
                 if !super::may_ascend_hit(expected, &current, passive(&el)?, depth, enabled, offscreen) {
-                    return Ok(None);
+                    let mut failure = ValidationFailure::rejected(mismatch);
+                    // Control View 枚举不保证 ElementFromPoint 返回同一叶子。只报告 Raw 命中，
+                    // 不把标题栏/窗口容器当作目标，也不按名称、矩形或 runtime ID 前缀放行。
+                    // hwnd 是核验上下文，不是从命中元素推导出的原生 ancestor 证明。
+                    failure.detail = format!("raw_hit_rejected, depth={depth}, control_type={control_type}, point={point:?}, expected_role={}, expected_runtime_id={:?} (len={}), hit_runtime_id={:?} (len={}), expected_rect={:?}, hit_rect={:?}",
+                        expected.role,
+                        &expected.identity.runtime_id[..expected.identity.runtime_id.len().min(8)], expected.identity.runtime_id.len(),
+                        &current.identity.runtime_id[..current.identity.runtime_id.len().min(8)], current.identity.runtime_id.len(),
+                        expected.rect, current.rect);
+                    return Err(failure);
                 }
-                el = walker.GetParentElement(&el)?;
+                el = probe("RawViewWalker.GetParentElement", walker.GetParentElement(&el))?;
             }
-            Ok(None)
+            Err(ValidationFailure::rejected("hit_ancestor_limit"))
         }
     }
 
@@ -710,30 +849,46 @@ mod imp {
     }
 
     pub fn validate(expected: &ScreenElement) -> Result<(i32, i32), ToolError> {
-        let _com = ComGuard::new().map_err(|e| ToolError::io(e.to_string()))?;
-        let check = || -> WinResult<Option<(i32, i32)>> { unsafe {
-            let uia: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
-            let walker = uia.RawViewWalker()?;
+        let one = |failure| super::validation_error(vec![failure]);
+        let started = Instant::now();
+        let _com = probe("CoInitializeEx", ComGuard::new()).map_err(one)?;
+        let setup = || -> Result<_, ValidationFailure> { unsafe {
+            let uia: IUIAutomation = probe("CoCreateInstance", CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER))?;
+            let walker = probe("RawViewWalker", uia.RawViewWalker())?;
             let hwnd = expected.identity.hwnd as windows_sys::Win32::Foundation::HWND;
-            if hwnd.is_null() || GetForegroundWindow() != hwnd || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 { return Ok(None); }
+            if hwnd.is_null() { return Err(ValidationFailure::rejected("invalid_window")); }
+            if GetForegroundWindow() != hwnd { return Err(ValidationFailure::rejected("background_window")); }
+            if IsWindowVisible(hwnd) == 0 { return Err(ValidationFailure::rejected("window_not_visible")); }
+            if IsIconic(hwnd) != 0 { return Err(ValidationFailure::rejected("window_minimized")); }
             let mut cloaked = 0u32;
-            DwmGetWindowAttribute(HWND(hwnd), DWMWA_CLOAKED, (&mut cloaked as *mut u32).cast(), 4)?;
-            if cloaked != 0 { return Ok(None); }
-            let monitors = monitors()?;
-            let started = Instant::now();
-            Ok(super::verified_candidate(super::candidate_points(expected.rect, expected.clickable_point, &monitors), |point| -> WinResult<bool> {
-                if started.elapsed() > Duration::from_secs(2) { return Ok(false); }
-                let window_hit = || GetForegroundWindow() == hwnd && GetAncestor(WindowFromPoint(windows_sys::Win32::Foundation::POINT { x: point.0, y: point.1 }), GA_ROOT) == hwnd;
-                if !window_hit() { return Ok(false); }
-                let Some(el) = resolve_hit(&uia, &walker, expected, point)? else { return Ok(false); };
-                let Some(latest) = resolve_hit(&uia, &walker, expected, point)? else { return Ok(false); };
-                use windows_sys::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONULL};
-                Ok(uia.CompareElements(&el, &latest)?.as_bool() && window_hit()
-                    && started.elapsed() <= Duration::from_secs(2)
-                    && !MonitorFromPoint(windows_sys::Win32::Foundation::POINT { x: point.0, y: point.1 }, MONITOR_DEFAULTTONULL).is_null())
-            }))
+            probe("DwmGetWindowAttribute", DwmGetWindowAttribute(HWND(hwnd), DWMWA_CLOAKED, (&mut cloaked as *mut u32).cast(), 4))?;
+            if cloaked != 0 { return Err(ValidationFailure::rejected("window_cloaked")); }
+            Ok((uia, walker, hwnd, probe("EnumDisplayMonitors", monitors())?))
         }};
-        check().map_err(|e| ToolError::io(e.to_string()))?.ok_or_else(|| ToolError::bad_args("实时命中与快照不一致"))
+        let (uia, walker, hwnd, monitors) = setup().map_err(one)?;
+        super::verified_candidate(super::candidate_points(expected.rect, expected.clickable_point, &monitors), |point| { unsafe {
+            if started.elapsed() > Duration::from_secs(2) { return Err(ValidationFailure::timeout()); }
+            let window_hit = || {
+                if GetForegroundWindow() != hwnd { return Err(ValidationFailure::rejected("background_window")); }
+                if GetAncestor(WindowFromPoint(windows_sys::Win32::Foundation::POINT { x: point.0, y: point.1 }), GA_ROOT) != hwnd {
+                    return Err(ValidationFailure::rejected("native_window_hit_mismatch"));
+                }
+                Ok(())
+            };
+            window_hit()?;
+            let el = resolve_hit(&uia, &walker, expected, point)?;
+            let latest = resolve_hit(&uia, &walker, expected, point)?;
+            if !probe("CompareElements", uia.CompareElements(&el, &latest))?.as_bool() {
+                return Err(ValidationFailure::rejected("hit_changed_between_checks"));
+            }
+            window_hit()?;
+            if started.elapsed() > Duration::from_secs(2) { return Err(ValidationFailure::timeout()); }
+            use windows_sys::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONULL};
+            if MonitorFromPoint(windows_sys::Win32::Foundation::POINT { x: point.0, y: point.1 }, MONITOR_DEFAULTTONULL).is_null() {
+                return Err(ValidationFailure::rejected("point_not_on_monitor"));
+            }
+            Ok(())
+        }}).map_err(super::validation_error)
     }
 
     pub fn overview() -> Result<(Vec<WindowSummary>, bool), ToolError> {
@@ -1000,457 +1155,9 @@ mod imp {
 // ==== 测试 ================================================================
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tools::screen::Rect;
+#[path = "screen_uia_validation_tests.rs"]
+mod validation_tests;
 
-    fn vs() -> Rect {
-        Rect {
-            x: 0,
-            y: 0,
-            width: 3200,
-            height: 2000,
-        }
-    }
-
-    fn raw(name: &str, rect: [i32; 4]) -> RawElement {
-        RawElement {
-            role: "Button",
-            name: name.to_owned(), label: display_label(name), label_source: "name",
-            enabled: true, foreground: true, offscreen: false, actionable: false, clickable_point: None,
-            window: "窗口".to_owned(),
-            rect,
-            parent_role: None,
-            identity: ElementIdentity::default(),
-        }
-    }
-
-    #[test]
-    fn cancelled_and_late_publishers_cannot_replace_new_snapshot() {
-        let _interaction = INTERACTION.lock().unwrap();
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let scope = crate::Scope::new(std::env::temp_dir()).with_cancel(cancel.clone());
-        let old_generation = cache_generation();
-        cache_invalidate();
-        let newer = cache_store(&[]);
-        let late = cache_store_checked(&[], &scope, old_generation);
-        let unchanged = cache_snapshot().unwrap().0 == newer;
-        cancel.store(true, std::sync::atomic::Ordering::Release);
-        let cancelled = cache_store_checked(&[], &scope, cache_generation());
-        let still_unchanged = cache_snapshot().unwrap().0 == newer;
-        let stale_invalidation = cache_invalidate_checked(&crate::Scope::new(std::env::temp_dir()), old_generation);
-        let not_cleared = cache_snapshot().is_some();
-        cache_invalidate();
-        drop(_interaction);
-        assert!(late.is_err(), "失效前启动的发布者必须拒绝");
-        assert!(unchanged && still_unchanged, "旧代或已取消发布者不能覆盖新快照");
-        assert!(cancelled.is_err(), "取消的 Scope 必须拒绝发布");
-        assert!(stale_invalidation.is_err() && not_cleared, "旧观察失败也不能清空新缓存");
-    }
-
-    #[test]
-    fn checked_publish_survives_job_drop_but_not_explicit_invalidation() {
-        let _interaction = INTERACTION.lock().unwrap();
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let scope = crate::Scope::new(std::env::temp_dir()).with_cancel(cancel.clone());
-        let id = cache_store_checked(&[], &scope, cache_generation()).unwrap();
-        let at = CACHE.lock().unwrap().as_ref().unwrap().at;
-        let generation = cache_generation();
-        assert_eq!(cache_publish_checked(&[], &scope, generation, Some(&id)).unwrap(), id);
-        assert_eq!(CACHE.lock().unwrap().as_ref().unwrap().at, at);
-        assert_eq!(cache_generation(), generation);
-        cancel.store(true, std::sync::atomic::Ordering::Release);
-        drop(scope);
-        assert_eq!(cache_snapshot().unwrap().0, id, "正常任务结束不使成功快照失效");
-        cache_invalidate();
-        assert!(cache_snapshot().is_none());
-        assert_ne!(cache_generation(), generation);
-        let empty_generation = cache_generation();
-        cache_invalidate();
-        assert_ne!(cache_generation(), empty_generation);
-    }
-
-    #[test]
-    fn publication_waiting_on_cache_lock_rechecks_cancellation_inside_lock() {
-        let _interaction = INTERACTION.lock().unwrap();
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let scope = crate::Scope::new(std::env::temp_dir()).with_cancel(cancel.clone());
-        let newer = cache_store(&[]);
-        let generation = cache_generation();
-        let lock = CACHE.lock().unwrap();
-        let (started, ready) = std::sync::mpsc::channel();
-        let result = std::thread::scope(|threads| {
-            let job = threads.spawn(|| {
-                started.send(()).unwrap();
-                cache_store_checked(&[], &scope, generation)
-            });
-            ready.recv().unwrap();
-            cancel.store(true, std::sync::atomic::Ordering::Release);
-            drop(lock);
-            job.join().unwrap()
-        });
-        assert!(result.is_err());
-        assert_eq!(cache_snapshot().unwrap().0, newer);
-        cache_invalidate();
-    }
-
-    #[test]
-    fn window_filter_selects_targets_before_spending_element_budget() {
-        let windows = [("其他窗口", 800), ("目标 EDITOR", 2), ("Editor 第二窗口", 3)];
-        let mut remaining = 4;
-        let mut visited = Vec::new();
-        for (title, count) in windows {
-            if window_matches(title, Some("editor")) {
-                let taken = count.min(remaining);
-                visited.push((title, taken));
-                remaining -= taken;
-            }
-        }
-        assert_eq!(visited, vec![("目标 EDITOR", 2), ("Editor 第二窗口", 2)]);
-        assert!(window_matches("任意窗口", None));
-        assert!(window_matches("ÄBC", Some("äb")));
-        assert!(!window_matches("其他窗口", Some("目标")));
-    }
-
-    /// 里程碑式的 happy path：过滤、排序、编号一条龙。
-    #[test]
-    fn finalize_sorts_by_reading_order_and_numbers() {
-        let els = finalize(
-            vec![
-                raw("右下", [500, 400, 100, 40]),
-                raw("左上", [10, 10, 100, 40]),
-                raw("同行右", [200, 10, 100, 40]),
-            ],
-            vs(),
-            800,
-        );
-        let ids: Vec<(usize, &str)> = els.iter().map(|e| (e.id, e.name.as_str())).collect();
-        assert_eq!(ids, vec![(1, "左上"), (2, "同行右"), (3, "右下")]);
-    }
-
-    /// 本机实测的两大噪音源：无名元素与滚动条步进按钮。
-    #[test]
-    fn noise_is_filtered() {
-        let els = finalize(
-            vec![
-                raw("", [10, 10, 100, 40]),             // 无名
-                raw("垂直小幅下降", [10, 60, 24, 100]), // 滚动条步进
-                raw("真按钮", [10, 200, 100, 40]),
-            ],
-            vs(),
-            800,
-        );
-        assert_eq!(els.len(), 1);
-        assert_eq!(els[0].name, "真按钮");
-    }
-
-    /// 父元素是 ScrollBar 的子按钮一律丢（比名字特征更可靠的信号）。
-    #[test]
-    fn scrollbar_children_are_dropped_by_parent_type() {
-        let mut sb = raw("拖我", [10, 60, 24, 100]);
-        sb.parent_role = Some(SCROLLBAR);
-        let els = finalize(vec![sb, raw("真按钮", [10, 200, 100, 40])], vs(), 800);
-        assert_eq!(els.len(), 1);
-    }
-
-    /// 叶子级可见性：部分露出窗口的按钮仍然保留（bbox 与桌面相交即可），
-    /// 但完全在桌面外的不留 —— 这就是"不能用 IsOffscreen 剪枝"的正确替代。
-    #[test]
-    fn visibility_is_decided_by_bbox_intersection() {
-        let els = finalize(
-            vec![
-                raw("半露出", [-50, 10, 100, 40]),  // 左半在屏幕外
-                raw("全在外", [-500, 10, 100, 40]), // 完全在桌面左侧之外
-                raw("在桌面内", [10, 10, 100, 40]),
-            ],
-            vs(),
-            800,
-        );
-        let names: Vec<&str> = els.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["半露出", "在桌面内"]);
-    }
-
-    #[test]
-    fn duplicates_are_collapsed() {
-        let els = finalize(
-            vec![
-                raw("同一个", [10, 10, 100, 40]),
-                raw("同一个", [10, 10, 100, 40]),
-            ],
-            vs(),
-            800,
-        );
-        assert_eq!(els.len(), 1);
-    }
-
-    #[test]
-    fn budget_truncates_after_numbering() {
-        let raws: Vec<RawElement> = (0..50)
-            .map(|i| raw(&format!("b{i}"), [0, i * 50, 100, 40]))
-            .collect();
-        let els = finalize(raws, vs(), 10);
-        assert_eq!(els.len(), 10);
-        assert_eq!(els.last().unwrap().id, 10);
-    }
-
-    #[test]
-    fn cache_round_trip_and_expiry_semantics() {
-        let els = vec![ScreenElement {
-            id: 1,
-            role: "Button",
-            name: "开始".into(),
-            window: "任务栏".into(),
-            rect: [1061, 1904, 90, 96],
-            identity: ElementIdentity::default(),
-            ..Default::default()
-        }];
-        let _interaction = INTERACTION.lock().unwrap();
-        let snapshot = cache_store(&els);
-        let got = cache_lookup(&snapshot, 1).expect("刚存过就应当查得到");
-        assert_eq!(got.name, "开始");
-        assert_eq!(got.center(), (1106, 1952));
-        assert!(cache_lookup(&snapshot, 99).is_none(), "没存过的编号查不到");
-        let newer = cache_store(&els);
-        assert!(cache_lookup(&snapshot, 1).is_none());
-        assert!(cache_lookup(&newer, 1).is_some());
-        CACHE.lock().unwrap().as_mut().unwrap().at = Instant::now() - Duration::from_secs(59);
-        assert!(cache_snapshot().is_some());
-        assert!(cache_remaining_seconds() <= 1);
-        let at = CACHE.lock().unwrap().as_ref().unwrap().at;
-        assert!(cache_snapshot().is_some());
-        assert_eq!(CACHE.lock().unwrap().as_ref().unwrap().at, at);
-        cache_invalidate();
-        assert!(cache_snapshot().is_none());
-        assert!(cache_lookup(&newer, 1).is_none());
-    }
-
-    #[test]
-    fn snapshot_is_consumed_once_across_threads_without_desktop_access() {
-        let _interaction = INTERACTION.lock().unwrap();
-        let els = finalize(vec![raw("保存", [0, 0, 100, 40])], vs(), 1);
-        let snapshot = cache_store(&els);
-        let barrier = std::sync::Barrier::new(8);
-        let successes = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..8).map(|_| scope.spawn(|| {
-                barrier.wait();
-                usize::from(cache_consume(&snapshot, 1).is_some())
-            })).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).sum::<usize>()
-        });
-        assert_eq!(successes, 1);
-        assert!(cache_snapshot().is_none());
-        assert!(validate_target(&els[0]).is_err());
-    }
-
-    #[test]
-    fn stale_ambiguous_and_changed_targets_fail_closed() {
-        let mut el = finalize(vec![raw("保存", [10, 10, 100, 40])], vs(), 10).remove(0);
-        el.identity = ElementIdentity { hwnd: 42, process_id: 7, process_started: 100,
-            window_process_id: 7, window_process_started: 100, window_runtime_id: vec![4, 5], runtime_id: vec![1, 2, 3] };
-        let mut cached = Cached { at: Instant::now(), id: "snapshot".into(), els: vec![el.clone()] };
-        assert!(lookup(&cached, "snapshot", 1).is_some());
-        assert!(lookup(&cached, "", 1).is_none());
-        assert!(lookup(&cached, "old", 1).is_none());
-        cached.at = Instant::now() - CACHE_TTL - Duration::from_secs(1);
-        assert!(lookup(&cached, "snapshot", 1).is_none());
-        cached.at = Instant::now();
-        cached.els.push(el.clone());
-        assert!(lookup(&cached, "snapshot", 1).is_none());
-        assert!(same_target(&el, &el, true, false));
-        assert!(!same_target(&el, &el, false, false));
-        assert!(!same_target(&el, &el, true, true));
-        let mut changed = el.clone();
-        changed.rect[0] += 1;
-        assert!(!same_target(&el, &changed, true, false));
-        changed = el.clone(); changed.identity.hwnd += 1;
-        assert!(!same_target(&el, &changed, true, false));
-        changed = el.clone(); changed.identity.window_runtime_id.push(9);
-        assert!(!same_target(&el, &changed, true, false));
-        changed = el.clone(); changed.identity.process_started += 1;
-        assert!(!same_target(&el, &changed, true, false));
-        changed = el.clone(); changed.identity.window_process_started += 1;
-        assert!(!same_target(&el, &changed, true, false));
-        changed = el.clone(); changed.identity.runtime_id.push(9);
-        assert!(!same_target(&el, &changed, true, false));
-        changed = el.clone(); changed.name = "删除".into();
-        assert!(!same_target(&el, &changed, true, false));
-        changed = el.clone(); changed.identity.runtime_id.clear();
-        assert!(!same_target(&changed, &changed, true, false));
-    }
-
-    #[test]
-    fn local_query_filters_before_result_budget_and_handles_negative_coordinates() {
-        let query = Query { keyword: "ä保", window_id: Some(42), region: Some([-1920, 0, 200, 200]), ..Default::default() };
-        assert!(query.matches("Ä保存", [-1900, 10, 100, 40]));
-        assert!(!query.matches("Ä保存", [100, 10, 100, 40]));
-        assert!(!query.matches("删除", [-1900, 10, 100, 40]));
-        assert!(intersects([i32::MAX - 1, 0, 100, 1], [i32::MAX, 0, 1, 1]));
-        assert!(!intersects([0, 0, 10, 10], [10, 0, 10, 10]));
-    }
-
-    #[test]
-    fn labels_do_not_change_raw_identity_and_unlabeled_actions_survive() {
-        let full = format!("  {}尾部", "中".repeat(120));
-        let mut source = raw(&full, [0, 0, 100, 40]);
-        source.identity = ElementIdentity { hwnd: 42, process_id: 7, process_started: 100,
-            window_process_id: 7, window_process_started: 100, window_runtime_id: vec![4], runtime_id: vec![1] };
-        let expected = finalize(vec![source], vs(), 1).remove(0);
-        assert_eq!(expected.name, full);
-        assert_eq!(expected.label.chars().count(), LABEL_CHARS);
-        let mut current = expected.clone();
-        current.label = "不同显示文字".into(); current.label_source = "child_text";
-        assert!(same_target(&expected, &current, true, false));
-        current.name.push('变');
-        assert!(!same_target(&expected, &current, true, false));
-        let mut unnamed = raw("", [0, 0, 10, 10]);
-        unnamed.actionable = true; unnamed.label_source = "unlabeled";
-        let result = finalize(vec![unnamed], vs(), 1);
-        assert_eq!(result.len(), 1);
-        assert!(result[0].label.is_empty());
-        let mut executable = expected.clone(); executable.actionable = true;
-        assert!(executable.non_executable_reason().is_none());
-        executable.foreground = false;
-        assert_eq!(executable.non_executable_reason(), Some("background_window"));
-        assert!(validate_target(&executable).is_err());
-    }
-
-    #[test]
-    fn label_limits_exclude_password_input_and_nested_actions() {
-        assert!(label_node_allowed("Text", false, false, false, 2, 16));
-        for (role, action, focus, password, depth, visits) in [
-            ("Text", false, false, true, 1, 1), ("Edit", false, false, false, 1, 1),
-            ("Button", false, false, false, 1, 1), ("Text", true, false, false, 1, 1),
-            ("Text", false, true, false, 1, 1), ("Text", false, false, false, 3, 1),
-            ("Text", false, false, false, 1, 17),
-        ] { assert!(!label_node_allowed(role, action, focus, password, depth, visits)); }
-        let mut pieces = Vec::new();
-        for text in ["甲", "乙", "丙", "丁"] { add_label_piece(&mut pieces, text); }
-        assert_eq!(pieces.len(), 3);
-        assert_eq!(display_label(&"中".repeat(200)).chars().count(), 96);
-        assert!(!passive_content("Text", false, false, true));
-        assert!(passive_content("Image", false, false, false));
-        assert!(!passive_content("Unknown", false, false, false));
-        assert!(!passive_content("Text", true, false, false));
-        assert!(!passive_content("Image", false, true, false));
-        assert!(!label_node_allowed("Unknown", false, false, false, 1, 1));
-        assert!(!label_node_allowed("Pane", true, false, false, 1, 1));
-    }
-
-    #[test]
-    fn partial_offscreen_candidates_use_visible_pixels_not_original_center_or_gaps() {
-        let rect = [-90, 10, 100, 40];
-        let monitors = [[0, 0, 100, 100], [200, 0, 100, 100]];
-        let points = candidate_points(rect, Some((-40, 30)), &monitors);
-        assert!(!points.is_empty());
-        assert!(points.iter().all(|p| point_in(rect, *p) && point_in(monitors[0], *p)));
-        assert!(candidate_points([110, 10, 50, 40], Some((120, 20)), &monitors).is_empty());
-        let points = candidate_points([0, 0, 300, 100], Some((150, 50)), &monitors);
-        assert!(points.iter().all(|p| monitors.iter().any(|m| point_in(*m, *p))));
-        assert_eq!(rect, [-90, 10, 100, 40]);
-    }
-
-    #[test]
-    fn text_ownership_requires_exact_ancestor_and_rejects_nested_button() {
-        let mut expected = finalize(vec![raw("保存", [0, 0, 100, 40])], vs(), 1).remove(0);
-        expected.identity = ElementIdentity { hwnd: 42, process_id: 7, process_started: 100,
-            window_process_id: 7, window_process_started: 100, window_runtime_id: vec![4], runtime_id: vec![1] };
-        let mut text = expected.clone(); text.role = "Text"; text.identity.runtime_id = vec![2];
-        assert!(!same_target(&expected, &text, true, false));
-        assert!(may_ascend_hit(&expected, &text, passive_content("Text", false, false, false), 0, true, false));
-        assert!(same_target(&expected, &expected, true, false));
-        assert!(!may_ascend_hit(&expected, &text, passive_content("Button", true, false, false), 0, true, false));
-        assert!(!may_ascend_hit(&expected, &text, true, HIT_ANCESTORS, true, false));
-        assert!(!may_ascend_hit(&expected, &text, true, 0, false, false));
-        assert!(!may_ascend_hit(&expected, &text, true, 0, true, true));
-        let mut sibling = expected.clone(); sibling.identity.runtime_id = vec![9];
-        assert!(!same_target(&expected, &sibling, true, false));
-        text.identity.hwnd += 1;
-        assert!(!may_ascend_hit(&expected, &text, true, 0, true, false));
-    }
-
-    #[test]
-    fn passwords_never_read_their_own_name() {
-        let name = protected_name::<()>(true, || panic!("password Name must not be read"));
-        assert_eq!(name.unwrap(), "");
-        assert_eq!(protected_name::<()>(false, || Ok("  原始名称  ".into())).unwrap(), "  原始名称  ");
-        assert!(protected_name(false, || Err::<String, _>("provider failure")).is_err());
-    }
-
-    #[test]
-    fn candidate_failures_do_not_bypass_occlusion_or_abort_other_candidates() {
-        let monitors = [[0, 0, 100, 100]];
-        let points = candidate_points([0, 0, 100, 100], Some((10, 10)), &monitors);
-        let mut visited = Vec::new();
-        let selected = verified_candidate(points.clone(), |point| {
-            visited.push(point);
-            match visited.len() {
-                1 => Err("provider failure"),
-                2 => Ok(false), // 遮挡不能退回几何坐标。
-                _ => Ok(true),
-            }
-        });
-        assert_eq!(visited, points[..3]);
-        assert_eq!(selected, Some(points[2]));
-        assert_eq!(verified_candidate(points, |_| Ok::<_, ()>(false)), None);
-        let fallback = candidate_points([0, 0, 100, 100], None, &monitors);
-        assert!(!fallback.is_empty());
-        assert_eq!(verified_candidate(fallback, |_| Err::<bool, _>("unknown")), None);
-    }
-
-    #[test]
-    fn monitor_gaps_do_not_consume_visible_element_budget() {
-        let monitors = [[-100, 0, 100, 100], [100, 0, 100, 100]];
-        let found: Vec<_> = [[10, 10, 50, 50], [-10, 10, 30, 30], [110, 10, 30, 30]].into_iter()
-            .filter(|rect| visible_on_monitors(*rect, &monitors)).take(1).collect();
-        assert_eq!(found, vec![[-10, 10, 30, 30]]);
-        assert!(!visible_on_monitors([0, 0, 100, 100], &monitors));
-        assert!(!visible_on_monitors([0, 0, 1, 1], &[]));
-    }
-
-    #[test]
-    fn role_prefilter_spends_budget_only_on_normalized_roles() {
-        assert_eq!(parse_role(" button ").unwrap(), Some("Button"));
-        assert_eq!(parse_role(" custom ").unwrap(), Some("Custom"));
-        assert!(parse_role("Buttons").is_err());
-        let query = Query { role: parse_role("button").unwrap(), ..Default::default() };
-        let found: Vec<_> = ["Edit", "Edit", "Button", "Button"].into_iter()
-            .filter(|r| query.matches_role(r)).take(1).collect();
-        assert_eq!(found, vec!["Button"]);
-    }
-
-    /// 只读的 Windows UIA 烟雾探针；默认忽略，避免无头 CI 被桌面会话影响。
-    #[test]
-    #[ignore = "诊断用：枚举当前桌面的 UIA 元素"]
-    fn enumerate_live_desktop_without_panicking() {
-        let els = enumerate_mode(None, true, 600, 800).expect("UIA 全桌面枚举应成功");
-        assert!(!els.is_empty(), "真实桌面应该至少有一个可交互元素");
-        assert!(els.len() <= 800);
-        assert!(els.iter().enumerate().all(|(i, e)| e.id == i + 1));
-        println!(
-            "UIA 全桌面枚举到 {} 个元素，首项：{:?}",
-            els.len(),
-            els.first()
-        );
-
-        let focused = enumerate_mode(None, false, 600, 800).expect("UIA 焦点窗口枚举应成功");
-        assert!(!focused.is_empty(), "焦点窗口应该至少有一个可交互元素");
-        let title = &focused[0].window;
-        assert!(
-            focused.iter().all(|e| &e.window == title),
-            "焦点模式不应混入其他顶层窗口"
-        );
-        println!("焦点窗口「{title}」枚举到 {} 个元素", focused.len());
-    }
-
-    /// 编号必须从 1 连续递增 —— 模型把它当一个列表引用，断号会让人怀疑丢数据。
-    #[test]
-    fn ids_are_contiguous_from_one() {
-        let raws: Vec<RawElement> = (0..7)
-            .map(|i| raw(&format!("x{i}"), [0, i * 50, 100, 40]))
-            .collect();
-        let els = finalize(raws, vs(), 800);
-        for (i, e) in els.iter().enumerate() {
-            assert_eq!(e.id, i + 1);
-        }
-    }
-}
+#[cfg(test)]
+#[path = "screen_uia_tests.rs"]
+mod tests;

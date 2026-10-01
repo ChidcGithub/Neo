@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from tools.check_release import CRT_NAMES
 
@@ -25,6 +26,12 @@ class NsModel:
                           "$BackupDir": r"C:\Programs\backup", "$PLUGINSDIR": r"C:\Temp\plugins",
                           "$DESKTOP": r"C:\Users\test\Desktop", "$SMPROGRAMS": r"C:\Users\test\Start"}
         self.files = {}
+        self.directories = set()
+        self.directory_ids = {}
+        self.next_directory_id = 1
+        self.residues = {}
+        self.payload = {"neo.exe": b"new executable"}
+        self.identity_path = None
         self.registry = None
         self.exported = None
         self.faults = set(faults)
@@ -56,10 +63,21 @@ class NsModel:
             text = SOURCE.split(f"!macro {macro} PATH FLAG NAME\n", 1)[1].split("!macroend", 1)[0]
             return text.replace("${PATH}", path.strip('"')).replace("${FLAG}", flag).replace("${NAME}", filename.strip('"'))
         body = re.sub(r'!insertmacro (?:Save|Restore)Shortcut[^\n]+', expand, body)
+        body = body.replace('${PREFIX}', 'un.' if name.startswith('un.') else '')
         # NSIS relative jumps count instructions, not labels or comments.
         instructions, labels = [], {}
+        enabled = True
         for line in body.splitlines():
             line = line.strip()
+            # Model the no-art build; the isolated compiler also checks this variant.
+            if line == '!ifdef HAVE_ART':
+                enabled = False
+                continue
+            if line in ('!else', '!endif'):
+                enabled = True
+                continue
+            if not enabled:
+                continue
             if not line or line.startswith(";"):
                 continue
             if line.endswith(":"):
@@ -68,7 +86,21 @@ class NsModel:
                 instructions.append(shlex.split(line, posix=False))
         return instructions, labels
 
+    def is_directory(self, path):
+        return path in self.directories or any(p.startswith(path + "\\") for p in (*self.files, *self.directories))
+
+    def exists(self, path):
+        if path.endswith(r"\*.*"):
+            return self.is_directory(path[:-4])
+        return path in self.files or self.is_directory(path)
+
     def execute(self, name):
+        # Fixtures may seed files directly. Their parents survive deletion of the last file.
+        for path in (*self.files, *self.directories):
+            parent = ntpath.dirname(path)
+            while parent and parent != path:
+                self.directories.add(parent)
+                path, parent = parent, ntpath.dirname(parent)
         lines, labels = self.lines(name)
         pc = 0
         for _ in range(1000):
@@ -95,7 +127,7 @@ class NsModel:
             elif op == "IfErrors":
                 jump = args[0] if self.error else (args[1] if len(args) > 1 else None)
             elif op == "IfFileExists":
-                jump = args[1] if v(args[0]) in self.files else args[2]
+                jump = args[1] if self.exists(v(args[0])) else (args[2] if len(args) > 2 else None)
             elif op == "ClearErrors":
                 self.error = False
             elif op == "SetErrors":
@@ -111,6 +143,8 @@ class NsModel:
                 return
             elif op == "Call":
                 self.execute(args[0])
+                if self.aborted:
+                    return
             elif op == "GetFullPathName":
                 self.variables[args[0]] = ntpath.normpath(v(args[1]))
             elif op == "${GetRoot}":
@@ -132,10 +166,32 @@ class NsModel:
                     for register, value in zip(("$1", "$2", "$3"), self.os_version):
                         self.variables[register] = str(value)
                 elif "GetFileAttributesW" in api:
-                    path = self.variables["$0"]
-                    attrs, err = self.attributes.get(path, (0 if path in self.files else -1, 2))
-                    self.variables["$1"] = str(attrs)
+                    match = re.search(r'GetFileAttributesW\(w (r0|"[^"]+")\) i \.r([01])', api)
+                    assert match is not None, api
+                    operand, register = match.groups()
+                    path = self.variables["$0"] if operand == "r0" else v(operand)
+                    dest = "$" + register
+                    default = 0x10 if self.is_directory(path) else (0 if path in self.files else -1)
+                    attrs, err = self.attributes.get(path, (default, 2))
+                    self.variables[dest] = str(attrs)
                     self.stack.append(str(err))
+                elif "CreateFileW" in api:
+                    self.identity_path = v("$INSTDIR")
+                    self.variables["$0"] = "-1" if "identity-open" in self.faults or not self.exists(self.identity_path) else "200"
+                elif "GetFileInformationByHandle" in api:
+                    self.variables["$2"] = "0" if "identity-query" in self.faults else "1"
+                elif api.startswith("'*$1(i .r2"):
+                    path = self.identity_path
+                    attrs = self.attributes.get(path, (0x10 if self.is_directory(path) else 0, 0))[0]
+                    if path not in self.directory_ids:
+                        self.directory_ids[path] = (101, 0, self.next_directory_id, self.next_directory_id, 456)
+                        self.next_directory_id += 1
+                    identity = self.directory_ids[path]
+                    self.variables["$2"] = str(attrs)
+                    for register, value in zip(("$3", "$4", "$5", "$6", "$7"), identity):
+                        self.variables[register] = str(value)
+                elif "CloseHandle" in api:
+                    self.calls.append("close-handle")
                 elif "CreateMutexW" in api:
                     self.calls.append("mutex")
                     self.variables["$0"] = "0" if "mutex-denied" in self.faults else "100"
@@ -146,6 +202,8 @@ class NsModel:
                     self.variables["$0"] = "10"
                 elif "RegCloseKey" not in api:
                     raise AssertionError(api)
+            elif op == "System::Alloc":
+                self.stack.append("0" if "identity-allocate" in self.faults else "300")
             elif op == "System::Free":
                 self.calls.append("free")
             elif op == "SetErrorLevel":
@@ -172,10 +230,27 @@ class NsModel:
                     self.files[dst] = self.files[src]
             elif op == "Delete":
                 path = v(args[0])
-                if ("delete", path) in self.faults:
+                if ("delete", path) in self.faults or self.is_directory(path):
                     self.error = True
                 else:
                     self.files.pop(path, None)
+            elif op in ("WriteRegStr", "WriteRegDWORD"):
+                key, field, data = v(args[1]), v(args[2]), v(args[3])
+                if key == v("$ResidueKey") and key:
+                    if "residue-write" in self.faults:
+                        self.error = True
+                    else:
+                        self.residues[key] = data
+                else:
+                    if self.registry is None:
+                        self.registry = {}
+                    self.registry[field] = data
+            elif op == "ReadRegStr":
+                key = v(args[2])
+                self.error = key not in self.residues or "residue-read" in self.faults
+                self.variables[args[0]] = "" if self.error else self.residues[key]
+            elif op == "DeleteRegKey" and v(args[1]) == v("$ResidueKey") and v("$ResidueKey"):
+                self.residues.pop(v(args[1]), None)
             elif op == "DeleteRegKey":
                 self.calls.append("reg-delete")
                 if "reg-delete" in self.faults:
@@ -185,19 +260,63 @@ class NsModel:
             elif op == "Rename":
                 src, dst = v(args[0]), v(args[1])
                 assert self.variables.get("$OUTDIR") != src
-                if ("rename", src) in self.faults:
+                if ("rename", src) in self.faults or not self.exists(src) or self.exists(dst):
                     self.error = True
                 else:
-                    moved = {p: b for p, b in self.files.items() if p.startswith(src + "\\")}
+                    moved_ids = {p: identity for p, identity in self.directory_ids.items()
+                                 if p == src or p.startswith(src + "\\")}
+                    for path, identity in moved_ids.items():
+                        self.directory_ids[dst + path[len(src):]] = identity
+                        del self.directory_ids[path]
+                    moved_dirs = {p for p in self.directories if p == src or p.startswith(src + "\\")}
+                    self.directories.difference_update(moved_dirs)
+                    self.directories.update(dst + p[len(src):] for p in moved_dirs)
+                    moved = {p: b for p, b in self.files.items() if p == src or p.startswith(src + "\\")}
                     for path, data in moved.items():
                         self.files[dst + path[len(src):]] = data
                         del self.files[path]
+            elif op == "CreateDirectory":
+                path = v(args[0])
+                if path in self.files:
+                    self.error = True
+                else:
+                    self.directories.add(path)
+            elif op == "GetTempFileName":
+                base = v(args[1]) + r"\stage"
+                path, suffix = base, 0
+                while self.exists(path):
+                    suffix += 1
+                    path = f"{base}-{suffix}"
+                self.variables[args[0]] = path
+                self.files[path] = b""
+            elif op == "File":
+                for path, data in self.payload.items():
+                    self.files[v("$OUTDIR") + "\\" + path] = data
+            elif op == "WriteUninstaller":
+                self.files[v(args[0])] = b"new uninstaller"
+            elif op == "CreateShortcut":
+                self.files[v(args[0])] = v(args[1]).encode()
+            elif op == "${GetSize}":
+                for register in args[2:]:
+                    self.variables[register] = "1"
+            elif op in ("SetOverwrite", "DetailPrint"):
+                pass
             elif op == "SetOutPath":
                 self.variables["$OUTDIR"] = v(args[0])
             elif op == "RMDir":
                 path = v(args[-1])
-                if "/r" in args:
+                if ("rmdir", path) in self.faults or not self.is_directory(path):
+                    self.error = True
+                elif "/r" in args:
                     self.files = {p: b for p, b in self.files.items() if not p.startswith(path + "\\")}
+                    self.directories = {p for p in self.directories if p != path and not p.startswith(path + "\\")}
+                    self.directory_ids = {p: identity for p, identity in self.directory_ids.items()
+                                          if p != path and not p.startswith(path + "\\")}
+                elif any(p.startswith(path + "\\") for p in (*self.files, *self.directories)):
+                    self.error = True
+                else:
+                    self.directories.discard(path)
+                    self.directory_ids.pop(path, None)
             elif op == "MessageBox":
                 self.messages.append(" ".join(args))
             elif op != "InitPluginsDir":
@@ -412,7 +531,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('StrCpy $StageDir ""', commit)
         body = SOURCE.split('Section "Uninstall"', 1)[1]
         self.assertLess(body.index("Call un.CheckRunning"), body.index("Delete "))
-        self.assertLess(body.index("Call un.CheckInstallPath"), body.index("Delete "))
+        self.assertLess(body.index("Call un.CheckInstallTarget"), body.index("Delete "))
         self.assertNotIn("RMDir /r", body)
         self.assertLess(body.index("DeleteRegKey"), body.index('Delete "$INSTDIR\\uninstall.exe"'))
 
@@ -438,7 +557,8 @@ class InstallerTests(unittest.TestCase):
                 m = NsModel()
                 path = m.value("$INSTDIR") + "\\" + name
                 uninstaller = m.value(r"$INSTDIR\uninstall.exe")
-                m.files.update({path: b"locked CRT", uninstaller: b"uninstaller"})
+                m.files.update({path: b"locked CRT", uninstaller: b"uninstaller",
+                                m.value(r"$INSTDIR\neo.exe"): b"old executable"})
                 m.registry = {"DisplayVersion": "old"}
                 m.faults.add(("delete", path))
                 m.execute("Uninstall")
@@ -446,6 +566,303 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(m.files[path], b"locked CRT")
                 self.assertIn(uninstaller, m.files)
                 self.assertEqual(m.registry, {"DisplayVersion": "old"})
+
+    def installed_model(self):
+        m = NsModel()
+        for name in ["neo.exe", "uninstall.exe", "assets\\hi_neo.onnx",
+                     "assets-stt\\model.int8.onnx", "runtime\\gitbash\\bin\\bash.exe",
+                     "assets\\custom.txt", "assets-stt\\custom.txt", "runtime\\custom.txt", "notes.txt"]:
+            m.files[m.value("$INSTDIR") + "\\" + name] = name.encode()
+        m.registry = {"DisplayVersion": "old"}
+        return m
+
+    def test_uninstall_then_reinstall_keeps_residue_and_user_data(self):
+        m = self.installed_model()
+        appdata = m.value(r"$APPDATA\Neo\memory.db")
+        m.files[appdata] = b"private data"
+        m.execute("Uninstall")
+        self.assertFalse(m.aborted)
+        self.assertIsNone(m.registry)
+        self.assertNotIn(m.value(r"$INSTDIR\neo.exe"), m.files)
+        self.assertNotIn(m.value(r"$INSTDIR\uninstall.exe"), m.files)
+        self.assertTrue(m.residues)
+        remaining = dict(m.files)
+        m.execute("CheckInstallTarget")
+        self.assertFalse(m.error)
+        m.execute("Install")
+        self.assertFalse(m.aborted, m.messages)
+        self.assertEqual(m.files[m.value(r"$INSTDIR\neo.exe")], b"new executable")
+        self.assertIn(m.value(r"$INSTDIR\uninstall.exe"), m.files)
+        for path, data in remaining.items():
+            preserved = path.replace(m.value("$INSTDIR"), m.value("$BackupDir"), 1) if path != appdata else path
+            self.assertEqual(m.files[preserved], data)
+        self.assertEqual(m.files[appdata], b"private data")
+        # A second uninstall records the new directory, not the moved backup.
+        m.execute("Uninstall")
+        self.assertFalse(m.aborted, m.messages)
+        m.execute("CheckInstallTarget")
+        self.assertFalse(m.error)
+
+    def test_reinstall_publish_failure_restores_residue_for_retry(self):
+        m = self.installed_model()
+        m.execute("Uninstall")
+        before = dict(m.files)
+        m.faults.add(("rename", m.value("$StageDir")))
+        m.execute("Install")
+        self.assertTrue(m.aborted)
+        self.assertEqual(m.files, before)
+        m.execute("CheckInstallTarget")
+        self.assertFalse(m.error)
+        m.aborted = False
+        m.faults.clear()
+        m.execute("Install")
+        self.assertFalse(m.aborted, m.messages)
+
+    def test_unknown_legacy_and_forged_residue_remain_rejected(self):
+        for names in [["notes.txt"], ["assets\\hi_neo.onnx", "assets-stt\\model.int8.onnx",
+                                    "runtime\\gitbash\\bin\\bash.exe"],
+                      [".neo-uninstalled", "assets\\custom.txt"], ["neo.exe"], ["uninstall.exe"]]:
+            with self.subTest(names=names):
+                m = NsModel()
+                m.files = {m.value("$INSTDIR") + "\\" + name: b"keep" for name in names}
+                before = dict(m.files)
+                m.execute("Install")
+                self.assertTrue(m.aborted)
+                self.assertEqual(m.files, before)
+                self.assertTrue(any("旧版卸载" in message for message in m.messages))
+                m.aborted = False
+                m.execute("Uninstall")
+                self.assertTrue(m.aborted)
+                self.assertFalse(m.residues, "a copied uninstaller must not bless an unknown directory")
+                self.assertEqual(m.files, before)
+
+    def test_entry_files_reject_directories_reparse_points_and_attribute_errors(self):
+        for name in ("neo.exe", "uninstall.exe"):
+            for kind in ("directory", "reparse", "denied", "io-error"):
+                for recorded in (False, True):
+                    with self.subTest(name=name, kind=kind, recorded=recorded):
+                        m = self.installed_model()
+                        if recorded:
+                            m.execute("Uninstall")
+                            m.files[m.value(r"$INSTDIR\neo.exe")] = b"app"
+                            m.files[m.value(r"$INSTDIR\uninstall.exe")] = b"uninstaller"
+                        path = m.value("$INSTDIR") + "\\" + name
+                        if kind == "directory":
+                            del m.files[path]
+                            m.directories.add(path)
+                        else:
+                            m.attributes[path] = {"reparse": (0x400, 0), "denied": (-1, 5),
+                                                  "io-error": (-1, 1117)}[kind]
+                        before, residues = dict(m.files), dict(m.residues)
+                        m.execute("CheckInstallTarget")
+                        self.assertTrue(m.error)
+                        m.execute("Uninstall")
+                        self.assertTrue(m.aborted)
+                        self.assertEqual(m.files, before)
+                        self.assertEqual(m.residues, residues)
+                        self.assertEqual(m.stack, [])
+
+    def model_instructions(self, model, text):
+        instructions = [shlex.split(line, posix=False) for line in text.splitlines() if line.strip()]
+        with patch.object(model, "lines", return_value=(instructions, {})):
+            model.execute("test instructions")
+
+    def test_model_rename_requires_source_and_absent_destination(self):
+        for source_exists, destination_kind in ((False, None), (True, "file"), (True, "directory")):
+            with self.subTest(source_exists=source_exists, destination_kind=destination_kind):
+                m = NsModel()
+                if source_exists:
+                    m.files[m.value(r"$INSTDIR\notes.txt")] = b"source"
+                if destination_kind == "file":
+                    m.files[m.value("$BackupDir")] = b"destination"
+                elif destination_kind == "directory":
+                    m.directories.add(m.value("$BackupDir"))
+                before = dict(m.files)
+                self.model_instructions(m, 'Rename "$INSTDIR" "$BackupDir"')
+                self.assertTrue(m.error)
+                self.assertEqual(m.files, before)
+
+    def test_consecutive_reinstalls_preserve_distinct_backups(self):
+        m = self.installed_model()
+        m.execute("Uninstall")
+        m.execute("Install")
+        self.assertFalse(m.aborted, m.messages)
+        first_backup = m.value("$BackupDir")
+        retained = {p: data for p, data in m.files.items() if p.startswith(first_backup + "\\")}
+        self.assertTrue(retained)
+        m.execute("Install")
+        self.assertFalse(m.aborted, m.messages)
+        self.assertNotEqual(m.value("$BackupDir"), first_backup)
+        for path, data in retained.items():
+            self.assertEqual(m.files[path], data)
+        self.assertNotIn(m.value(r"$INSTDIR\notes.txt"), m.files)
+        self.assertEqual(m.files[m.value(r"$INSTDIR\neo.exe")], b"new executable")
+
+    def test_temp_name_skips_existing_file_and_empty_directory(self):
+        m = NsModel()
+        m.files[r"C:\Programs\stage"] = b"keep"
+        m.directories.add(r"C:\Programs\stage-1")
+        self.model_instructions(m, 'GetTempFileName $StageDir "C:\\Programs"')
+        self.assertEqual(m.value("$StageDir"), r"C:\Programs\stage-2")
+        self.assertEqual(m.files[r"C:\Programs\stage"], b"keep")
+        self.assertEqual(m.files[m.value("$StageDir")], b"")
+
+    def test_rollback_destination_collision_keeps_backup_and_can_retry(self):
+        m = self.installed_model()
+        m.execute("Uninstall")
+        identity = m.directory_ids[m.value("$INSTDIR")]
+        self.model_instructions(m, 'Rename "$INSTDIR" "$BackupDir"\nCreateDirectory "$INSTDIR"')
+        m.variables["$OldMoved"] = "1"
+        before = dict(m.files)
+        m.execute("RollbackInstall")
+        self.assertEqual(m.files, before)
+        self.assertEqual(m.variables["$OldMoved"], "1")
+        self.assertTrue(m.messages)
+        self.model_instructions(m, 'RMDir "$INSTDIR"')
+        m.execute("RollbackInstall")
+        self.assertEqual(m.variables["$OldMoved"], "0")
+        self.assertEqual(m.directory_ids[m.value("$INSTDIR")], identity)
+        m.execute("CheckInstallTarget")
+        self.assertFalse(m.error)
+
+    def test_deleted_and_recreated_directory_cannot_reuse_residue_identity(self):
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive):
+                m = self.installed_model()
+                m.execute("Uninstall")
+                root = m.value("$INSTDIR")
+                original = m.directory_ids[root]
+                m.variables["$INSTDIR"] = root + r"\assets"
+                m.execute("GetResidueKey")
+                child_identity = m.directory_ids[m.value("$INSTDIR")]
+                m.variables["$INSTDIR"] = root
+                if recursive:
+                    self.model_instructions(m, 'RMDir /r "$INSTDIR"')
+                else:
+                    self.model_instructions(m, 'RMDir /r "$INSTDIR\\assets"\n'
+                                           'RMDir /r "$INSTDIR\\assets-stt"\n'
+                                           'RMDir /r "$INSTDIR\\runtime"\n'
+                                           'Delete "$INSTDIR\\notes.txt"\nRMDir "$INSTDIR"')
+                self.assertFalse(m.error)
+                self.assertNotIn(root, m.directory_ids)
+                self.assertNotIn(root + r"\assets", m.directory_ids)
+                self.assertTrue(m.residues, "external deletion leaves the old registry record")
+                self.model_instructions(m, 'CreateDirectory "$INSTDIR"\nCreateDirectory "$INSTDIR\\assets"')
+                m.files[root + r"\unrelated.txt"] = b"unknown directory"
+                m.execute("CheckInstallTarget")
+                self.assertTrue(m.error)
+                self.assertNotEqual(m.directory_ids[root], original)
+                m.variables["$INSTDIR"] = root + r"\assets"
+                m.execute("GetResidueKey")
+                self.assertNotEqual(m.directory_ids[m.value("$INSTDIR")], child_identity)
+
+    def test_residue_requires_same_path_volume_file_id_and_creation_time(self):
+        for mismatch in ("path", "volume", "file-id", "creation-time", "missing-record", "read-denied"):
+            with self.subTest(mismatch=mismatch):
+                m = self.installed_model()
+                m.execute("Uninstall")
+                path = m.value("$INSTDIR")
+                if mismatch == "path":
+                    m.residues = {key: r"C:\Other\Neo" for key in m.residues}
+                elif mismatch == "missing-record":
+                    m.residues.clear()
+                elif mismatch == "read-denied":
+                    m.faults.add("residue-read")
+                else:
+                    identity = list(m.directory_ids[path])
+                    identity[{"volume": 0, "file-id": 2, "creation-time": 3}[mismatch]] += 1
+                    m.directory_ids[path] = tuple(identity)
+                before = dict(m.files)
+                m.execute("CheckInstallTarget")
+                self.assertTrue(m.error)
+                self.assertEqual(m.files, before)
+
+    def test_identity_or_record_failure_precedes_uninstall_deletion(self):
+        for fault in ("identity-open", "identity-query", "identity-allocate", "residue-write", "residue-read"):
+            with self.subTest(fault=fault):
+                m = self.installed_model()
+                m.faults.add(fault)
+                before = dict(m.files)
+                m.execute("Uninstall")
+                self.assertTrue(m.aborted)
+                self.assertEqual(m.files, before)
+                self.assertEqual(m.registry, {"DisplayVersion": "old"})
+
+    def test_identity_rejects_zero_file_id_and_nondirectory_handle(self):
+        for attrs, identity in [(0x10, (101, 0, 0, 123, 456)),
+                                (0, (101, 0, 7, 123, 456)),
+                                (0x410, (101, 0, 7, 123, 456))]:
+            m = self.installed_model()
+            path = m.value("$INSTDIR")
+            m.attributes[path] = (attrs, 0)
+            m.directory_ids[path] = identity
+            m.execute("GetResidueKey")
+            self.assertTrue(m.error)
+            self.assertEqual(m.variables["$ResidueKey"], "")
+            self.assertEqual(m.stack, [])
+            self.assertIn("close-handle", m.calls)
+
+    def test_residue_does_not_bypass_reparse_or_access_checks(self):
+        for attrs in ((0x410, 0), (-1, 5)):
+            m = self.installed_model()
+            m.execute("Uninstall")
+            m.attributes[m.value("$INSTDIR")] = attrs
+            m.execute("CheckInstallTarget")
+            self.assertTrue(m.error)
+
+    def test_registry_delete_failure_keeps_reinstall_and_uninstall_retry(self):
+        m = self.installed_model()
+        m.faults.add("reg-delete")
+        m.execute("Uninstall")
+        self.assertTrue(m.aborted)
+        self.assertIn(m.value(r"$INSTDIR\uninstall.exe"), m.files)
+        self.assertEqual(m.registry, {"DisplayVersion": "old"})
+        m.execute("CheckInstallTarget")
+        self.assertFalse(m.error)
+        m.aborted = False
+        m.faults.clear()
+        m.execute("Uninstall")
+        self.assertFalse(m.aborted, m.messages)
+        m.execute("Install")
+        self.assertFalse(m.aborted, m.messages)
+
+    def test_partial_uninstall_can_retry_and_reinstall(self):
+        for path in (r"$INSTDIR\neo.exe", r"$INSTDIR\msvcp140.dll", r"$INSTDIR\uninstall.exe"):
+            m = self.installed_model()
+            m.files[m.value(r"$INSTDIR\msvcp140.dll")] = b"CRT"
+            m.faults.add(("delete", m.value(path)))
+            m.execute("Uninstall")
+            self.assertTrue(m.aborted)
+            m.execute("CheckInstallTarget")
+            self.assertFalse(m.error)
+            m.aborted = False
+            m.faults.clear()
+            m.execute("Uninstall")
+            self.assertFalse(m.aborted, m.messages)
+            m.execute("Install")
+            self.assertFalse(m.aborted, m.messages)
+
+    def test_empty_uninstall_removes_identity_record(self):
+        m = NsModel()
+        m.files = {m.value(r"$INSTDIR\neo.exe"): b"app",
+                   m.value(r"$INSTDIR\uninstall.exe"): b"uninstaller"}
+        m.execute("Uninstall")
+        self.assertFalse(m.aborted)
+        self.assertFalse(m.files)
+        self.assertFalse(m.residues)
+        m.execute("Install")
+        self.assertFalse(m.aborted, m.messages)
+
+    def test_residue_api_layout_and_validation_order(self):
+        body = SOURCE.split('Function ${PREFIX}GetResidueKey\n', 1)[1].split('FunctionEnd', 1)[0]
+        self.assertIn('System::Alloc 52', body)
+        self.assertIn('i 0x02200000', body)  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        self.assertIn('i .r2, i .r6, i .r7, i, i, i, i, i .r3, i, i, i, i .r4, i .r5', body)
+        install = SOURCE.split('Section "Install"\n', 1)[1].split('SectionEnd', 1)[0]
+        self.assertEqual(install.count('Call CheckInstallTarget'), 2)
+        uninstall = SOURCE.split('Section "Uninstall"\n', 1)[1]
+        self.assertLess(uninstall.index('WriteRegStr'), uninstall.index('Delete '))
+        self.assertLess(uninstall.index('ReadRegStr'), uninstall.index('Delete '))
 
     def test_crt_transaction_rollback_restores_all_old_dlls_and_unknown_files(self):
         for previous in (False, True):

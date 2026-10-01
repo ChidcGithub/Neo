@@ -40,7 +40,10 @@ pub static PARAMS: &[Param] = &[
          多条语句用 `;` 或换行分隔（5.1 不支持 `&&`）。\
          常用对应：`ls`=Get-ChildItem、`cat`=Get-Content、`rm -rf x`=Remove-Item -Recurse -Force x、\
          `grep`=Select-String、丢弃输出用 `> $null`（不是 `/dev/null`）。\
-         要写 bash 语法请改用 `bash` 工具。",
+         要写 bash 语法请改用 `bash` 工具。\
+         默认前台会在命令结束时清理整棵进程树（包括 GUI 子程序）；\
+         要打开并保留 GUI / 长驻程序，必须设置工具参数 `background: true`，\
+         仅在命令中使用 `Start-Process` 不会脱离前台清理。",
     ),
     Param::opt_text(
         "cwd",
@@ -49,7 +52,7 @@ pub static PARAMS: &[Param] = &[
     Param::opt_int(
         "timeout_ms",
         "前台模式的超时毫秒数。默认 500000（500 秒，够编译与测试），上限 1800000。\
-         超时会杀掉进程并返回 timeout。后台模式忽略此参数。",
+         超时或取消会清理整棵前台进程树；正常结束也会清理残留子进程。后台模式忽略此参数。",
         500_000,
         100,
         1_800_000,
@@ -57,7 +60,10 @@ pub static PARAMS: &[Param] = &[
     Param::flag(
         "background",
         "true = 后台启动：立即返回 PID，不等命令结束、不捕获输出。\
-         起服务/长驻进程时用它；编译测试这类要结果的仍用默认的 false。",
+         启动并保留 GUI / 服务 / 长驻进程时必须显式设为 true；\
+         启动后不随本次调用的超时或取消清理，需要自行关闭。\
+         返回 PID 是 shell PID，不一定是 GUI PID，成功只表示 shell 已启动。\
+         编译测试这类要结果且结束后清理子进程的仍用默认的 false。",
     ),
 ];
 
@@ -85,48 +91,5 @@ pub fn run(scope: &Scope, args: &Args) -> Outcome {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn timeout_default_is_500s_and_range_allows_it() {
-        let p = PARAMS
-            .iter()
-            .find(|p| p.name == "timeout_ms")
-            .expect("timeout_ms 参数存在");
-        assert_eq!(p.default, Some(crate::spec::Default::Int(500_000)));
-        let (lo, hi) = p.range.expect("有区间");
-        assert!(lo < 500_000 && hi >= 500_000, "区间必须容得下默认值");
-        assert_eq!(hi, 1_800_000);
-    }
-
-    #[test]
-    fn background_flag_defaults_off() {
-        let p = PARAMS
-            .iter()
-            .find(|p| p.name == "background")
-            .expect("background 参数存在");
-        assert!(!p.required);
-        assert_eq!(p.default, Some(crate::spec::Default::Bool(false)));
-    }
-
-    #[test]
-    fn preview_says_background_when_asked() {
-        let tool = crate::find("powershell").unwrap();
-
-        let v = json!({ "command": "npm run dev", "background": true });
-        assert!(preview(&Args::new(tool, &v)).contains("后台执行"));
-
-        let v = json!({ "command": "cargo test" });
-        assert!(!preview(&Args::new(tool, &v)).contains("后台"));
-    }
-
-    /// 参数说明必须点明"不是 bash，要 bash 请换工具" —— 模型不看文档也要能选对。
-    #[test]
-    fn command_hint_warns_about_shell_dialect() {
-        let p = PARAMS.iter().find(|p| p.name == "command").unwrap();
-        assert!(p.desc.contains("不是 bash"), "说明里要标明方言");
-        assert!(p.desc.contains("`bash` 工具"), "要指向姊妹工具");
-    }
-}
+#[path = "powershell_tests.rs"]
+mod tests;

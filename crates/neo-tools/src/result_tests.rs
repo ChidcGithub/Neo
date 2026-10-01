@@ -1,0 +1,132 @@
+
+    use super::*;
+
+    fn outcome_ok() -> Outcome {
+        Outcome::ok("read_file", "读取 a.rs", json!({ "lines": 3 }))
+    }
+
+    #[test]
+    fn model_json_shape_on_success() {
+        let v: Value = serde_json::from_str(&outcome_ok().to_model_json(4096)).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["tool"], "read_file");
+        assert_eq!(v["data"]["lines"], 3);
+    }
+
+    #[test]
+    fn model_json_shape_on_failure() {
+        let out = Outcome::fail("bash", ToolError::not_allowed("越界").with_hint("换个路径"));
+        let v: Value = serde_json::from_str(&out.to_model_json(4096)).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"]["kind"], "not_allowed");
+        assert_eq!(v["error"]["hint"], "换个路径");
+    }
+
+    #[test]
+    fn truncation_stays_valid_json() {
+        let out = Outcome::ok("bash", "输出很长", json!({ "stdout": "汉".repeat(500) }));
+        let v: Value = serde_json::from_str(&out.to_model_json(200)).expect("截断后仍是合法 JSON");
+        assert_eq!(v["truncated"], true);
+        assert!(v["head"].as_str().unwrap().chars().count() <= 200);
+    }
+
+    #[test]
+    fn model_json_budget_counts_final_escaped_output_and_summary() {
+        for content in ["中文".repeat(500), "\\\"\n\u{00}".repeat(500)] {
+            let out = Outcome::ok("bash", content.clone(), json!({"stdout": content}));
+            let original = out.data.clone();
+            for limit in 0..=400 {
+                let text = out.to_model_json(limit);
+                assert!(text.chars().count() <= limit.max(1), "limit={limit}");
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if limit >= 200 {
+                    assert_eq!(value["ok"], true);
+                    assert_eq!(value["tool"], "bash");
+                    assert_eq!(value["truncated"], true);
+                    assert!(value["summary"].is_string());
+                    assert!(value["head"].is_string());
+                }
+            }
+            assert_eq!(out.data, original);
+        }
+        assert_eq!(outcome_ok().to_model_json(0), "0");
+        assert_eq!(outcome_ok().to_model_json(1), "0");
+        assert_eq!(outcome_ok().to_model_json(2), "{}");
+        let out = Outcome::ok("bash", "中文", json!({"text": "汉字"}));
+        let full = out.to_model_json(4096);
+        assert!(full.len() > full.chars().count());
+        assert_eq!(out.to_model_json(full.chars().count()), full);
+        let fail = Outcome::fail("bash", ToolError::io("\\".repeat(500)));
+        let text = fail.to_model_json(200);
+        assert!(text.chars().count() <= 200);
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["ok"], false);
+    }
+
+    #[test]
+    fn args_report_range_and_type() {
+        let tool = crate::spec::find("read_file").unwrap();
+
+        let v = json!({ "path": "a.txt", "limit": 99999 });
+        let err = Args::new(tool, &v).opt_int("limit").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::BadArguments);
+        assert!(err.hint.unwrap().contains("2000"));
+
+        let v = json!({ "path": "a.txt", "limit": "x" });
+        assert_eq!(
+            Args::new(tool, &v).opt_int("limit").unwrap_err().kind,
+            ErrorKind::BadArguments
+        );
+
+        // 5.0 型浮点整数接纳（模型常这么写）；5.5 仍报错
+        let v = json!({ "path": "a.txt", "limit": 5.0 });
+        assert_eq!(Args::new(tool, &v).opt_int("limit").unwrap(), 5);
+        let v = json!({ "path": "a.txt", "limit": 5.5 });
+        assert_eq!(
+            Args::new(tool, &v).opt_int("limit").unwrap_err().kind,
+            ErrorKind::BadArguments
+        );
+
+        let v = json!({});
+        assert_eq!(
+            Args::new(tool, &v).require_str("path").unwrap_err().kind,
+            ErrorKind::BadArguments
+        );
+
+        let v = json!({ "path": "a.txt", "nope": 1 });
+        assert_eq!(
+            Args::new(tool, &v).reject_unknown().unwrap_err().kind,
+            ErrorKind::BadArguments
+        );
+    }
+
+    #[test]
+    fn defaults_come_from_declaration() {
+        let tool = crate::spec::find("read_file").unwrap();
+        let v = json!({ "path": "a.txt" });
+        let args = Args::new(tool, &v);
+        assert_eq!(args.opt_int("limit").unwrap(), 400);
+        assert_eq!(args.opt_int("offset").unwrap(), 0);
+        let null = json!({ "path": "a.txt", "limit": null });
+        let args = Args::new(tool, &null);
+        assert!(args.raw()["limit"].is_null());
+        assert!(!args.has("limit"));
+        assert_eq!(args.opt_int("limit").unwrap(), 400);
+    }
+
+    #[test]
+    fn empty_string_is_allowed_only_where_declared() {
+        let tool = crate::spec::find("edit_file").unwrap();
+        let v = json!({ "path": "a.txt", "old_string": "x", "new_string": "" });
+        let args = Args::new(tool, &v);
+        // 删除一段文本 → new_string 合法为空
+        assert_eq!(args.require_present_str("new_string").unwrap(), "");
+        // old_string 为空则无意义 → 必须报错
+        let v2 = json!({ "path": "a.txt", "old_string": "", "new_string": "y" });
+        assert_eq!(
+            Args::new(tool, &v2)
+                .require_str("old_string")
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadArguments
+        );
+    }

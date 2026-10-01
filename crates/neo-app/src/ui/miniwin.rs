@@ -25,7 +25,7 @@ use egui::{
     ViewportId, WindowLevel,
 };
 use neo_theme::{SquirclePaint, Theme};
-use neo_ui::Design;
+use neo_ui::{Button, Design};
 
 use crate::state::{AppState, Role, ToolState};
 
@@ -49,10 +49,8 @@ const FADEOUT_SECS: f32 = 0.45;
 const HEIGHT_ANIM_SECS: f32 = 0.22;
 /// 工具流水最多保留的步数（旧的滚出，最近的排最下）。
 const MAX_STEPS: usize = 4;
-/// 休眠位：屏幕外远处。本文件的所有视口都**不切 `Visible`**——透明视口
-/// 从隐藏切回可见的首帧还没跑过回调、surface 无内容，DWM 会补一帧黑，
-/// 就是「小窗弹出 / 截屏闪光时屏幕闪一下黑」的来源。改为常态可见 +
-/// 休眠时缩 1x1 挪到这里：surface 自创建起一直有（透明）内容，露面即正片。
+/// 被动视口的休眠位：常态缩 1x1 移出屏幕，避免透明 surface 恢复时闪黑。
+/// 桌面屏障仍可隐藏它们；交互弹窗不使用此休眠机制，关闭后撤销整个视口。
 pub(crate) const OFFSCREEN: Pos2 = Pos2::new(-16000.0, -16000.0);
 
 fn viewport_id() -> ViewportId {
@@ -111,34 +109,16 @@ pub(crate) fn screen_geometry(ctx: &Context, using_overlay: bool) -> ScreenGeome
     }
 }
 
-/// fallback 的屏幕点只属于 child；跨视口传递的命中区一律存全局物理像素。
+/// fallback 的屏幕点只属于 child；这里只缓存动画位置和 DPI，不参与输入排除。
 #[derive(Clone, Copy)]
 struct FallbackGeometry {
     screen: ScreenGeometry,
     position: Pos2,
-    physical_rects: [Rect; 4],
 }
 
 impl FallbackGeometry {
-    fn new(
-        screen: ScreenGeometry,
-        position: Pos2,
-        size: Vec2,
-        home: Pos2,
-        away: Pos2,
-        actual: Option<Rect>,
-    ) -> Self {
-        let requested = Rect::from_min_size(position, size);
-        Self {
-            screen,
-            position,
-            physical_rects: [
-                actual.unwrap_or(requested),
-                requested,
-                Rect::from_min_size(home, size),
-                Rect::from_min_size(away, size),
-            ].map(|r| r * screen.ppp),
-        }
+    fn new(screen: ScreenGeometry, position: Pos2) -> Self {
+        Self { screen, position }
     }
 
     fn screen(ctx: &Context) -> ScreenGeometry {
@@ -157,9 +137,6 @@ impl FallbackGeometry {
         })
     }
 
-    fn contains(self, physical: Pos2) -> bool {
-        self.physical_rects.iter().any(|r| r.contains(physical))
-    }
 
     fn store(self, ctx: &Context) {
         let id = Id::new("neo-miniwin-pos");
@@ -174,17 +151,6 @@ impl FallbackGeometry {
     }
 }
 
-fn fallback_position_settled(actual: Option<Rect>, expected: Pos2, ppp: f32) -> bool {
-    let Some(actual) = actual else { return false };
-    if !ppp.is_finite() || ppp <= 0.0 { return false; }
-    // egui-winit 的 OuterPosition 先乘 ppp（含 zoom），winit 再 round 为物理整数。
-    // 无边框视口的 inner/outer 原点相同，不能用点坐标距离拒绝合法像素取整。
-    let actual = actual.min * ppp;
-    let expected = expected * ppp;
-    actual.is_finite() && expected.is_finite()
-        && actual.x.round() == expected.x.round()
-        && actual.y.round() == expected.y.round()
-}
 
 /// 缓出三次方：避让与淡入共用这条「先快后慢」的曲线。
 fn ease_out_cubic(t: f32) -> f32 {
@@ -344,7 +310,6 @@ struct Snapshot {
     monitor: Vec2,
     /// 已完成驻留态（忙完后的 5s）：正文切到最后一段完整渲染。
     done: bool,
-    interrupt_open: bool,
     steps: Vec<Step>,
     /// 正文（markdown 源串，由 `markdown::render` 渲染，支持 LaTeX）。
     body: String,
@@ -361,7 +326,6 @@ impl Snapshot {
         target_h: f32,
         monitor: Vec2,
         done: bool,
-        interrupt_open: bool,
     ) -> Self {
         let last_assistant = state
             .messages
@@ -426,7 +390,6 @@ impl Snapshot {
             target_h,
             monitor,
             done,
-            interrupt_open,
             steps,
             body,
             body_dim,
@@ -435,11 +398,53 @@ impl Snapshot {
     }
 }
 
-fn interrupt_rects(inner: Rect, width: f32, height: f32, gap: f32) -> [Rect; 2] {
-    let width = width.min(((inner.width() - gap) * 0.5).max(0.0));
-    let height = height.min(inner.height().max(0.0));
-    let first = Rect::from_min_max(inner.max - Vec2::new(width, height), inner.max);
-    [first, first.translate(Vec2::new(-width - gap, 0.0))]
+fn interrupt_builder(theme: Theme, monitor: Vec2) -> ViewportBuilder {
+    let m = theme.metrics;
+    let size = Vec2::new(m.s(380.0), m.s(280.0)).min((monitor - Vec2::splat(m.s(32.0))).max(Vec2::splat(1.0)));
+    let position = Pos2::new((monitor.x - size.x - m.s(16.0)).max(0.0), m.s(16.0));
+    ViewportBuilder::default()
+        .with_title("Neo · 打断执行？")
+        .with_decorations(false)
+        .with_resizable(false)
+        .with_taskbar(false)
+        .with_always_on_top()
+        .with_active(false)
+        // 整个客户区拦截输入，不能因透明像素/圆角把正文点击送到桌面。
+        .with_transparent(false)
+        .with_mouse_passthrough(false)
+        .with_visible(true)
+        .with_inner_size(size)
+        .with_position(position)
+}
+
+fn paint_interrupt(ui: &mut egui::Ui, theme: Theme, generation: u64, answer: &AtomicU8) {
+    theme.apply(ui.ctx());
+    let d = Design::new(theme);
+    let m = d.m();
+    let rect = ui.max_rect();
+    ui.painter().rect_filled(rect, 0.0, d.p().bg_layer_1);
+    let inner = rect.shrink(m.s(18.0));
+    super::at(ui, inner, |ui| {
+        ui.label(egui::RichText::new("打断执行？").font(d.font_bold(d.t().headline)));
+        ui.add_space(m.s(12.0));
+        ui.label(egui::RichText::new("AI 本轮正在执行任务。打断会立即取消当前任务。")
+            .font(d.font(d.t().body)).color(d.p().label_secondary));
+    });
+    let footer = Rect::from_min_max(Pos2::new(inner.left(), inner.bottom() - m.s(48.0)), inner.max);
+    super::at(ui, footer, |ui| {
+        ui.spacing_mut().item_spacing.x = m.s(12.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for (button, value) in [(Button::new("打断").danger(), 1u8), (Button::new("继续").elevated(), 2u8)] {
+                let response = button.id_salt(("neo-interrupt", generation, value))
+                    .enabled(answer.load(Ordering::Acquire) == 0).show(ui, &d);
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| data.insert_temp(Id::new(("neo-interrupt-button", value)), response.rect));
+                if response.clicked() {
+                    let _ = answer.compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire);
+                }
+            }
+        });
+    });
 }
 
 /// 画一帧小窗内容：工具流水 + 正文（markdown / LaTeX 渲染）。
@@ -449,7 +454,6 @@ fn interrupt_rects(inner: Rect, width: f32, height: f32, gap: f32) -> [Rect; 2] 
 fn paint(
     ui: &mut egui::Ui,
     snap: &Snapshot,
-    result: &Arc<AtomicU8>,
     fade: f32,
     measure: &Arc<Mutex<f32>>,
 ) {
@@ -471,38 +475,6 @@ fn paint(
     painter.squircle_filled(rect, m.s(18.0), tint(p.bg_layer_1));
     painter.squircle_stroked(rect, m.s(18.0), Stroke::new(1.0, tint(p.border_l1)));
 
-    // 打断确认：**内联画在卡片里**（不能用模态 —— 模态居中到整层屏幕，
-    // 逃出卡片命中矩形，按钮永远点不到）。
-    if snap.interrupt_open {
-        let inner = rect.shrink(m.s(18.0));
-        painter.text(
-            inner.left_top(),
-            Align2::LEFT_TOP,
-            "打断执行？",
-            d.font_bold(d.t().headline),
-            tint(p.label_primary),
-        );
-        let body_y = inner.top() + d.t().headline * 1.6;
-        let body = ui.painter().layout(
-            "AI 本轮正在操作鼠标 / 键盘。打断会立即取消当前任务。".to_owned(),
-            d.font(d.t().body),
-            tint(p.label_secondary),
-            inner.width(),
-        );
-        painter.galley(Pos2::new(inner.left(), body_y), body, tint(p.label_secondary));
-        // 实绘与原生宿主共享这两个矩形，不使用组件扩大的触摸热区。
-        let buttons = interrupt_rects(inner, m.s(80.0), m.s(34.0), m.s(8.0));
-        for (index, button) in buttons.iter().enumerate() {
-            painter.rect_filled(*button, 0.0, tint(if index == 0 { p.error } else { p.bg_layer_1 }));
-            painter.text(button.center(), Align2::CENTER_CENTER,
-                if index == 0 { "打断" } else { "继续" }, d.font_bold(d.t().label),
-                tint(if index == 0 { Color32::WHITE } else { p.label_secondary }));
-        }
-        if fade >= 0.99 && result.load(Ordering::Acquire) == 0 {
-            neo_overlay::stage_interrupt_buttons(ui, buttons.map(|r| r.intersect(ui.clip_rect())), result.clone());
-        }
-        return;
-    }
 
     let inner = rect.shrink(m.s(14.0));
     let step_lh = d.t().caption * 1.55;
@@ -669,6 +641,26 @@ fn paint_border_beam(
     }
 }
 
+fn suspend_answer(answer: &AtomicU8) {
+    let _ = answer.compare_exchange(0, u8::MAX, Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// 任务身份由 state 的显式入口提供，与消息内容、位置和流的轮次无关。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TaskIdentity {
+    session_epoch: u64,
+    task_epoch: u64,
+}
+
+impl TaskIdentity {
+    fn of(state: &AppState) -> Self {
+        Self {
+            session_epoch: state.session_epoch,
+            task_epoch: state.task_epoch,
+        }
+    }
+}
+
 /// 迷你窗运行时状态，挂在 `NeoApp` 上，每帧由 [`MiniWin::tick`] 驱动。
 #[derive(Default)]
 pub struct MiniWin {
@@ -683,10 +675,15 @@ pub struct MiniWin {
     /// repaint 被 eframe 节流到 10fps（`INVISIBLE_WINDOW_REPAINT_INTERVAL`），
     /// 250ms 的淡入若靠快照下发只剩两三帧 —— 改由回调里现取现算。
     refade_since: Arc<Mutex<Option<Instant>>>,
-    /// 打断确认弹窗是否打开（画在小窗自己的视口里）。
+    /// 未决打断请求；挂起时关闭交互视口，但保留已经提交的同任务回执。
     interrupt_open: bool,
-    /// 打断确认结果（回调里写、tick 里读）：0 未决 / 1 打断 / 2 继续。
+    /// 0 未决 / 1 打断 / 2 继续 / MAX 已撤销。旧闭包只能 CAS 自己的 token。
     interrupt_result: Arc<AtomicU8>,
+    interrupt_viewport: Option<ViewportId>,
+    interrupt_generation: u64,
+    /// 显式任务代次隔离同一消息的重试；工具回灌仍属于同一请求。
+    interrupt_task: Option<TaskIdentity>,
+    input_task: Option<TaskIdentity>,
     session_epoch: u64,
     /// 已消费的左键按下沿时刻（同一沿在 250ms 窗口内不重复触发）。
     lmb_edge_consumed: u64,
@@ -709,17 +706,14 @@ pub struct MiniWin {
     content_h: Arc<Mutex<f32>>,
     /// 测试回退路径最近下发的视口尺寸（没变就不重发 InnerSize）。
     legacy_sent: Vec2,
-    /// 渲染层卡片的共享矩形（主屏点）：tick 写静止位、层内绘制闭包写
-    /// 避让动画位；层的 Area 定位与命中测试每帧重读它。打断判定的
-    /// 「点在小窗自己身上」也读它（替代旧视口的 ctx.data 通道）。
+    /// 渲染层卡片的共享矩形（主屏点）：tick 写静止位、绘制闭包写避让位。
+    /// 仅供层的 Area 定位；穿透的状态牌不能成为打断请求的排除区。
     layer_rect: Arc<Mutex<[f32; 4]>>,
 }
 
 impl Drop for MiniWin {
     fn drop(&mut self) {
         self.interrupt_result.store(u8::MAX, Ordering::Release);
-        #[cfg(not(test))]
-        if let Err(error) = neo_overlay::hide_interrupt_buttons() { eprintln!("{error}"); }
     }
 }
 
@@ -737,7 +731,9 @@ impl MiniWin {
     fn arm_input(&mut self, state: &AppState) -> bool {
         let eligible = (state.generating || state.tool_open || state.tool_round)
             && state.awaiting_tool().is_none();
-        let armed = self.input_armed;
+        let task = TaskIdentity::of(state);
+        let armed = self.input_armed && self.input_task.as_ref() == Some(&task);
+        self.input_task = Some(task);
         self.input_armed = eligible;
         armed && eligible
     }
@@ -801,6 +797,7 @@ impl MiniWin {
             && !synthetic
         {
             self.interrupt_open = true;
+            self.interrupt_task = Some(TaskIdentity::of(state));
             self.interrupt_result.store(u8::MAX, Ordering::Release);
             self.interrupt_result = Arc::new(AtomicU8::new(0));
         }
@@ -808,9 +805,7 @@ impl MiniWin {
 
     fn switch_backend(&mut self, ctx: &Context, using_overlay: bool) {
         if self.using_overlay != using_overlay {
-            self.interrupt_result.store(u8::MAX, Ordering::Release);
-            #[cfg(not(test))]
-            if let Err(error) = neo_overlay::hide_interrupt_buttons() { eprintln!("{error}"); }
+            // 打断弹窗独立于视觉后端；切换 Card/fallback 不能丢失回执。
             self.using_overlay = using_overlay;
             self.shown = false;
             self.legacy_sent = Vec2::ZERO;
@@ -820,6 +815,53 @@ impl MiniWin {
                 ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Close);
             }
         }
+    }
+
+    /// 撤销先于显隐命令：即使旧 deferred callback 排队未执行也不能回答新请求。
+    fn retire_interrupt(&mut self, ctx: &Context) {
+        self.interrupt_result.store(u8::MAX, Ordering::Release);
+        self.close_interrupt_viewport(ctx);
+    }
+
+    fn suspend_interrupt(&mut self, ctx: &Context) {
+        // CAS 和按钮提交竞争：先提交的有效回执必须留给 root，不能被隐藏覆盖。
+        suspend_answer(&self.interrupt_result);
+        self.close_interrupt_viewport(ctx);
+    }
+
+    fn close_interrupt_viewport(&mut self, ctx: &Context) {
+        if let Some(id) = self.interrupt_viewport.take() {
+            ctx.send_viewport_cmd_to(id, ViewportCommand::Visible(false));
+            ctx.send_viewport_cmd_to(id, ViewportCommand::Close);
+            // 不再注册该视口，下一次完整 pass 回收 HWND 和 egui 的按下状态。
+            ctx.request_repaint_of(ViewportId::ROOT);
+        }
+    }
+
+    fn show_interrupt(&mut self, ctx: &Context, theme: Theme) {
+        let id = *self.interrupt_viewport.get_or_insert_with(|| {
+            self.interrupt_generation += 1;
+            ViewportId::from_hash_of(("neo-miniwin-interrupt", self.interrupt_generation))
+        });
+        let generation = self.interrupt_generation;
+        let answer = self.interrupt_result.clone();
+        let screen = primary_geometry();
+        let builder = interrupt_builder(theme, screen.monitor / ctx.zoom_factor());
+        ctx.show_viewport_deferred(id, builder, move |ui, _| {
+            if crate::app::desktop_suspended(ui.ctx()) || answer.load(Ordering::Acquire) == u8::MAX {
+                suspend_answer(&answer);
+                ui.ctx().send_viewport_cmd_to(id, ViewportCommand::Visible(false));
+                ui.ctx().request_repaint_of(ViewportId::ROOT);
+                return;
+            }
+            if ui.input(|i| i.viewport().close_requested()) {
+                let _ = answer.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+            }
+            paint_interrupt(ui, theme, generation, &answer);
+            if answer.load(Ordering::Acquire) != 0 {
+                ui.ctx().request_repaint_of(ViewportId::ROOT);
+            }
+        });
     }
 
     /// 视口 builder：尺寸按显隐给（休眠 1x1），patch 自己收成增量命令。
@@ -849,8 +891,8 @@ impl MiniWin {
     /// 主窗隐藏时渲染循环走 logic-only 路径，两者都经过 `tick()`。
     ///
     /// `hidden_to_tray` 也包含桌面工具导致的主窗自动暂避。
-    /// `classwin_rect`：课堂总结弹窗开着时的目标矩形 —— 点它的「关闭」
-    /// 不该被当成「用户想打断 AI」。
+    /// `classwin_rect`：`ClassWin::visible_rect_physical(ctx)` 返回的全局物理
+    /// 客户区；不可传布局目标矩形或 ROOT 的逻辑坐标。
     pub fn tick(
         &mut self,
         ctx: &Context,
@@ -866,15 +908,19 @@ impl MiniWin {
             self.session_epoch = state.session_epoch;
             self.input_armed = false;
             self.interrupt_open = false;
-            self.interrupt_result.store(u8::MAX, Ordering::Release);
+            self.retire_interrupt(ctx);
+        }
+        let task = TaskIdentity::of(state);
+        if self.interrupt_open && self.interrupt_task.as_ref() != Some(&task) {
+            self.interrupt_open = false;
+            self.retire_interrupt(ctx);
         }
         let geometry = if overlay.is_some() {
             primary_geometry()
         } else {
             FallbackGeometry::screen(ctx)
         };
-        // classwin_rect 仍由调用者按 screen_geometry 的坐标约定传入。
-        let class_geometry = screen_geometry(ctx, false);
+
         // 1. 截屏信号：时间戳一变就进入短暂隐藏；隐藏结束后播淡入。
         let shot_at = neo_tools::tools::screen::SCREENSHOT_AT.load(Ordering::Relaxed);
         if shot_at != self.shot_seen {
@@ -901,11 +947,10 @@ impl MiniWin {
             *self.fadeout_since.lock().unwrap() = None;
         }
         let lingering = !busy && self.linger_until.is_some_and(|t| Instant::now() < t);
-        if !busy && !lingering {
-            // 真正闲下来才收确认框 —— 只判 !busy 的话，流结束与下一轮工具
-            // 启动之间的空档会把弹窗闪掉（用户正点着呢，框没了）。
+        if !busy {
+            // 完成态可以驻留，但未决确认不能跨越任务结束后继续有效。
             self.interrupt_open = false;
-            self.interrupt_result.store(u8::MAX, Ordering::Release);
+            self.retire_interrupt(ctx);
         }
         // 驻留结束 → 淡出（回调里播透明度 + 上飘），播完才真正收窗。
         // 只在「曾露过面」时起播：小窗没开过的静默期不该刷出一张淡出中的卡。
@@ -928,69 +973,61 @@ impl MiniWin {
 
         // 4. 几何：常态贴右上、避让时躲左上。宽度固定；高度**自适应内容** ——
         //    paint 量到的内容高（上一帧）+ 边距，钳制后由回调朝它做缓动。
-        //    打断弹窗打开时用固定大窗（模态需要稳定的落点）。
+
         let m = theme.metrics;
         let monitor = geometry.monitor;
-        let (width, target_h) = if self.interrupt_open {
-            (m.s(380.0), m.s(280.0))
-        } else {
-            let content = *self.content_h.lock().unwrap();
-            (
-                m.s(340.0),
-                (content + m.s(28.0)).clamp(m.s(96.0), (monitor.y - m.s(32.0)) * 0.62),
-            )
-        };
+        let content = *self.content_h.lock().unwrap();
+        let (width, target_h) = (
+            m.s(340.0),
+            (content + m.s(28.0)).clamp(m.s(96.0), (monitor.y - m.s(32.0)) * 0.62),
+        );
         let size = Vec2::new(width, target_h);
         let margin = m.s(16.0);
         let home = Pos2::new((monitor.x - width - margin).max(margin), margin);
-        let away = Pos2::new(margin, margin);
 
-        // 5. 打断确认：前后台执行中 + 用户左键按下沿，不依赖本轮工具种类。
-        //    点在小窗自己身上不算（那是在点弹窗按钮）；有待确认的工具也不算 ——
-        //    那一击多半是点在独立确认窗的按钮上，且等待权限时 AI 本就停着；
-        //    点在课堂总结弹窗上不算；AI 自己注入的点击（click/drag）更不算。
+        // 5. 只排除真实交互窗口；状态牌的 actual/home/away 都穿透到桌面。
+        //    确认/提问等待态与已打开的打断弹窗由 request_interrupt 排除。
         if lmb_edge {
-            let on_miniwin = self.shown && cursor.is_some_and(|physical| {
-                if overlay.is_some() {
-                    let c = geometry.point(physical);
-                    let r = *self.layer_rect.lock().unwrap();
-                    Rect::from_min_size(Pos2::new(r[0], r[1]), Vec2::new(r[2], r[3])).contains(c)
-                        || Rect::from_min_size(home, size).contains(c)
-                        || Rect::from_min_size(away, size).contains(c)
-                } else {
-                    // 缓存自带 child 的实测/动画/端点物理矩形，不再拼 root 的尺寸。
-                    ctx.data(|d| d.get_temp::<FallbackGeometry>(Id::new("neo-miniwin-pos")))
-                        .unwrap_or_else(|| FallbackGeometry::new(geometry, home, size, home, away, None))
-                        .contains(physical)
-                }
-            });
+            // hook 留存的是按下时的物理坐标；矩形是最新视口采样，非点击时归属。
             let on_classwin = cursor
                 .zip(classwin_rect)
-                .is_some_and(|(c, r)| r.contains(class_geometry.point(c)));
-            self.request_interrupt(state, true, on_miniwin || on_classwin, synthetic);
+                .is_some_and(|(c, r)| r.contains(c));
+            self.request_interrupt(state, true, on_classwin, synthetic);
         }
-        // 截屏/桌面屏障期间只记住请求；恢复可见后才提供确认按钮。
+        // 截屏/桌面屏障期间仍可记住真实桌面点击请求，但不接受新的弹窗回答。
         if busy {
             ctx.request_repaint_after(POLL);
         }
         let can_show = !shot_hiding && !crate::app::desktop_suspended(ctx);
-        let buttons_live = can_show && self.interrupt_open && state.awaiting_tool().is_none();
-        if buttons_live {
+        // 先验证任务，再消费回执；桌面挂起/截图/审批不能抹掉已经有效的回答。
+        if self.interrupt_open {
+            if can_show && state.awaiting_tool().is_none()
+                && self.interrupt_viewport.is_some_and(|id| ctx.input(|i|
+                    i.raw.viewports.get(&id).is_some_and(|v| v.close_requested()))) {
+                let _ = self.interrupt_result.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+            }
             match self.interrupt_result.load(Ordering::Acquire) {
                 1 => { state.cancel(); self.interrupt_open = false; }
                 2 => self.interrupt_open = false,
-                u8::MAX => self.interrupt_result = Arc::new(AtomicU8::new(0)),
                 _ => {}
             }
         }
-        if !buttons_live || !self.interrupt_open {
-            self.interrupt_result.store(u8::MAX, Ordering::Release);
-            #[cfg(not(test))]
-            if let Err(error) = neo_overlay::hide_interrupt_buttons() { eprintln!("{error}"); }
+        if !self.interrupt_open {
+            self.retire_interrupt(ctx);
+        } else if !can_show || state.awaiting_tool().is_some() {
+            self.suspend_interrupt(ctx);
+        } else {
+            if self.interrupt_result.load(Ordering::Acquire) == u8::MAX {
+                // callback 也可能已暂停 token；新的按钮必须使用新 HWND/代次。
+                self.close_interrupt_viewport(ctx);
+                self.interrupt_result = Arc::new(AtomicU8::new(0));
+            }
+            self.show_interrupt(ctx, theme);
         }
 
-        let open = can_show && ((hidden_to_tray && (busy || lingering || (fading && !faded)))
-            || (self.interrupt_open && state.awaiting_tool().is_none()));
+        // 状态牌和弹窗互斥，不能在同一位置叠两种输入角色。
+        let open = can_show && !self.interrupt_open && hidden_to_tray
+            && (busy || lingering || (fading && !faded));
 
         // 6. 显隐与内容。
         //
@@ -1005,7 +1042,6 @@ impl MiniWin {
                 target_h,
                 monitor,
                 !busy && (lingering || fading),
-                self.interrupt_open,
             ))
         } else {
             // 隐藏中不供内容：回调空转，Visible(false) 生效前的缝隙帧
@@ -1021,14 +1057,14 @@ impl MiniWin {
                     *self.refade_since.lock().unwrap() = Some(Instant::now());
                 }
                 let snap = snapshot.expect("open 必有快照");
-                let result = Arc::clone(&self.interrupt_result);
+
                 let refade = Arc::clone(&self.refade_since);
                 let rect_slot = Arc::clone(&self.layer_rect);
                 let fadeout = Arc::clone(&self.fadeout_since);
                 let measure = Arc::clone(&self.content_h);
                 let card = neo_overlay::Card {
                     rect: Arc::clone(&self.layer_rect),
-                    interactive: false,
+
                     draw: Box::new(move |ui| {
                         let ctx = ui.ctx().clone();
                         // 淡入：起点由 tick 写进共享槽，插值在这里现算。
@@ -1057,7 +1093,7 @@ impl MiniWin {
                             .unwrap_or(0.0);
                         let fade = fade_in * (1.0 - ease_out_cubic(fade_out));
                         // 避让：只盯「静止位」判定（卡片移动本身不会让光标
-                        // 反复进出，否则会在两个角之间振荡）；弹窗打开时不躲。
+                        // 反复进出，否则会在两个角之间振荡）。
                         let m = snap.theme.metrics;
                         let margin = m.s(16.0);
                         let monitor = snap.monitor;
@@ -1072,8 +1108,7 @@ impl MiniWin {
                             Pos2::new((monitor.x - size.x - margin).max(margin), margin);
                         let away = Pos2::new(margin, margin);
                         let cursor = poll_global_input().cursor.map(|p| geometry.point(p));
-                        let dodge = !snap.interrupt_open
-                            && cursor
+                        let dodge = cursor
                                 .is_some_and(|c| Rect::from_min_size(home, size).contains(c));
                         let t = ctx.animate_value_with_time(
                             Id::new("neo-miniwin-avoid"),
@@ -1082,10 +1117,9 @@ impl MiniWin {
                         );
                         let mut pos = home + (away - home) * ease_out_cubic(t);
                         pos.y -= m.s(10.0) * ease_out_cubic(fade_out);
-                        // 写回共享矩形：层的 Area 定位 + 命中测试 + tick 的
-                        // 打断排除区下一帧都用它（一帧延迟无感）。
+                        // 写回共享矩形，供层的 Area 下一帧定位。
                         *rect_slot.lock().unwrap() = [pos.x, pos.y, size.x, size.y];
-                        paint(ui, &snap, &result, fade, &measure);
+                        paint(ui, &snap, fade, &measure);
                     }),
                 };
                 layer.set_card(neo_overlay::card_id::MINI, Some(card));
@@ -1142,7 +1176,6 @@ impl MiniWin {
                 self.legacy_sent = size;
             }
         }
-        let result = Arc::clone(&self.interrupt_result);
         let refade = Arc::clone(&self.refade_since);
         let fadeout = Arc::clone(&self.fadeout_since);
         let measure = Arc::clone(&self.content_h);
@@ -1151,12 +1184,7 @@ impl MiniWin {
             viewport_id(),
             Self::builder(size, open).with_visible(!suspended),
             move |ui, _class| {
-                if crate::app::desktop_suspended(ui.ctx()) || snapshot.is_none() {
-                    #[cfg(not(test))]
-                    if let Err(error) = neo_overlay::hide_interrupt_buttons() { eprintln!("{error}"); }
-                    return;
-                }
-                neo_overlay::begin_interrupt_frame();
+                if crate::app::desktop_suspended(ui.ctx()) { return; }
                 let Some(snapshot) = &snapshot else { return };
                 let ctx = ui.ctx().clone();
                 // ---- 回调自驱的动画（主视口托盘态被 eframe 节流到 10fps，
@@ -1185,7 +1213,7 @@ impl MiniWin {
                     .unwrap_or(0.0);
                 let fade = fade_in * (1.0 - ease_out_cubic(fade_out));
                 // 避让：只盯「静止位」判定（窗口移动本身不会让光标反复进出，
-                // 否则会在两个角之间振荡）；弹窗打开时不躲（用户正要去点按钮）。
+                // 否则会在两个角之间振荡）。
                 let m = snapshot.theme.metrics;
                 let size = Vec2::new(snapshot.width, snapshot.target_h);
                 let margin = m.s(16.0);
@@ -1197,8 +1225,7 @@ impl MiniWin {
                 let home = Pos2::new((geometry.monitor.x - size.x - margin).max(margin), margin);
                 let away = Pos2::new(margin, margin);
                 let cursor = poll_global_input().cursor.map(|p| geometry.point(p));
-                let dodge = !snapshot.interrupt_open
-                    && cursor.is_some_and(|c| Rect::from_min_size(home, size).contains(c));
+                let dodge = cursor.is_some_and(|c| Rect::from_min_size(home, size).contains(c));
                 let t = ctx.animate_value_with_time(
                     Id::new("neo-miniwin-avoid"),
                     if dodge { 1.0 } else { 0.0 },
@@ -1206,17 +1233,8 @@ impl MiniWin {
                 );
                 let mut pos = home + (away - home) * ease_out_cubic(t);
                 pos.y -= m.s(10.0) * ease_out_cubic(fade_out);
-                // inner_rect 是屏幕点坐标（不是 ui.max_rect 的本地坐标）；
-                // 同时保留实测与待应用位置，覆盖窗口移动命令生效前后的点击。
-                let actual = ctx.input(|i| i.viewport().inner_rect);
-                FallbackGeometry::new(geometry, pos, size, home, away, actual).store(&ctx);
-                paint(ui, &snapshot, &result, fade, &measure);
-                // OuterPosition 尚未落地的动画帧只画，不留下上一位置的按钮命中。
-                if !fallback_position_settled(actual, pos, geometry.ppp) {
-                    neo_overlay::begin_interrupt_frame();
-                }
-                #[cfg(not(test))]
-                if let Err(error) = neo_overlay::commit_interrupt_buttons() { eprintln!("{error}"); }
+                FallbackGeometry::new(geometry, pos).store(&ctx);
+                paint(ui, snapshot, fade, &measure);
                 // 本视口自驱 60fps：流光 / 避让 / 淡入淡出全靠它。
                 ctx.request_repaint_after(POLL);
             },
@@ -1231,672 +1249,41 @@ impl MiniWin {
 }
 
 #[cfg(test)]
-mod beam_tests {
-    use super::*;
-
-    fn fallback_input(root_scale: f32, child_scale: f32) -> egui::RawInput {
-        let mut input = egui::RawInput::default();
-        let root = input.viewports.get_mut(&ViewportId::ROOT).unwrap();
-        root.native_pixels_per_point = Some(root_scale);
-        root.monitor_size = Some(Vec2::new(2560.0, 1440.0) / root_scale);
-        input.viewports.insert(viewport_id(), egui::ViewportInfo {
-            native_pixels_per_point: Some(child_scale),
-            monitor_size: Some(Vec2::new(1920.0, 1080.0) / child_scale),
-            ..Default::default()
-        });
-        input
-    }
-
-    #[test]
-    fn interrupt_all_task_kinds_require_confirmation_before_cancel() {
-        use crate::state::{ChatMessage, ToolMeta};
-        for kind in ["text", "read_file", "click", "drag", "round"] {
-            for answer in [0, 2, 1] {
-                let ctx = Context::default();
-                ctx.set_embed_viewports(false);
-                let mut state = AppState::default();
-                state.generating = kind == "text";
-                state.tool_open = !matches!(kind, "text" | "round");
-                state.tool_round = kind == "round";
-                if state.tool_open {
-                    let mut meta = ToolMeta::restored(kind);
-                    meta.state = ToolState::Running;
-                    state.messages.push(ChatMessage::tool_result(meta, String::new()));
-                }
-                let mut mini = MiniWin::default();
-                mini.session_epoch = state.session_epoch;
-                mini.request_interrupt(&state, true, false, false);
-                assert!(mini.interrupt_open, "{kind}");
-                assert!(!state.round_cancelled);
-                assert!(state.generating || state.tool_open || state.tool_round);
-                mini.interrupt_result.store(answer, Ordering::Release);
-                ctx.begin_pass(egui::RawInput::default());
-                mini.tick(&ctx, &mut state,
-                    Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard),
-                    true, None, None);
-                let mut output = ctx.end_pass();
-                output.textures_delta.clear();
-                assert_eq!(state.round_cancelled, answer == 1, "{kind}: {answer}");
-                assert_eq!(mini.interrupt_open, answer == 0);
-                assert_eq!(state.generating || state.tool_open || state.tool_round, answer != 1);
-            }
-        }
-    }
-
-    #[test]
-    fn interrupt_suspended_keeps_request_without_cancelling() {
-        let ctx = Context::default();
-        ctx.set_embed_viewports(false);
-        let mut state = AppState::default();
-        state.tool_open = true;
-        let mut mini = MiniWin::default();
-        mini.session_epoch = state.session_epoch;
-        mini.request_interrupt(&state, true, false, false);
-        let old = mini.interrupt_result.clone();
-        old.store(1, Ordering::Release); // 暂避前的旧回执不得在恢复后取消任务。
-        for suspended in [true, false] {
-            ctx.begin_pass(egui::RawInput::default());
-            ctx.data_mut(|d| d.insert_temp(Id::new("neo-desktop-suspended"), suspended));
-            mini.tick(&ctx, &mut state,
-                Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard),
-                true, None, None);
-            let mut output = ctx.end_pass();
-            output.textures_delta.clear();
-            assert!(mini.interrupt_open);
-            assert_eq!(mini.shown, !suspended, "只在桌面安全时展示确认");
-            assert!(state.tool_open);
-            assert!(!state.round_cancelled);
-            assert_eq!(old.load(Ordering::Acquire), u8::MAX);
-        }
-        assert_eq!(mini.interrupt_result.load(Ordering::Acquire), 0);
-        assert!(!Arc::ptr_eq(&old, &mini.interrupt_result));
-    }
-
-    #[test]
-    fn interrupt_excludes_confirmation_question_cards_idle_and_synthetic() {
-        use crate::state::{ChatMessage, ToolMeta};
-        for name in ["write_file", "ask_user"] {
-            let mut state = AppState::default();
-            state.tool_open = true;
-            let mut meta = ToolMeta::restored(name);
-            meta.state = ToolState::AwaitingConfirm;
-            state.messages.push(ChatMessage::tool_result(meta, String::new()));
-            let mut mini = MiniWin::default();
-            mini.request_interrupt(&state, true, false, false);
-            assert!(!mini.interrupt_open, "{name}");
-        }
-        for (busy, armed, on_card, synthetic) in [
-            (false, true, false, false),
-            (true, false, false, false),
-            (true, true, true, false), // MiniWin / 课堂卡。
-            (true, true, false, true),
-        ] {
-            let mut state = AppState::default();
-            state.generating = busy;
-            let mut mini = MiniWin::default();
-            mini.request_interrupt(&state, armed, on_card, synthetic);
-            assert!(!mini.interrupt_open);
-            assert!(!state.round_cancelled);
-        }
-    }
-
-    #[test]
-    fn interrupt_sampling_keeps_click_position_and_consumes_ignored_edges() {
-        let card = Rect::from_min_size(Pos2::new(600.0, 20.0), Vec2::new(640.0, 460.0));
-        let mut input = GlobalInput::default();
-        input.sample(Some((card.center(), true)), 2000, 0);
-        input.sample(Some((Pos2::new(500.0, 900.0), false)), 2016, 0);
-        assert!(card.contains(input.edge.unwrap().1));
-        assert!(!card.contains(input.cursor.unwrap()));
-        let mut mini = MiniWin::default();
-        assert!(mini.consume_click(input, 2100));
-        assert!(!mini.consume_click(input, 2110));
-        input.sample(Some((Pos2::ZERO, true)), 2200, 0);
-        assert!(!mini.consume_click(input, 2450));
-        assert_eq!(mini.lmb_edge_consumed, 2200);
-    }
-
-    #[test]
-    fn interrupt_synthetic_edge_cannot_escape_window_during_delayed_tick_or_drag() {
-        let mut input = GlobalInput::default();
-        input.sample(Some((Pos2::ZERO, true)), 1999, 1000);
-        input.sample(Some((Pos2::ZERO, false)), 2010, 1000);
-        let mut mini = MiniWin::default();
-        assert!(!mini.consume_click(input, 2050));
-        assert!(input.edge.is_none());
-        input.sample(Some((Pos2::ZERO, true)), 2999, 2000);
-        input.sample(Some((Pos2::ZERO, true)), 3100, 2000);
-        assert!(input.edge.is_none(), "合成拖动不能在排除窗口过期后变成新沿");
-        input.sample(Some((Pos2::ZERO, false)), 3110, 2000);
-        input.sample(Some((Pos2::ZERO, true)), 3120, 2000);
-        assert!(mini.consume_click(input, 3200), "窗口外的真实新点击可确认打断");
-        assert!(!synthetic_click_at(1000, 0));
-        assert!(synthetic_click_at(1000, 1001));
-        assert!(!synthetic_click_at(2000, 1000));
-    }
-
-    #[test]
-    fn interrupt_foreground_text_shows_confirmation_and_only_explicit_yes_cancels() {
-        for answer in [0, 2, 1] {
-            let ctx = Context::default();
-            ctx.set_embed_viewports(false);
-            let mut state = AppState::default();
-            state.generating = true;
-            let mut mini = MiniWin::default();
-            mini.session_epoch = state.session_epoch;
-            let mut input = GlobalInput::default();
-            assert!(!mini.task_click(&state, input, 2000));
-            input.sample(Some((Pos2::new(900.0, 700.0), true)), 2010, 0);
-            let clicked = mini.task_click(&state, input, 2010);
-            assert!(clicked);
-            mini.request_interrupt(&state, clicked, false, false);
-            for result in [0, answer] {
-                mini.interrupt_result.store(result, Ordering::Release);
-                ctx.begin_pass(egui::RawInput::default());
-                mini.tick(&ctx, &mut state,
-                    Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard),
-                    false, None, None);
-                let mut output = ctx.end_pass();
-                output.textures_delta.clear();
-                assert_eq!(mini.shown, result == 0, "前台只显示未决确认，不显示后台状态牌");
-                assert_eq!(state.round_cancelled, result == 1);
-                assert_eq!(state.generating, result != 1);
-            }
-        }
-    }
-
-    #[test]
-    fn interrupt_start_and_approval_clicks_are_consumed_before_arming() {
-        use crate::state::{ChatMessage, ToolMeta};
-        let mut state = AppState::default();
-        let mut mini = MiniWin::default();
-        let mut input = GlobalInput::default();
-        input.sample(Some((Pos2::ZERO, true)), 1000, 0);
-        assert!(!mini.task_click(&state, input, 1000), "闲时点击不能触发");
-        state.generating = true;
-        assert!(!mini.task_click(&state, input, 1010), "发送点击不能在任务开始后重放");
-        assert!(!mini.task_click(&state, input, 1020));
-        input.sample(Some((Pos2::ZERO, false)), 1030, 0);
-        input.sample(Some((Pos2::ZERO, true)), 1040, 0);
-        assert!(mini.task_click(&state, input, 1040));
-
-        for name in ["write_file", "ask_user"] {
-            let mut meta = ToolMeta::restored(name);
-            meta.state = ToolState::AwaitingConfirm;
-            state.messages.push(ChatMessage::tool_result(meta, String::new()));
-            assert!(!mini.task_click(&state, input, 1050));
-            input.sample(Some((Pos2::ZERO, false)), 1060, 0);
-            input.sample(Some((Pos2::ZERO, true)), 1070, 0);
-            state.messages.clear();
-            assert!(!mini.task_click(&state, input, 1070), "审批/提问回答点击不能触发");
-            assert!(!mini.task_click(&state, input, 1080));
-        }
-        // 首次采样已在任务开始后，也必须丢弃启动沿。
-        let mut fresh = MiniWin::default();
-        assert!(!fresh.task_click(&state, input, 1080));
-    }
-
-    #[test]
-    fn interrupt_hook_real_click_during_injection_waits_for_safe_confirmation() {
-        let ctx = Context::default();
-        ctx.set_embed_viewports(false);
-        let mut state = AppState::default();
-        state.tool_open = true;
-        let slot = Arc::new(mouse_hook::ClickSlot::default());
-        let mut mini = MiniWin::default();
-        mini.session_epoch = state.session_epoch;
-        mini.mock_clicks = Some(slot.clone());
-        assert_eq!(mini.poll_task_click(&state), (None, false, false));
-        slot.mock_down(1, 0, 50, 50); // 模型按下不触发、不占序号。
-        assert_eq!(mini.poll_task_click(&state), (None, false, false));
-        slot.mock_down(0, 0, 900, 700); // 无需等注入后 1s，也无需松开模型拖动。
-        slot.mock_down(1, 0, 50, 50); // 后续注入不能覆盖真实事件位置。
-        assert_eq!(slot.latest().unwrap().sequence, 1);
-        let theme = Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard);
-        for suspended in [true, false] {
-            ctx.begin_pass(egui::RawInput::default());
-            ctx.data_mut(|d| d.insert_temp(Id::new("neo-desktop-suspended"), suspended));
-            mini.tick(&ctx, &mut state, theme, false, None, None);
-            let mut output = ctx.end_pass();
-            output.textures_delta.clear();
-            assert!(mini.interrupt_open);
-            assert_eq!(mini.shown, !suspended);
-            assert!(state.tool_open);
-            assert!(!state.round_cancelled);
-        }
-        assert_eq!(mini.physical_sequence, 1);
-        let (_, repeated, synthetic) = mini.poll_task_click(&state);
-        assert!(!repeated);
-        assert!(!synthetic, "hook 路径不能再套用 1s 时间戳屏蔽");
-    }
-
-    #[test]
-    fn interrupt_hook_sequences_exclude_send_approval_and_question_clicks() {
-        use crate::state::{ChatMessage, ToolMeta};
-        let mut state = AppState::default();
-        let slot = Arc::new(mouse_hook::ClickSlot::default());
-        let mut mini = MiniWin::default();
-        mini.mock_clicks = Some(slot.clone());
-        slot.mock_down(0, 0, 10, 20);
-        assert!(!mini.poll_task_click(&state).1);
-        state.generating = true;
-        assert!(!mini.poll_task_click(&state).1, "发送沿已经消费");
-        for name in ["write_file", "ask_user"] {
-            let mut meta = ToolMeta::restored(name);
-            meta.state = ToolState::AwaitingConfirm;
-            state.messages.push(ChatMessage::tool_result(meta, String::new()));
-            slot.mock_down(0, 0, 10, 20);
-            assert!(!mini.poll_task_click(&state).1);
-            state.messages.clear();
-            slot.mock_down(0, 0, 10, 20);
-            assert!(!mini.poll_task_click(&state).1, "恢复首帧消费审批/回答点击");
-            assert!(!mini.poll_task_click(&state).1);
-            slot.mock_down(0, 0, 10, 20);
-            assert!(mini.poll_task_click(&state).1, "同毫秒/同位置的新真实点击靠序号区分");
-        }
-        mini.input_armed = false; // 切会话时重置监听；旧事件仍不可重放。
-        assert!(!mini.poll_task_click(&state).1);
-        assert!(!mini.poll_task_click(&state).1);
-    }
-
-    #[test]
-    fn interrupt_hook_unavailable_uses_fallback_without_installing_in_tests() {
-        let mut mini = MiniWin::default();
-        assert!(mini.hook_click().is_none());
-        assert!(mini.hook_attempted);
-        assert!(mini.mouse_hook.is_none(), "测试构建绝不能安装真实 hook");
-        assert!(mini.hook_click().is_none());
-        let mut state = AppState::default();
-        state.generating = true;
-        let mut input = GlobalInput::default();
-        assert!(!mini.task_click(&state, input, 1000));
-        input.sample(Some((Pos2::ZERO, true)), 1010, 1000);
-        assert!(!mini.task_click(&state, input, 1010));
-        input.sample(Some((Pos2::ZERO, false)), 2010, 1000);
-        input.sample(Some((Pos2::ZERO, true)), 2020, 1000);
-        assert!(mini.task_click(&state, input, 2020), "fallback sampling remains available");
-    }
-
-    #[test]
-    fn interrupt_hook_class_card_consumes_event_at_original_position() {
-        let ctx = Context::default();
-        ctx.set_embed_viewports(false);
-        let mut state = AppState::default();
-        state.generating = true;
-        let slot = Arc::new(mouse_hook::ClickSlot::default());
-        let mut mini = MiniWin::default();
-        mini.session_epoch = state.session_epoch;
-        mini.mock_clicks = Some(slot.clone());
-        mini.poll_task_click(&state);
-        slot.mock_down(0, 0, 100, 100);
-        let theme = Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard);
-        for card in [Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0))), None] {
-            ctx.begin_pass(egui::RawInput::default());
-            mini.tick(&ctx, &mut state, theme, false, card, None);
-            let mut output = ctx.end_pass();
-            output.textures_delta.clear();
-            assert!(!mini.interrupt_open, "关闭课堂卡后不能重放卡片点击");
-        }
-        assert_eq!(mini.physical_sequence, 1);
-    }
-
-    #[test]
-    fn interrupt_buttons_are_bounded_separate_and_body_always_passive() {
-        for scale in [0.75, 1.0, 1.5, 2.0, 3.0] {
-            let inner = Rect::from_min_size(Pos2::new(-500.0, -120.0), Vec2::new(344.0, 244.0) * scale);
-            let buttons = interrupt_rects(inner, 80.0 * scale, 34.0 * scale, 8.0 * scale);
-            for button in buttons {
-                assert!(inner.contains_rect(button));
-                assert!(button.contains(button.center()));
-                assert!(!button.contains(inner.min));
-            }
-            assert!(!buttons[0].intersects(buttons[1]));
-            let gap = Pos2::new((buttons[1].right() + buttons[0].left()) * 0.5, buttons[0].center().y);
-            assert!(buttons.iter().all(|r| !r.contains(gap)));
-            for open in [false, true] {
-                let builder = MiniWin::builder(inner.size(), open);
-                assert_eq!(builder.mouse_passthrough, Some(true));
-                assert_eq!(builder.active, Some(false));
-            }
-        }
-    }
-
-    #[test]
-    fn interrupt_hidden_closed_and_session_change_invalidate_old_results() {
-        for mode in 0..3 {
-            let ctx = Context::default();
-            ctx.set_embed_viewports(false);
-            let mut state = AppState::default();
-            state.generating = true;
-            let mut mini = MiniWin::default();
-            mini.session_epoch = state.session_epoch;
-            mini.interrupt_open = true;
-            let old = mini.interrupt_result.clone();
-            old.store(1, Ordering::Release);
-            if mode == 0 { mini.shot_hide_until = Some(Instant::now() + SHOT_HIDE); }
-            if mode == 1 { state.session_epoch += 1; }
-            ctx.begin_pass(egui::RawInput::default());
-            if mode == 2 { ctx.data_mut(|d| d.insert_temp(Id::new("neo-desktop-suspended"), true)); }
-            mini.tick(&ctx, &mut state, Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard), mode != 0, None, None);
-            let mut output = ctx.end_pass();
-            output.textures_delta.clear();
-            assert_eq!(old.load(Ordering::Acquire), u8::MAX);
-            assert!(old.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err());
-            assert!(state.generating);
-        }
-    }
-
-    #[test]
-    fn fallback_position_rounding_keeps_buttons_at_1366x768_scale085() {
-        let monitor = Vec2::new(1366.0, 768.0);
-        let scale = 0.85;
-        let size = Vec2::new(380.0, 280.0) * scale;
-        let margin = 16.0 * scale;
-        let expected = Pos2::new(monitor.x - size.x - margin, margin);
-        assert_eq!(expected, Pos2::new(1029.4, 13.6));
-        let actual = Rect::from_min_size(Pos2::new(1029.0, 14.0), size);
-        assert!((actual.min - expected).length() > 0.5, "旧点距离判定会永久清空按钮宿主");
-        assert!(fallback_position_settled(Some(actual), expected, 1.0));
-        assert!(!fallback_position_settled(Some(actual.translate(Vec2::X)), expected, 1.0));
-        assert!(!fallback_position_settled(None, expected, 1.0));
-    }
-
-    #[test]
-    fn fallback_position_rounding_uses_child_fractional_dpi_and_zoom() {
-        for native in [1.25, 1.5, 1.75, 2.5] {
-            for zoom in [0.85, 1.0, 1.1, 1.5] {
-                let ctx = Context::default();
-                ctx.set_zoom_factor(zoom);
-                let mut input = fallback_input(3.0, native);
-                input.viewport_id = viewport_id();
-                ctx.begin_pass(input);
-                let ppp = ctx.pixels_per_point();
-                assert!((ppp - native * zoom).abs() < 0.0001);
-                for physical in [Pos2::new(1029.4, 13.6), Pos2::new(-1029.4, -13.6),
-                    Pos2::new(10.5, -10.5)] {
-                    let expected = physical / ppp;
-                    let rounded = Pos2::new((expected.x * ppp).round(), (expected.y * ppp).round());
-                    let actual = Rect::from_min_size(rounded / ppp, Vec2::splat(100.0));
-                    assert!(fallback_position_settled(Some(actual), expected, ppp),
-                        "native={native}, zoom={zoom}, physical={physical:?}");
-                    for offset in [Vec2::X, -Vec2::X, Vec2::Y, -Vec2::Y] {
-                        let shifted = actual.translate(offset / ppp);
-                        assert!(!fallback_position_settled(Some(shifted), expected, ppp),
-                            "one physical pixel mismatch must disable button hosts");
-                    }
-                }
-                let mut output = ctx.end_pass();
-                output.textures_delta.clear();
-            }
-        }
-        let half = Pos2::new(10.5, -10.5);
-        let rounded = Rect::from_min_size(Pos2::new(11.0, -11.0), Vec2::splat(100.0));
-        assert!(fallback_position_settled(Some(rounded), half, 1.0));
-        for ppp in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-            assert!(!fallback_position_settled(Some(rounded), half, ppp));
-        }
-    }
-
-    #[test]
-    fn fallback_mixed_dpi_hits_child_physical_rects_not_root_points() {
-        for (root_scale, child_scale) in [(1.5, 1.0), (1.0, 1.5)] {
-            let ctx = Context::default();
-            ctx.begin_pass(fallback_input(root_scale, child_scale));
-            let screen = FallbackGeometry::screen(&ctx);
-            assert_eq!(screen.ppp, child_scale);
-            assert_eq!(screen.monitor, Vec2::new(1920.0, 1080.0) / child_scale);
-            let size = Vec2::new(340.0, 96.0);
-            let home = Pos2::new(screen.monitor.x - size.x - 16.0, 16.0);
-            let away = Pos2::new(16.0, 16.0);
-            let pos = home + (away - home) * 0.4;
-            let actual = Rect::from_min_size(Pos2::new(-1100.0, -180.0), size);
-            FallbackGeometry::new(screen, pos, size, home, away, Some(actual)).store(&ctx);
-            let cached = ctx.data(|d| d.get_temp::<FallbackGeometry>(Id::new("neo-miniwin-pos"))).unwrap();
-            for rect in [Rect::from_min_size(home, size), Rect::from_min_size(away, size),
-                Rect::from_min_size(pos, size), actual] {
-                for point in [rect.center(), rect.min + Vec2::splat(1.0), rect.max - Vec2::splat(1.0)] {
-                    let physical = point * child_scale;
-                    assert!(cached.contains(physical));
-                    assert!(rect.contains(screen.point(physical)));
-                }
-            }
-            let home_click = (home + size * 0.5) * child_scale;
-            // 旧代码把主窗 DPI 用在 child 的 home/live 上，两种比例都会漏命中。
-            assert!(!Rect::from_min_size(home, size).contains(home_click / root_scale));
-            assert!(!cached.contains(Pos2::new(-10.0, -10.0)));
-            assert!(!cached.contains(Pos2::new(3000.0, 2000.0)));
-            let mut output = ctx.end_pass();
-            output.textures_delta.clear();
-        }
-    }
-
-    #[test]
-    fn fallback_scale_and_size_changes_refresh_cache_and_position_commands() {
-        let ctx = Context::default();
-        ctx.set_embed_viewports(false);
-        let pos = Pos2::new(-1200.0, -200.0);
-        let size = Vec2::new(340.0, 96.0);
-        for (scale, height, expect_move) in [(1.0, 96.0, true), (1.0, 160.0, false),
-            (1.5, 160.0, true), (1.5, 96.0, false), (1.0, 96.0, true)] {
-            ctx.begin_pass(fallback_input(2.0, scale));
-            ctx.show_viewport_deferred(viewport_id(), ViewportBuilder::default(), |_, _| {});
-            let screen = FallbackGeometry::screen(&ctx);
-            let size = Vec2::new(size.x, height);
-            FallbackGeometry::new(screen, pos, size, pos, pos, None).store(&ctx);
-            let cached = ctx.data(|d| d.get_temp::<FallbackGeometry>(Id::new("neo-miniwin-pos"))).unwrap();
-            assert_eq!(cached.physical_rects[1], Rect::from_min_size(pos * scale, size * scale));
-            assert!(cached.contains((pos + size * 0.5) * scale));
-            assert!(!cached.contains((pos + size + Vec2::splat(1.0)) * scale));
-            let mut output = ctx.end_pass();
-            output.textures_delta.clear();
-            let moved = output.viewport_output.get(&viewport_id()).is_some_and(|v|
-                v.commands.iter().any(|c| matches!(c, ViewportCommand::OuterPosition(p) if *p == pos)));
-            assert_eq!(moved, expect_move);
-        }
-        // egui zoom 也属于完整 ppp，不能只记录系统 DPI。
-        ctx.set_zoom_factor(1.25);
-        let mut input = fallback_input(1.0, 1.5);
-        input.viewports.get_mut(&viewport_id()).unwrap().monitor_size = Some(Vec2::new(1920.0, 1080.0) / 1.875);
-        ctx.begin_pass(input);
-        ctx.show_viewport_deferred(viewport_id(), ViewportBuilder::default(), |_, _| {});
-        let screen = FallbackGeometry::screen(&ctx);
-        assert_eq!(screen.ppp, 1.875);
-        FallbackGeometry::new(screen, pos, size, pos, pos, None).store(&ctx);
-        assert!(ctx.data(|d| d.get_temp::<FallbackGeometry>(Id::new("neo-miniwin-pos")))
-            .unwrap().contains((pos + size * 0.5) * 1.875));
-        let mut output = ctx.end_pass();
-        output.textures_delta.clear();
-        assert!(output.viewport_output[&viewport_id()].commands.iter()
-            .any(|c| matches!(c, ViewportCommand::OuterPosition(p) if *p == pos)));
-    }
-
-    #[test]
-    fn fallback_missing_child_uses_cached_or_primary_geometry_never_root() {
-        let ctx = Context::default();
-        let mut input = fallback_input(1.5, 1.0);
-        input.viewports.remove(&viewport_id());
-        ctx.begin_pass(input);
-        let screen = FallbackGeometry::screen(&ctx);
-        assert_eq!(screen.ppp, 1.0);
-        assert_eq!(screen.monitor, Vec2::new(1920.0, 1080.0));
-        let child = ScreenGeometry::from_physical(Vec2::new(1920.0, 1080.0), 1.25);
-        FallbackGeometry::new(child, Pos2::new(100.0, 20.0), Vec2::new(340.0, 96.0),
-            Pos2::new(100.0, 20.0), Pos2::new(16.0, 16.0), None).store(&ctx);
-        assert_eq!(FallbackGeometry::screen(&ctx).ppp, 1.25);
-        let mut output = ctx.end_pass();
-        output.textures_delta.clear();
-    }
-
-    #[test]
-    fn mixed_dpi_overlay_geometry_and_class_click_use_primary_scale_once() {
-        let theme = Theme::new(neo_theme::ThemeMode::Dark, 1080.0, neo_theme::Distance::Standard);
-        for (primary_scale, secondary_scale) in [(1.0, 1.5), (1.5, 1.0)] {
-            let primary = ScreenGeometry::from_physical(Vec2::new(1920.0, 1080.0), primary_scale);
-            let secondary = ScreenGeometry::from_physical(Vec2::new(2560.0, 1440.0), secondary_scale);
-            let class = super::super::classwin::ClassWin::target_rect(theme, primary.monitor);
-            let physical_click = class.center() * primary_scale;
-            assert!(class.contains(primary.point(physical_click)));
-            assert_eq!(primary.point(physical_click), class.center());
-            assert_ne!(primary.point(physical_click), secondary.point(physical_click));
-            let home = Pos2::new(primary.monitor.x - 356.0, 16.0);
-            let card = Rect::from_min_size(home, Vec2::new(340.0, 96.0));
-            assert!(card.contains(primary.point(card.center() * primary_scale)));
-            assert_eq!(primary.monitor * primary_scale, Vec2::new(1920.0, 1080.0));
-        }
-    }
-
-    #[test]
-    fn flash_negative_origin_is_global_for_overlay_local_for_fallback() {
-        let physical = neo_tools::tools::screen::Rect { x: -1200, y: -150, width: 600, height: 300 };
-        let origin = Pos2::new(-1500.0, -300.0);
-        for scale in [1.0, 1.5] {
-            let geometry = ScreenGeometry::from_physical(Vec2::new(1920.0, 1080.0), scale);
-            let overlay = geometry.rect(physical, Pos2::ZERO);
-            let fallback = geometry.rect(physical, origin);
-            assert_eq!(overlay.min, Pos2::new(-1200.0, -150.0) / scale);
-            assert_eq!(fallback.min, Pos2::new(300.0, 150.0) / scale);
-            assert_eq!(overlay.size(), Vec2::new(600.0, 300.0) / scale);
-            assert_eq!(fallback.translate(geometry.point(origin).to_vec2()), overlay);
-        }
-    }
-
-    #[test]
-    fn backend_switch_resets_positions_but_preserves_local_beam_cache() {
-        let ctx = Context::default();
-        let mut input = egui::RawInput::default();
-        let root = input.viewports.get_mut(&ViewportId::ROOT).unwrap();
-        root.native_pixels_per_point = Some(1.5);
-        root.monitor_size = Some(Vec2::new(1700.0, 960.0));
-        ctx.begin_pass(input);
-        let fallback = screen_geometry(&ctx, false);
-        let overlay = screen_geometry(&ctx, true);
-        assert_eq!(fallback.monitor, Vec2::new(1700.0, 960.0));
-        assert_eq!(fallback.point(Pos2::new(150.0, 300.0)), Pos2::new(100.0, 200.0));
-        assert_eq!(overlay.monitor, Vec2::new(1920.0, 1080.0));
-        assert_eq!(overlay.point(Pos2::new(150.0, 300.0)), Pos2::new(150.0, 300.0));
-        let mut win = MiniWin::default();
-        let key = BeamKey::new(Vec2::new(340.0, 96.0), 18.0);
-        let mut cache = BeamGeometry::default();
-        assert!(cache.ensure(key));
-        for using_overlay in [true, false, true] {
-            win.shown = true;
-            win.legacy_sent = key.size;
-            *win.layer_rect.lock().unwrap() = [100.0, 20.0, 340.0, 96.0];
-            FallbackGeometry::new(fallback, Pos2::new(100.0, 20.0), key.size,
-                Pos2::new(100.0, 20.0), Pos2::new(16.0, 16.0), None).store(&ctx);
-            win.switch_backend(&ctx, using_overlay);
-            assert!(!win.shown);
-            assert_eq!(win.legacy_sent, Vec2::ZERO);
-            assert_eq!(*win.layer_rect.lock().unwrap(), [0.0; 4]);
-            assert!(ctx.data(|d| d.get_temp::<FallbackGeometry>(Id::new("neo-miniwin-pos"))).is_none());
-            assert!(!cache.ensure(key));
-        }
-        let mut output = ctx.end_pass();
-        output.textures_delta.clear();
-    }
-
-    #[test]
-    fn beam_cache_invalidates_only_geometry_inputs() {
-        let mut cache = BeamGeometry::default();
-        let mut key = BeamKey::new(Vec2::new(340.0, 96.0), 18.0);
-        assert!(cache.ensure(key));
-        assert!(!cache.ensure(key));
-        key.size.y += 1.0;
-        assert!(cache.ensure(key));
-        key.size.x += 1.0;
-        assert!(cache.ensure(key));
-        key.radius += 1.0;
-        assert!(cache.ensure(key));
-        key.segments += 1;
-        assert!(cache.ensure(key));
-        key.superellipse += 0.1;
-        assert!(cache.ensure(key));
-        assert!(!cache.ensure(key));
-    }
-
-    #[test]
-    fn beam_local_geometry_matches_absolute_reference_and_wraps() {
-        for size in [Vec2::new(340.0, 96.0), Vec2::new(340.0, 273.5), Vec2::new(510.0, 144.0)] {
-            for radius in [0.0, 18.0, 27.0] {
-                let mut cache = BeamGeometry::default();
-                cache.ensure(BeamKey::new(size, radius));
-                for origin in [Pos2::ZERO, Pos2::new(-1280.0, 16.0), Pos2::new(1523.25, 8.75)] {
-                    let pts = neo_theme::squircle::squircle_points(
-                        Rect::from_min_size(origin, size).shrink(0.5), radius,
-                        neo_theme::HARNESS_SUPERELLIPSE, neo_theme::squircle::DEFAULT_SEGMENTS);
-                    let mut cum = vec![0.0];
-                    for i in 0..pts.len() {
-                        cum.push(cum[i] + pts[i].distance(pts[(i + 1) % pts.len()]));
-                    }
-                    let total = *cum.last().unwrap();
-                    for now in [0.0, 0.3, 1.7, 2.39999, 2.4, 23.0] {
-                        let head = ((now / 2.4_f64).fract() as f32) * total;
-                        let tail = total * 0.30;
-                        for (i, p) in cache.tail_points(now).iter().enumerate() {
-                            let s = (head - tail + tail * (i as f32 / 28.0)).rem_euclid(total);
-                            let idx = match cum.binary_search_by(|c| c.partial_cmp(&s).unwrap()) {
-                                Ok(i) => i,
-                                Err(i) => i.saturating_sub(1),
-                            }.min(pts.len() - 1);
-                            let t = ((s - cum[idx]) / (cum[idx + 1] - cum[idx]).max(f32::EPSILON)).clamp(0.0, 1.0);
-                            let reference = pts[idx] + (pts[(idx + 1) % pts.len()] - pts[idx]) * t;
-                            assert!((*p + origin.to_vec2()).distance(reference) < 0.002);
-                        }
-                    }
-                }
-                assert!(cache.at(-cache.total * 0.25).distance(cache.at(cache.total * 0.75)) < 0.001);
-            }
-        }
-    }
-
-    #[test]
-    fn beam_synthetic_frames_reuse_buffers_and_reduce_rebuilds() {
-        const FRAMES: usize = 6000;
-        let key = BeamKey::new(Vec2::new(340.0, 180.0), 18.0);
-        let start = Instant::now();
-        for frame in 0..FRAMES {
-            let mut geometry = BeamGeometry::default();
-            geometry.ensure(std::hint::black_box(key));
-            let head = ((frame as f64 / 60.0 / 2.4).fract() as f32) * geometry.total;
-            let tail = geometry.total * 0.30;
-            for i in 0..28 {
-                std::hint::black_box(geometry.at(head - tail + tail * (i as f32 / 28.0)));
-                std::hint::black_box(geometry.at(head - tail + tail * ((i + 1) as f32 / 28.0)));
-            }
-        }
-        let uncached = start.elapsed();
-        let start = Instant::now();
-        let mut cache = BeamGeometry::default();
-        let mut rebuilds = usize::from(cache.ensure(key));
-        let buffers = (cache.points.as_ptr(), cache.cumulative.as_ptr());
-        let capacities = (cache.points.capacity(), cache.cumulative.capacity());
-        for frame in 0..FRAMES {
-            // 模拟避让平移，局部尺寸不变。
-            let rect = Rect::from_min_size(Pos2::new(frame as f32 * 0.25, 16.0), key.size);
-            rebuilds += usize::from(cache.ensure(BeamKey::new(rect.size(), key.radius)));
-            let points = cache.tail_points(std::hint::black_box(frame as f64 / 60.0));
-            std::hint::black_box(points.map(|p| p + rect.min.to_vec2()));
-            assert_eq!((cache.points.as_ptr(), cache.cumulative.as_ptr()), buffers);
-            assert_eq!((cache.points.capacity(), cache.cumulative.capacity()), capacities);
-        }
-        assert_eq!(rebuilds, 1);
-        eprintln!("{FRAMES} 合成帧：几何重建 {FRAMES} -> {rebuilds}，端点查找 {} -> {}；缓存命中不分配几何 Vec；未缓存 {:?}，缓存 {:?}（仅本机合成 CPU 路径）",
-            FRAMES * 56, FRAMES * 29, uncached, start.elapsed());
-    }
-}
+#[path = "miniwin_beam_tests.rs"]
+mod beam_tests;
 
 // ---------------------------------------------------------------------------
 // 截屏闪光
 // ---------------------------------------------------------------------------
 
-/// 闪光排程：截屏信号置位后这么久才亮 —— `capture()` 内置 300ms 等待 +
-/// 抓帧耗时，等闪光出现时画面早已抓完，AI 看到的截图里不会有这道白。
+/// 最早起闪时间；它不是抓帧完成的证明。桌面租约未释放时必须保留排程，
+/// 等屏障解除后才开始动画计时，不能在隐藏期间把整段闪光耗尽。
 const FLASH_DELAY: Duration = Duration::from_millis(450);
 /// 闪光总时长（前 13% 快速淡入，之后缓出）。
 const FLASH_SECS: f32 = 0.45;
 
 fn flash_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("neo-shotflash")
+}
+
+/// 回调与排程共享时钟；生产逐帧读单调时钟，测试可无 sleep 地推进 deferred 绘制。
+#[derive(Clone, Default)]
+struct FlashClock {
+    #[cfg(test)]
+    time: Arc<Mutex<Option<Instant>>>,
+}
+
+impl FlashClock {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = *self.time.lock().unwrap() { return now; }
+        Instant::now()
+    }
+
+    #[cfg(test)]
+    fn set(&self, now: Instant) {
+        *self.time.lock().unwrap() = Some(now);
+    }
 }
 
 /// 截屏闪光：AI 抓屏后，在被抓区域的边缘闪一道白框（整屏截图 = 全屏边框）。
@@ -1918,6 +1305,9 @@ pub struct ShotFlash {
     /// 上一帧是否在闪（沿检测用）。
     shown: bool,
     using_overlay: bool,
+    /// 作废挂起前/上一张截图的 deferred 回调，恢复后也不能重放旧帧。
+    frame_generation: Arc<std::sync::atomic::AtomicU64>,
+    clock: FlashClock,
 }
 
 impl ShotFlash {
@@ -1925,38 +1315,87 @@ impl ShotFlash {
     pub fn tick(&mut self, ctx: &Context, overlay: Option<&neo_overlay::OverlayHandle>) {
         use neo_tools::tools::screen;
 
+        let shot_at = screen::SCREENSHOT_AT.load(Ordering::Relaxed);
+        let region = if shot_at != self.shot_seen && shot_at != 0 {
+            screen::SCREENSHOT_RECT.lock().ok().and_then(|slot| *slot)
+        } else {
+            self.region
+        };
+        self.tick_at(ctx, overlay, Instant::now(), (shot_at, region));
+    }
+
+    fn advance(
+        &mut self,
+        now: Instant,
+        shot: (u64, Option<neo_tools::tools::screen::Rect>),
+        suspended: bool,
+    ) -> bool {
+        if shot.0 != self.shot_seen {
+            self.shot_seen = shot.0;
+            if shot.0 != 0 {
+                self.region = shot.1;
+                self.flash_at = Some(now + FLASH_DELAY);
+                self.flashing_since = None;
+                self.frame_generation.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        // 上一帧可能还没清理已到期动画；不能把它误当成被新租约打断的反馈。
+        if self.flashing_since.is_some_and(|t0| now.duration_since(t0).as_secs_f32() >= FLASH_SECS) {
+            self.flashing_since = None;
+            self.frame_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        if suspended {
+            if self.flashing_since.take().is_some() {
+                self.flash_at.get_or_insert(now);
+                self.frame_generation.fetch_add(1, Ordering::AcqRel);
+            }
+            return false;
+        }
+        if self.flash_at.is_some_and(|at| now >= at) {
+            self.flash_at = None;
+            self.flashing_since = Some(now);
+        }
+        self.flashing_since.is_some()
+    }
+
+    fn card(&self, ctx: &Context, rect: [f32; 4], t0: Instant) -> neo_overlay::Card {
+        let ctx = ctx.clone();
+        let generation = self.frame_generation.clone();
+        let expected = generation.load(Ordering::Acquire);
+        let clock = self.clock.clone();
+        neo_overlay::Card::passive(rect, move |ui| {
+            if crate::app::desktop_suspended(&ctx) || generation.load(Ordering::Acquire) != expected {
+                return;
+            }
+            paint_flash_at(ui, Some((ui.max_rect(), t0)), clock.now());
+        })
+    }
+
+    /// 与生产 tick 共用的时钟/信号入口，回归不写全局信号、不抓屏或启动原生层。
+    pub(crate) fn tick_at(
+        &mut self,
+        ctx: &Context,
+        overlay: Option<&neo_overlay::OverlayHandle>,
+        now: Instant,
+        shot: (u64, Option<neo_tools::tools::screen::Rect>),
+    ) {
+        #[cfg(test)]
+        self.clock.set(now);
         let overlay = overlay.filter(|layer| layer.is_alive());
         if self.using_overlay != overlay.is_some() {
             self.using_overlay = overlay.is_some();
             self.shown = false;
+            self.frame_generation.fetch_add(1, Ordering::AcqRel);
             if self.using_overlay {
                 ctx.send_viewport_cmd_to(flash_viewport_id(), ViewportCommand::Close);
             }
         }
         let geometry = screen_geometry(ctx, overlay.is_some());
-        // 1. 截屏信号：时间戳一变就锁定区域并排程闪光。
-        let shot_at = screen::SCREENSHOT_AT.load(Ordering::Relaxed);
-        if shot_at != self.shot_seen {
-            self.shot_seen = shot_at;
-            if shot_at != 0 {
-                self.region = screen::SCREENSHOT_RECT.lock().ok().and_then(|slot| *slot);
-                self.flash_at = Some(Instant::now() + FLASH_DELAY);
-            }
-        }
-        if self.flash_at.is_some_and(|at| Instant::now() >= at) {
-            self.flash_at = None;
-            self.flashing_since = Some(Instant::now());
-        }
-        if self
-            .flashing_since
-            .is_some_and(|t0| t0.elapsed().as_secs_f32() >= FLASH_SECS)
-        {
-            self.flashing_since = None;
-        }
-        let on = self.flashing_since.is_some();
+        // 两个后端共用排程；屏障解除表示抓屏 dispatch 已退出，不靠固定延时猜完成。
+        let on = self.advance(now, shot, crate::app::desktop_suspended(ctx));
 
         // 2. 物理矩形只换算一次；overlay 使用全局点，fallback 绘制时才减原点。
-        let vs = screen::virtual_screen();
+        let vs = neo_tools::tools::screen::virtual_screen();
         let desktop = geometry.rect(vs, Pos2::ZERO);
         let vs_size = desktop.size().max(Vec2::splat(1.0));
         let origin = desktop.min;
@@ -1968,10 +1407,7 @@ impl ShotFlash {
                 let rect = geometry.rect(region, Pos2::ZERO);
                 let rect = [rect.min.x, rect.min.y, rect.width(), rect.height()];
                 let t0 = self.flashing_since.unwrap_or_else(Instant::now);
-                let card = neo_overlay::Card::passive(rect, move |ui| {
-                    let r = ui.max_rect();
-                    paint_flash(ui, Some((r, t0)));
-                });
+                let card = self.card(ctx, rect, t0);
                 layer.set_card(neo_overlay::card_id::FLASH, Some(card));
             } else {
                 layer.set_card(neo_overlay::card_id::FLASH, None);
@@ -2017,6 +1453,9 @@ impl ShotFlash {
             None
         };
         let suspended = crate::app::desktop_viewport(ctx, flash_viewport_id());
+        let generation = self.frame_generation.clone();
+        let expected = generation.load(Ordering::Acquire);
+        let clock = self.clock.clone();
         ctx.show_viewport_deferred(
             flash_viewport_id(),
             ViewportBuilder::default()
@@ -2033,13 +1472,12 @@ impl ShotFlash {
                 .with_inner_size(if on { vs_size } else { Vec2::new(1.0, 1.0) })
                 .with_position(if on { origin } else { OFFSCREEN }),
             move |ui, _class| {
-                if frame.is_none() {
+                if crate::app::desktop_suspended(ui.ctx()) || frame.is_none()
+                    || generation.load(Ordering::Acquire) != expected
+                {
                     return;
                 }
-                paint_flash(ui, frame);
-                // 闪光动画由本视口自驱：主视口托盘态被 eframe 节流到 10fps，
-                // 指望它拉帧率闪光会卡成慢动作。
-                ui.ctx().request_repaint_after(POLL);
+                paint_flash_at(ui, frame, clock.now());
             },
         );
 
@@ -2051,9 +1489,13 @@ impl ShotFlash {
 }
 
 /// 画一帧闪光：区域边缘一道白框 + 极淡的白色填充，快速淡入后缓出。
-fn paint_flash(ui: &mut egui::Ui, frame: Option<(Rect, Instant)>) {
+fn paint_flash_at(ui: &mut egui::Ui, frame: Option<(Rect, Instant)>, now: Instant) {
     let Some((rect, t0)) = frame else { return };
-    let k = (t0.elapsed().as_secs_f32() / FLASH_SECS).clamp(0.0, 1.0);
+    let elapsed = now.saturating_duration_since(t0).as_secs_f32();
+    if elapsed >= FLASH_SECS { return; }
+    // 子视口自行拉帧；到期即停止绘制/重绘，不依赖可能被托盘节流的 ROOT tick。
+    ui.ctx().request_repaint_after(POLL);
+    let k = (elapsed / FLASH_SECS).clamp(0.0, 1.0);
     let alpha = if k < 0.13 {
         k / 0.13
     } else {

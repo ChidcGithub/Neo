@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-use semver::Version;
+use semver::{Prerelease, Version};
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
@@ -267,6 +267,50 @@ impl<'de> Deserialize<'de> for Releases {
     }
 }
 
+/// Neo 在 0.1.0 发布前从 rc + 九位数字的日期式构建号改为 preN（3dcfcde7）。
+/// 这批九位数字 rc 是早期构建，不是比 preN 更新的候选版；仅保留该历史格式的兼容。
+/// 新的候选版应使用标准 rc.N，其他版本线不继承这段历史。
+fn is_legacy_rc(version: &Version) -> bool {
+    (version.major, version.minor, version.patch) == (0, 1, 0)
+        && version
+            .pre
+            .as_str()
+            .strip_prefix("rc")
+            .is_some_and(|n| n.len() == 9 && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn update_prerelease(version: &Version) -> Prerelease {
+    let pre = version.pre.as_str();
+    let prefix = if is_legacy_rc(version) { "rc" } else { "pre" };
+    if let Some(n) = pre.strip_prefix(prefix) {
+        if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
+            // pre9/pre10 是 SemVer 字符串，更新策略则把项目序号解释为 pre.9/pre.10。
+            // 不转为机器整数，避免合法的长序号溢出；前导零不构成新版本。
+            let n = n.trim_start_matches('0');
+            let n = if n.is_empty() { "0" } else { n };
+            return Prerelease::new(&format!("{prefix}.{n}"))
+                .expect("ASCII prefix and decimal identifier are valid SemVer");
+        }
+    }
+    version.pre.clone()
+}
+
+fn cmp_update_versions(left: &Version, right: &Version) -> std::cmp::Ordering {
+    let stage = |v: &Version| {
+        if v.pre.is_empty() {
+            2
+        } else if is_legacy_rc(v) {
+            0
+        } else {
+            1
+        }
+    };
+    (left.major, left.minor, left.patch)
+        .cmp(&(right.major, right.minor, right.patch))
+        .then_with(|| stage(left).cmp(&stage(right)))
+        .then_with(|| update_prerelease(left).cmp(&update_prerelease(right)))
+}
+
 fn select_release(body: &[u8], current: &str) -> Result<Status, &'static str> {
     if body.len() > MAX_BODY_BYTES {
         return Err(RESPONSE_ERROR);
@@ -289,13 +333,13 @@ fn select_release(body: &[u8], current: &str) -> Result<Status, &'static str> {
         if release.html_url != format!("https://github.com/ChidcGithub/Neo/releases/tag/{tag}") {
             continue;
         }
-        // build metadata 不影响 SemVer 优先级，不能把仅构建号变化视为更新。
-        if !version.cmp_precedence(&current).is_gt() {
+        // 使用同一项目排序比较当前版本和候选版本；build metadata 不构成更新。
+        if !cmp_update_versions(&version, &current).is_gt() {
             continue;
         }
         if newest
             .as_ref()
-            .is_none_or(|(best, _)| version.cmp_precedence(best).is_gt())
+            .is_none_or(|(best, _)| cmp_update_versions(&version, best).is_gt())
         {
             newest = Some((version, release.html_url));
         }
@@ -310,282 +354,5 @@ fn select_release(body: &[u8], current: &str) -> Result<Status, &'static str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::{json, Value};
-
-    fn release(tag: &str, prerelease: bool) -> Value {
-        json!({
-            "tag_name": tag,
-            "html_url": format!("https://github.com/ChidcGithub/Neo/releases/tag/{tag}"),
-            "draft": false,
-            "prerelease": prerelease,
-        })
-    }
-
-    fn select(releases: Vec<Value>, current: &str) -> Status {
-        select_release(&serde_json::to_vec(&releases).unwrap(), current).unwrap()
-    }
-
-    fn available(tag: &str) -> Status {
-        Status::Available {
-            version: tag.strip_prefix('v').unwrap_or(tag).into(),
-            url: format!("https://github.com/ChidcGithub/Neo/releases/tag/{tag}"),
-        }
-    }
-
-    #[test]
-    fn semver_orders_numeric_components_and_prerelease_identifiers() {
-        assert_eq!(
-            select(
-                vec![release("v0.9.0", false), release("0.10.0", false)],
-                "0.8.0"
-            ),
-            available("0.10.0")
-        );
-        assert_eq!(
-            select(
-                vec![release("v1.0.0-rc.10", true), release("v1.0.0-rc.2", true)],
-                "1.0.0-rc.1",
-            ),
-            available("v1.0.0-rc.10")
-        );
-        // pre2/pre10 是字母数字标识符，必须遵从 SemVer 的字典序而不是自然数排序。
-        assert_eq!(
-            select(vec![release("v0.1.0-pre10", true)], "0.1.0-pre2"),
-            Status::UpToDate
-        );
-        assert_eq!(
-            select(vec![release("v1.0.0+new", false)], "1.0.0+old"),
-            Status::UpToDate
-        );
-    }
-
-    #[test]
-    fn prerelease_channel_accepts_stable_and_prerelease() {
-        assert_eq!(
-            select(vec![release("v0.1.0-pre3", true)], "0.1.0-pre2"),
-            available("v0.1.0-pre3")
-        );
-        assert_eq!(
-            select(
-                vec![release("v0.1.0", false), release("v0.1.0-pre3", true)],
-                "0.1.0-pre2"
-            ),
-            available("v0.1.0")
-        );
-    }
-
-    #[test]
-    fn stable_channel_rejects_both_kinds_of_prerelease_marker() {
-        assert_eq!(
-            select(
-                vec![
-                    release("v2.0.0-rc.1", false),
-                    release("v3.0.0", true),
-                    release("v1.1.0", false)
-                ],
-                "1.0.0",
-            ),
-            available("v1.1.0")
-        );
-    }
-
-    #[test]
-    fn drafts_removed_releases_invalid_tags_and_older_versions_are_ignored() {
-        let mut draft = release("v9.0.0", false);
-        draft["draft"] = json!(true);
-        assert_eq!(
-            select(
-                vec![
-                    draft,
-                    release("release-8.0.0", false),
-                    release("v01.0.0", false),
-                    release("v0.9.0", false)
-                ],
-                "1.0.0"
-            ),
-            Status::UpToDate
-        );
-        assert_eq!(select(Vec::new(), "0.1.0-pre2"), Status::UpToDate);
-    }
-
-    #[test]
-    fn only_matching_repository_release_links_are_allowed() {
-        for url in [
-            "javascript:alert(1)",
-            "http://github.com/ChidcGithub/Neo/releases/tag/v2.0.0",
-            "https://evil.example/ChidcGithub/Neo/releases/tag/v2.0.0",
-            "https://github.com/Other/Neo/releases/tag/v2.0.0",
-            "https://github.com/ChidcGithub/Other/releases/tag/v2.0.0",
-            "https://github.com@evil.example/ChidcGithub/Neo/releases/tag/v2.0.0",
-            "https://github.com/ChidcGithub/Neo/releases/tag/v1.0.0",
-            "https://github.com/ChidcGithub/Neo/releases/tag/v2.0.0?next=https://evil.example",
-            "https://github.com/ChidcGithub/Neo/releases/tag/v2.0.0#fragment",
-        ] {
-            let mut item = release("v2.0.0", false);
-            item["html_url"] = json!(url);
-            assert_eq!(select(vec![item], "1.0.0"), Status::UpToDate, "{url}");
-        }
-    }
-
-    #[test]
-    fn giant_bodies_are_rejected_with_or_without_content_length() {
-        let body = vec![b' '; MAX_BODY_BYTES + 10];
-        assert_eq!(
-            read_body(body.as_slice(), Some(body.len() as u64)),
-            Err(RESPONSE_ERROR)
-        );
-        assert_eq!(read_body(body.as_slice(), None), Err(RESPONSE_ERROR));
-        assert_eq!(read_body(body.as_slice(), Some(1)), Err(RESPONSE_ERROR));
-        assert_eq!(select_release(&body, "1.0.0"), Err(RESPONSE_ERROR));
-        let exact = vec![b' '; MAX_BODY_BYTES];
-        assert_eq!(
-            read_body(exact.as_slice(), None).unwrap().len(),
-            MAX_BODY_BYTES
-        );
-    }
-
-    #[test]
-    fn malformed_and_unbounded_metadata_only_produce_safe_errors() {
-        for body in [
-            b"not json secret".as_slice(),
-            b"{}",
-            b"[{}]",
-            b"null",
-            b"[] trailing",
-        ] {
-            assert_eq!(select_release(body, "1.0.0"), Err(RESPONSE_ERROR));
-        }
-        let many = serde_json::to_vec(&vec![release("v2.0.0", false); MAX_RELEASES + 1]).unwrap();
-        assert_eq!(select_release(&many, "1.0.0"), Err(RESPONSE_ERROR));
-        for (field, limit) in [("tag_name", MAX_TAG_BYTES), ("html_url", MAX_URL_BYTES)] {
-            let mut item = release("v2.0.0", false);
-            item[field] = json!("x".repeat(limit + 1));
-            assert_eq!(
-                select_release(&serde_json::to_vec(&vec![item]).unwrap(), "1.0.0"),
-                Err(RESPONSE_ERROR)
-            );
-        }
-        assert_eq!(select_release(b"[]", "invalid"), Err(RESPONSE_ERROR));
-    }
-
-    #[test]
-    fn duplicate_requests_are_single_flight_and_completion_is_delivered_once() {
-        let ctx = egui::Context::default();
-        let mut checker = UpdateChecker::default();
-        assert_eq!(checker.status(), &Status::Idle);
-        assert_eq!(checker.poll(), None);
-        let mut job = None;
-        checker.start(
-            &ctx,
-            || Status::UpToDate,
-            |worker| {
-                job = Some(worker);
-                Ok(())
-            },
-        );
-        assert_eq!(checker.status(), &Status::Checking);
-        checker.start(&ctx, || unreachable!(), |_| panic!("duplicate spawn"));
-        assert_eq!(checker.poll(), None);
-        job.unwrap()();
-        assert_eq!(checker.poll(), Some(Status::UpToDate));
-        assert_eq!(checker.poll(), None);
-    }
-
-    #[test]
-    fn cancel_discards_old_results_but_holds_single_flight_until_worker_finishes() {
-        let ctx = egui::Context::default();
-        let mut checker = UpdateChecker::default();
-        let mut old_job = None;
-        checker.start(
-            &ctx,
-            || available("v2.0.0"),
-            |job| {
-                old_job = Some(job);
-                Ok(())
-            },
-        );
-        checker.cancel();
-        assert_eq!(checker.status(), &Status::Idle);
-        assert!(checker.is_running());
-        for _ in 0..10 {
-            checker.start(
-                &ctx,
-                || unreachable!(),
-                |_| panic!("cancel bypassed single flight"),
-            );
-            checker.cancel();
-        }
-        old_job.unwrap()();
-        assert!(!checker.is_running());
-        assert_eq!(checker.poll(), None);
-        assert_eq!(checker.status(), &Status::Idle);
-        checker.start(
-            &ctx,
-            || Status::UpToDate,
-            |job| {
-                job();
-                Ok(())
-            },
-        );
-        assert_eq!(checker.poll(), Some(Status::UpToDate));
-    }
-
-    #[test]
-    fn cancel_also_discards_already_queued_completion() {
-        let ctx = egui::Context::default();
-        let mut checker = UpdateChecker::default();
-        checker.start(
-            &ctx,
-            || available("v2.0.0"),
-            |job| {
-                job();
-                Ok(())
-            },
-        );
-        checker.cancel();
-        assert_eq!(checker.poll(), None);
-        assert_eq!(checker.status(), &Status::Idle);
-    }
-
-    #[test]
-    fn spawn_failure_is_visible_once_and_can_be_retried() {
-        let ctx = egui::Context::default();
-        let mut checker = UpdateChecker::default();
-        checker.start(
-            &ctx,
-            || unreachable!(),
-            |_| Err(io::Error::other("private OS details")),
-        );
-        assert_eq!(checker.status(), &Status::Failed(SPAWN_ERROR.into()));
-        assert_eq!(checker.poll(), Some(Status::Failed(SPAWN_ERROR.into())));
-        assert_eq!(checker.poll(), None);
-        checker.start(
-            &ctx,
-            || Status::UpToDate,
-            |job| {
-                job();
-                Ok(())
-            },
-        );
-        assert_eq!(checker.poll(), Some(Status::UpToDate));
-    }
-
-    #[test]
-    fn drop_does_not_wait_for_pending_worker() {
-        let ctx = egui::Context::default();
-        let mut checker = UpdateChecker::default();
-        let mut pending = None;
-        checker.start(
-            &ctx,
-            || Status::UpToDate,
-            |job| {
-                pending = Some(job);
-                Ok(())
-            },
-        );
-        drop(checker);
-        pending.unwrap()();
-    }
-}
+#[path = "updates_tests.rs"]
+mod tests;
