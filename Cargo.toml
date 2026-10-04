@@ -51,6 +51,7 @@ ratex-types = "0.1"
 # Local compatibility fixes for constrained tables and safe media/link handling.
 [patch.crates-io]
 egui_commonmark = { path = "vendor/egui_commonmark" }
+sherpa-onnx-sys = { path = "vendor/sherpa-onnx-sys" }
 
 [profile.release]
 opt-level = 3

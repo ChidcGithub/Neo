@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tools.check_release import CRT_NAMES, REQUIRED_FILES
+from tools.check_release import CRT_NAMES, CRT_MIN_VERSION, CRT_DOWNLOAD_URL, REQUIRED_FILES
 
 
 SOURCE = Path(__file__).with_name("installer.nsi").read_text(encoding="utf-8")
@@ -44,6 +44,10 @@ class NsModel:
         self.native_machine = 0x8664
         self.os_version = (10, 0, 19041)
         self.process_result = "0"
+        self.reg_view = "32"
+        self.last_reg_view = "32"
+        self.crt_registry = {"Installed": 1, "Version": "v14.51.36247.0"}
+        self.crt_reads = []
 
     def value(self, token):
         token = token.strip('"')
@@ -110,7 +114,10 @@ class NsModel:
             jump = None
             v = self.value
             if op == "StrCpy":
-                self.variables[args[0]] = v(args[1])[:int(v(args[2]))] if len(args) > 2 else v(args[1])
+                text = v(args[1])
+                if len(args) > 3:
+                    text = text[int(v(args[3])):]
+                self.variables[args[0]] = text[:int(v(args[2]))] if len(args) > 2 else text
             elif op == "StrLen":
                 self.variables[args[0]] = str(len(v(args[1])))
             elif op == "StrCmp":
@@ -120,8 +127,9 @@ class NsModel:
                 index = 2 if a == b else (3 if a < b else 4)
                 jump = args[index] if len(args) > index else None
             elif op == "IntOp":
-                assert args[2] == "&"
-                self.variables[args[0]] = str(int(v(args[1]), 0) & int(v(args[3]), 0))
+                a, b = int(v(args[1]), 0), int(v(args[3]), 0)
+                assert args[2] in ("&", "+")
+                self.variables[args[0]] = str(a & b if args[2] == "&" else a + b)
             elif op == "Goto":
                 jump = args[0]
             elif op == "IfErrors":
@@ -245,6 +253,20 @@ class NsModel:
                     if self.registry is None:
                         self.registry = {}
                     self.registry[field] = data
+            elif op == "SetRegView":
+                view = self.last_reg_view if args[0] == "lastused" else args[0]
+                self.last_reg_view, self.reg_view = self.reg_view, view
+            elif op in ("ReadRegStr", "ReadRegDWORD") and args[1] == "HKLM":
+                key, field = v(args[2]), v(args[3])
+                assert key == r"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+                self.crt_reads.append((self.reg_view, field))
+                data = self.crt_registry.get(field) if self.reg_view == "64" else None
+                expected_type = int if op == "ReadRegDWORD" else str
+                self.error = type(data) is not expected_type or "crt-reg-denied" in self.faults
+                self.variables[args[0]] = "" if self.error else str(data)
+            elif op == "${VersionCompare}":
+                a, b = (tuple(map(int, v(arg).split("."))) for arg in args[:2])
+                self.variables[args[2]] = "0" if a == b else ("1" if a > b else "2")
             elif op == "ReadRegStr":
                 key = v(args[2])
                 self.error = key not in self.residues or "residue-read" in self.faults
@@ -496,6 +518,63 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("CheckPlatform", uninstall_init)
         self.assertIn("Call un.AcquireLock", uninstall_init)
         self.assertLess(SOURCE.index("Call CheckPlatform"), SOURCE.index('File /r "dist'))
+
+    def test_crt_registry_version_boundaries_and_invalid_values(self):
+        cases = [("v14.44.35211.0", False), ("v14.51.36231.0", False),
+                 ("v14.51.36246.0", False), ("v14.51.36247.0", True),
+                 ("14.51.36247.0", True), ("v14.51.36247.1", True),
+                 ("v14.52.1.0", True), ("v15.0.0.0", True),
+                 ("", False), ("v", False), ("v14.51.36247", False),
+                 ("v14.51..0", False), ("v14.51.36247.0.1", False),
+                 ("v14.51.36247.0x", False), ("v14.51.-36247.0", False),
+                 ("v999999999999.0.0.0", False), (123, False)]
+        for version, allowed in cases:
+            with self.subTest(version=version):
+                m = NsModel()
+                m.crt_registry["Version"] = version
+                m.execute("CheckVCRuntime")
+                self.assertEqual(not m.aborted, allowed)
+                self.assertEqual(m.reg_view, "32")
+                self.assertEqual(m.crt_reads, [("64", "Installed"), ("64", "Version")])
+                self.assertFalse(m.files)
+                self.assertFalse(m.stack)
+                if not allowed:
+                    self.assertEqual(m.variables["exit_code"], "2")
+                    self.assertIn(CRT_DOWNLOAD_URL, m.messages[0])
+
+    def test_crt_failure_aborts_before_any_install_mutation(self):
+        for registry, fault in [({}, None), ({"Installed": 0}, None),
+                                ({"Installed": "1"}, None), ({"Installed": 1}, None),
+                                ({"Installed": 1, "Version": "v14.44.1.0"}, None),
+                                ({"Installed": 1, "Version": "v14.51.36247.0"}, "crt-reg-denied")]:
+            with self.subTest(registry=registry, fault=fault):
+                m = NsModel([fault])
+                m.crt_registry = registry
+                m.files = {r"C:\Programs\Neo\neo.exe": b"old",
+                           r"C:\Programs\backup\neo.exe": b"backup",
+                           r"C:\Users\test\AppData\Roaming\Neo\credentials": b"untouched"}
+                m.registry = {"DisplayName": "old Neo"}
+                before = dict(m.files)
+                m.execute("Install")
+                self.assertTrue(m.aborted)
+                self.assertEqual(m.files, before)
+                self.assertEqual(m.registry, {"DisplayName": "old Neo"})
+                self.assertFalse(m.calls)
+                self.assertEqual(m.reg_view, "32")
+
+    def test_crt_preflight_scope_order_and_shared_requirement(self):
+        body = SOURCE.split("Function CheckVCRuntime\n", 1)[1].split("FunctionEnd", 1)[0]
+        self.assertIn(f'"{CRT_MIN_VERSION}"', body)
+        self.assertIn(CRT_DOWNLOAD_URL, body)
+        self.assertIn("未验证 DLL 完整性或运行兼容性", body)
+        self.assertNotIn("System::Call", body)
+        self.assertNotIn("Exec", body)
+        self.assertIn("RequestExecutionLevel user", SOURCE)
+        install = SOURCE.split('Section "Install"\n', 1)[1].split("SectionEnd", 1)[0]
+        self.assertLess(install.index("Call CheckVCRuntime"), install.index("Call CheckRunning"))
+        self.assertLess(install.index("Call CheckVCRuntime"), install.index("Rename"))
+        self.assertLess(install.index("Call CheckVCRuntime"), install.index("File /r"))
+        self.assertEqual(SOURCE.count("Call CheckVCRuntime"), 1)
 
     def test_process_gate_distinguishes_running_failure_timeout_and_start_error(self):
         for result, message in [("0", None), ("10", "正在运行"), ("20", "无法枚举进程"),

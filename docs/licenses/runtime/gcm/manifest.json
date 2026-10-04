@@ -1,0 +1,3190 @@
+{
+  "schema": "neo-gcm-notices-v1",
+  "runtime": "MinGit-2.55.0.5-64-bit",
+  "gcm_version": "2.9.1",
+  "runtime_snapshot_sha256": "8fc31f66d0a9c016cfdc6c6fcba445399c374422d1889b49c19725228ab89790",
+  "files": [
+    {
+      "path": "mingw64/bin/Atlassian.Bitbucket.dll",
+      "sha256": "3a9dd735b3e0fc2e4b3f83ed94d11cbfe3e72b86e0a957a0c419f90ce12ab5f4",
+      "size": 105272,
+      "version_resources": [
+        {
+          "FileVersion": "2.9.1.0"
+        },
+        {
+          "ProductVersion": "2.9.1+6760f0ef069c994aa2bb1d703fb374986ee82a3e"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Git Credential Manager",
+          "version": "2.9.1",
+          "commit": "6760f0ef069c994aa2bb1d703fb374986ee82a3e",
+          "method": "official GCM payload whole-file SHA matched; source and build projects retained"
+        }
+      ],
+      "notice_files": [
+        "GCM-2.9.1-LICENSE.txt",
+        "GCM-2.9.1-NOTICE.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.Base.dll",
+      "sha256": "ce1eda48b18fb19653e1a6c9a88dec3d9a5c6abd4f06bfd677c410b0de308a24",
+      "size": 1922880,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia/11.1.3/avalonia.11.1.3.nupkg",
+          "package_sha256": "933fa4fef92e5a82f45c1bd14fc49a74c3a699108593d5bf27893f20cea8617d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.Base.dll",
+              "member": "lib/netstandard2.0/Avalonia.Base.dll",
+              "sha256": "afd53cb3bca62fa260f564696e389261c846bfb31e863417da3527f761d342bf",
+              "size": 1912832,
+              "package_pe_content": {
+                "sha256": "19798b0e878f326aac499b4f10528cd57a496f29f1de811fe8ddacdc4def5d06",
+                "size": 1912832,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "19798b0e878f326aac499b4f10528cd57a496f29f1de811fe8ddacdc4def5d06",
+                "size": 1912832,
+                "certificate_size": 10048,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "ce1eda48b18fb19653e1a6c9a88dec3d9a5c6abd4f06bfd677c410b0de308a24"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.Controls.dll",
+      "sha256": "40c47e611b9f95b32bbf0a6d95c6d84fc89507502a20d21fdb71edecbe77e17a",
+      "size": 1032000,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia/11.1.3/avalonia.11.1.3.nupkg",
+          "package_sha256": "933fa4fef92e5a82f45c1bd14fc49a74c3a699108593d5bf27893f20cea8617d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.Controls.dll",
+              "member": "lib/netstandard2.0/Avalonia.Controls.dll",
+              "sha256": "ad32d2a4bbe7bf2a431172b5821386eadb34d4638629b9062bbf403a64dd33ae",
+              "size": 1021952,
+              "package_pe_content": {
+                "sha256": "91ad79c8b89b4a420006e732baaf40ad967d6764ddbd656d081cb97c1eaff069",
+                "size": 1021952,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "91ad79c8b89b4a420006e732baaf40ad967d6764ddbd656d081cb97c1eaff069",
+                "size": 1021952,
+                "certificate_size": 10048,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "40c47e611b9f95b32bbf0a6d95c6d84fc89507502a20d21fdb71edecbe77e17a"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.DesignerSupport.dll",
+      "sha256": "934339931173fcd6d6d1654e05b428b539ef341f7ca4e5acb4da734e0c2795ca",
+      "size": 218424,
+      "version_resources": [
+        {
+          "FileVersion": "0.7.0.0"
+        },
+        {
+          "ProductVersion": "0.7.0+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia/11.1.3/avalonia.11.1.3.nupkg",
+          "package_sha256": "933fa4fef92e5a82f45c1bd14fc49a74c3a699108593d5bf27893f20cea8617d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.DesignerSupport.dll",
+              "member": "lib/netstandard2.0/Avalonia.DesignerSupport.dll",
+              "sha256": "038280a6a16c81f2e2ac4c23291f9994b037ccf50dbe1a5e3c9b5a305b5ef841",
+              "size": 208384,
+              "package_pe_content": {
+                "sha256": "8789ff3c39a43e05d9ab9ae71ec5bd3c3f3a44fb52eeef9d159d0996b8f1de3f",
+                "size": 208384,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "8789ff3c39a43e05d9ab9ae71ec5bd3c3f3a44fb52eeef9d159d0996b8f1de3f",
+                "size": 208384,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "934339931173fcd6d6d1654e05b428b539ef341f7ca4e5acb4da734e0c2795ca"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.Dialogs.dll",
+      "sha256": "747f439687eccf7e1118b1f127aa03f5bb22142d68cd6cec41d628eee85a2a71",
+      "size": 252728,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia/11.1.3/avalonia.11.1.3.nupkg",
+          "package_sha256": "933fa4fef92e5a82f45c1bd14fc49a74c3a699108593d5bf27893f20cea8617d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.Dialogs.dll",
+              "member": "lib/netstandard2.0/Avalonia.Dialogs.dll",
+              "sha256": "7dbe757aadbd0ced7e206140c5ddc88bd9df2245e0be9dda7aa0737197502095",
+              "size": 242688,
+              "package_pe_content": {
+                "sha256": "7dbe757aadbd0ced7e206140c5ddc88bd9df2245e0be9dda7aa0737197502095",
+                "size": 242688,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "7dbe757aadbd0ced7e206140c5ddc88bd9df2245e0be9dda7aa0737197502095",
+                "size": 242688,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "747f439687eccf7e1118b1f127aa03f5bb22142d68cd6cec41d628eee85a2a71"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.dll",
+      "sha256": "06de78055dd7f7705a5514456a34b47bf52d1c8815c34149a4e5a4dfd376aadf",
+      "size": 14136,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia/11.1.3/avalonia.11.1.3.nupkg",
+          "package_sha256": "933fa4fef92e5a82f45c1bd14fc49a74c3a699108593d5bf27893f20cea8617d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.dll",
+              "member": "lib/netstandard2.0/Avalonia.dll",
+              "sha256": "165bf896581c8e4aae0c64814b637e5d7f54de588577f423a9c8052822ec48e1",
+              "size": 4096,
+              "package_pe_content": {
+                "sha256": "25cf40ed20d40a046182c8e2bd5cc6bf35abb1d8997ca2e53b08873db10a4050",
+                "size": 4096,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "25cf40ed20d40a046182c8e2bd5cc6bf35abb1d8997ca2e53b08873db10a4050",
+                "size": 4096,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "06de78055dd7f7705a5514456a34b47bf52d1c8815c34149a4e5a4dfd376aadf"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.Markup.dll",
+      "sha256": "5d07211022aff0ec79716ed7ba6f5cada7b42a0214fd17fd8cc6f9251a1b9e10",
+      "size": 71016,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia/11.1.3/avalonia.11.1.3.nupkg",
+          "package_sha256": "933fa4fef92e5a82f45c1bd14fc49a74c3a699108593d5bf27893f20cea8617d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.Markup.dll",
+              "member": "lib/netstandard2.0/Avalonia.Markup.dll",
+              "sha256": "7e2ff583514a2c06bd9cfecf0ec9ee068bcb1ca17604d39b6199c928227d2507",
+              "size": 60928,
+              "package_pe_content": {
+                "sha256": "546a1ae060f0c057ee965d9710bd31aba39f7a485051e45910613eb03aefa440",
+                "size": 60928,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "546a1ae060f0c057ee965d9710bd31aba39f7a485051e45910613eb03aefa440",
+                "size": 60928,
+                "certificate_size": 10088,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "5d07211022aff0ec79716ed7ba6f5cada7b42a0214fd17fd8cc6f9251a1b9e10"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.Markup.Xaml.dll",
+      "sha256": "177df637eaf4e7ee5bad8b0d2d23db33e289035178bd2f3d2b505f62d69b383e",
+      "size": 93024,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia/11.1.3/avalonia.11.1.3.nupkg",
+          "package_sha256": "933fa4fef92e5a82f45c1bd14fc49a74c3a699108593d5bf27893f20cea8617d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.Markup.Xaml.dll",
+              "member": "lib/netstandard2.0/Avalonia.Markup.Xaml.dll",
+              "sha256": "4b794a0e8fb0532c77053a4f8610eab861380f8bdfc0ad23fc148e2f96962721",
+              "size": 82944,
+              "package_pe_content": {
+                "sha256": "395ea22260393905f1508783743ff7f9a4219ae7671b7191bcb94e9d647c8835",
+                "size": 82944,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "395ea22260393905f1508783743ff7f9a4219ae7671b7191bcb94e9d647c8835",
+                "size": 82944,
+                "certificate_size": 10080,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "177df637eaf4e7ee5bad8b0d2d23db33e289035178bd2f3d2b505f62d69b383e"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.Metal.dll",
+      "sha256": "5ee3b9609227895cafd3cc8ea4928f64a29ab1a8be3d0d279db10b430c518063",
+      "size": 24376,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia/11.1.3/avalonia.11.1.3.nupkg",
+          "package_sha256": "933fa4fef92e5a82f45c1bd14fc49a74c3a699108593d5bf27893f20cea8617d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.Metal.dll",
+              "member": "lib/netstandard2.0/Avalonia.Metal.dll",
+              "sha256": "3ccfb4cceeace8facc8829c818c547bb9cb78a6ac9c6bf908efb122dda26e357",
+              "size": 14336,
+              "package_pe_content": {
+                "sha256": "c5799df7947a2998b4fc453aa17e1db6176bba9e050e393c1fa1edd48bf21b29",
+                "size": 14336,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "c5799df7947a2998b4fc453aa17e1db6176bba9e050e393c1fa1edd48bf21b29",
+                "size": 14336,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "5ee3b9609227895cafd3cc8ea4928f64a29ab1a8be3d0d279db10b430c518063"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.MicroCom.dll",
+      "sha256": "4a5074ccd8356f99e50b123f64ac846e491f543fa602eb965ef6666089f624b3",
+      "size": 25448,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia/11.1.3/avalonia.11.1.3.nupkg",
+          "package_sha256": "933fa4fef92e5a82f45c1bd14fc49a74c3a699108593d5bf27893f20cea8617d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.MicroCom.dll",
+              "member": "lib/net6.0/Avalonia.MicroCom.dll",
+              "sha256": "bdf80944f530919660734bf62c980de80d4bde9aac461e3ad58c49b493dd2681",
+              "size": 15360,
+              "package_pe_content": {
+                "sha256": "335991ab6ec31ccbc61687b5fb5b7bd4a525d1607f972e400dc15c6a9bef1d4a",
+                "size": 15360,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "335991ab6ec31ccbc61687b5fb5b7bd4a525d1607f972e400dc15c6a9bef1d4a",
+                "size": 15360,
+                "certificate_size": 10088,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "4a5074ccd8356f99e50b123f64ac846e491f543fa602eb965ef6666089f624b3"
+            },
+            {
+              "runtime_path": "mingw64/bin/Avalonia.MicroCom.dll",
+              "member": "lib/net8.0/Avalonia.MicroCom.dll",
+              "sha256": "bdf80944f530919660734bf62c980de80d4bde9aac461e3ad58c49b493dd2681",
+              "size": 15360,
+              "package_pe_content": {
+                "sha256": "335991ab6ec31ccbc61687b5fb5b7bd4a525d1607f972e400dc15c6a9bef1d4a",
+                "size": 15360,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "335991ab6ec31ccbc61687b5fb5b7bd4a525d1607f972e400dc15c6a9bef1d4a",
+                "size": 15360,
+                "certificate_size": 10088,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "4a5074ccd8356f99e50b123f64ac846e491f543fa602eb965ef6666089f624b3"
+            },
+            {
+              "runtime_path": "mingw64/bin/Avalonia.MicroCom.dll",
+              "member": "lib/netstandard2.0/Avalonia.MicroCom.dll",
+              "sha256": "bdf80944f530919660734bf62c980de80d4bde9aac461e3ad58c49b493dd2681",
+              "size": 15360,
+              "package_pe_content": {
+                "sha256": "335991ab6ec31ccbc61687b5fb5b7bd4a525d1607f972e400dc15c6a9bef1d4a",
+                "size": 15360,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "335991ab6ec31ccbc61687b5fb5b7bd4a525d1607f972e400dc15c6a9bef1d4a",
+                "size": 15360,
+                "certificate_size": 10088,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "4a5074ccd8356f99e50b123f64ac846e491f543fa602eb965ef6666089f624b3"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.OpenGL.dll",
+      "sha256": "9e76ad1503760dae0437abc5352c82cf247209af34cfe5037400065d45474b45",
+      "size": 106296,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia/11.1.3/avalonia.11.1.3.nupkg",
+          "package_sha256": "933fa4fef92e5a82f45c1bd14fc49a74c3a699108593d5bf27893f20cea8617d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.OpenGL.dll",
+              "member": "lib/netstandard2.0/Avalonia.OpenGL.dll",
+              "sha256": "edf211698fe574c17cb92befc4d1896ce9b9f0668ac0e35de670e29b1ae0519d",
+              "size": 96256,
+              "package_pe_content": {
+                "sha256": "045e9b4f06c753eedd46f54b94761767d888d46a7838dc23bc46e51809468131",
+                "size": 96256,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "045e9b4f06c753eedd46f54b94761767d888d46a7838dc23bc46e51809468131",
+                "size": 96256,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "9e76ad1503760dae0437abc5352c82cf247209af34cfe5037400065d45474b45"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.Remote.Protocol.dll",
+      "sha256": "9d4b55a9aa9f8e8dd487e53c909d7f552319fc19df9b6734ee1344c229d5dcfe",
+      "size": 82744,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia.Remote.Protocol",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia.remote.protocol/11.1.3/avalonia.remote.protocol.11.1.3.nupkg",
+          "package_sha256": "08a17eeb6cc26cad5177f1e20ba306ada82cdf2957ad54359678b7526d0cbaa9",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.Remote.Protocol.dll",
+              "member": "lib/netstandard2.0/Avalonia.Remote.Protocol.dll",
+              "sha256": "b5ad8e47846970b7c1acfadc435f93f8aa62bc1424472c7063458a809400bd9d",
+              "size": 72704,
+              "package_pe_content": {
+                "sha256": "e68cc14fb87478ebb1aa6e39612bb8d9d7a218fac05466759122cdb3d2c7fb7e",
+                "size": 72704,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "e68cc14fb87478ebb1aa6e39612bb8d9d7a218fac05466759122cdb3d2c7fb7e",
+                "size": 72704,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "9d4b55a9aa9f8e8dd487e53c909d7f552319fc19df9b6734ee1344c229d5dcfe"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.Skia.dll",
+      "sha256": "ce8e860f42018a6c319402ae2c6e43a8dbbe52754a203265ce5b356c4a98781e",
+      "size": 133440,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia.Skia",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia.skia/11.1.3/avalonia.skia.11.1.3.nupkg",
+          "package_sha256": "12d07cea0fa7cfa8bcc0beb1cad324625d84860b7718530c34fcd07e16dfa293",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.Skia.dll",
+              "member": "lib/netstandard2.0/Avalonia.Skia.dll",
+              "sha256": "c50998f52460139787aafb4dac1838824283917bf1d552d16618cac5b6df2271",
+              "size": 123392,
+              "package_pe_content": {
+                "sha256": "103936734d26affe499e5404d0a1fe1696999904419baacaf22c9ffa30692c73",
+                "size": 123392,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "103936734d26affe499e5404d0a1fe1696999904419baacaf22c9ffa30692c73",
+                "size": 123392,
+                "certificate_size": 10048,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "ce8e860f42018a6c319402ae2c6e43a8dbbe52754a203265ce5b356c4a98781e"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.Themes.Fluent.dll",
+      "sha256": "eb8e4ead3446893a2382ca08e2769274cd2eb27763c40af7f30e0f135928c997",
+      "size": 579896,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia.Themes.Fluent",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia.themes.fluent/11.1.3/avalonia.themes.fluent.11.1.3.nupkg",
+          "package_sha256": "a9f9912b680b192807c7874d21e55eb16c4b523728a24f444f6c6bbbf5f28b0f",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.Themes.Fluent.dll",
+              "member": "lib/netstandard2.0/Avalonia.Themes.Fluent.dll",
+              "sha256": "326c0bf30d7ba812dcaef3de9b285f7e63b4395011285a0a117cf6cea3cd2cf4",
+              "size": 569856,
+              "package_pe_content": {
+                "sha256": "326c0bf30d7ba812dcaef3de9b285f7e63b4395011285a0a117cf6cea3cd2cf4",
+                "size": 569856,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "326c0bf30d7ba812dcaef3de9b285f7e63b4395011285a0a117cf6cea3cd2cf4",
+                "size": 569856,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "eb8e4ead3446893a2382ca08e2769274cd2eb27763c40af7f30e0f135928c997"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.Vulkan.dll",
+      "sha256": "9f726db10a8e4f1615c36092dba406e2bced5ae44759225fc444ea64a4a3e674",
+      "size": 186176,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia/11.1.3/avalonia.11.1.3.nupkg",
+          "package_sha256": "933fa4fef92e5a82f45c1bd14fc49a74c3a699108593d5bf27893f20cea8617d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.Vulkan.dll",
+              "member": "lib/netstandard2.0/Avalonia.Vulkan.dll",
+              "sha256": "babfce450a2ddd70083541557e9c52a6edb7ea2e2074981242d4b7d2596ac036",
+              "size": 176128,
+              "package_pe_content": {
+                "sha256": "619cb8624e04a47053d96c799ab727a3adb605fb8ecaac2066b77b6f4638e1b7",
+                "size": 176128,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "619cb8624e04a47053d96c799ab727a3adb605fb8ecaac2066b77b6f4638e1b7",
+                "size": 176128,
+                "certificate_size": 10048,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "9f726db10a8e4f1615c36092dba406e2bced5ae44759225fc444ea64a4a3e674"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Avalonia.Win32.dll",
+      "sha256": "65c2e5dbf921a953797b9332280c3c3220c53ebae635ecb96b5de0395d969114",
+      "size": 745784,
+      "version_resources": [
+        {
+          "FileVersion": "11.1.3.0"
+        },
+        {
+          "ProductVersion": "11.1.3+45a2d36e3214ac4b3623940ba728b2503de5c668"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia.Win32",
+          "version": "11.1.3",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia.win32/11.1.3/avalonia.win32.11.1.3.nupkg",
+          "package_sha256": "cdcc53a449e92dfe74a7c61a8b2964e7f092f4c3437bb94ad6e5f508f6890547",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/Avalonia/",
+            "commit": "45a2d36e3214ac4b3623940ba728b2503de5c668"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Avalonia.Win32.dll",
+              "member": "lib/netstandard2.0/Avalonia.Win32.dll",
+              "sha256": "dca792172107f57e78e3aebab7c9adfdeb9c24cf05e5ddf1d19dfd7eb7bbe53f",
+              "size": 735744,
+              "package_pe_content": {
+                "sha256": "e65af458b0dfdd79b1067d1d07ac906a2c1212e17eff2ec7baabd4707f4a1c75",
+                "size": 735744,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "e65af458b0dfdd79b1067d1d07ac906a2c1212e17eff2ec7baabd4707f4a1c75",
+                "size": 735744,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "65c2e5dbf921a953797b9332280c3c3220c53ebae635ecb96b5de0395d969114"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Avalonia-11.1.3-LICENSE.md",
+        "Avalonia-11.1.3-NOTICE.md"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/av_libglesv2.dll",
+      "sha256": "a5e15a6b84c938c23816ed78475294bc28994582c3659965abc6ca3dceac8fed",
+      "size": 4450616,
+      "version_resources": [
+        {
+          "FileVersion": "2.1.22045 git hash: 4a177dd16290"
+        },
+        {
+          "ProductVersion": "2.1.22045 git hash: 4a177dd16290"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Avalonia.Angle.Windows.Natives",
+          "version": "2.1.22045.20230930",
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia.angle.windows.natives/2.1.22045.20230930/avalonia.angle.windows.natives.2.1.22045.20230930.nupkg",
+          "package_sha256": "4713dc5944f76fff91dd3bb91397eda6be69a422d9ae19be393b22d12c16de97",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AvaloniaUI/angle/",
+            "commit": "26406952a84f41c4be1e762884cda61fd2e022a9"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/av_libglesv2.dll",
+              "member": "runtimes/win-x64/native/av_libglesv2.dll",
+              "sha256": "caff1be1faee32f7c5bfba9162ee617c347aad40772caa9a1aff794e3a191420",
+              "size": 4440576,
+              "package_pe_content": {
+                "sha256": "caff1be1faee32f7c5bfba9162ee617c347aad40772caa9a1aff794e3a191420",
+                "size": 4440576,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "caff1be1faee32f7c5bfba9162ee617c347aad40772caa9a1aff794e3a191420",
+                "size": 4440576,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "a5e15a6b84c938c23816ed78475294bc28994582c3659965abc6ca3dceac8fed"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "ANGLE-Chromium-LICENSE.txt",
+        "ANGLE-Khronos-eglplatform.h",
+        "ANGLE-Khronos-khrplatform.h",
+        "ANGLE-RapidJSON-LICENSE.txt",
+        "ANGLE-astc-encoder-LICENSE.txt",
+        "ANGLE-ceval-LICENSE.txt",
+        "ANGLE-xxHash-LICENSE.txt",
+        "ANGLE-zlib-LICENSE.txt",
+        "Avalonia.Angle.Windows.Natives-2.1.22045.20230930-LICENSE"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/gcmcore.dll",
+      "sha256": "cb6a89c6f288117da4b77a902505643230b9e3cdba48cfe88719112a51da0690",
+      "size": 463208,
+      "version_resources": [
+        {
+          "FileVersion": "2.9.1.0"
+        },
+        {
+          "ProductVersion": "2.9.1+6760f0ef069c994aa2bb1d703fb374986ee82a3e"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Git Credential Manager",
+          "version": "2.9.1",
+          "commit": "6760f0ef069c994aa2bb1d703fb374986ee82a3e",
+          "method": "official GCM payload whole-file SHA matched; source and build projects retained"
+        }
+      ],
+      "notice_files": [
+        "GCM-2.9.1-LICENSE.txt",
+        "GCM-2.9.1-NOTICE.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/git-credential-manager.exe",
+      "sha256": "a1e4f00c79b0c9c7f087e72eed50a892e833bdd403652f2b40da86e81f27e9dd",
+      "size": 132920,
+      "version_resources": [
+        {
+          "FileVersion": "2.9.1.0"
+        },
+        {
+          "ProductVersion": "2.9.1+6760f0ef069c994aa2bb1d703fb374986ee82a3e"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Git Credential Manager",
+          "version": "2.9.1",
+          "commit": "6760f0ef069c994aa2bb1d703fb374986ee82a3e",
+          "method": "official GCM payload whole-file SHA matched; source and build projects retained"
+        }
+      ],
+      "notice_files": [
+        "GCM-2.9.1-LICENSE.txt",
+        "GCM-2.9.1-NOTICE.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/GitHub.dll",
+      "sha256": "e84351b4f90169c001ec2f88889a731308f286612dd03c7a2526ad013266fc8d",
+      "size": 154984,
+      "version_resources": [
+        {
+          "FileVersion": "2.9.1.0"
+        },
+        {
+          "ProductVersion": "2.9.1+6760f0ef069c994aa2bb1d703fb374986ee82a3e"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Git Credential Manager",
+          "version": "2.9.1",
+          "commit": "6760f0ef069c994aa2bb1d703fb374986ee82a3e",
+          "method": "official GCM payload whole-file SHA matched; source and build projects retained"
+        }
+      ],
+      "notice_files": [
+        "GCM-2.9.1-LICENSE.txt",
+        "GCM-2.9.1-NOTICE.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/GitLab.dll",
+      "sha256": "c87e5ee958cf609ef4c2a027d12659d1e2c1ec7efcc7dbc15c9ec4518e4860f0",
+      "size": 71480,
+      "version_resources": [
+        {
+          "FileVersion": "2.9.1.0"
+        },
+        {
+          "ProductVersion": "2.9.1+6760f0ef069c994aa2bb1d703fb374986ee82a3e"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Git Credential Manager",
+          "version": "2.9.1",
+          "commit": "6760f0ef069c994aa2bb1d703fb374986ee82a3e",
+          "method": "official GCM payload whole-file SHA matched; source and build projects retained"
+        }
+      ],
+      "notice_files": [
+        "GCM-2.9.1-LICENSE.txt",
+        "GCM-2.9.1-NOTICE.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/HarfBuzzSharp.dll",
+      "sha256": "d37714e703cfd98fcabd01cf495a66c0acf5f99bc78c5372ff4752632deddb1e",
+      "size": 215352,
+      "version_resources": [
+        {
+          "FileVersion": "7.3.0.2"
+        },
+        {
+          "ProductVersion": "7.3.0.2-7af1d0840a381c0ce7ef2877454a88dbb2949686"
+        }
+      ],
+      "packages": [
+        {
+          "id": "HarfBuzzSharp",
+          "version": "7.3.0.2",
+          "url": "https://api.nuget.org/v3-flatcontainer/harfbuzzsharp/7.3.0.2/harfbuzzsharp.7.3.0.2.nupkg",
+          "package_sha256": "89b828ab34f5355ed0a397bb5f65ba56defdf3d4caae4776336a6efa58520e0f",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/mono/SkiaSharp",
+            "branch": "release/2.88.8",
+            "commit": "7af1d0840a381c0ce7ef2877454a88dbb2949686"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/HarfBuzzSharp.dll",
+              "member": "lib/net462/HarfBuzzSharp.dll",
+              "sha256": "58ed012f14157cfa02f8b911319945e457109618f15a248968fd0a1caf2d789c",
+              "size": 215584,
+              "package_pe_content": {
+                "sha256": "c2d8626459474ab2ee1d2aecd612205e5ead9d6899f75538fe2467fb7bb7fe83",
+                "size": 205312,
+                "certificate_size": 10272,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "c2d8626459474ab2ee1d2aecd612205e5ead9d6899f75538fe2467fb7bb7fe83",
+                "size": 205312,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "d37714e703cfd98fcabd01cf495a66c0acf5f99bc78c5372ff4752632deddb1e"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "HarfBuzzSharp-7.3.0.2-LICENSE.txt",
+        "HarfBuzzSharp-7.3.0.2-THIRD-PARTY-NOTICES.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/libHarfBuzzSharp.dll",
+      "sha256": "8449848dd71c47bebfb16892d56918f2e26706d67138133fdb940831fd9f09e3",
+      "size": 1606968,
+      "version_resources": [],
+      "packages": [
+        {
+          "id": "HarfBuzzSharp.NativeAssets.Win32",
+          "version": "7.3.0.2",
+          "url": "https://api.nuget.org/v3-flatcontainer/harfbuzzsharp.nativeassets.win32/7.3.0.2/harfbuzzsharp.nativeassets.win32.7.3.0.2.nupkg",
+          "package_sha256": "c7888cdcd1ecf55cb0786e7bc40ef8c9de2e2ee5e5cb5e3ba287b49af350f33a",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/mono/SkiaSharp",
+            "branch": "release/2.88.8",
+            "commit": "7af1d0840a381c0ce7ef2877454a88dbb2949686"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/libHarfBuzzSharp.dll",
+              "member": "runtimes/win-x64/native/libHarfBuzzSharp.dll",
+              "sha256": "ef5923ef4cdc8612c1825b294174b5b8cc8a056ed0f06b58db56aabc56aaae12",
+              "size": 1607216,
+              "package_pe_content": {
+                "sha256": "32ddb11412c4c85d92876bfe8beac361a4c09ebb8dd2177eed4c8487a65e6a70",
+                "size": 1596928,
+                "certificate_size": 10288,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "32ddb11412c4c85d92876bfe8beac361a4c09ebb8dd2177eed4c8487a65e6a70",
+                "size": 1596928,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "8449848dd71c47bebfb16892d56918f2e26706d67138133fdb940831fd9f09e3"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "HarfBuzzSharp-7.3.0.2-LICENSE.txt",
+        "HarfBuzzSharp-7.3.0.2-THIRD-PARTY-NOTICES.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/libSkiaSharp.dll",
+      "sha256": "8dc867e29f3dacca41e15af5d557542f4982c59f770ba6ac811ed6026fd2874e",
+      "size": 9413944,
+      "version_resources": [],
+      "packages": [
+        {
+          "id": "SkiaSharp.NativeAssets.Win32",
+          "version": "2.88.8",
+          "url": "https://api.nuget.org/v3-flatcontainer/skiasharp.nativeassets.win32/2.88.8/skiasharp.nativeassets.win32.2.88.8.nupkg",
+          "package_sha256": "6fc55bf78acd8f03ca4890d0819d17bf675657b80c5459791b04cafd08993cf3",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/mono/SkiaSharp",
+            "branch": "release/2.88.8",
+            "commit": "7af1d0840a381c0ce7ef2877454a88dbb2949686"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/libSkiaSharp.dll",
+              "member": "runtimes/win-x64/native/libSkiaSharp.dll",
+              "sha256": "2ca940b7c4621ecd27d2f07c5f46fafa0375f493692cd4e6e1e66c07fbc8109a",
+              "size": 9414184,
+              "package_pe_content": {
+                "sha256": "be63851b15c23a921dc177788cca5272b71aae700bf1ebaf8d03c622b4c17734",
+                "size": 9403904,
+                "certificate_size": 10280,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "be63851b15c23a921dc177788cca5272b71aae700bf1ebaf8d03c622b4c17734",
+                "size": 9403904,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "8dc867e29f3dacca41e15af5d557542f4982c59f770ba6ac811ed6026fd2874e"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "HarfBuzzSharp-7.3.0.2-LICENSE.txt",
+        "HarfBuzzSharp-7.3.0.2-THIRD-PARTY-NOTICES.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/MicroCom.Runtime.dll",
+      "sha256": "67fcbaa2bd582e79e2f3646c1a43bb86676a096cb17729cf946f69a5c07abaeb",
+      "size": 24376,
+      "version_resources": [
+        {
+          "FileVersion": "0.11.0.0"
+        },
+        {
+          "ProductVersion": "0.11.0"
+        }
+      ],
+      "packages": [
+        {
+          "id": "MicroCom.Runtime",
+          "version": "0.11.0",
+          "url": "https://api.nuget.org/v3-flatcontainer/microcom.runtime/0.11.0/microcom.runtime.0.11.0.nupkg",
+          "package_sha256": "55dc293f97ec725bcda89ba9a5a3afc04c2fda87e7008e594b3d95f9411d2c5d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/kekekeks/MicroCom"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/MicroCom.Runtime.dll",
+              "member": "lib/netstandard2.0/MicroCom.Runtime.dll",
+              "sha256": "e992f1407476ec7691ab6fe15e3239fd9b887fe53f2e19c79464f594ea667ca1",
+              "size": 14336,
+              "package_pe_content": {
+                "sha256": "3b4c880bf228fea5a6eda9918e2890ba86e86d255e703fd9107b1e14cc57885d",
+                "size": 14336,
+                "certificate_size": 0,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "3b4c880bf228fea5a6eda9918e2890ba86e86d255e703fd9107b1e14cc57885d",
+                "size": 14336,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "67fcbaa2bd582e79e2f3646c1a43bb86676a096cb17729cf946f69a5c07abaeb"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "MicroCom-0.11.0-LICENSE.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Microsoft.AzureRepos.dll",
+      "sha256": "3e7965775aa78682af5b0dce2516c5b1abd8b96d6af9419f540b7f17f66be5d6",
+      "size": 69472,
+      "version_resources": [
+        {
+          "FileVersion": "2.9.1.0"
+        },
+        {
+          "ProductVersion": "2.9.1+6760f0ef069c994aa2bb1d703fb374986ee82a3e"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Git Credential Manager",
+          "version": "2.9.1",
+          "commit": "6760f0ef069c994aa2bb1d703fb374986ee82a3e",
+          "method": "official GCM payload whole-file SHA matched; source and build projects retained"
+        }
+      ],
+      "notice_files": [
+        "GCM-2.9.1-LICENSE.txt",
+        "GCM-2.9.1-NOTICE.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Microsoft.Bcl.AsyncInterfaces.dll",
+      "sha256": "18940307939380c25f2ea6467d9846bba566438320740fdd4c31184be46b709d",
+      "size": 26432,
+      "version_resources": [
+        {
+          "FileVersion": "8.0.23.53103"
+        },
+        {
+          "ProductVersion": "8.0.0+5535e31a712343a63f5d7d796cd874e563e5ac14"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Microsoft.Bcl.AsyncInterfaces",
+          "version": "8.0.0",
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.bcl.asyncinterfaces/8.0.0/microsoft.bcl.asyncinterfaces.8.0.0.nupkg",
+          "package_sha256": "f5a5a68b03092ab2abf68843d4a4aea25dfbcbe8dd0f13c625cb779b6fc1927c",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/dotnet/runtime",
+            "commit": "5535e31a712343a63f5d7d796cd874e563e5ac14"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Microsoft.Bcl.AsyncInterfaces.dll",
+              "member": "lib/net462/Microsoft.Bcl.AsyncInterfaces.dll",
+              "sha256": "80678203bd0203a6594f4e330b22543c0de5059382bb1c9334b7868b8f31b1bc",
+              "size": 26904,
+              "package_pe_content": {
+                "sha256": "df9e81656f904f7b11014cfe6ec2ca8a2777a5d0a76861d4aec4c8f64a8a612c",
+                "size": 16384,
+                "certificate_size": 10520,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "df9e81656f904f7b11014cfe6ec2ca8a2777a5d0a76861d4aec4c8f64a8a612c",
+                "size": 16384,
+                "certificate_size": 10048,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "18940307939380c25f2ea6467d9846bba566438320740fdd4c31184be46b709d"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Microsoft.Identity.Client.Broker.dll",
+      "sha256": "2fa5fc6cfa093bb1cd9d67e2783212ccce0606987c043add43e588e93e5e51f4",
+      "size": 74048,
+      "version_resources": [
+        {
+          "FileVersion": "4.84.2.0"
+        },
+        {
+          "ProductVersion": "4.84.2+bad7cae331c1d9e699ca2150a5fecb108ea54916"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Microsoft.Identity.Client.Broker",
+          "version": "4.84.2",
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.identity.client.broker/4.84.2/microsoft.identity.client.broker.4.84.2.nupkg",
+          "package_sha256": "c9150b209bc24e203fa47260782f2df30a467e3e55b6d2c9c10b7c20e395f68d",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AzureAD/microsoft-authentication-library-for-dotnet",
+            "commit": "bad7cae331c1d9e699ca2150a5fecb108ea54916"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Microsoft.Identity.Client.Broker.dll",
+              "member": "lib/net462/Microsoft.Identity.Client.Broker.dll",
+              "sha256": "24db1c436972208712616609a66d407b222bf6414572a7206b9841e7ee4940a1",
+              "size": 74040,
+              "package_pe_content": {
+                "sha256": "3ee9efe25b30e84883624f967ac92cd03c863cfd17dabd557de25b7bfed4b852",
+                "size": 64000,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "3ee9efe25b30e84883624f967ac92cd03c863cfd17dabd557de25b7bfed4b852",
+                "size": 64000,
+                "certificate_size": 10048,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "2fa5fc6cfa093bb1cd9d67e2783212ccce0606987c043add43e588e93e5e51f4"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "MSAL-4.84.2-LICENSE.txt",
+        "MSAL-4.84.2-ThirdPartyNotice.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Microsoft.Identity.Client.dll",
+      "sha256": "8626e4695db1862b13ee7398b6ceaf77edf2818b4803f23665cba484454dd6dd",
+      "size": 1260344,
+      "version_resources": [
+        {
+          "FileVersion": "4.84.2.0"
+        },
+        {
+          "ProductVersion": "4.84.2+bad7cae331c1d9e699ca2150a5fecb108ea54916"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Microsoft.Identity.Client",
+          "version": "4.84.2",
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.identity.client/4.84.2/microsoft.identity.client.4.84.2.nupkg",
+          "package_sha256": "a5830133086b59ffee21535fa2fdd1a66100165911f9fa6c91458c7fa1e55353",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AzureAD/microsoft-authentication-library-for-dotnet",
+            "commit": "bad7cae331c1d9e699ca2150a5fecb108ea54916"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Microsoft.Identity.Client.dll",
+              "member": "lib/net472/Microsoft.Identity.Client.dll",
+              "sha256": "44150bc05b4cc5ccfa5daeee0041026d7c383fe5abaf9e97d89b79cfbcba607e",
+              "size": 1260384,
+              "package_pe_content": {
+                "sha256": "7179fac01e494778f7a330ac7094f17800205e8a018ca8b65cc3f6add69456a8",
+                "size": 1250304,
+                "certificate_size": 10080,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "7179fac01e494778f7a330ac7094f17800205e8a018ca8b65cc3f6add69456a8",
+                "size": 1250304,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "8626e4695db1862b13ee7398b6ceaf77edf2818b4803f23665cba484454dd6dd"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "MSAL-4.84.2-LICENSE.txt",
+        "MSAL-4.84.2-ThirdPartyNotice.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Microsoft.Identity.Client.Extensions.Msal.dll",
+      "sha256": "c428de0dbf5a66afb09e3f11cc932ab0096c3559456b980ec0bc0cbd2d13f64c",
+      "size": 65336,
+      "version_resources": [
+        {
+          "FileVersion": "4.84.2.0"
+        },
+        {
+          "ProductVersion": "4.84.2+bad7cae331c1d9e699ca2150a5fecb108ea54916"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Microsoft.Identity.Client.Extensions.Msal",
+          "version": "4.84.2",
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.identity.client.extensions.msal/4.84.2/microsoft.identity.client.extensions.msal.4.84.2.nupkg",
+          "package_sha256": "b9611017286cb42bbd5f3c6e55ddf6eca648fba8426d795f4030d6e10adf3c27",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AzureAD/microsoft-authentication-library-for-dotnet",
+            "commit": "bad7cae331c1d9e699ca2150a5fecb108ea54916"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Microsoft.Identity.Client.Extensions.Msal.dll",
+              "member": "lib/netstandard2.0/Microsoft.Identity.Client.Extensions.Msal.dll",
+              "sha256": "b9c4779243e74dc93378194e13c61d8aed8545ca567745014081a82151ffdc93",
+              "size": 65376,
+              "package_pe_content": {
+                "sha256": "d2fe049179a4e9fb8dfb1e41022bbffe15a4b9cb49138479b53b491b1964ce0d",
+                "size": 55296,
+                "certificate_size": 10080,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "d2fe049179a4e9fb8dfb1e41022bbffe15a4b9cb49138479b53b491b1964ce0d",
+                "size": 55296,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "c428de0dbf5a66afb09e3f11cc932ab0096c3559456b980ec0bc0cbd2d13f64c"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "MSAL-4.84.2-LICENSE.txt",
+        "MSAL-4.84.2-ThirdPartyNotice.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/Microsoft.Identity.Client.NativeInterop.dll",
+      "sha256": "5dcaf7095cb9a0115d39f00705643930f739d9b570eb45a3f51daedab5a369c3",
+      "size": 92520,
+      "version_resources": [
+        {
+          "FileVersion": "0.20.6.0"
+        },
+        {
+          "ProductVersion": "0.20.6+ddd579d61e24a3f6495458c0899672d7644e637c"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Microsoft.Identity.Client.NativeInterop",
+          "version": "0.20.6",
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.identity.client.nativeinterop/0.20.6/microsoft.identity.client.nativeinterop.0.20.6.nupkg",
+          "package_sha256": "3db68ddb526eba1e5f9dfa7ce2e5fe42d19727436614611013f5a3ca59d60fc3",
+          "repository": {
+            "type": "git",
+            "url": "https://office.visualstudio.com/_git/OneAuth"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Microsoft.Identity.Client.NativeInterop.dll",
+              "member": "lib/net462/Microsoft.Identity.Client.NativeInterop.dll",
+              "sha256": "6149fc8fd0f1d5d4a55e90d17e98af3a0daed6af64510c03665dfff34f85be7e",
+              "size": 92512,
+              "package_pe_content": {
+                "sha256": "48d5f68704f6f41145cab3a01891860a1d8392eac49cd5ca1e5034e8be785a83",
+                "size": 82432,
+                "certificate_size": 10080,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "48d5f68704f6f41145cab3a01891860a1d8392eac49cd5ca1e5034e8be785a83",
+                "size": 82432,
+                "certificate_size": 10088,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "5dcaf7095cb9a0115d39f00705643930f739d9b570eb45a3f51daedab5a369c3"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Identity.Client.NativeInterop-0.20.6-LICENSE"
+      ],
+      "redistribution_status": "blocked-no-redistribution-grant"
+    },
+    {
+      "path": "mingw64/bin/Microsoft.IdentityModel.Abstractions.dll",
+      "sha256": "692cc596ee7a620e899335be03a83229520aed5a3e1a450c37ebff7c93dfafa0",
+      "size": 19776,
+      "version_resources": [
+        {
+          "FileVersion": "8.14.0.60815"
+        },
+        {
+          "ProductVersion": "8.14.0+c8f7d87bcda35557a68f6cb9c55856a2ee733856"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Microsoft.IdentityModel.Abstractions",
+          "version": "8.14.0",
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.identitymodel.abstractions/8.14.0/microsoft.identitymodel.abstractions.8.14.0.nupkg",
+          "package_sha256": "6e40aecf55a3e7a37e2c758bbc728b702b4846a04afb7939bc3daa7c1ef15ca9",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/AzureAD/azure-activedirectory-identitymodel-extensions-for-dotnet",
+            "commit": "c8f7d87bcda35557a68f6cb9c55856a2ee733856"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/Microsoft.IdentityModel.Abstractions.dll",
+              "member": "lib/net472/Microsoft.IdentityModel.Abstractions.dll",
+              "sha256": "de168bcbc53946ddcc19f466cc40e685c56b5461859667033cf83553cebe4ad8",
+              "size": 20024,
+              "package_pe_content": {
+                "sha256": "cc69a179a1166cb120059be99344dd3c6fe8e920e5e544839234c83e66c6a9e7",
+                "size": 9728,
+                "certificate_size": 10296,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "cc69a179a1166cb120059be99344dd3c6fe8e920e5e544839234c83e66c6a9e7",
+                "size": 9728,
+                "certificate_size": 10048,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "692cc596ee7a620e899335be03a83229520aed5a3e1a450c37ebff7c93dfafa0"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "IdentityModel-8.14.0-LICENSE.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/msalruntime.dll",
+      "sha256": "ad1b1935ccbbde75e544641bd9159e7b5bd6d394ddcf4c81aeb7cfad1ebba07a",
+      "size": 3060536,
+      "version_resources": [
+        {
+          "ProductVersion": "0.20.6"
+        }
+      ],
+      "packages": [
+        {
+          "id": "Microsoft.Identity.Client.NativeInterop",
+          "version": "0.20.6",
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.identity.client.nativeinterop/0.20.6/microsoft.identity.client.nativeinterop.0.20.6.nupkg",
+          "package_sha256": "3db68ddb526eba1e5f9dfa7ce2e5fe42d19727436614611013f5a3ca59d60fc3",
+          "repository": {
+            "type": "git",
+            "url": "https://office.visualstudio.com/_git/OneAuth"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/msalruntime.dll",
+              "member": "runtimes/win-x64/native/msalruntime.dll",
+              "sha256": "060ff9a4d78ed94498618b0b5255f0cc17693cd4a436a23de759dfc79daed21d",
+              "size": 3060576,
+              "package_pe_content": {
+                "sha256": "9634fdf1594db100d1e3f6bea4656350a17c508c8a8d1ce11c4dd29b6b48e4e3",
+                "size": 3050496,
+                "certificate_size": 10080,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "9634fdf1594db100d1e3f6bea4656350a17c508c8a8d1ce11c4dd29b6b48e4e3",
+                "size": 3050496,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "ad1b1935ccbbde75e544641bd9159e7b5bd6d394ddcf4c81aeb7cfad1ebba07a"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Identity.Client.NativeInterop-0.20.6-LICENSE"
+      ],
+      "redistribution_status": "blocked-no-redistribution-grant"
+    },
+    {
+      "path": "mingw64/bin/SkiaSharp.dll",
+      "sha256": "1c0fdec5e90624fbe7a5afccea355eec112ca593576fd893ee424b22304e4eeb",
+      "size": 805688,
+      "version_resources": [
+        {
+          "FileVersion": "2.88.8.0"
+        },
+        {
+          "ProductVersion": "2.88.8.0-7af1d0840a381c0ce7ef2877454a88dbb2949686"
+        }
+      ],
+      "packages": [
+        {
+          "id": "SkiaSharp",
+          "version": "2.88.8",
+          "url": "https://api.nuget.org/v3-flatcontainer/skiasharp/2.88.8/skiasharp.2.88.8.nupkg",
+          "package_sha256": "ac3e607384a79514d7c33dfaeee1e6f171b9780210a599681aa2d11a7bcdbb40",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/mono/SkiaSharp",
+            "branch": "release/2.88.8",
+            "commit": "7af1d0840a381c0ce7ef2877454a88dbb2949686"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/SkiaSharp.dll",
+              "member": "lib/net462/SkiaSharp.dll",
+              "sha256": "9d329d01e929fb81eaaa451d0909859a85507ea7268f6039156d56ba69fd8d53",
+              "size": 805920,
+              "package_pe_content": {
+                "sha256": "6ff441b99024ccef214b00c6c2e7a4c511d0d854e73c60880988e3fffd725c0f",
+                "size": 795648,
+                "certificate_size": 10272,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "6ff441b99024ccef214b00c6c2e7a4c511d0d854e73c60880988e3fffd725c0f",
+                "size": 795648,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "1c0fdec5e90624fbe7a5afccea355eec112ca593576fd893ee424b22304e4eeb"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "HarfBuzzSharp-7.3.0.2-LICENSE.txt",
+        "HarfBuzzSharp-7.3.0.2-THIRD-PARTY-NOTICES.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.Buffers.dll",
+      "sha256": "322b7e92ef79d35821f7859ce04500819e819892e80bdb4872bcc8183120b07a",
+      "size": 21856,
+      "version_resources": [
+        {
+          "FileVersion": "4.6.28619.01"
+        },
+        {
+          "ProductVersion": "4.6.28619.01 @BuiltBy: dlab14-DDVSOWINAGE069 @Branch: release/2.1 @SrcCode: https://github"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.Buffers",
+          "version": "4.5.1",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.buffers/4.5.1/system.buffers.4.5.1.nupkg",
+          "package_sha256": "c30b3dd2c7e2f4cee4b823d692fd42118309b42ab1f5007f923d329a5b0d6b12",
+          "repository": null,
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.Buffers.dll",
+              "member": "lib/net461/System.Buffers.dll",
+              "sha256": "accccfbe45d9f08ffeed9916e37b33e98c65be012cfff6e7fa7b67210ce1fefb",
+              "size": 20856,
+              "package_pe_content": {
+                "sha256": "6df62701f8959c7aaea899a167abda98449bcb4822cf631100534842ecf93376",
+                "size": 11776,
+                "certificate_size": 9080,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "6df62701f8959c7aaea899a167abda98449bcb4822cf631100534842ecf93376",
+                "size": 11776,
+                "certificate_size": 10080,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "322b7e92ef79d35821f7859ce04500819e819892e80bdb4872bcc8183120b07a"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.Buffers-4.5.1-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.CommandLine.dll",
+      "sha256": "7013e24a56109cb1cdf2dbe493b03540ed9cf9e23b7b35d71f37237b0c9305e8",
+      "size": 206648,
+      "version_resources": [
+        {
+          "FileVersion": "2.0.22.27201"
+        },
+        {
+          "ProductVersion": "2.0.0-beta4.22272.1+209b724a3c843253d3071e8348c353b297b0b8b5"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.CommandLine",
+          "version": "2.0.0-beta4.22272.1",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.commandline/2.0.0-beta4.22272.1/system.commandline.2.0.0-beta4.22272.1.nupkg",
+          "package_sha256": "cd23be0989cc1fc75e0470c8f431e108f8fbf427b718ecc70b21f5fd3887c5c7",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/dotnet/command-line-api",
+            "commit": "209b724a3c843253d3071e8348c353b297b0b8b5"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.CommandLine.dll",
+              "member": "lib/netstandard2.0/System.CommandLine.dll",
+              "sha256": "d665f036a8371a380fff304dc70481fe1be9d62f2073f908234f69c9f84b73f9",
+              "size": 206736,
+              "package_pe_content": {
+                "sha256": "3fd47c3117665adeda933be26b7b59147113b761561f2cb7531eb410590669bf",
+                "size": 196608,
+                "certificate_size": 10128,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "3fd47c3117665adeda933be26b7b59147113b761561f2cb7531eb410590669bf",
+                "size": 196608,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "7013e24a56109cb1cdf2dbe493b03540ed9cf9e23b7b35d71f37237b0c9305e8"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "System.CommandLine-2.0.0-beta4.22272.1-LICENSE.txt"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.ComponentModel.Annotations.dll",
+      "sha256": "46736b11724e6107112751fb20b013e9158fd9b335c19ee408b3df309b3c52b6",
+      "size": 37224,
+      "version_resources": [
+        {
+          "FileVersion": "4.6.26515.06"
+        },
+        {
+          "ProductVersion": "4.6.26515.06 @BuiltBy: dlab-DDVSOWINAGE059 @Branch: release/2.1 @SrcCode: https://github.c"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.ComponentModel.Annotations",
+          "version": "4.5.0",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.componentmodel.annotations/4.5.0/system.componentmodel.annotations.4.5.0.nupkg",
+          "package_sha256": "d79c84d8da13f6f98bf681826b11c29504758cb5b58f579fe611cc839e7146ca",
+          "repository": null,
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.ComponentModel.Annotations.dll",
+              "member": "lib/net461/System.ComponentModel.Annotations.dll",
+              "sha256": "04113c8549185519f3202790ceb23df609644872b9c249a56d2bcf59566102c4",
+              "size": 43152,
+              "package_pe_content": {
+                "sha256": "4e097bc1617ebf34519da9f8a99346323775ed64c17a28f2dd669bbc756140d5",
+                "size": 27136,
+                "certificate_size": 16016,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "4e097bc1617ebf34519da9f8a99346323775ed64c17a28f2dd669bbc756140d5",
+                "size": 27136,
+                "certificate_size": 10088,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "46736b11724e6107112751fb20b013e9158fd9b335c19ee408b3df309b3c52b6"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.Buffers-4.5.1-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.Diagnostics.DiagnosticSource.dll",
+      "sha256": "f539096f5e4bc3e018f00206da279a9a664b6e5a44b9c304d8949abf004205f4",
+      "size": 167736,
+      "version_resources": [
+        {
+          "FileVersion": "6.0.1523.11507"
+        },
+        {
+          "ProductVersion": "6.0.15+5edef4b20babd4c3ddac7460e536f86fd0f2d724"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.Diagnostics.DiagnosticSource",
+          "version": "6.0.1",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.diagnostics.diagnosticsource/6.0.1/system.diagnostics.diagnosticsource.6.0.1.nupkg",
+          "package_sha256": "5e2f30ad48d5962a33fff4cf423147a9c57f406853aa74df51c96db0d95c089e",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/dotnet/runtime",
+            "commit": "5edef4b20babd4c3ddac7460e536f86fd0f2d724"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.Diagnostics.DiagnosticSource.dll",
+              "member": "lib/net461/System.Diagnostics.DiagnosticSource.dll",
+              "sha256": "19ba42737c1c0500373736968f3d15cb7897cb195049fd5f492e6fe1629daaab",
+              "size": 168112,
+              "package_pe_content": {
+                "sha256": "6464195f7280b668192c7497464b370a7a2fa2c8e96763ae4988fc4532e63eb6",
+                "size": 157696,
+                "certificate_size": 10416,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "6464195f7280b668192c7497464b370a7a2fa2c8e96763ae4988fc4532e63eb6",
+                "size": 157696,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "f539096f5e4bc3e018f00206da279a9a664b6e5a44b9c304d8949abf004205f4"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.Diagnostics.DiagnosticSource-6.0.1-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.Formats.Asn1.dll",
+      "sha256": "52abac01da817aec9c53c1b4e683bcfc24ec22e86c7156a70678d3014d658c83",
+      "size": 104760,
+      "version_resources": [
+        {
+          "FileVersion": "8.0.724.31311"
+        },
+        {
+          "ProductVersion": "8.0.7+2aade6beb02ea367fd97c4070a4198802fe61c03"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.Formats.Asn1",
+          "version": "8.0.1",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.formats.asn1/8.0.1/system.formats.asn1.8.0.1.nupkg",
+          "package_sha256": "99acbf5a0f9eb269b5375e244131b81123018be19028fa7466bac1a3fa3a3973",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/dotnet/runtime",
+            "commit": "2aade6beb02ea367fd97c4070a4198802fe61c03"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.Formats.Asn1.dll",
+              "member": "lib/net462/System.Formats.Asn1.dll",
+              "sha256": "84692333cd9e3d9ef2761722a853dc88a412e1e71809744e18639a293c218c8e",
+              "size": 105232,
+              "package_pe_content": {
+                "sha256": "f5ef09f8ad51e79a208cc9d2a5bc51dfefd411840fcb1d78be3c8ea0f53243ff",
+                "size": 94720,
+                "certificate_size": 10512,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "f5ef09f8ad51e79a208cc9d2a5bc51dfefd411840fcb1d78be3c8ea0f53243ff",
+                "size": 94720,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "52abac01da817aec9c53c1b4e683bcfc24ec22e86c7156a70678d3014d658c83"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.Formats.Asn1-8.0.1-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.IO.FileSystem.AccessControl.dll",
+      "sha256": "03dca81b81188f83ef7621752c48417428ebb1c2e8550c3cb4c9d3aae713fb7b",
+      "size": 29496,
+      "version_resources": [
+        {
+          "FileVersion": "5.0.20.51904"
+        },
+        {
+          "ProductVersion": "5.0.0+cf258a14b70ad9069470a108f13765e0e5988f51"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.IO.FileSystem.AccessControl",
+          "version": "5.0.0",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.io.filesystem.accesscontrol/5.0.0/system.io.filesystem.accesscontrol.5.0.0.nupkg",
+          "package_sha256": "73d3250ca25f8fadd846f97b6eb44136ce7da25ae66cbf86d40ea84d2f32b447",
+          "repository": {
+            "type": "git",
+            "url": "git://github.com/dotnet/runtime",
+            "commit": "cf258a14b70ad9069470a108f13765e0e5988f51"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.IO.FileSystem.AccessControl.dll",
+              "member": "lib/net461/System.IO.FileSystem.AccessControl.dll",
+              "sha256": "e6026501ad4056ff2f1655b0afdfe8923bc6e8fbad67e1e9ef56e3002f49fbb9",
+              "size": 28552,
+              "package_pe_content": {
+                "sha256": "2ac7e083696b41d574b1cbca4eccd9e9baac1f52b7699fdc38409912b8e1f656",
+                "size": 19456,
+                "certificate_size": 9096,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "2ac7e083696b41d574b1cbca4eccd9e9baac1f52b7699fdc38409912b8e1f656",
+                "size": 19456,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "03dca81b81188f83ef7621752c48417428ebb1c2e8550c3cb4c9d3aae713fb7b"
+            },
+            {
+              "runtime_path": "mingw64/bin/System.IO.FileSystem.AccessControl.dll",
+              "member": "runtimes/win/lib/net461/System.IO.FileSystem.AccessControl.dll",
+              "sha256": "e6026501ad4056ff2f1655b0afdfe8923bc6e8fbad67e1e9ef56e3002f49fbb9",
+              "size": 28552,
+              "package_pe_content": {
+                "sha256": "2ac7e083696b41d574b1cbca4eccd9e9baac1f52b7699fdc38409912b8e1f656",
+                "size": 19456,
+                "certificate_size": 9096,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "2ac7e083696b41d574b1cbca4eccd9e9baac1f52b7699fdc38409912b8e1f656",
+                "size": 19456,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "03dca81b81188f83ef7621752c48417428ebb1c2e8550c3cb4c9d3aae713fb7b"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.IO.FileSystem.AccessControl-5.0.0-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.Memory.dll",
+      "sha256": "a538621e978f6559c96c401a0c35f9fbbbe85c18db496c33debe93d6865d71bb",
+      "size": 142136,
+      "version_resources": [
+        {
+          "FileVersion": "4.6.31308.01"
+        },
+        {
+          "ProductVersion": "4.6.31308.01 @BuiltBy: cloudtest-841353dfc000000 @Branch: release/2.1-MSRC @SrcCode: https"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.Memory",
+          "version": "4.5.5",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.memory/4.5.5/system.memory.4.5.5.nupkg",
+          "package_sha256": "10f43da352a29fb2b3188e4edd4dcf5100194c8b526e4f61fe2e2b5623775a22",
+          "repository": null,
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.Memory.dll",
+              "member": "lib/net461/System.Memory.dll",
+              "sha256": "bf3fb84664f4097f1a8a9bc71a51dcf8cf1a905d4080a4d290da1730866e856f",
+              "size": 142240,
+              "package_pe_content": {
+                "sha256": "64f9444d4e8d1395077e7ef66875d60482a8cd61d72366b6a022c92c9d171b35",
+                "size": 132096,
+                "certificate_size": 10144,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "64f9444d4e8d1395077e7ef66875d60482a8cd61d72366b6a022c92c9d171b35",
+                "size": 132096,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "a538621e978f6559c96c401a0c35f9fbbbe85c18db496c33debe93d6865d71bb"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.Buffers-4.5.1-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.Numerics.Vectors.dll",
+      "sha256": "0dcbc9b6f7115e8aaa401850253aef651f47615e6e2006bc99840d836a1691f5",
+      "size": 109880,
+      "version_resources": [
+        {
+          "FileVersion": "4.6.26515.06"
+        },
+        {
+          "ProductVersion": "4.6.26515.06 @BuiltBy: dlab-DDVSOWINAGE059 @Branch: release/2.1 @SrcCode: https://github.c"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.Numerics.Vectors",
+          "version": "4.5.0",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.numerics.vectors/4.5.0/system.numerics.vectors.4.5.0.nupkg",
+          "package_sha256": "a9d49320581fda1b4f4be6212c68c01a22cdf228026099c20a8eabefcf90f9cf",
+          "repository": null,
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.Numerics.Vectors.dll",
+              "member": "lib/net46/System.Numerics.Vectors.dll",
+              "sha256": "1d3ef8698281e7cf7371d1554afef5872b39f96c26da772210a33da041ba1183",
+              "size": 115856,
+              "package_pe_content": {
+                "sha256": "3c5cab4fc537a775e6b559764fa535849880fbb27748d69de62704ec938c20bc",
+                "size": 99840,
+                "certificate_size": 16016,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "3c5cab4fc537a775e6b559764fa535849880fbb27748d69de62704ec938c20bc",
+                "size": 99840,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "0dcbc9b6f7115e8aaa401850253aef651f47615e6e2006bc99840d836a1691f5"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.Buffers-4.5.1-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.Runtime.CompilerServices.Unsafe.dll",
+      "sha256": "cff361880bf7962e876c968bd7cc2144338e8d9dc84a0c9db933cfffc328df6c",
+      "size": 18744,
+      "version_resources": [
+        {
+          "FileVersion": "6.0.21.52210"
+        },
+        {
+          "ProductVersion": "6.0.0+4822e3c3aa77eb82b2fb33c9321f923cf11ddde6"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.Runtime.CompilerServices.Unsafe",
+          "version": "6.0.0",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.runtime.compilerservices.unsafe/6.0.0/system.runtime.compilerservices.unsafe.6.0.0.nupkg",
+          "package_sha256": "6c41b53e70e9eee298cff3a02ce5acdd15b04125589be0273f0566026720a762",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/dotnet/runtime",
+            "commit": "4822e3c3aa77eb82b2fb33c9321f923cf11ddde6"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.Runtime.CompilerServices.Unsafe.dll",
+              "member": "lib/net461/System.Runtime.CompilerServices.Unsafe.dll",
+              "sha256": "37768488e8ef45729bc7d9a2677633c6450042975bb96516e186da6cb9cd0dcf",
+              "size": 18024,
+              "package_pe_content": {
+                "sha256": "109dc060dd74c14a033fafec8671c655dba551b1bd42923ff94acd391eb9329b",
+                "size": 8704,
+                "certificate_size": 9320,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "109dc060dd74c14a033fafec8671c655dba551b1bd42923ff94acd391eb9329b",
+                "size": 8704,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "cff361880bf7962e876c968bd7cc2144338e8d9dc84a0c9db933cfffc328df6c"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.Runtime.CompilerServices.Unsafe-6.0.0-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.Security.AccessControl.dll",
+      "sha256": "40d981a0cafd6c07deacc0bafb93548d282b3faadb09c5e8cb222ba77a3e7feb",
+      "size": 34616,
+      "version_resources": [
+        {
+          "FileVersion": "5.0.20.51904"
+        },
+        {
+          "ProductVersion": "5.0.0+cf258a14b70ad9069470a108f13765e0e5988f51"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.Security.AccessControl",
+          "version": "5.0.0",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.security.accesscontrol/5.0.0/system.security.accesscontrol.5.0.0.nupkg",
+          "package_sha256": "b9e486f989fcd9ebf1c86067138f4de03fa780e0c35e0a2b9e506d4373a6c39e",
+          "repository": {
+            "type": "git",
+            "url": "git://github.com/dotnet/runtime",
+            "commit": "cf258a14b70ad9069470a108f13765e0e5988f51"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.Security.AccessControl.dll",
+              "member": "lib/net461/System.Security.AccessControl.dll",
+              "sha256": "1fda491eebdb19ea0a83cf6c16ab5dd004a1bfdfc845ede017ebe0945beb927f",
+              "size": 33672,
+              "package_pe_content": {
+                "sha256": "ab3ac2bc6cd2002d3903f51a0b9e2dd761c6bb9c879f1ff94453d2bee99a9b29",
+                "size": 24576,
+                "certificate_size": 9096,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "ab3ac2bc6cd2002d3903f51a0b9e2dd761c6bb9c879f1ff94453d2bee99a9b29",
+                "size": 24576,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "40d981a0cafd6c07deacc0bafb93548d282b3faadb09c5e8cb222ba77a3e7feb"
+            },
+            {
+              "runtime_path": "mingw64/bin/System.Security.AccessControl.dll",
+              "member": "runtimes/win/lib/net461/System.Security.AccessControl.dll",
+              "sha256": "1fda491eebdb19ea0a83cf6c16ab5dd004a1bfdfc845ede017ebe0945beb927f",
+              "size": 33672,
+              "package_pe_content": {
+                "sha256": "ab3ac2bc6cd2002d3903f51a0b9e2dd761c6bb9c879f1ff94453d2bee99a9b29",
+                "size": 24576,
+                "certificate_size": 9096,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "ab3ac2bc6cd2002d3903f51a0b9e2dd761c6bb9c879f1ff94453d2bee99a9b29",
+                "size": 24576,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "40d981a0cafd6c07deacc0bafb93548d282b3faadb09c5e8cb222ba77a3e7feb"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.IO.FileSystem.AccessControl-5.0.0-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.Security.Cryptography.ProtectedData.dll",
+      "sha256": "95500dff838eec1e079bc94c4e0f8db3e7df6f1fc2dfdd0a18c3276baf63e62c",
+      "size": 17720,
+      "version_resources": [
+        {
+          "FileVersion": "4.6.26515.06"
+        },
+        {
+          "ProductVersion": "4.6.26515.06 @BuiltBy: dlab-DDVSOWINAGE059 @Branch: release/2.1 @SrcCode: https://github.c"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.Security.Cryptography.ProtectedData",
+          "version": "4.5.0",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.security.cryptography.protecteddata/4.5.0/system.security.cryptography.protecteddata.4.5.0.nupkg",
+          "package_sha256": "67e5f5676944acb2fb627b768c5b3392eebf220ae780edd5d5b49f6530621487",
+          "repository": null,
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.Security.Cryptography.ProtectedData.dll",
+              "member": "lib/net461/System.Security.Cryptography.ProtectedData.dll",
+              "sha256": "a79ad1e9e7205bd790f40d6c1900baf1a9c8caa06089878d24ed3599ac3228a9",
+              "size": 23696,
+              "package_pe_content": {
+                "sha256": "cad7e322ee1383cc4f8d912ba192be27438003a5e5c4504a081da2358c04721e",
+                "size": 7680,
+                "certificate_size": 16016,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "cad7e322ee1383cc4f8d912ba192be27438003a5e5c4504a081da2358c04721e",
+                "size": 7680,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "95500dff838eec1e079bc94c4e0f8db3e7df6f1fc2dfdd0a18c3276baf63e62c"
+            },
+            {
+              "runtime_path": "mingw64/bin/System.Security.Cryptography.ProtectedData.dll",
+              "member": "runtimes/win/lib/net461/System.Security.Cryptography.ProtectedData.dll",
+              "sha256": "a79ad1e9e7205bd790f40d6c1900baf1a9c8caa06089878d24ed3599ac3228a9",
+              "size": 23696,
+              "package_pe_content": {
+                "sha256": "cad7e322ee1383cc4f8d912ba192be27438003a5e5c4504a081da2358c04721e",
+                "size": 7680,
+                "certificate_size": 16016,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "cad7e322ee1383cc4f8d912ba192be27438003a5e5c4504a081da2358c04721e",
+                "size": 7680,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "95500dff838eec1e079bc94c4e0f8db3e7df6f1fc2dfdd0a18c3276baf63e62c"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.Buffers-4.5.1-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.Security.Principal.Windows.dll",
+      "sha256": "0139ce79d7ec025724732f4c62e8d4008898942d18b8f040f067f7639ffd5b55",
+      "size": 19264,
+      "version_resources": [
+        {
+          "FileVersion": "5.0.20.51904"
+        },
+        {
+          "ProductVersion": "5.0.0+cf258a14b70ad9069470a108f13765e0e5988f51"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.Security.Principal.Windows",
+          "version": "5.0.0",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.security.principal.windows/5.0.0/system.security.principal.windows.5.0.0.nupkg",
+          "package_sha256": "081390c25f6f78592b28ada853c24514488a221fe9f9a24efaaf5373643ff3d6",
+          "repository": {
+            "type": "git",
+            "url": "git://github.com/dotnet/runtime",
+            "commit": "cf258a14b70ad9069470a108f13765e0e5988f51"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.Security.Principal.Windows.dll",
+              "member": "lib/net461/System.Security.Principal.Windows.dll",
+              "sha256": "b4d8e15adc235d0e858e39b5133e5d00a4baa8c94f4f39e3b5e791b0f9c0c806",
+              "size": 18312,
+              "package_pe_content": {
+                "sha256": "07de294a8b9aaef8416413e2939be63dc2621cdb4046835c9c7be9abc16799b3",
+                "size": 9216,
+                "certificate_size": 9096,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "07de294a8b9aaef8416413e2939be63dc2621cdb4046835c9c7be9abc16799b3",
+                "size": 9216,
+                "certificate_size": 10048,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "0139ce79d7ec025724732f4c62e8d4008898942d18b8f040f067f7639ffd5b55"
+            },
+            {
+              "runtime_path": "mingw64/bin/System.Security.Principal.Windows.dll",
+              "member": "runtimes/win/lib/net461/System.Security.Principal.Windows.dll",
+              "sha256": "b4d8e15adc235d0e858e39b5133e5d00a4baa8c94f4f39e3b5e791b0f9c0c806",
+              "size": 18312,
+              "package_pe_content": {
+                "sha256": "07de294a8b9aaef8416413e2939be63dc2621cdb4046835c9c7be9abc16799b3",
+                "size": 9216,
+                "certificate_size": 9096,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "07de294a8b9aaef8416413e2939be63dc2621cdb4046835c9c7be9abc16799b3",
+                "size": 9216,
+                "certificate_size": 10048,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "0139ce79d7ec025724732f4c62e8d4008898942d18b8f040f067f7639ffd5b55"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.IO.FileSystem.AccessControl-5.0.0-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.Text.Encodings.Web.dll",
+      "sha256": "5690c9873b767956258bba077d734a92cb0514721ad6801e01e1542530ed4297",
+      "size": 78696,
+      "version_resources": [
+        {
+          "FileVersion": "8.0.23.53103"
+        },
+        {
+          "ProductVersion": "8.0.0+5535e31a712343a63f5d7d796cd874e563e5ac14"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.Text.Encodings.Web",
+          "version": "8.0.0",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.text.encodings.web/8.0.0/system.text.encodings.web.8.0.0.nupkg",
+          "package_sha256": "21442442457da68d4b0b442caab8a5ab03733ef9dcfb8795beafa10afabc7ef1",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/dotnet/runtime",
+            "commit": "5535e31a712343a63f5d7d796cd874e563e5ac14"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.Text.Encodings.Web.dll",
+              "member": "lib/net462/System.Text.Encodings.Web.dll",
+              "sha256": "e9c4f5eed186cb129c527c4b8d67d163ea2f2396e9d8b96e30b5e7c12203ce84",
+              "size": 79024,
+              "package_pe_content": {
+                "sha256": "e1104c7e87e80ab2d58122e57d8e572680595b313372811261b1034055168132",
+                "size": 68608,
+                "certificate_size": 10416,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "e1104c7e87e80ab2d58122e57d8e572680595b313372811261b1034055168132",
+                "size": 68608,
+                "certificate_size": 10088,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "5690c9873b767956258bba077d734a92cb0514721ad6801e01e1542530ed4297"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.Text.Json.dll",
+      "sha256": "76a73b925787597c25456dbe27b7bed58d2fce89034fed323f08135c20f4ea55",
+      "size": 644408,
+      "version_resources": [
+        {
+          "FileVersion": "8.0.1024.46610"
+        },
+        {
+          "ProductVersion": "8.0.10+81cabf2857a01351e5ab578947c7403a5b128ad1"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.Text.Json",
+          "version": "8.0.5",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.text.json/8.0.5/system.text.json.8.0.5.nupkg",
+          "package_sha256": "c8ac68e78c39a1d593ea73ebb9456c697e77a0f45efa02b31af2e79f1b703faf",
+          "repository": {
+            "type": "git",
+            "url": "https://github.com/dotnet/runtime",
+            "commit": "81cabf2857a01351e5ab578947c7403a5b128ad1"
+          },
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.Text.Json.dll",
+              "member": "lib/net462/System.Text.Json.dll",
+              "sha256": "86c3f263ae9b4469ab1266c80471087082447eb4a38e6b97bf5e84de15c07a1d",
+              "size": 644888,
+              "package_pe_content": {
+                "sha256": "7a7dc97eaed03699f2c575513aff8e93a48b1559fec82548b8a9293dd1ebf7a1",
+                "size": 634368,
+                "certificate_size": 10520,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "7a7dc97eaed03699f2c575513aff8e93a48b1559fec82548b8a9293dd1ebf7a1",
+                "size": 634368,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "76a73b925787597c25456dbe27b7bed58d2fce89034fed323f08135c20f4ea55"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.Formats.Asn1-8.0.1-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.Threading.Tasks.Extensions.dll",
+      "sha256": "74f7f157ce574a131da14186964c347f6b3200cf745c67b28b52da51bf963e50",
+      "size": 26936,
+      "version_resources": [
+        {
+          "FileVersion": "4.6.28619.01"
+        },
+        {
+          "ProductVersion": "4.6.28619.01 @BuiltBy: dlab14-DDVSOWINAGE069 @Branch: release/2.1 @SrcCode: https://github"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.Threading.Tasks.Extensions",
+          "version": "4.5.4",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.threading.tasks.extensions/4.5.4/system.threading.tasks.extensions.4.5.4.nupkg",
+          "package_sha256": "a304a963cc0796c5179f9c6b7d8022bbce3b2fa7c029eb6196f631f7b462d678",
+          "repository": null,
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.Threading.Tasks.Extensions.dll",
+              "member": "lib/net461/System.Threading.Tasks.Extensions.dll",
+              "sha256": "4f81ffd0dc7204db75afc35ea4291769b07c440592f28894260eea76626a23c6",
+              "size": 25984,
+              "package_pe_content": {
+                "sha256": "6645d34a4d8e9c95e6af1c55ffc254638a93a52f2fee8d594043d69b07db9bfa",
+                "size": 16896,
+                "certificate_size": 9088,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "6645d34a4d8e9c95e6af1c55ffc254638a93a52f2fee8d594043d69b07db9bfa",
+                "size": 16896,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "74f7f157ce574a131da14186964c347f6b3200cf745c67b28b52da51bf963e50"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.Buffers-4.5.1-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    },
+    {
+      "path": "mingw64/bin/System.ValueTuple.dll",
+      "sha256": "420fa431a72f24995c72a57b4b134c29fd0a11e56aad1b860a1e6905d268ecb1",
+      "size": 19256,
+      "version_resources": [
+        {
+          "FileVersion": "4.6.26515.06"
+        },
+        {
+          "ProductVersion": "4.6.26515.06 @BuiltBy: dlab-DDVSOWINAGE059 @Branch: release/2.1 @SrcCode: https://github.c"
+        }
+      ],
+      "packages": [
+        {
+          "id": "System.ValueTuple",
+          "version": "4.5.0",
+          "url": "https://api.nuget.org/v3-flatcontainer/system.valuetuple/4.5.0/system.valuetuple.4.5.0.nupkg",
+          "package_sha256": "9e21fa9767d4e76bc0cee065c1d40cc34384a114bfec4d70e6c981168a926802",
+          "repository": null,
+          "matching_members": [
+            {
+              "runtime_path": "mingw64/bin/System.ValueTuple.dll",
+              "member": "lib/net47/System.ValueTuple.dll",
+              "sha256": "e905d102585b22c6df04f219af5cbdbfa7bc165979e9788b62df6dcc165e10f4",
+              "size": 25232,
+              "package_pe_content": {
+                "sha256": "d9b81e9fc3bd4a327109c0b17a7874a930e6f7e9d124b54d865791f29f0bb4ef",
+                "size": 9216,
+                "certificate_size": 16016,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "runtime_pe_content": {
+                "sha256": "d9b81e9fc3bd4a327109c0b17a7874a930e6f7e9d124b54d865791f29f0bb4ef",
+                "size": 9216,
+                "certificate_size": 10040,
+                "signature_verified": false,
+                "method": "All bytes except checksum, security-directory entry and bounded trailing WIN_CERTIFICATE"
+              },
+              "match_method": "all-non-signing-bytes",
+              "runtime_sha256": "420fa431a72f24995c72a57b4b134c29fd0a11e56aad1b860a1e6905d268ecb1"
+            }
+          ]
+        }
+      ],
+      "notice_files": [
+        "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+        "System.Buffers-4.5.1-THIRD-PARTY-NOTICES.TXT"
+      ],
+      "redistribution_status": "notices-collected"
+    }
+  ],
+  "notice_files": [
+    {
+      "path": "Avalonia.Angle.Windows.Natives-2.1.22045.20230930-LICENSE",
+      "sha256": "54aff7276217df9f6b5181613999d208c9e40d2b1d51bf55217837e6871a4a63",
+      "size": 1675,
+      "origins": [
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/avalonia.angle.windows.natives/2.1.22045.20230930/avalonia.angle.windows.natives.2.1.22045.20230930.nupkg",
+          "package_sha256": "4713dc5944f76fff91dd3bb91397eda6be69a422d9ae19be393b22d12c16de97",
+          "member": "LICENSE"
+        }
+      ]
+    },
+    {
+      "path": "HarfBuzzSharp-7.3.0.2-LICENSE.txt",
+      "sha256": "89101e35a8c66fd4d6dffc1763259161d35cb564c169714ec227a768c89f2938",
+      "size": 1129,
+      "origins": [
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/harfbuzzsharp/7.3.0.2/harfbuzzsharp.7.3.0.2.nupkg",
+          "package_sha256": "89b828ab34f5355ed0a397bb5f65ba56defdf3d4caae4776336a6efa58520e0f",
+          "member": "LICENSE.txt"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/harfbuzzsharp.nativeassets.win32/7.3.0.2/harfbuzzsharp.nativeassets.win32.7.3.0.2.nupkg",
+          "package_sha256": "c7888cdcd1ecf55cb0786e7bc40ef8c9de2e2ee5e5cb5e3ba287b49af350f33a",
+          "member": "LICENSE.txt"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/skiasharp/2.88.8/skiasharp.2.88.8.nupkg",
+          "package_sha256": "ac3e607384a79514d7c33dfaeee1e6f171b9780210a599681aa2d11a7bcdbb40",
+          "member": "LICENSE.txt"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/skiasharp.nativeassets.win32/2.88.8/skiasharp.nativeassets.win32.2.88.8.nupkg",
+          "package_sha256": "6fc55bf78acd8f03ca4890d0819d17bf675657b80c5459791b04cafd08993cf3",
+          "member": "LICENSE.txt"
+        }
+      ]
+    },
+    {
+      "path": "HarfBuzzSharp-7.3.0.2-THIRD-PARTY-NOTICES.txt",
+      "sha256": "21504c46c4c58aa64c1055bd2dcbc5f9a136b4b8c412ed3cc6740e22c5b127f5",
+      "size": 139775,
+      "origins": [
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/harfbuzzsharp/7.3.0.2/harfbuzzsharp.7.3.0.2.nupkg",
+          "package_sha256": "89b828ab34f5355ed0a397bb5f65ba56defdf3d4caae4776336a6efa58520e0f",
+          "member": "THIRD-PARTY-NOTICES.txt"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/harfbuzzsharp.nativeassets.win32/7.3.0.2/harfbuzzsharp.nativeassets.win32.7.3.0.2.nupkg",
+          "package_sha256": "c7888cdcd1ecf55cb0786e7bc40ef8c9de2e2ee5e5cb5e3ba287b49af350f33a",
+          "member": "THIRD-PARTY-NOTICES.txt"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/skiasharp/2.88.8/skiasharp.2.88.8.nupkg",
+          "package_sha256": "ac3e607384a79514d7c33dfaeee1e6f171b9780210a599681aa2d11a7bcdbb40",
+          "member": "THIRD-PARTY-NOTICES.txt"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/skiasharp.nativeassets.win32/2.88.8/skiasharp.nativeassets.win32.2.88.8.nupkg",
+          "package_sha256": "6fc55bf78acd8f03ca4890d0819d17bf675657b80c5459791b04cafd08993cf3",
+          "member": "THIRD-PARTY-NOTICES.txt"
+        }
+      ]
+    },
+    {
+      "path": "Microsoft.Bcl.AsyncInterfaces-8.0.0-LICENSE.TXT",
+      "sha256": "d7a68596ab69b06f51ca278a6545148e4269a9381c26d597c13df5d88e08cf5b",
+      "size": 1139,
+      "origins": [
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.bcl.asyncinterfaces/8.0.0/microsoft.bcl.asyncinterfaces.8.0.0.nupkg",
+          "package_sha256": "f5a5a68b03092ab2abf68843d4a4aea25dfbcbe8dd0f13c625cb779b6fc1927c",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.buffers/4.5.1/system.buffers.4.5.1.nupkg",
+          "package_sha256": "c30b3dd2c7e2f4cee4b823d692fd42118309b42ab1f5007f923d329a5b0d6b12",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.componentmodel.annotations/4.5.0/system.componentmodel.annotations.4.5.0.nupkg",
+          "package_sha256": "d79c84d8da13f6f98bf681826b11c29504758cb5b58f579fe611cc839e7146ca",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.diagnostics.diagnosticsource/6.0.1/system.diagnostics.diagnosticsource.6.0.1.nupkg",
+          "package_sha256": "5e2f30ad48d5962a33fff4cf423147a9c57f406853aa74df51c96db0d95c089e",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.formats.asn1/8.0.1/system.formats.asn1.8.0.1.nupkg",
+          "package_sha256": "99acbf5a0f9eb269b5375e244131b81123018be19028fa7466bac1a3fa3a3973",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.io.filesystem.accesscontrol/5.0.0/system.io.filesystem.accesscontrol.5.0.0.nupkg",
+          "package_sha256": "73d3250ca25f8fadd846f97b6eb44136ce7da25ae66cbf86d40ea84d2f32b447",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.memory/4.5.5/system.memory.4.5.5.nupkg",
+          "package_sha256": "10f43da352a29fb2b3188e4edd4dcf5100194c8b526e4f61fe2e2b5623775a22",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.numerics.vectors/4.5.0/system.numerics.vectors.4.5.0.nupkg",
+          "package_sha256": "a9d49320581fda1b4f4be6212c68c01a22cdf228026099c20a8eabefcf90f9cf",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.runtime.compilerservices.unsafe/6.0.0/system.runtime.compilerservices.unsafe.6.0.0.nupkg",
+          "package_sha256": "6c41b53e70e9eee298cff3a02ce5acdd15b04125589be0273f0566026720a762",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.security.accesscontrol/5.0.0/system.security.accesscontrol.5.0.0.nupkg",
+          "package_sha256": "b9e486f989fcd9ebf1c86067138f4de03fa780e0c35e0a2b9e506d4373a6c39e",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.security.cryptography.protecteddata/4.5.0/system.security.cryptography.protecteddata.4.5.0.nupkg",
+          "package_sha256": "67e5f5676944acb2fb627b768c5b3392eebf220ae780edd5d5b49f6530621487",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.security.principal.windows/5.0.0/system.security.principal.windows.5.0.0.nupkg",
+          "package_sha256": "081390c25f6f78592b28ada853c24514488a221fe9f9a24efaaf5373643ff3d6",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.text.encodings.web/8.0.0/system.text.encodings.web.8.0.0.nupkg",
+          "package_sha256": "21442442457da68d4b0b442caab8a5ab03733ef9dcfb8795beafa10afabc7ef1",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.text.json/8.0.5/system.text.json.8.0.5.nupkg",
+          "package_sha256": "c8ac68e78c39a1d593ea73ebb9456c697e77a0f45efa02b31af2e79f1b703faf",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.threading.tasks.extensions/4.5.4/system.threading.tasks.extensions.4.5.4.nupkg",
+          "package_sha256": "a304a963cc0796c5179f9c6b7d8022bbce3b2fa7c029eb6196f631f7b462d678",
+          "member": "LICENSE.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.valuetuple/4.5.0/system.valuetuple.4.5.0.nupkg",
+          "package_sha256": "9e21fa9767d4e76bc0cee065c1d40cc34384a114bfec4d70e6c981168a926802",
+          "member": "LICENSE.TXT"
+        }
+      ]
+    },
+    {
+      "path": "Microsoft.Bcl.AsyncInterfaces-8.0.0-THIRD-PARTY-NOTICES.TXT",
+      "sha256": "19c19dcac9f3ee6302cfbc6745bb8e79f08efc4c933eb8dc5509bf14b88347ec",
+      "size": 68911,
+      "origins": [
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.bcl.asyncinterfaces/8.0.0/microsoft.bcl.asyncinterfaces.8.0.0.nupkg",
+          "package_sha256": "f5a5a68b03092ab2abf68843d4a4aea25dfbcbe8dd0f13c625cb779b6fc1927c",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.text.encodings.web/8.0.0/system.text.encodings.web.8.0.0.nupkg",
+          "package_sha256": "21442442457da68d4b0b442caab8a5ab03733ef9dcfb8795beafa10afabc7ef1",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        }
+      ]
+    },
+    {
+      "path": "Microsoft.Identity.Client.NativeInterop-0.20.6-LICENSE",
+      "sha256": "0fe665c2ada5962fd01190ab5b2947b9a9d2c625a9f8225577441eb3256e14e3",
+      "size": 13142,
+      "origins": [
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/microsoft.identity.client.nativeinterop/0.20.6/microsoft.identity.client.nativeinterop.0.20.6.nupkg",
+          "package_sha256": "3db68ddb526eba1e5f9dfa7ce2e5fe42d19727436614611013f5a3ca59d60fc3",
+          "member": "LICENSE"
+        }
+      ]
+    },
+    {
+      "path": "System.Buffers-4.5.1-THIRD-PARTY-NOTICES.TXT",
+      "sha256": "7864a01e2fdef7e8fdf81b906efb1466f083206affea7ba7e6dadea429754765",
+      "size": 15835,
+      "origins": [
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.buffers/4.5.1/system.buffers.4.5.1.nupkg",
+          "package_sha256": "c30b3dd2c7e2f4cee4b823d692fd42118309b42ab1f5007f923d329a5b0d6b12",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.componentmodel.annotations/4.5.0/system.componentmodel.annotations.4.5.0.nupkg",
+          "package_sha256": "d79c84d8da13f6f98bf681826b11c29504758cb5b58f579fe611cc839e7146ca",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.memory/4.5.5/system.memory.4.5.5.nupkg",
+          "package_sha256": "10f43da352a29fb2b3188e4edd4dcf5100194c8b526e4f61fe2e2b5623775a22",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.numerics.vectors/4.5.0/system.numerics.vectors.4.5.0.nupkg",
+          "package_sha256": "a9d49320581fda1b4f4be6212c68c01a22cdf228026099c20a8eabefcf90f9cf",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.security.cryptography.protecteddata/4.5.0/system.security.cryptography.protecteddata.4.5.0.nupkg",
+          "package_sha256": "67e5f5676944acb2fb627b768c5b3392eebf220ae780edd5d5b49f6530621487",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.threading.tasks.extensions/4.5.4/system.threading.tasks.extensions.4.5.4.nupkg",
+          "package_sha256": "a304a963cc0796c5179f9c6b7d8022bbce3b2fa7c029eb6196f631f7b462d678",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.valuetuple/4.5.0/system.valuetuple.4.5.0.nupkg",
+          "package_sha256": "9e21fa9767d4e76bc0cee065c1d40cc34384a114bfec4d70e6c981168a926802",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        }
+      ]
+    },
+    {
+      "path": "System.Diagnostics.DiagnosticSource-6.0.1-THIRD-PARTY-NOTICES.TXT",
+      "sha256": "404c3a4978896df11ad61b92888dcdd44f272d3e137b6d4e0fc0a1aec31c9dbd",
+      "size": 47728,
+      "origins": [
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.diagnostics.diagnosticsource/6.0.1/system.diagnostics.diagnosticsource.6.0.1.nupkg",
+          "package_sha256": "5e2f30ad48d5962a33fff4cf423147a9c57f406853aa74df51c96db0d95c089e",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        }
+      ]
+    },
+    {
+      "path": "System.Formats.Asn1-8.0.1-THIRD-PARTY-NOTICES.TXT",
+      "sha256": "b60b2912da28eaa6518593c9e2efb5334ee062d3c42e80d8fdfa806b3dc52977",
+      "size": 68910,
+      "origins": [
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.formats.asn1/8.0.1/system.formats.asn1.8.0.1.nupkg",
+          "package_sha256": "99acbf5a0f9eb269b5375e244131b81123018be19028fa7466bac1a3fa3a3973",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.text.json/8.0.5/system.text.json.8.0.5.nupkg",
+          "package_sha256": "c8ac68e78c39a1d593ea73ebb9456c697e77a0f45efa02b31af2e79f1b703faf",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        }
+      ]
+    },
+    {
+      "path": "System.IO.FileSystem.AccessControl-5.0.0-THIRD-PARTY-NOTICES.TXT",
+      "sha256": "78e22d4d24a710d2a09426c09060f3448204778ed506b1da55447a6089b54fae",
+      "size": 44279,
+      "origins": [
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.io.filesystem.accesscontrol/5.0.0/system.io.filesystem.accesscontrol.5.0.0.nupkg",
+          "package_sha256": "73d3250ca25f8fadd846f97b6eb44136ce7da25ae66cbf86d40ea84d2f32b447",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.security.accesscontrol/5.0.0/system.security.accesscontrol.5.0.0.nupkg",
+          "package_sha256": "b9e486f989fcd9ebf1c86067138f4de03fa780e0c35e0a2b9e506d4373a6c39e",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        },
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.security.principal.windows/5.0.0/system.security.principal.windows.5.0.0.nupkg",
+          "package_sha256": "081390c25f6f78592b28ada853c24514488a221fe9f9a24efaaf5373643ff3d6",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        }
+      ]
+    },
+    {
+      "path": "System.Runtime.CompilerServices.Unsafe-6.0.0-THIRD-PARTY-NOTICES.TXT",
+      "sha256": "a6344bfb229bc08d1071cec400eea216e307439f961c5943ec1b56d2245acb95",
+      "size": 46990,
+      "origins": [
+        {
+          "url": "https://api.nuget.org/v3-flatcontainer/system.runtime.compilerservices.unsafe/6.0.0/system.runtime.compilerservices.unsafe.6.0.0.nupkg",
+          "package_sha256": "6c41b53e70e9eee298cff3a02ce5acdd15b04125589be0273f0566026720a762",
+          "member": "THIRD-PARTY-NOTICES.TXT"
+        }
+      ]
+    },
+    {
+      "path": "MSAL-4.84.2-LICENSE.txt",
+      "sha256": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c",
+      "size": 1073,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/AzureAD/microsoft-authentication-library-for-dotnet/bad7cae331c1d9e699ca2150a5fecb108ea54916/LICENSE",
+          "response_sha256": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c",
+          "transform": "none"
+        }
+      ]
+    },
+    {
+      "path": "MSAL-4.84.2-ThirdPartyNotice.txt",
+      "sha256": "6ceaa32c30e007e6f7f7a4ba5e07926da77c82866c459f29b020e66c78d8adcf",
+      "size": 1832,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/AzureAD/microsoft-authentication-library-for-dotnet/bad7cae331c1d9e699ca2150a5fecb108ea54916/ThirdPartyNotice.txt",
+          "response_sha256": "6ceaa32c30e007e6f7f7a4ba5e07926da77c82866c459f29b020e66c78d8adcf",
+          "transform": "none"
+        }
+      ]
+    },
+    {
+      "path": "IdentityModel-8.14.0-LICENSE.txt",
+      "sha256": "cba03f5387b05405e56b688376421acae396136af4b5116738dc6e5160f87ddd",
+      "size": 1085,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/AzureAD/azure-activedirectory-identitymodel-extensions-for-dotnet/c8f7d87bcda35557a68f6cb9c55856a2ee733856/LICENSE.txt",
+          "response_sha256": "cba03f5387b05405e56b688376421acae396136af4b5116738dc6e5160f87ddd",
+          "transform": "none"
+        }
+      ]
+    },
+    {
+      "path": "System.CommandLine-2.0.0-beta4.22272.1-LICENSE.txt",
+      "sha256": "58fd5ebf25d75b5bb5f4cd407a9fef3befd3641e1af90a1d0716618e6430fc19",
+      "size": 1115,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/dotnet/command-line-api/209b724a3c843253d3071e8348c353b297b0b8b5/LICENSE.md",
+          "response_sha256": "58fd5ebf25d75b5bb5f4cd407a9fef3befd3641e1af90a1d0716618e6430fc19",
+          "transform": "none"
+        }
+      ]
+    },
+    {
+      "path": "MicroCom-0.11.0-LICENSE.txt",
+      "sha256": "6ee769c9ac4dac9abb16b98b1341e9528ff9f4ab685481410d3376d14148f3a9",
+      "size": 1072,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/kekekeks/MicroCom/4b8a38f773c109bad558ee3713d9f16d80776e42/LICENSE",
+          "response_sha256": "6ee769c9ac4dac9abb16b98b1341e9528ff9f4ab685481410d3376d14148f3a9",
+          "transform": "none"
+        }
+      ]
+    },
+    {
+      "path": "Avalonia-11.1.3-NOTICE.md",
+      "sha256": "0e1ecea8b94eaacec8ade631994149d678940d05163b21d6f4be3d5dccb0a08d",
+      "size": 18076,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/AvaloniaUI/Avalonia/45a2d36e3214ac4b3623940ba728b2503de5c668/NOTICE.md",
+          "response_sha256": "0e1ecea8b94eaacec8ade631994149d678940d05163b21d6f4be3d5dccb0a08d",
+          "transform": "none"
+        }
+      ]
+    },
+    {
+      "path": "Avalonia-11.1.3-LICENSE.md",
+      "sha256": "213814d306090074d234d760239ff0f67eb9b8d20eefb4d5631bb39dbe0b769b",
+      "size": 1096,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/AvaloniaUI/Avalonia/45a2d36e3214ac4b3623940ba728b2503de5c668/licence.md",
+          "response_sha256": "213814d306090074d234d760239ff0f67eb9b8d20eefb4d5631bb39dbe0b769b"
+        }
+      ]
+    },
+    {
+      "path": "ANGLE-xxHash-LICENSE.txt",
+      "sha256": "86ec6953794503942b70fcd4f35b565d44f63f703b7037ce44dad965c4aaae91",
+      "size": 1314,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/AvaloniaUI/angle/26406952a84f41c4be1e762884cda61fd2e022a9/src/common/third_party/xxhash/LICENSE",
+          "response_sha256": "86ec6953794503942b70fcd4f35b565d44f63f703b7037ce44dad965c4aaae91",
+          "transform": "none"
+        }
+      ]
+    },
+    {
+      "path": "ANGLE-astc-encoder-LICENSE.txt",
+      "sha256": "494accc32e50eb523a0e384d0ae6d4b702db867a89d6971216760e92b240ee12",
+      "size": 10139,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/ARM-software/astc-encoder/573c475389bf51d16a5c3fc8348092e094e50e8f/LICENSE.txt",
+          "response_sha256": "494accc32e50eb523a0e384d0ae6d4b702db867a89d6971216760e92b240ee12",
+          "transform": "none"
+        }
+      ]
+    },
+    {
+      "path": "ANGLE-zlib-LICENSE.txt",
+      "sha256": "e1cfcc55c325b3f78cf55df9664abaa066e2271dffe8213347d9fccdfbac8f2c",
+      "size": 910,
+      "origins": [
+        {
+          "url": "https://chromium.googlesource.com/chromium/src/third_party/zlib/+/3f0af7f1d5ca6bb9d247f40b861346627c3032a1/LICENSE?format=TEXT",
+          "response_sha256": "a933cce44298f130692ed93dd7820bb26de792251c4b4c4677bf746f4dd9492d",
+          "transform": "base64 decode Gitiles TEXT"
+        }
+      ]
+    },
+    {
+      "path": "ANGLE-RapidJSON-LICENSE.txt",
+      "sha256": "a140e5d46fe734a1c78f1a3c3ef207871dd75648be71fdda8e309b23ab8b1f32",
+      "size": 5152,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/Tencent/rapidjson/781a4e667d84aeedbeb8184b7b62425ea66ec59f/license.txt",
+          "response_sha256": "a140e5d46fe734a1c78f1a3c3ef207871dd75648be71fdda8e309b23ab8b1f32",
+          "transform": "none"
+        }
+      ]
+    },
+    {
+      "path": "ANGLE-ceval-LICENSE.txt",
+      "sha256": "0dd71b8a6d6db0db4dc38a983749e1b2f4bb57aba30141a168042042c4a7b6f8",
+      "size": 1060,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/AvaloniaUI/angle/26406952a84f41c4be1e762884cda61fd2e022a9/src/third_party/ceval/LICENSE",
+          "response_sha256": "0dd71b8a6d6db0db4dc38a983749e1b2f4bb57aba30141a168042042c4a7b6f8",
+          "transform": "none"
+        }
+      ]
+    },
+    {
+      "path": "ANGLE-Chromium-LICENSE.txt",
+      "sha256": "368cca1106be99d39ecd32a38d8305585d802a475effb66380b91ffc9bcf709b",
+      "size": 1536,
+      "origins": [
+        {
+          "url": "https://chromium.googlesource.com/chromium/src/+/refs/tags/117.0.5938.132/LICENSE?format=TEXT",
+          "response_sha256": "363eddfec00830d4826f38173bd40a17eeada40a947a8d93b935371a1ae5a6d1",
+          "transform": "base64 decode Gitiles TEXT"
+        }
+      ]
+    },
+    {
+      "path": "ANGLE-Khronos-khrplatform.h",
+      "sha256": "e206a6931f98ffe1c5c7ece69c4f94bbe1c9279243f40cbe7782848a0d3fa2de",
+      "size": 10279,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/AvaloniaUI/angle/26406952a84f41c4be1e762884cda61fd2e022a9/include/KHR/khrplatform.h",
+          "response_sha256": "e206a6931f98ffe1c5c7ece69c4f94bbe1c9279243f40cbe7782848a0d3fa2de",
+          "transform": "none"
+        }
+      ]
+    },
+    {
+      "path": "ANGLE-Khronos-eglplatform.h",
+      "sha256": "b748729767798d85ecf8e1923552879328a76d572327b641ce737549b391cc9c",
+      "size": 5439,
+      "origins": [
+        {
+          "url": "https://raw.githubusercontent.com/AvaloniaUI/angle/26406952a84f41c4be1e762884cda61fd2e022a9/include/EGL/eglplatform.h",
+          "response_sha256": "b748729767798d85ecf8e1923552879328a76d572327b641ce737549b391cc9c",
+          "transform": "none"
+        }
+      ]
+    },
+    {
+      "path": "GCM-2.9.1-LICENSE.txt",
+      "sha256": "b47f1a8a744ecdc7a3da35804f88552805d33f51a726b87a2105acdfae406b07",
+      "size": 1102,
+      "origins": [
+        {
+          "runtime_path": "mingw64/doc/git-credential-manager/LICENSE",
+          "source_archive": ".cache/gitbash-sources/mingw-w64-git-credential-manager-2.9.1-1.src.tar.gz"
+        }
+      ]
+    },
+    {
+      "path": "GCM-2.9.1-NOTICE.txt",
+      "sha256": "f573f5d21d5d8a054aad1ffcbe0165391a4d93a5aa3e23c3db0752759adfd50c",
+      "size": 2597,
+      "origins": [
+        {
+          "runtime_path": "mingw64/doc/git-credential-manager/NOTICE"
+        }
+      ]
+    }
+  ],
+  "approval": false,
+  "published": false,
+  "release_ready": false,
+  "unmapped_executable_files": [],
+  "blockers": [
+    {
+      "id": "nativeinterop-0.20.6-redistribution",
+      "files": [
+        "mingw64/bin/Microsoft.Identity.Client.NativeInterop.dll",
+        "mingw64/bin/msalruntime.dll"
+      ],
+      "package": "Microsoft.Identity.Client.NativeInterop 0.20.6",
+      "license_file": "Microsoft.Identity.Client.NativeInterop-0.20.6-LICENSE",
+      "clause": "3(e): share, publish, distribute, or lease the software ... or transfer the software or this agreement to any third party.",
+      "upstream_issue": "https://github.com/AzureAD/microsoft-authentication-library-for-dotnet/issues/6118",
+      "finding": "Exact package embeds proprietary Microsoft terms restricting redistribution. Retained issue/comments contain no additional grant. Do not substitute the parent MSAL MIT license.",
+      "resolution": "Obtain applicable official redistribution permission for these exact two DLLs, or separately authorize a runtime replacement/removal and re-audit every changed file. No runtime changes made."
+    }
+  ],
+  "scope_notes": [
+    "Only 50 shipped executable files, plus existing GCM config/notices; 44 map to exact NuGet packages, six to GCM itself.",
+    "Whole files differ from NuGet due to Authenticode re-signing; ALL other bytes match. This is not signature verification.",
+    "Official complete same-release notice files retained verbatim and deduplicated by SHA-256, including sections for other platforms; retention does not assert those components ship.",
+    "NuGet lower-bound dependencies are discovery hints, not exact resolved versions. DiagnosticSource 6.0.1, not 6.0.2; System.Text.Json package 8.0.5 contains ProductVersion 8.0.10.",
+    "No deps.json in net472 payload. Evidence uses exact package members, complete PE non-signing bytes, NuGet nuspec revisions, and recorded PE ProductVersion.",
+    "NuGet package signatures and executable Authenticode signatures not verified. Official HTTPS + local SHA is not independent publisher authentication."
+  ]
+}

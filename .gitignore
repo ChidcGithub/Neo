@@ -8,13 +8,17 @@
 Thumbs.db
 desktop.ini
 
-# 仅公开 MOD 接口与发行说明；其余文档与截图仅保留本地
+# 自写说明、审计与过程文档只保留本地；法律正文和第三方原始材料除外
+/README.md
+/tools/*.md
+/crates/**/*.md
+/vendor/sherpa-onnx-sys/NEO-ASR.md
 /docs/*
-!/docs/mod-api.md
-!/docs/distribution/
-/docs/distribution/*
-!/docs/distribution/README.md
 !/docs/licenses/
+/docs/licenses/**/README.md
+/docs/licenses/README.md
+# MPL 对应源码供给告知，属于发行法律材料而非过程说明
+!/docs/licenses/runtime/native-sources/README.md
 /docs-pri/
 
 # 本地临时文件

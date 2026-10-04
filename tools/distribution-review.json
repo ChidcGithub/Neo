@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "status": "BLOCKED",
+  "blockers": [
+    {
+      "issue": "sherpa-native",
+      "outstanding": "A source-built no-TTS Sherpa candidate and isolated Neo relink now exclude detected eSpeak/Piper retention with ASR/VAD and build-graph evidence. Complete native ORT/Eigen provenance, corresponding-source/notice obligations and release-artifact binding; the technical fix and no-marker scan are not blanket distribution clearance."
+    },
+    {
+      "issue": "gitbash-source",
+      "outstanding": "The owner authorized removal of the entire GCM component. A separate 310-file distribution removes 56 GCM/selector files, preserves Git/Bash and wincred, and has a matching 57-package source companion without the GCM archive. Verify final package policy/hashes and deliver this matching source companion with equivalent recipient access; historical unfiltered packages and source ZIPs must not be published."
+    },
+    {
+      "issue": "model-rights",
+      "outstanding": "The owner confirmed self-training and selected MIT for the hash-identified hi_neo weights; the author-license gap is resolved. CI Silero v4 MIT and historical SenseVoice FunASR terms are identified. Review intended-use compliance and known third-party input rights separately, retain embedding/conversion notices, and use the verified CI VAD rather than an unidentified local artifact."
+    },
+    {
+      "issue": "msvc-authorization",
+      "outstanding": "External official x64 Redistributable prerequisite selected; no CRT files/installer are bundled. Confirm developer toolchain entitlement, required runtime version across all components, and clean-machine prerequisite acceptance. The external policy does not constitute toolchain or product acceptance."
+    }
+  ],
+  "review": null,
+  "resolutions": {}
+}

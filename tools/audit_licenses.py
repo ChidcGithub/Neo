@@ -300,9 +300,105 @@ def inspect_package(package, meta, root, cargo_home, workspace_ids):
     return entry, texts
 
 
+def supplemental(root, cargo_home, packages):
+    """Fail closed: a supplement belongs to an exact locked registry archive.
+
+    verified means provenance checked, not legal approval. Partial notices remain
+    pending even when they increase the original license/notice file count.
+    """
+    directory = root / "docs/licenses/supplemental"
+    path = directory / "index.json"
+    if not path.exists():
+        return {}, None
+    raw_index = path.read_bytes()
+    index = json.loads(raw_index)
+    if index.get("schema_version") != 1:
+        raise ValueError("Unsupported supplemental schema")
+    locked = {key(p): p for p in packages}
+    result = {}
+    for item in index["packages"]:
+        identity = key(item)
+        label = "Supplemental " + item["name"] + " " + item["version"]
+        package = locked.get(identity)
+        if (package is None or item.get("checksum") != package.get("checksum")
+                or not re.fullmatch(r"[0-9a-f]{64}", item.get("checksum") or "")
+                or not (item.get("source") or "").startswith("registry+")):
+            raise ValueError(label + ": lock identity/checksum mismatch")
+        if identity in result or item.get("verified") is not True:
+            raise ValueError(label + ": duplicate or unverified entry")
+        if item.get("status") not in {"complete-text", "pending"} or not item.get("files"):
+            raise ValueError(label + ": missing files or invalid status")
+        stem = item["name"] + "-" + item["version"]
+        archives = sorted((cargo_home / "registry/cache").glob("*/" + stem + ".crate"))
+        archive = next((a for a in archives if digest(a.read_bytes()) == item["checksum"]), None)
+        if archive is None:
+            raise ValueError(label + ": missing checksum-verified archive")
+        source = Source(label, archive=archive)
+        manifest = tomllib.loads(source.read("Cargo.toml").decode("utf-8"))["package"]
+        if (manifest.get("name"), manifest.get("version")) != identity[:2]:
+            raise ValueError(label + ": archive manifest mismatch")
+        vcs_raw = source.read(".cargo_vcs_info.json")
+        rev = item.get("exact_rev")
+        if rev is not None:
+            if not re.fullmatch(r"[0-9a-f]{40}", rev) or not vcs_raw or digest(vcs_raw) != item.get("vcs_sha256"):
+                raise ValueError(label + ": VCS evidence mismatch")
+            vcs = json.loads(vcs_raw)
+            if vcs.get("git", {}).get("sha1") != rev or vcs.get("git", {}).get("dirty"):
+                raise ValueError(label + ": exact revision mismatch or dirty publication")
+        elif item.get("vcs_sha256") is not None:
+            raise ValueError(label + ": VCS hash without revision")
+        texts, seen = [], set()
+        for file in sorted(item["files"], key=lambda f: (f["path"], f["upstream"])):
+            name = file["path"]
+            target = (directory / name).resolve()
+            if (not name or "\\" in name or PurePosixPath(name).is_absolute()
+                    or ".." in PurePosixPath(name).parts or not target.is_relative_to(directory.resolve())):
+                raise ValueError(label + ": unsafe file path")
+            if name in seen or not target.is_file():
+                raise ValueError(label + ": duplicate or missing file: " + name)
+            seen.add(name)
+            raw = target.read_bytes()
+            if not raw or digest(raw) != file["sha256"]:
+                raise ValueError(label + ": file hash mismatch: " + name)
+            if file.get("exact_rev") != rev:
+                raise ValueError(label + ": file revision mismatch")
+            if file["kind"] == "source-header":
+                original = source.read(file["source_path"])
+                start, end = file["line_start"], file["line_end"]
+                if (original is None or digest(original) != file["source_sha256"]
+                        or not 1 <= start <= end <= len(original.splitlines(keepends=True))
+                        or raw != b"".join(original.splitlines(keepends=True)[start - 1:end])):
+                    raise ValueError(label + ": source header mismatch")
+            elif file["kind"] in {"upstream-license", "upstream-notice"}:
+                upstream_rev = file.get("upstream_rev", rev)
+                if (not rev or not re.fullmatch(r"[0-9a-f]{40}", upstream_rev or "")
+                        or not file["upstream"].startswith("https://") or "/" + upstream_rev + "/" not in file["upstream"]):
+                    raise ValueError(label + ": upstream URL is not revision-pinned")
+                if upstream_rev != rev:
+                    # A nested repository is pinned by its parent tree and a byte-
+                    # identical published source file, not by a floating submodule.
+                    binding = file.get("submodule", {})
+                    original = source.read(binding.get("source_path", ""))
+                    if (original is None or digest(original) != binding.get("source_sha256")
+                            or "/" + rev + "/" not in binding.get("parent_tree", "")
+                            or "/" + upstream_rev + "/" not in binding.get("source_url", "")):
+                        raise ValueError(label + ": submodule source binding mismatch")
+            else:
+                raise ValueError(label + ": unknown evidence kind")
+            evidence = {**file, "path": "docs/licenses/supplemental/" + name,
+                        "kind": "supplemental-" + file["kind"], "bytes": len(raw),
+                        "origin": file["upstream"]}
+            texts.append((evidence, raw))
+        if item["status"] == "complete-text" and not any(f["kind"] == "upstream-license" for f in item["files"]):
+            raise ValueError(label + ": complete-text requires a full license file")
+        result[identity] = (item["status"], texts)
+    return result, digest(raw_index)
+
+
 def inventory(root, cargo_home, metadata=None, windows_metadata=None, trees=None):
     lock_bytes = (root / "Cargo.lock").read_bytes()
     packages = tomllib.loads(lock_bytes.decode("utf-8"))["package"]
+    supplements, supplement_hash = supplemental(root, cargo_home, packages)
     by_key, workspace_ids = {}, set()
     for doc in (windows_metadata, metadata):
         if doc:
@@ -320,6 +416,15 @@ def inventory(root, cargo_home, metadata=None, windows_metadata=None, trees=None
     for package in sorted(packages, key=lambda p: (p["name"], p["version"], p.get("source") or "")):
         entry, texts = inspect_package(package, by_key.get(key(package)), root, cargo_home, workspace_ids)
         identity = key(package)
+        if identity in supplements:
+            status, extra = supplements[identity]
+            texts.extend(extra)
+            entry["evidence"].extend(evidence for evidence, _ in extra)
+            entry["license_text_count"] = len(texts)
+            entry["supplemental_status"] = status
+            entry["issues"] = [i for i in entry["issues"] if i != "No conventionally named or declared local license/notice file found"]
+            if status == "pending":
+                entry["issues"].append("Supplement contains only partial notices/headers; full license text or attribution remains pending (cargo-remediation.md)")
         entry["scopes"] = {
             "all_lock": True,
             "windows_normal_build": None if nb is None else identity in nb,
@@ -340,11 +445,17 @@ def inventory(root, cargo_home, metadata=None, windows_metadata=None, trees=None
               "no_license_text": sum(not p.get("license_text_count") for p in entries),
               "windows_normal_build_no_license_text": None if nb is None else sum(
                   p["scopes"]["windows_normal_build"] and not p.get("license_text_count") for p in entries),
+              "supplemental_packages": len(supplements),
+              "supplemental_pending": sum(p.get("supplemental_status") == "pending" for p in entries),
+              "unresolved_text_packages": sum(not p.get("license_text_count") or p.get("supplemental_status") == "pending" for p in entries),
+              "windows_normal_build_unresolved_text": None if nb is None else sum(
+                  p["scopes"]["windows_normal_build"] and (not p.get("license_text_count") or p.get("supplemental_status") == "pending") for p in entries),
               "license_notice_files": len(collected),
               "packages_with_review_flags": sum(bool(p["review_flags"]) for p in entries)}
     for scope in entries[0]["scopes"] if entries else []:
         counts[scope] = None if any(p["scopes"][scope] is None for p in entries) else sum(p["scopes"][scope] for p in entries)
-    return {"schema_version": 1, "lock_sha256": digest(lock_bytes), "counts": counts,
+    return {"schema_version": 2, "lock_sha256": digest(lock_bytes), "counts": counts,
+            "supplemental_index_sha256": supplement_hash,
             "graph_issues": graph_issues, "license_expression_counts": dict(sorted(Counter(p["license"] or "UNKNOWN" for p in entries).items())),
             "packages": entries}, collected
 
@@ -379,7 +490,12 @@ appendix) are review hints, NOT proof the named library or license is included.
 SHA-256 hashes describe the inspected local evidence;
 metadata-attributed unpacked sources are not independently authenticated against crates.io.
 Archive fallback is accepted only when its SHA-256 matches Cargo.lock. Missing cache/files
-are reported rather than fetched. Nonconventional in-source headers may not be collected.
+are reported rather than fetched. Supplemental index entries are bound to name/version/source,
+lock checksum, checksum-verified local archive/VCS revision, and original text SHA-256.
+Explicit source-header ranges are checked against that archive. Supplement verification is
+provenance verification, not legal approval. Partial notices/headers remain pending:
+no_license_text counts absence of any text; unresolved_text_packages also counts these
+partial supplements. Nonconventional in-source headers may otherwise not be collected.
 This is NOT an exhaustive native-library/SDK/binary/runtime, bundled font/model/asset,
 Git Bash, redistributable, or copied-source audit. Nested native notices found inside crates
 are retained, but do not establish native configuration or distribution coverage.
@@ -427,7 +543,7 @@ def markdown(report):
     for p in missing:
         lines.append(f"- **{p['name']} {p['version']}** ({scope_label(p)}): " + "; ".join(p["issues"]))
     lines.extend("- " + issue for issue in report["graph_issues"])
-    lines += ["", "## Collected texts", "", "`cargo-notices.txt` contains every discovered local license/notice file for all-lock packages,",
+    lines += ["", "## Collected texts", "", "`cargo-notices.txt` contains discovered local and validated supplemental license/notice files for all-lock packages,",
               "not just the Windows runtime candidates. File bytes are preserved between labeled",
               "boundaries; duplicate texts and alternative licenses are deliberately retained.",
               "Use JSON evidence paths, byte lengths and hashes to locate and verify each file.",
@@ -443,7 +559,7 @@ def write_notices(path, collected):
         stream.write(("Cargo local license/notice collection — all-lock scope\n\n" + SCOPE + "\n").encode("utf-8"))
         for entry, evidence, raw in collected:
             heading = (f"\n===== BEGIN {entry['name']} {entry['version']} :: {evidence['path']} =====\n"
-                       f"Source: {entry['source'] or 'workspace/path'}\nOrigin: {entry['evidence_origin']}\n"
+                       f"Source: {entry['source'] or 'workspace/path'}\nOrigin: {evidence.get('origin', entry.get('evidence_origin', 'unknown'))}\n"
                        f"Declared license: {entry['license'] or 'UNKNOWN'}\nScope: {scope_label(entry)}\n"
                        f"SHA-256: {evidence['sha256']}\nBytes: {len(raw)}\n----- ORIGINAL FILE BYTES -----\n")
             stream.write(heading.encode("utf-8"))
@@ -457,6 +573,7 @@ def main(argv=None):
     parser.add_argument("--cargo-home", type=Path, default=Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")))
     parser.add_argument("--target", default=TARGET)
     parser.add_argument("--timeout", type=int, default=120, help="Per-command timeout in seconds")
+    parser.add_argument("--reuse-capture", action="store_true", help="Read existing target outputs after checking inventory command hashes; run no Cargo commands")
     args = parser.parse_args(argv)
     root, cargo_home = args.root.resolve(), args.cargo_home.resolve()
     work, output = root / "target/license-audit", root / "docs-pri/licenses"
@@ -465,7 +582,18 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=True)
     notices.parent.mkdir(parents=True, exist_ok=True)
     original_lock = (root / "Cargo.lock").read_bytes()
-    commands = capture(root, work, args.target, args.timeout)
+    if args.reuse_capture:
+        previous = read_json(output / "cargo-inventory.json")
+        if not previous or previous["lock_sha256"] != digest(original_lock) or previous["target"] != args.target:
+            raise ValueError("Captured inventory lock/target mismatch")
+        commands = previous["commands"]
+        for result in commands.values():
+            for stream in ("stdout", "stderr"):
+                path = (root / result[stream]).resolve()
+                if not path.is_relative_to(work.resolve()) or digest(path.read_bytes()) != result[stream + "_sha256"]:
+                    raise ValueError("Captured command evidence mismatch: " + result[stream])
+    else:
+        commands = capture(root, work, args.target, args.timeout)
     if (root / "Cargo.lock").read_bytes() != original_lock:
         raise RuntimeError("Cargo.lock changed during audit; refusing to publish a mixed snapshot")
     def successful(name):

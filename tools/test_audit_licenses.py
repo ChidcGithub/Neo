@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from tools.audit_licenses import (
     Source, build_candidates, command, digest, inspect_package, inventory,
-    license_candidate, locate, main, review_flags, tree_members, write_notices,
+    license_candidate, locate, main, review_flags, supplemental, tree_members, write_notices,
 )
 
 
@@ -230,6 +230,181 @@ class AuditTests(unittest.TestCase):
         report = json.loads(snapshots[0]["docs-pri/licenses/cargo-inventory.json"])
         self.assertEqual(report["notices_sha256"], digest(notices))
         self.assertEqual((self.root / "Cargo.lock").read_bytes(), original_lock)
+
+    def supplement(self, status="complete-text"):
+        p = self.package()
+        rev = "a" * 40
+        vcs = json.dumps({"git": {"sha1": rev}, "path_in_vcs": "crate"}).encode()
+        header = b"// Copyright fixture\r\n// Licensed under MIT\r\n"
+        source = header + b"fn main() {}\r\n"
+        archive = self.home / "registry/cache/test/sample-1.0.0.crate"
+        archive.parent.mkdir(parents=True)
+        with tarfile.open(archive, "w:gz") as tar:
+            for name, raw in {
+                "Cargo.toml": b'[package]\nname="sample"\nversion="1.0.0"\nlicense="MIT"\n',
+                ".cargo_vcs_info.json": vcs, "src/lib.rs": source,
+            }.items():
+                info = tarfile.TarInfo("sample-1.0.0/" + name)
+                info.size = len(raw)
+                tar.addfile(info, io.BytesIO(raw))
+        p["checksum"] = digest(archive.read_bytes())
+        self.lock([p])
+        directory = self.root / "docs/licenses/supplemental"
+        directory.mkdir(parents=True)
+        raw = b"Synthetic full license\r\n" if status == "complete-text" else header
+        (directory / "LICENSE.txt").write_bytes(raw)
+        file = {"path": "LICENSE.txt", "sha256": digest(raw), "exact_rev": rev,
+                "kind": "upstream-license", "upstream": "https://example.invalid/repo/raw/" + rev + "/LICENSE"}
+        if status == "pending":
+            file.update(kind="source-header", source_path="src/lib.rs", source_sha256=digest(source),
+                        line_start=1, line_end=2)
+        index = {"schema_version": 1, "packages": [{**p, "verified": True, "status": status,
+                 "exact_rev": rev, "vcs_sha256": digest(vcs), "files": [file]}]}
+        path = directory / "index.json"
+        path.write_text(json.dumps(index), encoding="utf-8")
+        return p, path, index, raw
+
+    def test_supplement_merge_preserves_bytes_and_is_reproducible(self):
+        p, path, _, raw = self.supplement()
+        snapshots = []
+        for _ in range(2):
+            report, texts = inventory(self.root, self.home)
+            self.assertEqual(report["supplemental_index_sha256"], digest(path.read_bytes()))
+            self.assertEqual(report["counts"]["no_license_text"], 0)
+            self.assertEqual(report["counts"]["unresolved_text_packages"], 0)
+            self.assertEqual(report["packages"][0]["issues"], [])
+            output = self.root / "notices.txt"
+            write_notices(output, texts)
+            self.assertIn(raw, output.read_bytes())
+            self.assertIn(b"Origin: https://example.invalid", output.read_bytes())
+            snapshots.append((report, output.read_bytes()))
+        self.assertEqual(snapshots[0], snapshots[1])
+
+    def test_supplement_wrong_identity_checksum_revision_and_schema_rejected(self):
+        p, path, index, _ = self.supplement()
+        original = json.dumps(index)
+        for field, value in (("name", "other"), ("version", "2.0.0"), ("source", "registry+other"),
+                             ("checksum", "f" * 64), ("exact_rev", "b" * 40),
+                             ("exact_rev", "main"), ("vcs_sha256", "0" * 64),
+                             ("verified", False), ("status", "approved")):
+            with self.subTest(field=field, value=value):
+                bad = json.loads(original)
+                bad["packages"][0][field] = value
+                path.write_text(json.dumps(bad), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    inventory(self.root, self.home)
+        for bad in ({**index, "schema_version": 99}, {**index, "packages": index["packages"] * 2}):
+            path.write_text(json.dumps(bad), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                inventory(self.root, self.home)
+
+    def test_supplement_hash_missing_file_and_unsafe_path_rejected(self):
+        _, path, index, raw = self.supplement()
+        text = path.parent / "LICENSE.txt"
+        text.write_bytes(raw + b"tampered")
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            inventory(self.root, self.home)
+        text.unlink()
+        with self.assertRaisesRegex(ValueError, "missing file"):
+            inventory(self.root, self.home)
+        for name in ("../LICENSE.txt", "C:/outside.txt", "nested\\LICENSE.txt"):
+            index["packages"][0]["files"][0]["path"] = name
+            path.write_text(json.dumps(index), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                inventory(self.root, self.home)
+
+    def test_supplement_archive_missing_or_tampered_rejected(self):
+        self.supplement()
+        archive = next(self.home.glob("registry/cache/*/*.crate"))
+        archive.write_bytes(b"wrong archive")
+        with self.assertRaisesRegex(ValueError, "checksum-verified archive"):
+            inventory(self.root, self.home)
+        archive.unlink()
+        with self.assertRaisesRegex(ValueError, "checksum-verified archive"):
+            inventory(self.root, self.home)
+
+    def test_partial_header_remains_pending_and_checks_original_ranges(self):
+        _, path, index, raw = self.supplement("pending")
+        report, texts = inventory(self.root, self.home, trees={"windows-normal-build": "0sample v1.0.0\n"})
+        self.assertEqual(texts[0][2], raw)
+        self.assertEqual(report["counts"]["no_license_text"], 0)
+        self.assertEqual(report["counts"]["unresolved_text_packages"], 1)
+        self.assertEqual(report["counts"]["windows_normal_build_unresolved_text"], 1)
+        self.assertTrue(report["packages"][0]["issues"])
+        index["packages"][0]["files"][0]["line_end"] = 3
+        path.write_text(json.dumps(index), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "source header mismatch"):
+            inventory(self.root, self.home)
+
+    def test_upstream_must_be_pinned_and_notices_cannot_claim_full_text(self):
+        _, path, index, _ = self.supplement()
+        file = index["packages"][0]["files"][0]
+        file["upstream"] = "https://example.invalid/repo/raw/main/LICENSE"
+        path.write_text(json.dumps(index), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "revision-pinned"):
+            inventory(self.root, self.home)
+        file["upstream"] = "https://example.invalid/repo/raw/" + file["exact_rev"] + "/LICENSE"
+        file["kind"] = "upstream-notice"
+        path.write_text(json.dumps(index), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "full license"):
+            inventory(self.root, self.home)
+
+    def test_submodule_license_requires_published_source_binding(self):
+        _, path, index, _ = self.supplement()
+        file = index["packages"][0]["files"][0]
+        rev = "b" * 40
+        file.update(upstream_rev=rev, upstream="https://example.invalid/nested/raw/" + rev + "/LICENSE")
+        path.write_text(json.dumps(index), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "submodule source binding"):
+            inventory(self.root, self.home)
+        file["submodule"] = {
+            "parent_tree": "https://example.invalid/repo/tree/" + file["exact_rev"] + "/nested",
+            "source_path": "src/lib.rs",
+            "source_sha256": digest(b"// Copyright fixture\r\n// Licensed under MIT\r\nfn main() {}\r\n"),
+            "source_url": "https://example.invalid/nested/raw/" + rev + "/src/lib.rs",
+        }
+        path.write_text(json.dumps(index), encoding="utf-8")
+        report, _ = inventory(self.root, self.home)
+        self.assertEqual(report["counts"]["supplemental_packages"], 1)
+        file["submodule"]["source_sha256"] = "0" * 64
+        path.write_text(json.dumps(index), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "submodule source binding"):
+            inventory(self.root, self.home)
+
+    def test_header_without_vcs_uses_archive_identity_and_stays_pending(self):
+        _, path, index, _ = self.supplement("pending")
+        item = index["packages"][0]
+        item["exact_rev"] = item["vcs_sha256"] = item["files"][0]["exact_rev"] = None
+        path.write_text(json.dumps(index), encoding="utf-8")
+        report, _ = inventory(self.root, self.home)
+        self.assertEqual(report["counts"]["supplemental_pending"], 1)
+        item["files"][0]["kind"] = "upstream-license"
+        path.write_text(json.dumps(index), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "revision-pinned"):
+            inventory(self.root, self.home)
+
+    def test_reuse_capture_checks_hashes_without_running_commands(self):
+        self.supplement()
+        names = ("all-targets-metadata", "windows-metadata", "windows-normal-build", "windows-runtime", "windows-with-dev")
+        work = self.root / "target/license-audit"
+        work.mkdir(parents=True)
+        commands = {}
+        for name in names:
+            commands[name] = {"returncode": 1}
+            for stream in ("stdout", "stderr"):
+                path = work / (name + "." + stream)
+                path.write_bytes(b"")
+                commands[name][stream] = path.relative_to(self.root).as_posix()
+                commands[name][stream + "_sha256"] = digest(b"")
+        args = ["--root", str(self.root), "--cargo-home", str(self.home)]
+        with patch("tools.audit_licenses.capture", return_value=commands), patch("sys.stdout", new_callable=io.StringIO):
+            main(args)
+        with patch("tools.audit_licenses.capture") as capture, patch("sys.stdout", new_callable=io.StringIO):
+            main(args + ["--reuse-capture"])
+            capture.assert_not_called()
+            (work / "windows-metadata.stdout").write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "evidence mismatch"):
+                main(args + ["--reuse-capture"])
 
     def test_failed_command_preserves_output_and_error(self):
         work = self.root / "target/license-audit"

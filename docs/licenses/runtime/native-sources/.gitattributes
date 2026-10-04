@@ -1,0 +1,2 @@
+# Preserve original notice/patch bytes and indexed hashes across checkouts.
+* -text

@@ -1,0 +1,3 @@
+// Derived from zbus.
+// Copyright 2024 Zeeshan Ali Khan.
+// Licensed under the MIT license (found in the LICENSE-MIT file).

@@ -7,7 +7,7 @@ This does not revoke permissions granted for earlier MIT releases or
 relicense third-party material.
 
 Third-party code, fonts, models and runtimes retain their own copyrights
-and licenses. See docs/licenses/README.md and the license texts there.
+and licenses. Their license texts and attribution are in docs/licenses/.
 Their inclusion does not certify that all third-party distribution
 obligations have been fulfilled.
 

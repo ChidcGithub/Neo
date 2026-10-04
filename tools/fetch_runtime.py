@@ -30,14 +30,20 @@ GitHub 的 release 资产在国内经常下不动（本机实测直接 `TimeoutE
 > 资产叫 `MinGit-2.55.0.5-64-bit.zip`（少一段 `.windows`）。
 > 所以先问 API 拿准确文件名再拼地址 —— **别自己从 tag 拼资产名**（拼了会 404）。
 
+发布时使用 --version 和 --sha256（64 位十六进制）固定并校验解压前的 ZIP。
+缓存的 .neo-version / .neo-archive-sha256 仅记录 tag 与已下载归档摘要；
+用户可写这些 marker，它们不是缓存内容认证、对应源码完整性或许可批准。
+
 只要 stdlib，不引第三方依赖。
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import stat
@@ -208,10 +214,17 @@ def main() -> int:
     ap.add_argument("--version", default=None, help="Git for Windows 版本，默认最新")
     ap.add_argument("--mirror", default=None, choices=sorted(MIRRORS), help="只用指定源")
     ap.add_argument("--force", action="store_true", help="已存在也重下")
+    ap.add_argument("--sha256", help="预期 ZIP SHA-256（64 位十六进制，须同时指定 --version）")
     args = ap.parse_args()
+    if args.sha256 is not None:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", args.sha256):
+            ap.error("--sha256 必须是 64 位十六进制摘要")
+        if not args.version or not args.version.removeprefix("v").strip():
+            ap.error("--sha256 必须同时指定 --version")
+        args.sha256 = args.sha256.lower()
 
     try:
-        for rel in ("", "bin/bash.exe", "usr/bin/bash.exe", ".neo-version"):
+        for rel in ("", "bin/bash.exe", "usr/bin/bash.exe", ".neo-version", ".neo-archive-sha256"):
             check_local_path(os.path.join(DEST, rel))
     except (OSError, ValueError) as e:
         print(f"运行时路径无效：{e}", file=sys.stderr)
@@ -223,8 +236,15 @@ def main() -> int:
             cached_tag = f.read(256).strip()
     except (OSError, UnicodeError):
         pass
+    cached_sha256 = None
+    try:
+        with open(os.path.join(DEST, ".neo-archive-sha256"), encoding="utf-8") as f:
+            cached_sha256 = f.read(256).strip()
+    except (OSError, UnicodeError):
+        pass
     requested = "v" + args.version.removeprefix("v") if args.version else None
-    if bash and not args.force and (requested is None or requested == cached_tag):
+    if (bash and not args.force and (requested is None or requested == cached_tag)
+            and (args.sha256 is None or args.sha256 == cached_sha256)):
         print(f"已存在：{bash}")
         return 0
 
@@ -242,6 +262,13 @@ def main() -> int:
             zip_path = os.path.join(td, "runtime.zip")
             used = download(tag, asset, args.mirror, zip_path)
             print(f"下载完成（源：{used}）")
+            digest = hashlib.sha256()
+            with open(zip_path, "rb") as f:
+                for chunk in iter(lambda: f.read(262144), b""):
+                    digest.update(chunk)
+            archive_sha256 = digest.hexdigest()
+            if args.sha256 is not None and archive_sha256 != args.sha256:
+                raise ValueError(f"ZIP SHA-256 不匹配：预期 {args.sha256}，实际 {archive_sha256}")
             stage = os.path.join(td, "payload")
             os.mkdir(stage)
             with zipfile.ZipFile(zip_path) as z:
@@ -261,6 +288,9 @@ def main() -> int:
                 return 1
             with open(os.path.join(stage, ".neo-version"), "w", encoding="utf-8") as f:
                 f.write(tag)
+            # 与 tag 一起原子发布；仅为来源关联，不认证可由用户修改的解压后缓存。
+            with open(os.path.join(stage, ".neo-archive-sha256"), "w", encoding="utf-8") as f:
+                f.write(archive_sha256)
             replace_runtime(stage, DEST)
             print(f"完成：{find_bash(DEST)}\n  {version}")
         return 0

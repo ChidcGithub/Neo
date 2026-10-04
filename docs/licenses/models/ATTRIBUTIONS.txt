@@ -1,0 +1,97 @@
+Model-related author and scope notices
+
+hi_neo
+Copyright (c) 2026 Chidc
+License: hi_neo-MIT.txt (MIT).
+Exact model identity and scope: hi_neo-model.json.
+The author confirms this model was self-trained and grants MIT for these
+weights. Other models and training materials retain their own terms.
+
+SenseVoice / SenseVoice-Small
+Source: https://github.com/FunAudioLLM/SenseVoice
+Authors/project: FunAudioLLM; Alibaba Group.
+ONNX conversion distributed by csukuangfj / sherpa-onnx.
+Historical model agreement v1.0: FunASR-MODEL_LICENSE-v1.0.
+Later agreement v1.1: FunASR-MODEL_LICENSE.
+The conversion's original notices are preserved in sherpa-sense-README.md
+and sherpa-sense-LICENSE. The distributed variant is ONNX with dynamic
+MatMul QUInt8 quantization; tokens.txt enumerates tokenizer pieces and IDs.
+Conversion script notice: Copyright 2024 Xiaomi Corp. (Fangjun Kuang).
+The script credits Yuekai Zhang's export_onnx.py as a reference.
+These describe upstream conversion; Neo has not retrained these weights.
+
+LiveKit wakeword
+Source: https://github.com/livekit/livekit-wakeword
+Package author: Binh Pham <binh.pham@livekit.io>.
+Apache License 2.0 text: livekit-0.2.1-LICENSE.
+
+openWakeWord
+Source: https://github.com/dscripka/openWakeWord
+The following copyright/license header is retained from model.py at
+c8ef6912c5feccf1037b852d9bc6c7ed644135ba (comment markers omitted):
+
+Copyright 2022 David Scripka. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Upstream README at that revision states:
+"All of the code in this repository is licensed under the **Apache 2.0**
+license. All of the included pre-trained models are licensed under the
+[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+license due to the inclusion of datasets with unknown or restrictive
+licensing as part of the training data."
+The same README specifically identifies Google's speech_embedding/1
+backbone as Apache-2.0 and the mel frontend as a fixed-parameter transform.
+These distinct upstream scopes do not assign NC-SA to every Neo model.
+Google speech embedding source: https://tfhub.dev/google/speech_embedding/1
+Google version-1 card: google-speech-embedding-card.md.
+Research authors named in that card: James Lin, Kevin Kilgour, Dominik Roblek,
+Matthew Sharifi; Training Keyword Spotters with Limited and Synthesized
+Speech Data. Google model attribution is not a newly invented copyright year.
+Modification notice: openWakeWord manually reimplemented/separated the Google
+backbone and distributed the ONNX frontend subsequently carried by LiveKit.
+Neo redistributes those frontend files without additional weight changes.
+The recovered original card has no explicit license field; Apache-2.0 is the
+specific upstream openWakeWord attribution, not inferred from a dataset.
+Complete license texts: openwakeword-LICENSE and CC-BY-NC-SA-4.0.txt.
+
+Silero VAD
+Copyright (c) 2020-present Silero Team
+Source: https://github.com/snakers4/silero-vad
+Complete MIT text for the CI v4 export: silero-v4.0-LICENSE, from v4.0 commit
+915dd3d639b8333a52e001af095f87c5b7f1e0ac.
+Modification notice: k2-fsa exported Silero v4 to ONNX, retaining only the
+16 kHz branch. Source and conversion documentation:
+https://k2-fsa.github.io/sherpa/onnx/vad/silero-vad.html
+The v5.1 text remains a reference, not the identity of the local VAD file.
+
+Mel-transform source: torchlibrosa
+Copyright (c) 2018-2021 Qiuqiang Kong
+Source: https://github.com/qiuqiangkong/torchlibrosa
+Complete MIT text: torchlibrosa-LICENSE.
+
+Piper sample generator
+Copyright (c) 2023 Michael Hansen
+Source: https://github.com/dscripka/piper-sample-generator
+Complete MIT text: piper-generator-LICENSE.
+
+LibriTTS
+Dataset prepared by Heiga Zen with Google Speech and Google Brain team
+members. Source: https://www.openslr.org/60/
+Citation: Heiga Zen, Viet Dang, Rob Clark, Yu Zhang, Ron J. Weiss, Ye Jia,
+Zhifeng Chen, and Yonghui Wu. LibriTTS: A Corpus Derived from LibriSpeech
+for Text-to-Speech. 2019.
+Voice card: piper-libritts-high-MODEL_CARD. Dataset terms: CC-BY-4.0.txt.
+
+These attributions retain upstream notices; they do not grant new rights
+or certify authorization of any particular model artifact.

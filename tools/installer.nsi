@@ -85,6 +85,7 @@ Var ResidueKey
 
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
+!include "WordFunc.nsh"
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "LICENSE"
@@ -324,6 +325,67 @@ platform_abort:
 platform_supported:
 FunctionEnd
 
+; Registry preflight only, not proof of DLL integrity/exports or runtime compatibility.
+; 14.51.36247.0 is a conservative release floor for the observed 14.51 toolset.
+; Re-evaluate for newer build tools; do not change the Windows platform floor here.
+Function CheckVCRuntime
+  SetRegView 64
+  ClearErrors
+  ReadRegDWORD $0 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Installed"
+  IfErrors crt_missing
+  StrCmp $0 "1" 0 crt_missing
+  ReadRegStr $1 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Version"
+  IfErrors crt_missing
+  ; Microsoft normally writes v14.xx.xxxxx.x. Reject malformed/empty values
+  ; before VersionCompare (which is a comparator, not a version validator).
+  StrCpy $2 $1 1
+  StrCmp $2 "v" 0 crt_validate
+  StrCpy $1 $1 1024 1
+crt_validate:
+  StrCpy $2 0
+  StrCpy $4 0
+  StrCpy $5 0
+crt_char:
+  StrCpy $3 $1 1 $2
+  StrCmp $3 "" crt_end
+  StrCmp $3 "." crt_dot
+  StrCmp $3 "0" crt_digit
+  StrCmp $3 "1" crt_digit
+  StrCmp $3 "2" crt_digit
+  StrCmp $3 "3" crt_digit
+  StrCmp $3 "4" crt_digit
+  StrCmp $3 "5" crt_digit
+  StrCmp $3 "6" crt_digit
+  StrCmp $3 "7" crt_digit
+  StrCmp $3 "8" crt_digit
+  StrCmp $3 "9" crt_digit crt_missing
+crt_digit:
+  IntOp $4 $4 + 1
+  IntCmp $4 5 crt_next crt_next crt_missing
+crt_dot:
+  StrCmp $4 0 crt_missing
+  IntOp $5 $5 + 1
+  IntCmp $5 3 0 0 crt_missing
+  StrCpy $4 0
+crt_next:
+  IntOp $2 $2 + 1
+  Goto crt_char
+crt_end:
+  StrCmp $4 0 crt_missing
+  StrCmp $5 3 0 crt_missing
+  ${VersionCompare} "$1" "14.51.36247.0" $0
+  StrCmp $0 2 crt_missing
+  SetRegView lastused
+  DetailPrint "VC++ v14 x64 注册版本：$1（仅前置检查；未验证 DLL 完整性或运行兼容性）。"
+  ClearErrors
+  Return
+crt_missing:
+  SetRegView lastused
+  MessageBox MB_OK|MB_ICONSTOP "需要 Microsoft Visual C++ v14 x64 运行库 14.51.36247.0 或更新版本；未安装、版本过旧或无法可靠读取注册信息。$\r$\n$\r$\n请自行从微软官方下载并安装最新受支持版本，再重新运行 Neo 安装器：$\r$\nhttps://aka.ms/vc14/vc_redist.x64.exe$\r$\n$\r$\nNeo 不自动联网、下载或安装运行库，也不请求提权；微软运行库安装可能需要管理员协助。现有 Neo 文件未改动。"
+  SetErrorLevel 2
+  Abort
+FunctionEnd
+
 Function .onInit
   Call AcquireLock
   Call CheckPlatform
@@ -447,6 +509,8 @@ Function .onInstFailed
 FunctionEnd
 
 Section "Install"
+  ; After welcome/license, before any payload, backup rename or shell mutation.
+  Call CheckVCRuntime
   StrCpy $OldMoved "0"
   StrCpy $Published "0"
   StrCpy $ShellDirty "0"

@@ -1,0 +1,222 @@
+{
+  "schema": 1,
+  "scope": "Native license texts and Eigen source supply; not release approval",
+  "texts": {
+    "BUILD-MODIFICATIONS.md": {
+      "size": 4817,
+      "sha256": "7bfa66be0bc12c330c16357f885f3b9d92e526f4c1824e008d22b010dd582ecf"
+    },
+    "eigen-1d8b82b-COPYING.APACHE": {
+      "size": 11362,
+      "sha256": "03379001a7b12a2ec997a25554247d985270b353c10d5bafee9ac8d6519820b7"
+    },
+    "eigen-1d8b82b-COPYING.BSD": {
+      "size": 1517,
+      "sha256": "51928dce36213c5333ba3172e847d735d4c6e9b7ff2722a326c49067155b82eb"
+    },
+    "eigen-1d8b82b-COPYING.MINPACK": {
+      "size": 2193,
+      "sha256": "c87b7f8ee88f6195e91743820c00354833583aef091b72e2d4a49c8e28e798a0"
+    },
+    "eigen-1d8b82b-COPYING.MPL2": {
+      "size": 16727,
+      "sha256": "66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172"
+    },
+    "eigen-1d8b82b-COPYING.README": {
+      "size": 264,
+      "sha256": "db640ff2bd90c6abd6a4d3fbb351e0ee4d555417cf840492054d1cbb2ea85644"
+    },
+    "eigen-5.0.1-COPYING.APACHE": {
+      "size": 11362,
+      "sha256": "03379001a7b12a2ec997a25554247d985270b353c10d5bafee9ac8d6519820b7"
+    },
+    "eigen-5.0.1-COPYING.BSD": {
+      "size": 1517,
+      "sha256": "51928dce36213c5333ba3172e847d735d4c6e9b7ff2722a326c49067155b82eb"
+    },
+    "eigen-5.0.1-COPYING.MINPACK": {
+      "size": 2193,
+      "sha256": "c87b7f8ee88f6195e91743820c00354833583aef091b72e2d4a49c8e28e798a0"
+    },
+    "eigen-5.0.1-COPYING.MPL2": {
+      "size": 16727,
+      "sha256": "66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172"
+    },
+    "eigen-5.0.1-COPYING.README": {
+      "size": 264,
+      "sha256": "db640ff2bd90c6abd6a4d3fbb351e0ee4d555417cf840492054d1cbb2ea85644"
+    },
+    "eigen-5.0.1-CopyrightMINPACK.txt": {
+      "size": 2194,
+      "sha256": "8887036b1039e299ebcc8b95a73ea1538df548393fb8462361c80bea605a4fbe"
+    },
+    "eigen-5.0.1-LICENSE": {
+      "size": 16725,
+      "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5"
+    },
+    "json-LICENSE.MIT": {
+      "size": 1076,
+      "sha256": "46a65cffd1ea955132d95a8dd921640714a8d6b537d2e4e482d31145ae95b603"
+    },
+    "kaldi_decoder-LICENSE": {
+      "size": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    "kaldi_native_fbank-LICENSE": {
+      "size": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    "kaldifst-LICENSE": {
+      "size": 11728,
+      "sha256": "a682d6efd1ee5dee08a8e405c233c2c198ea70ae0718129daa83ab58cfe31c5d"
+    },
+    "kissfft-BSD-3-Clause": {
+      "size": 1830,
+      "sha256": "4d6bcab46f27d6d0c878e8305d4bdcfe040d52bf6656b9771f04c9fb9902c0ed"
+    },
+    "kissfft-COPYING": {
+      "size": 246,
+      "sha256": "a2840585f8411be8e6826a31ef15ae65c950bd74a2437a73b013398a934ad0c6"
+    },
+    "onnxruntime-1.28.2-LICENSE": {
+      "size": 1073,
+      "sha256": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c"
+    },
+    "onnxruntime-1.28.2-ThirdPartyNotices.txt": {
+      "size": 325054,
+      "sha256": "0e07b95f3a8d6230037707c5c4a2b554d12c4cb67369669ac255635528ffcee2"
+    },
+    "openfst-COPYING": {
+      "size": 559,
+      "sha256": "4300529197035fd3452350718a0b8cee984e9412c9932d7f35fcde849fc97a4b"
+    },
+    "ort-1.28.2-eigen-s390x-build-werror.patch": {
+      "size": 610,
+      "sha256": "a1a7b0ca8382cb00542587b6bc725f59abd59ad5bb491825f7876ad6e344ef0b"
+    },
+    "ort-1.28.2-eigen-s390x-build.patch": {
+      "size": 17794,
+      "sha256": "6d41f4504f665bc591336c668a1aa16ffc5e0f02fe9c2f9c46c6f5660b54c849"
+    },
+    "README.md": {
+      "size": 7874,
+      "sha256": "4ff7acfd47728203d393aea8716a0a3f55fbf1ec957e8a230234ce4c2935743f"
+    },
+    "sherpa-LICENSE": {
+      "size": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    "simple-sentencepiece-LICENSE": {
+      "size": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    }
+  },
+  "origins": {
+    "eigen-1d8b82b-COPYING.APACHE": {
+      "archive_sha256": "6a60d76351f97132669daeeb721d6bf14b008101883ad2d687a3201c5c461eb0",
+      "member": "eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33/COPYING.APACHE"
+    },
+    "eigen-1d8b82b-COPYING.BSD": {
+      "archive_sha256": "6a60d76351f97132669daeeb721d6bf14b008101883ad2d687a3201c5c461eb0",
+      "member": "eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33/COPYING.BSD"
+    },
+    "eigen-1d8b82b-COPYING.MINPACK": {
+      "archive_sha256": "6a60d76351f97132669daeeb721d6bf14b008101883ad2d687a3201c5c461eb0",
+      "member": "eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33/COPYING.MINPACK"
+    },
+    "eigen-1d8b82b-COPYING.MPL2": {
+      "archive_sha256": "6a60d76351f97132669daeeb721d6bf14b008101883ad2d687a3201c5c461eb0",
+      "member": "eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33/COPYING.MPL2"
+    },
+    "eigen-1d8b82b-COPYING.README": {
+      "archive_sha256": "6a60d76351f97132669daeeb721d6bf14b008101883ad2d687a3201c5c461eb0",
+      "member": "eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33/COPYING.README"
+    },
+    "eigen-5.0.1-COPYING.APACHE": {
+      "archive_sha256": "e9c326dc8c05cd1e044c71f30f1b2e34a6161a3b6ecf445d56b53ff1669e3dec",
+      "member": "eigen-5.0.1/COPYING.APACHE"
+    },
+    "eigen-5.0.1-COPYING.BSD": {
+      "archive_sha256": "e9c326dc8c05cd1e044c71f30f1b2e34a6161a3b6ecf445d56b53ff1669e3dec",
+      "member": "eigen-5.0.1/COPYING.BSD"
+    },
+    "eigen-5.0.1-COPYING.MINPACK": {
+      "archive_sha256": "e9c326dc8c05cd1e044c71f30f1b2e34a6161a3b6ecf445d56b53ff1669e3dec",
+      "member": "eigen-5.0.1/COPYING.MINPACK"
+    },
+    "eigen-5.0.1-COPYING.MPL2": {
+      "archive_sha256": "e9c326dc8c05cd1e044c71f30f1b2e34a6161a3b6ecf445d56b53ff1669e3dec",
+      "member": "eigen-5.0.1/COPYING.MPL2"
+    },
+    "eigen-5.0.1-COPYING.README": {
+      "archive_sha256": "e9c326dc8c05cd1e044c71f30f1b2e34a6161a3b6ecf445d56b53ff1669e3dec",
+      "member": "eigen-5.0.1/COPYING.README"
+    },
+    "eigen-5.0.1-LICENSE": {
+      "archive_sha256": "e9c326dc8c05cd1e044c71f30f1b2e34a6161a3b6ecf445d56b53ff1669e3dec",
+      "member": "eigen-5.0.1/LICENSE"
+    },
+    "eigen-5.0.1-CopyrightMINPACK.txt": {
+      "archive_sha256": "e9c326dc8c05cd1e044c71f30f1b2e34a6161a3b6ecf445d56b53ff1669e3dec",
+      "member": "eigen-5.0.1/unsupported/Eigen/src/LevenbergMarquardt/CopyrightMINPACK.txt"
+    },
+    "sherpa-LICENSE": {
+      "receipt_sha256": "5fef57cc8591730386b76fa7d1b7c78439258066026e030459f714dc2f9c81bb",
+      "member": "licenses/sherpa/LICENSE"
+    },
+    "kaldi_native_fbank-LICENSE": {
+      "receipt_sha256": "5fef57cc8591730386b76fa7d1b7c78439258066026e030459f714dc2f9c81bb",
+      "member": "licenses/kaldi_native_fbank/LICENSE"
+    },
+    "kaldi_decoder-LICENSE": {
+      "receipt_sha256": "5fef57cc8591730386b76fa7d1b7c78439258066026e030459f714dc2f9c81bb",
+      "member": "licenses/kaldi_decoder/LICENSE"
+    },
+    "kaldifst-LICENSE": {
+      "receipt_sha256": "5fef57cc8591730386b76fa7d1b7c78439258066026e030459f714dc2f9c81bb",
+      "member": "licenses/kaldifst/LICENSE"
+    },
+    "openfst-COPYING": {
+      "receipt_sha256": "5fef57cc8591730386b76fa7d1b7c78439258066026e030459f714dc2f9c81bb",
+      "member": "licenses/openfst/COPYING"
+    },
+    "kissfft-COPYING": {
+      "receipt_sha256": "5fef57cc8591730386b76fa7d1b7c78439258066026e030459f714dc2f9c81bb",
+      "member": "licenses/kissfft/COPYING"
+    },
+    "simple-sentencepiece-LICENSE": {
+      "receipt_sha256": "5fef57cc8591730386b76fa7d1b7c78439258066026e030459f714dc2f9c81bb",
+      "member": "licenses/simple-sentencepiece/LICENSE"
+    },
+    "json-LICENSE.MIT": {
+      "receipt_sha256": "5fef57cc8591730386b76fa7d1b7c78439258066026e030459f714dc2f9c81bb",
+      "member": "licenses/json/LICENSE.MIT"
+    },
+    "kissfft-BSD-3-Clause": {
+      "archive_sha256": "497103e664168ebe39580b757adbe616f6cf85a16572af581ca7bc42d0ab13fd",
+      "member": "kissfft-febd4caeed32e33ad8b2e0bb5ea77542c40f18ec/LICENSES/BSD-3-Clause"
+    },
+    "onnxruntime-1.28.2-LICENSE": {
+      "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/33ca9628233dc8f002435e868d4c2e9f82766ca1/LICENSE",
+      "binding": "verified upstream baseline text; not actual producer tree attestation"
+    },
+    "onnxruntime-1.28.2-ThirdPartyNotices.txt": {
+      "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/33ca9628233dc8f002435e868d4c2e9f82766ca1/ThirdPartyNotices.txt",
+      "binding": "verified upstream baseline text; not actual producer tree attestation"
+    },
+    "ort-1.28.2-eigen-s390x-build.patch": {
+      "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/33ca9628233dc8f002435e868d4c2e9f82766ca1/cmake/patches/eigen/s390x-build.patch",
+      "binding": "verified upstream baseline text; not actual producer tree attestation"
+    },
+    "ort-1.28.2-eigen-s390x-build-werror.patch": {
+      "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/33ca9628233dc8f002435e868d4c2e9f82766ca1/cmake/patches/eigen/s390x-build-werror.patch",
+      "binding": "verified upstream baseline text; not actual producer tree attestation"
+    }
+  },
+  "source_companion": "neo-native-sources.zip",
+  "binding": {
+    "eigen_5_0_1": "verified local no-TTS build source input",
+    "ort_eigen": "verified source identity and upstream recipe patches; inferred default dependency; precise producer binding unconfirmed",
+    "ort_1_30_0_dll": "separate notices in parent directory; not covered by this source companion"
+  }
+}

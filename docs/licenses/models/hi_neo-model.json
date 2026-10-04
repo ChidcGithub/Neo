@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "name": "hi_neo",
+  "path": "resources/models/wake/hi_neo.onnx",
+  "source_path": "crates/neo-wake/assets/hi_neo.onnx",
+  "sha256": "8b1f1155a4dcba2f9fa5390c50c4649076817e79a99906f683f8d2d4b2b3d37b",
+  "size": 99190,
+  "license": "MIT",
+  "license_file": "hi_neo-MIT.txt",
+  "copyright": "Copyright (c) 2026 Chidc",
+  "scope": "Author-owned hi_neo weights identified by this hash. Other models, training inputs and third-party materials retain their own terms."
+}

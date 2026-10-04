@@ -1,5 +1,6 @@
 """Isolated regression tests; never download or execute a real runtime."""
 import base64
+import hashlib
 import importlib.util
 import io
 import json
@@ -48,10 +49,15 @@ class RuntimeTests(unittest.TestCase):
         patch.object(runtime, "pick_asset", return_value=("v9", "runtime.zip", "mock://asset")).start()
         members = members if members is not None else {"usr/bin/sh.exe": b"mock bash", "cmd/git.exe": b"mock git"}
 
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for name, contents in members.items():
+                archive.writestr(name if isinstance(name, zipfile.ZipInfo) else zipfile.ZipInfo(name), contents)
+        data = buffer.getvalue()
+        self.archive_sha256 = hashlib.sha256(data).hexdigest()
+
         def download(tag, asset, mirror, path):
-            with zipfile.ZipFile(path, "w") as archive:
-                for name, contents in members.items():
-                    archive.writestr(name, contents)
+            Path(path).write_bytes(data)
             return "mock"
 
         return patch.object(runtime, "download", side_effect=download).start()
@@ -86,6 +92,79 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "version unavailable"):
                 self.main("--version", "9")
             pick.assert_called_once_with("9")
+        self.old_intact()
+
+    def test_sha256_cli_rejects_invalid_or_unversioned_pins_before_io(self):
+        with patch.object(runtime, "check_local_path") as check, patch.object(runtime, "pick_asset") as pick:
+            for args in [("--sha256", "a" * 64),
+                         ("--version", "", "--sha256", "a" * 64),
+                         ("--version", "v", "--sha256", "a" * 64),
+                         *(("--version", "9", "--sha256", value)
+                           for value in ("", "a" * 63, "a" * 65, "g" * 64, "a" * 63 + "\n", "sha256:" + "a" * 64))]:
+                with self.subTest(args=args), self.assertRaises(SystemExit) as error:
+                    self.main(*args)
+                self.assertEqual(error.exception.code, 2)
+            check.assert_not_called()
+            pick.assert_not_called()
+        self.old_intact()
+
+    def test_matching_sha256_installs_and_pinned_cache_hits(self):
+        download = self.mock_release()
+        with patch.object(runtime, "smoke_test", return_value="5.2"):
+            self.assertEqual(self.main("--version", "9", "--sha256", self.archive_sha256.upper()), 0)
+        self.assertEqual((self.dest / ".neo-version").read_text(), "v9")
+        self.assertEqual((self.dest / ".neo-archive-sha256").read_text(), self.archive_sha256)
+        self.assertEqual((self.dest / "usr/bin/bash.exe").read_bytes(), b"mock bash")
+        with patch.object(runtime, "pick_asset", side_effect=AssertionError("cache missed")):
+            self.assertEqual(self.main("--version", "v9", "--sha256", self.archive_sha256), 0)
+        download.assert_called_once()
+
+    def test_wrong_sha256_rejected_before_zip_open_and_keeps_old_cache(self):
+        self.mock_release()
+        (self.dest / ".neo-version").write_text("v8")
+        (self.dest / ".neo-archive-sha256").write_text("b" * 64)
+        before = {p.relative_to(self.dest): p.read_bytes() for p in self.dest.rglob("*") if p.is_file()}
+        with patch.object(runtime.zipfile, "ZipFile", side_effect=AssertionError("ZIP opened before hash")), \
+                patch.object(runtime, "smoke_test") as smoke:
+            self.assertEqual(self.main("--version", "9", "--sha256", "0" * 64), 1)
+            smoke.assert_not_called()
+        self.assertEqual(before, {p.relative_to(self.dest): p.read_bytes() for p in self.dest.rglob("*") if p.is_file()})
+        self.old_intact()
+
+    def test_pinned_cache_requires_both_markers_and_force_redownloads(self):
+        pick_asset = runtime.pick_asset
+        download = self.mock_release()
+        bash = self.dest / "bin/bash.exe"
+        bash.parent.mkdir()
+        bash.write_bytes(b"cached")
+        cases = [("v9", None, False), ("v9", "0" * 64, False),
+                 ("v8", self.archive_sha256, False), (None, self.archive_sha256, False),
+                 ("v9", b"\xff", False), ("v9", self.archive_sha256, True)]
+        for tag, digest, force in cases:
+            with self.subTest(tag=tag, digest=digest, force=force):
+                for name, value in ((".neo-version", tag), (".neo-archive-sha256", digest)):
+                    marker = self.dest / name
+                    marker.unlink(missing_ok=True)
+                    if value is not None:
+                        marker.write_bytes(value if isinstance(value, bytes) else value.encode())
+                # Exercise the real version-specific API selection, never latest or live network.
+                metadata = {"tag_name": "v9", "assets": [{"name": "MinGit-9-64-bit.zip", "browser_download_url": "mock://asset"}]}
+                with patch.object(runtime, "pick_asset", wraps=pick_asset), \
+                        patch.object(runtime, "fetch_bytes", return_value=json.dumps(metadata).encode()) as fetch, \
+                        patch.object(runtime, "smoke_test", return_value="5.2"):
+                    self.assertEqual(self.main("--version", "9", "--sha256", self.archive_sha256,
+                                               *(["--force"] if force else [])), 0)
+                    fetch.assert_called_once_with(
+                        "https://api.github.com/repos/git-for-windows/git/releases/tags/v9", timeout=60)
+                self.assertEqual((self.dest / ".neo-archive-sha256").read_text(), self.archive_sha256)
+        self.assertEqual(download.call_count, len(cases))
+
+    def test_pinned_version_api_failure_never_uses_latest(self):
+        with patch.object(runtime, "fetch_bytes", side_effect=OSError("mock API failure")) as fetch:
+            with self.assertRaisesRegex(SystemExit, "指定版本"):
+                self.main("--version", "9.9", "--sha256", "a" * 64)
+            fetch.assert_called_once_with(
+                "https://api.github.com/repos/git-for-windows/git/releases/tags/v9.9", timeout=60)
         self.old_intact()
 
     def test_specified_version_api_failure_does_not_fallback(self):

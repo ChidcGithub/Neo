@@ -33,9 +33,22 @@ concurrency:
 jobs:
   check:
     runs-on: windows-latest
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Development-test dependency only; no package/runtime dependency.
+      - name: Install pinned workflow YAML parser
+        run: python -m pip install PyYAML==6.0.3
+
+      - name: Parse complete workflow YAML
+        shell: pwsh
+        run: |
+          python -c "import yaml; assert yaml.__version__ == '6.0.3'"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest tools.test_workflow_syntax -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --no-self-update --target x86_64-pc-windows-msvc
@@ -44,6 +57,26 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: windows-x64-msvc
+          # target also contains native evidence; never transfer it between runners.
+          cache-targets: false
+
+      # Only immutable downloads, never native installs/build trees or receipts.
+      - name: Cache Sherpa download archives and CMake wheel
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/sherpa-asr/*.tar.gz
+            .cache/sherpa-asr/*.tar.bz2
+            .cache/sherpa-asr/*.zip
+            .cache/tools/cmake-4.2.3-py3-none-win_amd64.whl
+          key: sherpa-downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build_sherpa_asr.py', 'tools/prepare_sherpa_ci.py') }}
+
+      - name: Native preparation offline regressions
+        run: python -B -m unittest tools.test_prepare_sherpa_ci -v
+
+      - name: Prepare mandatory no-TTS Sherpa native
+        timeout-minutes: 30
+        run: python -B tools/prepare_sherpa_ci.py --budget-seconds 600 --validation-seconds 180 --max-download-mib 256
 
       - name: Check all workspace targets
         run: cargo check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
@@ -88,19 +121,81 @@ jobs:
         run: 'cargo test --locked -p neo-app --bin neo updates::tests::'
 
       - name: Installer and release checks (isolated, never install)
-        run: python -m unittest tools.test_audit_licenses tools.test_installer tools.test_check_release tools.test_fetch_runtime tools.test_release_workflow -v
+        env:
+          PYTHONPATH: tools
+        run: python -m unittest tools.test_audit_licenses tools.test_audit_native_link tools.test_installer tools.test_check_release tools.test_distribution_review tools.test_fetch_runtime tools.test_prepare_runtime_distribution tools.test_package_combined -v
+
+      # Deliberately no PYTHONPATH workaround: package imports must work from repo root.
+      - name: Drawing release root-package regressions
+        run: python -B -m unittest tools.test_assemble_drawing_release tools.test_release_workflow -v
+
+  # Build validation is not distribution approval. Never upload this job's binaries.
+  drawing-check:
+    runs-on: windows-2022
+    timeout-minutes: 75
+    steps:
+      - name: Checkout main for drawing lock
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read drawing CI pin
+        id: drawing-pin
+        run: python tools/assemble_drawing_release.py lock-outputs
+
+      - name: Checkout pinned drawing for CI
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.drawing-pin.outputs.repository }}
+          ref: ${{ steps.drawing-pin.outputs.commit }}
+          path: target/package/drawing-src
+          persist-credentials: false
+
+      - name: Install drawing CI toolchain
+        run: rustup toolchain install ${{ steps.drawing-pin.outputs.rust }} --profile minimal --no-self-update --target x86_64-pc-windows-msvc
+
+      # Only in-memory JSON-lines protocol tests; no GUI, models or ignored tests.
+      - name: Drawing synthetic protocol tests
+        working-directory: target/package/drawing-src
+        run: cargo +${{ steps.drawing-pin.outputs.rust }} test --locked -p board-protocol --lib --target x86_64-pc-windows-msvc --target-dir "${{ github.workspace }}/target/package/drawing-tests"
+
+      - name: Build drawing CI and check both windowless versions
+        run: python tools/assemble_drawing_release.py build --source target/package/drawing-src --target-dir target/package/drawing-build
 
   release:
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
-    needs: check
+    needs: [check, drawing-check]
     permissions:
       contents: write
-    runs-on: windows-latest
+    runs-on: windows-2022
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # 需要完整历史生成 changelog
+
+      # 默认阻断；审批记录不是自动法律判断。不得给门禁添加 continue-on-error/绕过参数。
+      - name: Verify distribution approval (fail closed)
+        run: python tools/check_distribution_review.py --policy tools/distribution-review.json
+
+      - name: Verify drawing lock approval (fail closed)
+        run: python tools/assemble_drawing_release.py check-approval
+
+      - name: Read drawing release pin
+        id: drawing-pin
+        run: python tools/assemble_drawing_release.py lock-outputs
+
+      - name: Checkout pinned drawing for release
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.drawing-pin.outputs.repository }}
+          ref: ${{ steps.drawing-pin.outputs.commit }}
+          path: target/package/drawing-src
+          persist-credentials: false
+
+      - name: Verify drawing reviewed source and legal bodies (fail closed)
+        run: python tools/assemble_drawing_release.py verify-review --source target/package/drawing-src
 
       - name: Determine version
         id: ver
@@ -134,9 +229,33 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: windows-x64-msvc
+          # target also contains native evidence; never transfer it between runners.
+          cache-targets: false
+
+      # Rebuild on this runner; no native artifact transfer from the check job.
+      - name: Cache Sherpa download archives and CMake wheel
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/sherpa-asr/*.tar.gz
+            .cache/sherpa-asr/*.tar.bz2
+            .cache/sherpa-asr/*.zip
+            .cache/tools/cmake-4.2.3-py3-none-win_amd64.whl
+          key: sherpa-downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build_sherpa_asr.py', 'tools/prepare_sherpa_ci.py') }}
+
+      - name: Prepare mandatory no-TTS Sherpa native
+        timeout-minutes: 30
+        run: python -B tools/prepare_sherpa_ci.py --budget-seconds 600 --validation-seconds 180 --max-download-mib 256
 
       - name: Build
         run: cargo build --locked --release -p neo-app --target x86_64-pc-windows-msvc
+
+      - name: Install drawing release toolchain
+        run: rustup toolchain install ${{ steps.drawing-pin.outputs.rust }} --profile minimal --no-self-update --target x86_64-pc-windows-msvc
+
+      # Rebuild on this runner at the same lock SHA; never consume drawing-check artifacts.
+      - name: Build drawing release and check both windowless versions
+        run: python tools/assemble_drawing_release.py build --source target/package/drawing-src --target-dir target/package/drawing-build
 
       # ---- 以下全部为打包/发布步骤：分支推送及 PR 不执行 ----
 
@@ -146,19 +265,55 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $base = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models'
-          New-Item -ItemType Directory -Force .cache\stt\extracted, .cache\stt\models\sense-voice, .cache\stt\models\vad | Out-Null
+          # 官方 release 资产摘要只固定字节，不表示模型许可或来源审查已通过。
+          $svExpected = '7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e'
+          $vadExpected = '9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6'
+          if ((Test-Path .cache\stt\extracted) -or (Test-Path .cache\stt\models)) {
+            throw 'STT extraction and model directories must be clean'
+          }
+          New-Item -ItemType Directory -Force .cache\stt | Out-Null
           Invoke-WebRequest "$base/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2" -OutFile .cache\stt\sv.tar.bz2
+          $svHash = (Get-FileHash -Algorithm SHA256 -LiteralPath .cache\stt\sv.tar.bz2).Hash.ToLowerInvariant()
+          if ($svHash -cne $svExpected) { throw 'SenseVoice archive SHA-256 mismatch' }
+          Invoke-WebRequest "$base/silero_vad.onnx" -OutFile .cache\stt\silero_vad.onnx
+          $vadHash = (Get-FileHash -Algorithm SHA256 -LiteralPath .cache\stt\silero_vad.onnx).Hash.ToLowerInvariant()
+          if ($vadHash -cne $vadExpected) { throw 'Silero SHA-256 mismatch' }
+          New-Item -ItemType Directory .cache\stt\extracted, .cache\stt\models\sense-voice, .cache\stt\models\vad | Out-Null
           tar -xjf .cache\stt\sv.tar.bz2 -C .cache\stt\extracted
           if ($LASTEXITCODE -ne 0) { throw 'STT model extraction failed' }
+          # 构建证据留在 cache 根，不复制进 models 或发行包；不读取本地开发模型。
+          $extracted = (Resolve-Path .cache\stt\extracted).Path
+          $members = @(Get-ChildItem -LiteralPath $extracted -Recurse -File | Sort-Object FullName | ForEach-Object {
+            [ordered]@{
+              archive = 'sv.tar.bz2'
+              path = [IO.Path]::GetRelativePath($extracted, $_.FullName).Replace('\', '/')
+              size = $_.Length
+              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            }
+          })
+          $members += [ordered]@{ archive = $null; path = 'silero_vad.onnx'; size = (Get-Item .cache\stt\silero_vad.onnx).Length; sha256 = $vadHash }
+          [ordered]@{ sense_voice_archive_sha256 = $svHash; silero_sha256 = $vadHash; members = $members } |
+            ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 .cache\stt\member-sha256.json
           Copy-Item '.cache\stt\extracted\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\model.int8.onnx',
                     '.cache\stt\extracted\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\tokens.txt' .cache\stt\models\sense-voice\
-          Invoke-WebRequest "$base/silero_vad.onnx" -OutFile .cache\stt\models\vad\silero_vad.onnx
+          Copy-Item .cache\stt\silero_vad.onnx .cache\stt\models\vad\silero_vad.onnx
 
       - name: Fetch MinGit runtime
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         env:
           PYTHONUTF8: "1" # runner 默认 cp1252，脚本输出中文会炸
-        run: python tools/fetch_runtime.py --mirror github
+        # 固定已核对的官方资产；对应源码完整性与交付仍未决，不能解除 distribution gate。
+        run: python tools/fetch_runtime.py --mirror github --version 2.55.0.windows.5 --sha256 56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e
+
+      # Pure runtime copy only: no remote source archives are available here.
+      # This does NOT satisfy the matching source companion/publication gate.
+      - name: Prepare GCM-free MinGit distribution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force target/package | Out-Null
+          python tools/prepare_runtime_distribution.py --source .cache/runtime/gitbash --output target/package/runtime-distribution --trusted-output-root target/package
+          if ($LASTEXITCODE -ne 0) { throw 'Filtered MinGit preparation failed; no raw cache fallback' }
 
       - name: Assemble package
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
@@ -174,17 +329,20 @@ jobs:
           }
           Copy-Item crates\neo-wake\assets\*.dll "$pkg\runtime\onnx\"
           Copy-Item -Recurse .cache\stt\models "$pkg\resources\models\stt"
-          Copy-Item -Recurse .cache\runtime\gitbash "$pkg\runtime\gitbash"
+          Copy-Item -Recurse target\package\runtime-distribution\runtime\gitbash "$pkg\runtime\gitbash"
+          New-Item -ItemType Directory "$pkg\docs\runtime-distribution" | Out-Null
+          foreach ($record in @('MANIFEST.json', 'MODIFICATIONS.md', 'gitbash-distribution-policy.json')) {
+            Copy-Item "target\package\runtime-distribution\$record" "$pkg\docs\runtime-distribution\"
+          }
           Copy-Item resources\lang\zh-CN.lang, resources\lang\en-US.lang "$pkg\resources\lang\"
-          Copy-Item docs\distribution\README.md "$pkg\docs\README.md"
+
           Copy-Item LICENSE $pkg\
           Copy-Item NOTICE "$pkg\NOTICE"
           # 仅复制公开法律文件；docs-pri 审计报告与本地证据不随包。
           Copy-Item -Recurse docs\licenses "$pkg\docs\licenses"
 
-      # 只从已授权 VS 的 Redist 目录收集真实导入依赖，不使用 System32 或执行 vc_redist。
-      # app-local CRT 安全更新需要随 Neo 重新发布；UCRT/API sets 由 Win10 自带。
-      - name: Audit packaged PE imports and collect app-local MSVC CRT
+      # 外部官方 x64 CRT prerequisite：只审计 PE，不收集 DLL，不下载或执行 vc_redist。
+      - name: Audit packaged PE imports (external CRT prerequisite)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -192,10 +350,13 @@ jobs:
           $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw 'Licensed Visual Studio C++ tools not found' }
           $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1
-          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory | Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $dumpbin -or -not $crt) { throw 'MSVC dumpbin or licensed x64 CRT redistributables missing; no system DLL fallback' }
-          python tools/check_release.py --package dist/neo --dumpbin "$($dumpbin.FullName)" --redist-dir "$($crt.FullName)"
+          if (-not $dumpbin) { throw 'MSVC dumpbin missing; no system DLL fallback' }
+          python tools/check_release.py --package dist/neo --dumpbin "$($dumpbin.FullName)" --crt-policy external
           if ($LASTEXITCODE -ne 0) { throw 'Packaged PE / CRT audit failed' }
+
+      # Drawing has its own PE audit; both applications use an external CRT prerequisite.
+      - name: Assemble approved drawing release
+        run: python tools/assemble_drawing_release.py assemble --source target/package/drawing-src --target-dir target/package/drawing-build --package dist/neo
 
       - name: Zip portable package
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
@@ -255,7 +416,7 @@ jobs:
           $notes += '### Artifacts'
           $notes += ''
           $notes += "- ``neo-${{ steps.ver.outputs.version }}-installer-x64.exe`` — 安装包（per-user 免管理员，装到 ``%LOCALAPPDATA%\Programs\Neo``，含卸载与开始菜单/桌面快捷方式）"
-          $notes += "- ``neo-${{ steps.ver.outputs.version }}-portable-x64.zip`` — 便携包（解压即用）"
+          $notes += "- ``neo-${{ steps.ver.outputs.version }}-portable-x64.zip`` — 便携包（先满足下述外部运行库前置条件，再解压运行）"
           $notes += ''
           $notes += '两者内容一致：'
           $notes += ''
@@ -265,8 +426,10 @@ jobs:
           $notes += '- ``resources/lang/`` - Chinese and English language resources (zh-CN / en-US)'
           $notes += '- ``runtime/onnx/`` - ONNX Runtime DLLs'
           $notes += '- ``runtime/gitbash/`` - bundled MinGit (bash tool runtime)'
-          $notes += '- ``docs/README.md`` - distribution guide'
-          $notes += '- ``LICENSE`` (Neo Apache-2.0), ``NOTICE`` and imported app-local MSVC CRT DLLs remain next to ``neo.exe``'
+
+          $notes += '- ``LICENSE`` (Neo Apache-2.0) and ``NOTICE`` remain next to ``neo.exe``; MSVC CRT DLLs are not bundled'
+          $notes += '- Prerequisite: official Microsoft Visual C++ v14 x64 Redistributable >= 14.51.36247.0 and at least as new as the build tools; obtain the latest supported version from https://aka.ms/vc14/vc_redist.x64.exe'
+          $notes += '- Install that prerequisite independently if needed; neither package downloads or installs it automatically. This conservative version requirement is not inferred from PE imports; clean-machine compatibility remains unverified.'
           $notes += '- ``docs/licenses/`` - public third-party license texts, notices and indexes; private audit reports are excluded and payload checks are not legal clearance'
           $notes -join "`n" | Out-File -Encoding utf8 dist\notes.md
           Get-Content dist\notes.md

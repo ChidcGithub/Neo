@@ -1,6 +1,7 @@
-"""检查发行必需载荷非空，核验有限范围的 x64 PE 导入并收集获授权的 MSVC CRT。
+"""检查发行载荷及有限范围 x64 PE；CLI 默认 MSVC external-prerequisite，不复制 CRT。
 
-PE 范围仅为 neo.exe、runtime/onnx/*.dll 及其递归导入的白名单 CRT；
+PE 范围为 neo.exe、runtime/onnx/*.dll；app-local 另查递归导入的白名单 CRT；
+只读解析实际 PE 导出并拒绝已知 eSpeak/Piper 标记；无标记不证明不存在 GPL 代码。
 不验证完整第三方 DLL 依赖闭包、模型有效性或 MinGit 运行能力。
 法律文件仅检查载荷非空，不判定许可合规或解除审计中的发布阻断项。
 """
@@ -11,12 +12,21 @@ import re
 import shutil
 import subprocess
 
+if __package__:
+    from .audit_native_link import PE, risk_family
+    from .prepare_runtime_distribution import verify_distribution, file_record, check_path
+else:
+    from audit_native_link import PE, risk_family
+    from prepare_runtime_distribution import verify_distribution, file_record, check_path
+
 
 CRT_NAMES = (
     "vcruntime140.dll", "vcruntime140_1.dll", "vcruntime140_threads.dll",
     "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
     "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll", "concrt140.dll",
 )
+CRT_MIN_VERSION = "14.51.36247.0"
+CRT_DOWNLOAD_URL = "https://aka.ms/vc14/vc_redist.x64.exe"
 CRT_NAME = re.compile("(?:" + "|".join(re.escape(name) for name in CRT_NAMES) + ")", re.I)
 CRT_FAMILY = re.compile(r"(?:vcruntime|msvcp|msvcr|concrt|vccorlib).*\.dll", re.I)
 MODELS = ("melspectrogram.onnx", "embedding_model.onnx", "hi_neo.onnx")
@@ -24,8 +34,9 @@ LANGUAGES = ("zh-CN", "en-US")
 REQUIRED_FILES = (
     "neo.exe", *(f"resources/models/wake/{name}" for name in MODELS), "runtime/onnx/onnxruntime.dll",
     "resources/models/stt/sense-voice/model.int8.onnx", "resources/models/stt/sense-voice/tokens.txt",
-    "resources/models/stt/vad/silero_vad.onnx", "LICENSE", "NOTICE", "docs/README.md",
-    "docs/licenses/README.md", "docs/licenses/cargo-notices.txt",
+    "resources/models/stt/vad/silero_vad.onnx", "LICENSE", "NOTICE",
+    "docs/licenses/cargo-notices.txt",
+    "docs/licenses/models/hi_neo-model.json", "docs/licenses/models/hi_neo-MIT.txt",
     *(f"resources/lang/{language}.lang" for language in LANGUAGES),
 )
 # fetch_runtime.ensure_bash_named 将 MinGit 的 usr/bin/sh.exe 补名为 usr/bin/bash.exe；
@@ -62,6 +73,23 @@ def validate_languages(package):
         raise ValueError(f"Language resource keys differ: {directory / 'zh-CN.lang'} and {directory / 'en-US.lang'}")
 
 
+def validate_hi_neo(model, legal):
+    index_path = legal / "hi_neo-model.json"
+    license_path = legal / "hi_neo-MIT.txt"
+    for path in (model, index_path, license_path):
+        check_path(path)
+        require_nonempty_file(path)
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    if (index.get("path") != "resources/models/wake/hi_neo.onnx"
+            or index.get("license") != "MIT" or index.get("license_file") != "hi_neo-MIT.txt"
+            or type(index.get("size")) is not int
+            or file_record(model) != {k: index.get(k) for k in ("sha256", "size")}):
+        raise ValueError("hi_neo model bytes/license index mismatch")
+    if not license_path.read_text(encoding="utf-8-sig").strip():
+        raise ValueError("hi_neo MIT license text is empty")
+    return index
+
+
 def validate_payload(package):
     for name in REQUIRED_FILES:
         require_nonempty_file(package / name)
@@ -73,6 +101,8 @@ def validate_payload(package):
     # 两种布局可共存，但不能让空的优先候选遮蔽另一个可用的 bash。
     for path in present:
         require_nonempty_file(path)
+    validate_hi_neo(package / "resources/models/wake/hi_neo.onnx", package / "docs/licenses/models")
+    verify_distribution(package / "docs/runtime-distribution", package / "runtime/gitbash")
 
 
 def parse_pe_report(report):
@@ -88,7 +118,19 @@ def parse_pe_report(report):
     return imports
 
 
+def inspect_native_exports(binary):
+    # Read actual export tables, not strings/dumpbin mocks; never load the image.
+    exports = PE(Path(binary).read_bytes()).exports()
+    findings = [entry["symbol"] for entry in exports if risk_family(entry["symbol"])]
+    if findings:
+        raise ValueError(f"Distribution BLOCKED: eSpeak/Piper native export markers in {binary}: "
+                         + ", ".join(findings))
+    print(f"Native export scan: {binary}: no known eSpeak/Piper markers; "
+          "absence is inconclusive, NOT legal clearance or proof of GPL-free code.")
+
+
 def inspect_pe(binary, dumpbin):
+    inspect_native_exports(binary)
     result = subprocess.run([str(dumpbin), "/NOLOGO", "/HEADERS", "/IMPORTS", str(binary)],
                             capture_output=True, text=True, errors="replace", timeout=60, check=True)
     imports = parse_pe_report(result.stdout)
@@ -110,8 +152,18 @@ def validate_redist_dir(directory):
     return directory
 
 
-def check_package(package, dumpbin, redist_dir=None):
+def check_package(package, dumpbin, redist_dir=None, crt_policy="app-local"):
+    # Keep existing Python callers compatible; the release CLI defaults to external.
+    if crt_policy not in ("external", "app-local"):
+        raise ValueError(f"Unknown CRT policy: {crt_policy}")
+    if crt_policy == "external" and redist_dir is not None:
+        raise ValueError("--redist-dir requires --crt-policy app-local; external never copies CRT")
     package = Path(package)
+    if crt_policy == "external":
+        bundled = sorted(str(path.relative_to(package)) for path in package.rglob("*")
+                         if CRT_NAME.fullmatch(path.name))
+        if bundled:
+            raise ValueError("external-prerequisite forbids bundled allowlisted CRT: " + ", ".join(bundled))
     onnx = package / "runtime/onnx"
     validate_payload(package)
     pending = [package / "neo.exe", *sorted(onnx.glob("*.dll"))]
@@ -130,6 +182,8 @@ def check_package(package, dumpbin, redist_dir=None):
             if not CRT_NAME.fullmatch(name):
                 continue
             required.add(name)
+            if crt_policy == "external":
+                continue
             target = package / name
             if redist:
                 source = redist / name
@@ -144,8 +198,21 @@ def check_package(package, dumpbin, redist_dir=None):
     print("Required release payload files exist and are non-empty (including bundled Bash and legal documents).")
     print("Legal documents: payload completeness only; license compliance is NOT verified. "
           "Unresolved legal release blockers still require review; private audit reports are not release payloads.")
-    print("Verified x64 PE images (neo.exe, runtime/onnx/*.dll and imported allowlisted CRT only):", len(inspected))
-    print("Required app-local CRT:", ", ".join(sorted(required)) or "none")
+    if crt_policy == "external":
+        print("CRT policy: external-prerequisite (no CRT copied or bundled).")
+        print("Verified x64 PE images (neo.exe and runtime/onnx/*.dll only):", len(inspected))
+        print("Required CRT names (direct/delay imports in audited images only):",
+              ", ".join(sorted(required)) or "none")
+        print(f"Prerequisite: official Microsoft Visual C++ v14 x64 Redistributable >= {CRT_MIN_VERSION}; "
+              f"install the latest supported release independently: {CRT_DOWNLOAD_URL}")
+        print("This is a conservative release prerequisite, NOT a minimum inferred from PE imports. "
+              "A newer build toolset/runtime requires re-evaluation; use a runtime at least as new as the build tools.")
+        print("External runtime presence, DLL versions/exports and transitive CRT imports are NOT verified; "
+              "in-process import/runtime compatibility is NOT established.")
+    else:
+        print("CRT policy: app-local; redistribution approval/evidence is separately required, NOT granted here.")
+        print("Verified x64 PE images (neo.exe, runtime/onnx/*.dll and imported allowlisted CRT only):", len(inspected))
+        print("Required app-local CRT:", ", ".join(sorted(required)) or "none")
     print("Full third-party DLL dependency closure is NOT audited; MinGit PE images/dependencies "
           "and model validity are NOT audited.")
     print("Static checks only; Windows 10 19041 runtime validation is still required.")
@@ -156,9 +223,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path, default=Path("dist/neo"))
     parser.add_argument("--dumpbin", default="dumpbin.exe")
-    parser.add_argument("--redist-dir", type=Path, help="Licensed Visual Studio x64 CRT directory; never System32")
+    parser.add_argument("--crt-policy", choices=("external", "app-local"), default="external",
+                        help="Default: external prerequisite, no bundled CRT; app-local requires separate approval")
+    parser.add_argument("--redist-dir", type=Path,
+                        help="Requires --crt-policy app-local; licensed Visual Studio x64 CRT directory, never System32")
     args = parser.parse_args()
-    check_package(args.package, args.dumpbin, args.redist_dir)
+    if args.redist_dir is not None and args.crt_policy != "app-local":
+        parser.error("--redist-dir requires explicit --crt-policy app-local")
+    check_package(args.package, args.dumpbin, args.redist_dir, crt_policy=args.crt_policy)
 
 
 if __name__ == "__main__":
