@@ -13,7 +13,7 @@ is done, it fades back into the system tray and waits for the next call.
 [![ci](https://img.shields.io/github/actions/workflow/status/ChidcGithub/Neo/release.yml?label=release%20ci)](https://github.com/ChidcGithub/Neo/actions/workflows/release.yml)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%202004%2B-0078D6)](#requirements)
 [![rust](https://img.shields.io/badge/rust-1.95%2B-orange)](#build-from-source)
-[![license](https://img.shields.io/badge/license-MIT-green)](#license)
+[![license](https://img.shields.io/badge/license-Apache--2.0-green)](#license)
 
 </div>
 
@@ -418,6 +418,12 @@ flowchart LR
 
 ## License
 
-[MIT](LICENSE) — Copyright (c) 2026 Chidc (the workspace author).
-Third-party code, models, fonts and runtimes retain their own licenses; the
-bundled third-party LICENSE/notice review is still pending.
+[Apache-2.0](LICENSE) — Copyright (c) 2026 Chidc. See [NOTICE](NOTICE).
+This applies to Neo's original code, not a relicensing of third-party material
+or a revocation of permissions granted for earlier MIT releases.
+
+Third-party code, fonts, models and runtimes retain their own terms; see the
+[license texts and notices](docs/licenses/README.md). Detailed audit reports
+are kept locally in `docs-pri/licenses/`, not in Git or release packages.
+Native GPL linkage, corresponding-source delivery, model rights and missing
+notices still require review before distribution approval.

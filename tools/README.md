@@ -72,7 +72,7 @@ python tools/fetch_runtime.py --mirror github # 只用官方源
 python tools/fetch_runtime.py --force         # 重下
 ```
 
-源码缓存落 `.cache/runtime/gitbash/`（**不进版本库**）；发行时仅复制该目录到
+运行时下载缓存落 `.cache/runtime/gitbash/`（**不进版本库**，不是对应源码交付）；发行时仅复制该目录到
 `dist/neo/runtime/gitbash/`，发行路径保持不变。旧根目录 `runtime/` 不再作为下载目的地，
 本脚本不会自动迁移或删除旧缓存。
 
@@ -89,6 +89,19 @@ python tools/fetch_runtime.py --force         # 重下
    资产叫 `MinGit-2.55.0.5-64-bit.zip`（少一段 `.windows`）。
    所以必须先问 API 拿文件名再拼地址 —— 从 tag 拼出来的地址是 404。
 
+## 离线许可审计
+
+`python tools/audit_licenses.py`（Python 3.11+）使用 `Cargo.lock`、离线 Cargo 元数据和本地缓存，
+不构建、不联网、不选择许可证或作出合规结论。相同输入可重现生成：
+
+- `docs-pri/licenses/cargo-inventory.json`、`cargo-inventory.md`：私有详细审计清单，不上传、不随包。
+- `docs/licenses/cargo-notices.txt`：公开的第三方完整许可/notice 汇编，保留原始文本字节，继续随包。
+- `target/license-audit/`：原始命令证据，不随包。
+
+素材、运行时详细审计及详细 README 备份也放在 `docs-pri/licenses/`；
+公开 `docs/licenses/` 保留简短索引和第三方完整法律文本。生成器不搬迁或删除旧报告；
+迁移旧工作区时须先将公开目录中的详细审计移入私有目录，避免递归装配将其带入发行包。
+
 ## 发行辅助工具
 
 - `make_installer_art.py`：从 `crates/neo-app/src/brand/whale_path.rs` 生成 NSIS
@@ -99,9 +112,15 @@ python tools/fetch_runtime.py --force         # 重下
   旧版无可信卸载残留记录时应先将原目录改名保留，再安装到原路径。
   新 `resources/`、`docs/`、`runtime/` 和旧 `assets/`、`assets-stt/` 均只清理已知空目录，
   `resources/lang/` 同样只清理空目录；非空资源/文档目录及自定义文件保留；
-  旧根 `README.md` 仍按已知文件处理。
+  根 `LICENSE`、`NOTICE` 和旧根 `README.md` 按已知文件删除；
+  `docs/licenses/` 及其 `assets/`、`runtime/` 仅清理空目录，非空法律资料及用户文件不递归删除。
+  NSIS 许可证页读取仓库根 `LICENSE`（Neo Apache-2.0），其余安装交互保持不变。
   详见[发行使用说明](../docs/distribution/README.md)。
-- `check_release.py`：检查必需载荷非空；两份语言资源必须是 UTF-8 JSON `str:str` 对象，
+- `check_release.py`：检查必需载荷非空，包含根 `LICENSE`、`NOTICE`，以及
+  `docs/licenses/README.md`（公开索引）和 `cargo-notices.txt`；缺失、空文件或同名目录都会失败。
+  私有的 Cargo 清单、素材及运行时审计不属于必需发行载荷。
+  **法律文件检查仅证明载荷完整，不证明许可合规、notice 充分或再分发已获授权。**
+  两份语言资源必须是 UTF-8 JSON `str:str` 对象，
   key 集合非空、key 非空且两份一致，英文翻译不得留空，不接受其他 `.lang` 语言文件。
   审计 `neo.exe`、`runtime/onnx/*.dll` 及递归导入的
   白名单 CRT 的 x64 PE；**不覆盖完整第三方 DLL 闭包、MinGit PE/依赖或模型有效性**。
@@ -110,7 +129,10 @@ python tools/fetch_runtime.py --force         # 重下
 
 发行装配契约（`.github/workflows/release.yml`）：
 
-- `dist/neo/neo.exe`、`LICENSE`、实际导入的白名单 MSVC CRT DLL 保留在发行根。
+- `dist/neo/neo.exe`、`LICENSE`（Neo Apache-2.0）、`NOTICE`、实际导入的白名单 MSVC CRT DLL 保留在发行根。
+- 仅公开的 `docs/licenses/` 整个目录递归复制到发行 `docs/licenses/`，包含简短索引、
+  第三方 notices 及 `assets/`、`runtime/` 下的完整法律文件；不依赖或复制 `docs-pri/` 详细审计或私有缓存。
+  Neo 的 Apache-2.0 不替代第三方组件各自的许可证。
 - `crates/neo-wake/assets/` 只取三个正式 ONNX 模型到 `resources/models/wake/`；
   同源 DLL 单独复制到 `runtime/onnx/`，不混入模型目录。
 - STT 下载包、解压目录及待打包模型全部放 `.cache/stt/`；只将 `models/` 复制为
@@ -123,9 +145,16 @@ python tools/fetch_runtime.py --force         # 重下
 不下载、不安装的定向检查：
 
 ```bash
-python -B -m unittest tools.test_installer tools.test_check_release tools.test_fetch_runtime tools.test_release_workflow -v
+python -B -m unittest tools.test_audit_licenses tools.test_installer tools.test_check_release tools.test_fetch_runtime tools.test_release_workflow -v
 ```
 
-这些测试不等同于实际安装验收。当前版本为 **0.0.1-pre8**，完整发布门禁和已知未验项由
-维护者记录在仓库根目录下的本地验收清单 `docs-pri/release-0.1.0.md` 中；`docs-pri/` 不纳入
-Git 跟踪，也不随克隆提供。公开使用说明见 `docs/distribution/README.md`。
+测试使用临时载荷实际执行工作流的 PowerShell 装配片段，检查法律文件及嵌套目录逐字节随包、
+开发根 README、四份私有审计报告、详细 README 备份和私有缓存不随包，
+并确认必需公开法律文件缺失会在装配或随后的载荷检查失败。生成器测试同时检查输出分流及逐字节可重现性。
+有 NSIS 时仅隔离编译，不执行生成的安装器；这些测试不等同于实际安装验收。
+
+公开法律文件索引见 [`docs/licenses/README.md`](../docs/licenses/README.md)；详细审计留在
+`docs-pri/licenses/`，不上传、不随包。**未解决的法务阻断项必须在公开发行前解决或取得明确授权**。
+本次不新增依据法务结论自动阻断现有 CI 的策略；CI 通过仅表示这些技术检查通过，
+不能代替人工发布批准。必须随发行提供的第三方许可证、notice 及其他法定义务材料不能仅留在私有目录。
+公开使用说明见 [`docs/distribution/README.md`](../docs/distribution/README.md)。

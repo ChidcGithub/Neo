@@ -194,6 +194,23 @@ impl Point {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presentation {
+    Render,
+    Move,
+    Idle,
+}
+
+fn presentation(dirty: bool, origin: Point, presented: Option<Point>) -> Presentation {
+    if dirty || presented.is_none() {
+        Presentation::Render
+    } else if presented != Some(origin) {
+        Presentation::Move
+    } else {
+        Presentation::Idle
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
     Main,
     Close,

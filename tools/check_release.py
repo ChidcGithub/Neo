@@ -2,6 +2,7 @@
 
 PE 范围仅为 neo.exe、runtime/onnx/*.dll 及其递归导入的白名单 CRT；
 不验证完整第三方 DLL 依赖闭包、模型有效性或 MinGit 运行能力。
+法律文件仅检查载荷非空，不判定许可合规或解除审计中的发布阻断项。
 """
 import argparse
 import json
@@ -23,7 +24,8 @@ LANGUAGES = ("zh-CN", "en-US")
 REQUIRED_FILES = (
     "neo.exe", *(f"resources/models/wake/{name}" for name in MODELS), "runtime/onnx/onnxruntime.dll",
     "resources/models/stt/sense-voice/model.int8.onnx", "resources/models/stt/sense-voice/tokens.txt",
-    "resources/models/stt/vad/silero_vad.onnx", "LICENSE", "docs/README.md",
+    "resources/models/stt/vad/silero_vad.onnx", "LICENSE", "NOTICE", "docs/README.md",
+    "docs/licenses/README.md", "docs/licenses/cargo-notices.txt",
     *(f"resources/lang/{language}.lang" for language in LANGUAGES),
 )
 # fetch_runtime.ensure_bash_named 将 MinGit 的 usr/bin/sh.exe 补名为 usr/bin/bash.exe；
@@ -139,7 +141,9 @@ def check_package(package, dumpbin, redist_dir=None):
             elif not target.is_file() or target.stat().st_size == 0:
                 raise ValueError(f"Missing app-local CRT or empty file: {target}; supply licensed VS redistributables")
             pending.append(target)
-    print("Required release payload files exist and are non-empty (including bundled Bash).")
+    print("Required release payload files exist and are non-empty (including bundled Bash and legal documents).")
+    print("Legal documents: payload completeness only; license compliance is NOT verified. "
+          "Unresolved legal release blockers still require review; private audit reports are not release payloads.")
     print("Verified x64 PE images (neo.exe, runtime/onnx/*.dll and imported allowlisted CRT only):", len(inspected))
     print("Required app-local CRT:", ", ".join(sorted(required)) or "none")
     print("Full third-party DLL dependency closure is NOT audited; MinGit PE images/dependencies "

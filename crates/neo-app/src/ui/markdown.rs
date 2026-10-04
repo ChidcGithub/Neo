@@ -93,7 +93,7 @@ fn configure(ui: &mut Ui, skin: &Skin<'_>) {
 }
 
 fn draw_math(ui: &mut Ui, latex: &str, size: f32, display: bool, color: egui::Color32) {
-    let Some(measured) = math::measure(latex, size, display) else {
+    let Some(dl) = math::cached_layout(latex, display) else {
         ui.label(
             RichText::new(if display {
                 format!("$${latex}$$")
@@ -105,6 +105,7 @@ fn draw_math(ui: &mut Ui, latex: &str, size: f32, display: bool, color: egui::Co
         .on_hover_text(tr("公式尚未完整或语法不受支持，保留原文"));
         return;
     };
+    let measured = math::measure_layout(&dl, size);
     // Formula widgets reserve their actual width AND height. Oversized formulas
     // get a local horizontal viewport instead of covering following text.
     if measured.x > ui.available_width() {
@@ -113,10 +114,10 @@ fn draw_math(ui: &mut Ui, latex: &str, size: f32, display: bool, color: egui::Co
             .auto_shrink([false, true])
             .id_salt(ui.next_auto_id())
             .show(ui, |ui| {
-                let _ = math::render(ui, color, latex, size, display);
+                let _ = math::render_layout(ui, color, &dl, size);
             });
     } else {
-        let _ = math::render(ui, color, latex, size, display);
+        let _ = math::render_layout(ui, color, &dl, size);
     }
 }
 

@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tools.check_release import CRT_NAMES
+from tools.check_release import CRT_NAMES, REQUIRED_FILES
 
 
 SOURCE = Path(__file__).with_name("installer.nsi").read_text(encoding="utf-8")
@@ -539,19 +539,25 @@ class InstallerTests(unittest.TestCase):
         paths = [r"assets", r"assets-stt\sense-voice", r"assets-stt\vad", r"assets-stt",
                  r"resources\models\wake", r"resources\models\stt\sense-voice",
                  r"resources\models\stt\vad", r"resources\models\stt", r"resources\models",
-                 r"resources\lang", r"resources", r"docs", r"runtime\onnx", r"runtime\gitbash", r"runtime"]
+                 r"resources\lang", r"resources", r"docs\licenses\assets", r"docs\licenses\runtime",
+                 r"docs\licenses", r"docs", r"runtime\onnx", r"runtime\gitbash", r"runtime"]
         for populated in (False, True):
             with self.subTest(populated=populated):
                 m = NsModel()
                 root = m.value("$INSTDIR")
                 m.files.update({root + r"\neo.exe": b"app", root + r"\uninstall.exe": b"uninstaller",
-                                root + r"\README.md": b"legacy readme", root + r"\LICENSE": b"license"})
+                                root + r"\README.md": b"legacy readme", root + r"\LICENSE": b"license",
+                                root + r"\NOTICE": b"notice"})
                 m.directories.update(root + "\\" + path for path in paths)
                 retained = {root + "\\" + path + r"\custom.txt": b"custom" for path in paths} if populated else {}
                 m.files.update(retained)
                 if populated:
                     m.files[root + r"\docs\README.md"] = b"distribution guide"
                     retained[root + r"\docs\README.md"] = b"distribution guide"
+                    for name in ("README.md", "cargo-inventory.json", "cargo-inventory.md", "cargo-notices.txt",
+                                 "assets-audit.md", "runtime-audit.md", "assets/font/LICENSE", "runtime/onnx/NOTICE"):
+                        path = root + "\\docs\\licenses\\" + name.replace("/", "\\")
+                        m.files[path] = retained[path] = b"legal evidence"
                     for name in ("zh-CN.lang", "en-US.lang", "custom.lang"):
                         path = root + "\\resources\\lang\\" + name
                         m.files[path] = retained[path] = b'{"key": "user translation"}'
@@ -625,7 +631,8 @@ class InstallerTests(unittest.TestCase):
                      "resources\\models\\stt\\sense-voice\\model.int8.onnx", "resources\\custom.txt",
                      "resources\\lang\\zh-CN.lang", "resources\\lang\\en-US.lang", "resources\\lang\\custom.lang",
                      "runtime\\onnx\\onnxruntime.dll", "runtime\\onnx\\custom.dll",
-                     "docs\\README.md", "docs\\custom.md"]:
+                     "docs\\README.md", "docs\\custom.md", "NOTICE", "docs\\licenses\\README.md",
+                     "docs\\licenses\\assets\\custom.txt", "docs\\licenses\\runtime\\custom.txt"]:
             m.files[m.value("$INSTDIR") + "\\" + name] = name.encode()
         m.registry = {"DisplayVersion": "old"}
         return m
@@ -961,6 +968,13 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("安装资源缺失：hi_neo.onnx", wake)
         self.assertNotIn("请先跑 wake-training", wake)
 
+    def test_apache_license_page_preserves_existing_page_order(self):
+        pages = re.findall(r'^!insertmacro (MUI_PAGE_\w+)(.*)$', SOURCE, re.M)
+        self.assertEqual(pages, [("MUI_PAGE_WELCOME", ""), ("MUI_PAGE_LICENSE", ' "LICENSE"'),
+                                 ("MUI_PAGE_DIRECTORY", ""), ("MUI_PAGE_INSTFILES", ""),
+                                 ("MUI_PAGE_FINISH", "")])
+        self.assertIn('VIAddVersionKey /LANG=2052 "LegalCopyright" "Apache-2.0"', SOURCE)
+
     def test_isolated_nsis_compile(self):
         compiler = shutil.which("makensis")
         if not compiler:
@@ -973,8 +987,15 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             payload = Path(td) / "dist/neo"
             payload.mkdir(parents=True)
-            (payload / "neo.exe").write_bytes(b"inert test payload; never execute")
-            (payload / "resources/lang").mkdir(parents=True)
+            for name in (*REQUIRED_FILES, "docs/licenses/assets/font/LICENSE",
+                         "docs/licenses/runtime/onnx/NOTICE"):
+                path = payload / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"inert test payload; never execute")
+            # MUI reads the repository LICENSE at compile time, not from the payload.
+            license_path = script.parent.parent / "LICENSE"
+            shutil.copy2(license_path, Path(td) / "LICENSE")
+            shutil.copy2(license_path, payload / "LICENSE")
             for language in ("zh-CN", "en-US"):
                 (payload / f"resources/lang/{language}.lang").write_bytes(b'{"key": "translation"}')
             result = subprocess.run(

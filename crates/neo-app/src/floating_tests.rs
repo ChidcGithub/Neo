@@ -1,6 +1,34 @@
 use super::*;
 
 #[test]
+fn unchanged_drag_pixels_only_move_but_animation_and_invalidation_render() {
+    let origin = Point { x: 10.0, y: 20.0 };
+    let moved = Point { x: 15.0, y: 25.0 };
+    assert_eq!(presentation(false, origin, None), Presentation::Render);
+    assert_eq!(
+        presentation(false, origin, Some(origin)),
+        Presentation::Idle
+    );
+    assert_eq!(presentation(false, moved, Some(origin)), Presentation::Move);
+    // Glass removal, language and DPI changes use the same dirty override.
+    assert_eq!(
+        presentation(true, moved, Some(origin)),
+        Presentation::Render
+    );
+    let mut animation = MenuAnimation::default();
+    animation.advance(true, 0.18);
+    let dirty = animation.advance(false, 0.016);
+    assert!(dirty);
+    assert_eq!(
+        presentation(dirty, moved, Some(origin)),
+        Presentation::Render
+    );
+    animation.advance(false, 0.18);
+    assert!(!animation.advance(false, 0.016));
+    assert_eq!(presentation(false, moved, Some(origin)), Presentation::Move);
+}
+
+#[test]
 fn menu_labels_and_idle_invalidation_follow_language_changes() {
     use crate::i18n::{tr, with_language, Language};
     with_language(Language::ZhCn, || {

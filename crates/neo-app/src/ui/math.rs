@@ -28,9 +28,12 @@
 //!    「指令序列 + 像素尺寸」缓存成白色 alpha 纹理，绘制时 `tint` 上色 ——
 //!    与图标同一条路子。
 
+use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::mem::size_of;
+use std::sync::Arc;
 
 use egui::{
     Align2, Color32, FontId, Id, Painter, Pos2, Rect, Stroke, TextureHandle, TextureOptions, Vec2,
@@ -44,6 +47,7 @@ use ratex_types::path_command::PathCommand;
 /// 按给定字号排版并绘制。返回 `None` 表示 **LaTeX 有语法错误**（不画、不弹窗）。
 ///
 /// `display` 为真走行间公式（`$$…$$`）：大运算符上下限、分数更舒展。
+#[cfg(test)]
 pub fn render(
     ui: &mut egui::Ui,
     color: Color32,
@@ -51,30 +55,150 @@ pub fn render(
     size: f32,
     display: bool,
 ) -> Option<Rect> {
-    let dl = layout(latex, display)?;
-    let w = (dl.width as f32) * size;
-    let h = (dl.total_height() as f32) * size;
+    let dl = cached_layout(latex, display)?;
+    render_layout(ui, color, &dl, size)
+}
+
+/// 绘制已排版的公式，与 `render` 使用相同的尺寸校验和取整规则。
+pub fn render_layout(
+    ui: &mut egui::Ui,
+    color: Color32,
+    dl: &DisplayList,
+    size: f32,
+) -> Option<Rect> {
+    let Vec2 { x: w, y: h } = measure_layout(dl, size);
     if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
         return None;
     }
     let (rect, _) = ui.allocate_exact_size(Vec2::new(w.ceil(), h.ceil()), egui::Sense::hover());
-    paint(ui.painter(), &dl, rect, size, color);
+    paint(ui.painter(), dl, rect, size, color);
     // 返回占用的矩形。基线是 `rect.top() + height × size` ——
     // 需要行内对齐时用 `layout()` 自己拿显示列表算，不必在这里多存一份。
     Some(rect)
 }
 
 /// 只要尺寸、不绘制（判断某个公式放不放得下时用）。
+#[cfg(test)]
 pub fn measure(latex: &str, size: f32, display: bool) -> Option<Vec2> {
-    let dl = layout(latex, display)?;
-    Some(Vec2::new(
-        (dl.width as f32) * size,
-        (dl.total_height() as f32) * size,
-    ))
+    let dl = cached_layout(latex, display)?;
+    Some(measure_layout(&dl, size))
 }
 
-/// 排版成显示列表。测试与「排一次画多次」用。
+/// em 显示列表不依赖字号；保留 `measure` 的非取整、非校验语义。
+pub fn measure_layout(dl: &DisplayList, size: f32) -> Vec2 {
+    Vec2::new((dl.width as f32) * size, (dl.total_height() as f32) * size)
+}
+
+const MAX_CACHE_ENTRIES: usize = 128;
+const MAX_CACHE_SOURCE_BYTES: usize = 8 * 1024;
+const MAX_CACHE_ENTRY_BYTES: usize = 256 * 1024;
+const MAX_CACHE_BYTES: usize = 2 * 1024 * 1024;
+
+struct LayoutEntry {
+    latex: Box<str>,
+    display: bool,
+    result: Option<Arc<DisplayList>>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct LayoutCache {
+    // 最旧的在前。最多 128 项，直接比较完整 key，避免哈希碰撞及命中时分配。
+    entries: VecDeque<LayoutEntry>,
+    bytes: usize,
+}
+
+impl LayoutCache {
+    fn get_or_layout(&mut self, latex: &str, display: bool) -> Option<Arc<DisplayList>> {
+        if latex.len() <= MAX_CACHE_SOURCE_BYTES {
+            if let Some(index) = self
+                .entries
+                .iter()
+                .position(|entry| entry.display == display && entry.latex.as_ref() == latex)
+            {
+                let entry = self.entries.remove(index).unwrap();
+                let result = entry.result.clone();
+                self.entries.push_back(entry);
+                return result;
+            }
+        }
+
+        let result = layout(latex, display).map(Arc::new);
+        self.insert(latex, display, result.clone());
+        result
+    }
+
+    fn insert(&mut self, latex: &str, display: bool, result: Option<Arc<DisplayList>>) {
+        if latex.len() > MAX_CACHE_SOURCE_BYTES {
+            return;
+        }
+        let bytes = size_of::<LayoutEntry>()
+            .saturating_add(latex.len())
+            .saturating_add(result.as_deref().map_or(0, display_list_bytes));
+        if bytes > MAX_CACHE_ENTRY_BYTES {
+            return;
+        }
+        while self.entries.len() >= MAX_CACHE_ENTRIES || self.bytes + bytes > MAX_CACHE_BYTES {
+            let oldest = self.entries.pop_front().unwrap();
+            self.bytes -= oldest.bytes;
+        }
+        self.entries.push_back(LayoutEntry {
+            latex: latex.into(),
+            display,
+            result,
+            bytes,
+        });
+        self.bytes += bytes;
+    }
+}
+
+// 计入 Vec/String 的 capacity（不是 len），路径命令也可能远多于显示项。
+// 容器槽位另由 entry 上限约束；预算只约束缓存持有量，不限制临时排版内存。
+fn display_list_bytes(dl: &DisplayList) -> usize {
+    let base = size_of::<DisplayList>() + 2 * size_of::<usize>(); // Arc 计数
+    dl.items.iter().fold(
+        base.saturating_add(dl.items.capacity().saturating_mul(size_of::<DisplayItem>())),
+        |bytes, item| {
+            bytes.saturating_add(match item {
+                DisplayItem::GlyphPath { font, .. } => font.capacity(),
+                DisplayItem::Path { commands, .. } => {
+                    commands.capacity().saturating_mul(size_of::<PathCommand>())
+                }
+                DisplayItem::Line { .. } | DisplayItem::Rect { .. } => 0,
+            })
+        },
+    )
+}
+
+thread_local! {
+    // measure 没有 Context 参数。每个 UI 线程共享有限缓存，线程退出即释放；
+    // 不向 egui data 塞入可能不满足 Send/Sync 的排版器内部状态。
+    static LAYOUT_CACHE: RefCell<LayoutCache> = RefCell::new(LayoutCache::default());
+    #[cfg(test)]
+    static PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 共享 em 排版结果（含语法失败）。字号、颜色、视口宽度均不属于 key。
+/// 超长源码或复杂输出仍正常返回，但不驻留缓存。调用方持有 Arc 可安全跨越淘汰。
+pub fn cached_layout(latex: &str, display: bool) -> Option<Arc<DisplayList>> {
+    LAYOUT_CACHE.with(|cache| cache.borrow_mut().get_or_layout(latex, display))
+}
+
+#[cfg(test)]
+pub(super) fn reset_layout_cache() {
+    LAYOUT_CACHE.with(|cache| *cache.borrow_mut() = LayoutCache::default());
+    PARSE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn parse_calls() -> usize {
+    PARSE_CALLS.with(|calls| calls.get())
+}
+
+/// 无缓存排版成独立显示列表。保留测试与显式重新排版的接口。
 pub fn layout(latex: &str, display: bool) -> Option<DisplayList> {
+    #[cfg(test)]
+    PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let nodes = parse(latex).ok()?;
     let opts = LayoutOptions {
         style: if display {

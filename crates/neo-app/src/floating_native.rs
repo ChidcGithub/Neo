@@ -293,9 +293,10 @@ impl Surface {
         self.origin.y += 90.0 * (old_scale - self.scale);
         self.work = work;
         self.clamp();
+        // Monitor polling during a drag is not itself a pixel change.
+        self.dirty |= self.glass.is_some() || old_scale != self.scale;
         clear_glass(&mut self.glass);
         self.recapture = true;
-        self.dirty = true;
         Ok(())
     }
 }
@@ -419,15 +420,44 @@ unsafe fn label_font(height: i32) -> Result<HFONT, String> {
     Ok(font)
 }
 
+#[derive(Default)]
+struct Fonts(Vec<(i32, HFONT)>);
+
+impl Fonts {
+    unsafe fn get(&mut self, height: i32) -> Result<HFONT, String> {
+        if let Some((_, font)) = self.0.iter().find(|(h, _)| *h == height) {
+            return Ok(*font);
+        }
+        let font = label_font(height)?;
+        self.0.push((height, font));
+        Ok(font)
+    }
+}
+
+impl Drop for Fonts {
+    fn drop(&mut self) {
+        for (_, font) in self.0.drain(..) {
+            unsafe {
+                DeleteObject(font);
+            }
+        }
+    }
+}
+
 // Measure with the actual Win10 GDI font/fallback, not UTF-8 length or an
 // assumed Latin glyph width. Keep both lines inside the circular button.
-unsafe fn draw_label(dc: HDC, text: &str, bounds: RECT, height: i32) -> Result<SIZE, String> {
+unsafe fn draw_label(
+    dc: HDC,
+    text: &str,
+    bounds: RECT,
+    height: i32,
+    fonts: &mut Fonts,
+) -> Result<SIZE, String> {
     let text = wide(text);
     let mut height = height.max(1);
-    let mut font = label_font(height)?;
+    let mut font = fonts.get(height)?;
     let old = SelectObject(dc, font);
     if old.is_null() || old as isize == GDI_ERROR as isize {
-        DeleteObject(font);
         return Err(error("select label font"));
     }
     SetTextColor(dc, 0x00ffffff);
@@ -456,9 +486,8 @@ unsafe fn draw_label(dc: HDC, text: &str, bounds: RECT, height: i32) -> Result<S
             break size;
         }
         SelectObject(dc, old);
-        DeleteObject(font);
         height -= 1;
-        font = label_font(height)?;
+        font = fonts.get(height)?;
         SelectObject(dc, font);
     };
     let mut rect = bounds;
@@ -471,7 +500,6 @@ unsafe fn draw_label(dc: HDC, text: &str, bounds: RECT, height: i32) -> Result<S
         DT_CENTER | DT_NOPREFIX,
     );
     SelectObject(dc, old);
-    DeleteObject(font);
     Ok(measured)
 }
 
@@ -484,13 +512,19 @@ fn label_bounds(circle: Circle, scale: f32) -> RECT {
     }
 }
 
-unsafe fn labels(dib: &mut Dib, scale: f32, amount: f32) -> Result<Vec<u8>, String> {
+unsafe fn labels(
+    dib: &mut Dib,
+    scale: f32,
+    amount: f32,
+    fonts: &mut Fonts,
+) -> Result<Vec<u8>, String> {
     for circle in animated_circles(amount).skip(2) {
         draw_label(
             dib.dc,
             circle.target.label(),
             label_bounds(circle, scale),
             (8.5 * scale).round().max(1.0) as i32,
+            fonts,
         )?;
     }
     let flushed = GdiFlush();
@@ -500,7 +534,106 @@ unsafe fn labels(dib: &mut Dib, scale: f32, amount: f32) -> Result<Vec<u8>, Stri
     Ok(dib.pixels().iter().map(|p| *p as u8).collect())
 }
 
-#[cfg(not(test))]
+// Only generated artwork is cached. The reusable DIB is wiped after upload so
+// revoking capture cannot leave a second persistent copy of desktop pixels.
+#[derive(Default)]
+struct RenderCache {
+    dib: Option<Dib>,
+    scale: Option<f32>,
+    icon: Option<image::RgbaImage>,
+    blurred: Option<(f32, image::RgbaImage)>,
+    fonts: Fonts,
+    label_key: Option<LabelKey>,
+    mask: Vec<u8>,
+    #[cfg(test)]
+    work: CacheWork,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CacheWork {
+    dibs: usize,
+    rasterizations: usize,
+    blurs: usize,
+    masks: usize,
+}
+
+#[derive(PartialEq, Eq)]
+struct LabelKey {
+    language: crate::i18n::Language,
+    bounds: Vec<(i32, i32, i32, i32)>,
+}
+
+impl RenderCache {
+    unsafe fn prepare(&mut self, size: i32, scale: f32, amount: f32) -> Result<(), String> {
+        if self.dib.as_ref().is_none_or(|dib| dib.size != size) {
+            self.dib = Some(Dib::new(size)?);
+            #[cfg(test)]
+            {
+                self.work.dibs += 1;
+            }
+            self.label_key = None;
+        }
+        if self.scale != Some(scale) {
+            let icon_size = (34.0 * scale).round().max(1.0) as usize;
+            let (mut rgba, width, height) = crate::brand::whale_rgba(icon_size);
+            #[cfg(test)]
+            {
+                self.work.rasterizations += 1;
+            }
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel[..3].copy_from_slice(&[65, 68, 72]);
+            }
+            self.icon = Some(
+                image::RgbaImage::from_raw(width, height, rgba)
+                    .ok_or("floating invalid whale bitmap")?,
+            );
+            self.blurred = None;
+            self.fonts = Fonts::default();
+            self.label_key = None;
+            self.scale = Some(scale);
+        }
+        if amount > 0.0 {
+            if self
+                .blurred
+                .as_ref()
+                .is_none_or(|(previous, _)| *previous != amount)
+            {
+                self.blurred = Some((
+                    amount,
+                    image::imageops::blur(self.icon.as_ref().unwrap(), 0.8 * scale * amount),
+                ));
+                #[cfg(test)]
+                {
+                    self.work.blurs += 1;
+                }
+            }
+            // Use exact integer GDI bounds, not quantized animation progress.
+            let key = LabelKey {
+                language: crate::i18n::language(),
+                bounds: animated_circles(amount)
+                    .skip(2)
+                    .map(|circle| {
+                        let r = label_bounds(circle, scale);
+                        (r.left, r.top, r.right, r.bottom)
+                    })
+                    .collect(),
+            };
+            if self.label_key.as_ref() != Some(&key) {
+                let dib = self.dib.as_mut().unwrap();
+                dib.pixels().fill(0);
+                self.mask = labels(dib, scale, amount, &mut self.fonts)?;
+                #[cfg(test)]
+                {
+                    self.work.masks += 1;
+                }
+                self.label_key = Some(key);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn blend(base: u32, rgb: [u8; 3], alpha: u32) -> u32 {
     let channel = |shift: u32, v: u8| {
         ((((base >> shift) & 255) * (255 - alpha) + v as u32 * alpha + 127) / 255) << shift
@@ -508,44 +641,39 @@ fn blend(base: u32, rgb: [u8; 3], alpha: u32) -> u32 {
     0xff000000 | channel(16, rgb[0]) | channel(8, rgb[1]) | channel(0, rgb[2])
 }
 
-#[cfg(not(test))]
-unsafe fn render(hwnd: HWND, surface: &Surface) -> Result<(), String> {
-    let mut dib = Dib::new(surface.size)?;
-    let amount = surface.menu_animation.amount();
-    let mask = if amount > 0.0 {
-        labels(&mut dib, surface.scale, amount)?
-    } else {
-        vec![]
-    };
-    let icon_size = (34.0 * surface.scale).round().max(1.0) as usize;
-    let (mut rgba, width, height) = crate::brand::whale_rgba(icon_size);
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel[..3].copy_from_slice(&[65, 68, 72]);
-    }
-    let icon =
-        image::RgbaImage::from_raw(width, height, rgba).ok_or("floating invalid whale bitmap")?;
+unsafe fn paint(
+    cache: &mut RenderCache,
+    size: i32,
+    scale: f32,
+    amount: f32,
+    glass: Option<&[u32]>,
+) -> Result<(), String> {
+    cache.prepare(size, scale, amount)?;
     let icon = if amount > 0.0 {
-        image::imageops::blur(&icon, 0.8 * surface.scale * amount)
+        &cache.blurred.as_ref().unwrap().1
     } else {
-        icon
+        cache.icon.as_ref().unwrap()
     };
-    let icon_left = (90.0 * surface.scale).round() as i32 - icon_size as i32 / 2;
-    let pixels = dib.pixels();
+    let icon_size = icon.width() as i32;
+    let icon_left = (90.0 * scale).round() as i32 - icon_size / 2;
+    let frame_circles: Vec<_> = animated_circles(amount).collect(); // At most four.
+    let pixels = cache.dib.as_mut().unwrap().pixels();
     pixels.fill(0);
-    for y in 0..surface.size {
-        for x in 0..surface.size {
+    for y in 0..size {
+        for x in 0..size {
             let p = Point {
-                x: (x as f32 + 0.5) / surface.scale,
-                y: (y as f32 + 0.5) / surface.scale,
+                x: (x as f32 + 0.5) / scale,
+                y: (y as f32 + 0.5) / scale,
             };
-            let Some(circle) =
-                animated_circles(amount).find(|c| circle_coverage(p, *c, surface.scale) > 0.0)
-            else {
+            let Some((circle, coverage)) = frame_circles.iter().find_map(|circle| {
+                let coverage = circle_coverage(p, *circle, scale);
+                (coverage > 0.0).then_some((circle, coverage))
+            }) else {
                 continue;
             };
-            let index = (y * surface.size + x) as usize;
+            let index = (y * size + x) as usize;
             let distance = p.distance(circle.center);
-            let mut color = surface.glass.as_ref().map_or(0xffc1c1c1, |v| v[index]);
+            let mut color = glass.map_or(0xffc1c1c1, |v| v[index]);
             // Soft inner rim; outside pixels stay exactly alpha zero.
             let rim = (distance - (circle.radius - 1.0)).clamp(0.0, 1.0);
             color = blend(color, [236, 238, 240], (100.0 * rim) as u32);
@@ -559,23 +687,30 @@ unsafe fn render(hwnd: HWND, surface: &Surface) -> Result<(), String> {
                 let dx = (p.x - circle.center.x).abs();
                 let dy = (p.y - circle.center.y).abs();
                 if dx.max(dy) < 6.5 {
-                    let coverage = ((1.4 - (dx - dy).abs()) * surface.scale).clamp(0.0, 1.0);
+                    let coverage = ((1.4 - (dx - dy).abs()) * scale).clamp(0.0, 1.0);
                     color = blend(color, [197, 54, 59], (coverage * 255.0) as u32);
                 }
             } else {
-                color = blend(color, [96, 99, 103], mask[index] as u32);
+                color = blend(color, [96, 99, 103], cache.mask[index] as u32);
             }
             let opacity = if circle.target == Target::Main {
                 1.0
             } else {
                 amount
             };
-            let alpha = circle_coverage(p, circle, surface.scale) * opacity;
+            let alpha = coverage * opacity;
             let a = (alpha * 255.0).round() as u32;
             let premul = |shift: u32| (((color >> shift) & 255) * a + 127) / 255;
             pixels[index] = a << 24 | premul(16) << 16 | premul(8) << 8 | premul(0);
         }
     }
+    Ok(())
+}
+
+#[cfg(not(test))]
+unsafe fn render(hwnd: HWND, surface: &Surface, cache: &mut RenderCache) -> Result<(), String> {
+    let amount = surface.menu_animation.amount();
+    // Build the region before painting; any early error leaves no desktop copy.
     // A union region additionally excludes gaps from cross-process hit testing;
     // HTTRANSPARENT alone would only forward clicks within the current thread.
     let region = CreateRectRgn(0, 0, 0, 0);
@@ -619,7 +754,15 @@ unsafe fn render(hwnd: HWND, surface: &Surface) -> Result<(), String> {
         SourceConstantAlpha: 255,
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
-    if UpdateLayeredWindow(
+    paint(
+        cache,
+        surface.size,
+        surface.scale,
+        amount,
+        surface.glass.as_deref(),
+    )?;
+    let dib = cache.dib.as_mut().unwrap();
+    let uploaded = UpdateLayeredWindow(
         hwnd,
         null_mut(),
         &destination,
@@ -629,8 +772,10 @@ unsafe fn render(hwnd: HWND, surface: &Surface) -> Result<(), String> {
         0,
         &blend,
         ULW_ALPHA,
-    ) == 0
-    {
+    );
+    GdiFlush();
+    dib.pixels().fill(0);
+    if uploaded == 0 {
         return Err(error("UpdateLayeredWindow"));
     }
     Ok(())
@@ -657,8 +802,8 @@ fn apply(
         Effect::Drag(delta) => {
             surface.origin.x += delta.x * surface.press_scale;
             surface.origin.y += delta.y * surface.press_scale;
+            surface.dirty |= surface.glass.is_some();
             clear_glass(&mut surface.glass);
-            surface.dirty = true;
             surface.recapture = true;
         }
     }
@@ -768,6 +913,8 @@ unsafe fn run_inner(
         dirty: true,
         recapture: true,
     };
+    let mut cache = RenderCache::default();
+    let mut presented_origin = None;
     let clock = Instant::now();
     let mut animation_tick = clock;
     let mut initialized = false;
@@ -879,7 +1026,10 @@ unsafe fn run_inner(
                 if surface.shown {
                     hide(hwnd, &mut surface, shared, false);
                 }
-                if shared.may_capture(capture_revision) && (!initialized || flush_compositor()) {
+                if shared.may_capture(capture_revision)
+                    && IsWindowVisible(hwnd) == 0
+                    && (!initialized || flush_compositor())
+                {
                     surface.glass = capture(&surface, shared, capture_revision);
                 }
             }
@@ -893,9 +1043,28 @@ unsafe fn run_inner(
         if !shared.interactive() {
             continue;
         }
-        if surface.dirty {
-            render(hwnd, &surface)?;
-            surface.dirty = false;
+        match presentation(surface.dirty, surface.origin, presented_origin) {
+            Presentation::Render => {
+                render(hwnd, &surface, &mut cache)?;
+                surface.dirty = false;
+                presented_origin = Some(surface.origin);
+            }
+            Presentation::Move => {
+                if SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    surface.origin.x as i32,
+                    surface.origin.y as i32,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                ) == 0
+                {
+                    return Err(error("move floating window"));
+                }
+                presented_origin = Some(surface.origin);
+            }
+            Presentation::Idle => {}
         }
         if !shared.interactive() {
             continue;

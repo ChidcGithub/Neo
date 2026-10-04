@@ -16,45 +16,79 @@
 //!   只在当前 surface 帧提交后露面（不等同于 DWM 已完成合成）
 //! - 抓屏线程最多 20fps 把桌面帧喂给渲染线程，光带动画仍随交换链 vsync
 //! - 控制命令走 mpsc + `PostThreadMessageW` 唤醒（消息循环在隐藏时整块睡眠）
-//! - 视觉为 VCC edgeglow v2 移植：0.6x 离屏渲染光环 + 线性放大 blit 上屏（低频内容几乎无损，省 ~65% GPU）
+//! - 视觉为 VCC edgeglow v2 移植：最高 0.6x、像素预算受限的离屏光环 + 线性放大 blit；卡片保持原分辨率
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use neo_tools::tools::screen::{self, Shot};
+use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM, POINT, SIZE,
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
-use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, PeekMessageW, PostThreadMessageW, RegisterClassExW, RemovePropW, SetPropW,
-    UpdateLayeredWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
-    HTTRANSPARENT, HWND_TOPMOST, ULW_ALPHA, MSG, PM_REMOVE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WDA_EXCLUDEFROMCAPTURE, WM_APP,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTTRANSPARENT, HWND_TOPMOST, MSG,
+    PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, ULW_ALPHA,
+    WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NCDESTROY, WM_NCHITTEST,
+    WM_QUIT, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 /// 相位目标表（VCC TARGETS 照搬）：(强度, 速度, 环流)。
 const PH_IDLE: (f32, f32, f32) = (0.00, 0.50, 0.015);
 const PH_LISTEN: (f32, f32, f32) = (0.76, 0.85, 0.07);
-/// 离屏渲染比例（VCC RENDER_SCALE=0.6：光环是低频内容，线性放大几乎无损）。
+/// 离屏比例上限；更大桌面可能略柔化，但不改变 shader 的归一化光带宽度。
 const RENDER_SCALE: f32 = 0.6;
+const OFFSCREEN_PIXEL_BUDGET: u32 = 746_496; // 1920 * 1080 * 0.6²
+const OFFSCREEN_MAX_HEIGHT: u32 = 648;
+
+fn offscreen_size((width, height): (u32, u32)) -> (u32, u32) {
+    // 无效桌面由调用方验证；helper 对零/极端输入仍保持非零、有界且不溢出。
+    let w = f64::from(width.max(1));
+    let h = f64::from(height.max(1));
+    let budget = f64::from(OFFSCREEN_PIXEL_BUDGET);
+    let scale = f64::from(RENDER_SCALE)
+        .min(f64::from(OFFSCREEN_MAX_HEIGHT) / h)
+        .min((budget / (w * h)).sqrt())
+        // 极端长宽比下，短边最少占一个像素，长边也必须遵守总预算。
+        .min(budget / w.max(h));
+    ((w * scale).max(1.0) as u32, (h * scale).max(1.0) as u32)
+}
+
+fn edge_scissors((w, h): (u32, u32)) -> impl Iterator<Item = (u32, u32, u32, u32)> {
+    // 与 shader 的 d < -120*px、inset=12*px、corner=14*px 对应。
+    // 向外取整并留 2 个离屏像素 AA guard；只裁片元，不改 viewport/几何/UV。
+    let edge = ((120.0 + 12.0 + 14.0) * f64::from(h) / 432.0).ceil() as u32 + 2;
+    let rects = if u64::from(edge) * 2 >= u64::from(w.min(h)) {
+        [(0, 0, w, h), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]
+    } else {
+        [
+            (0, 0, w, edge),
+            (0, h - edge, w, edge),
+            (0, edge, edge, h - 2 * edge),
+            (w - edge, edge, edge, h - 2 * edge),
+        ]
+    };
+    rects
+        .into_iter()
+        .filter(|&(_, _, width, height)| width > 0 && height > 0)
+}
 /// 线程消息：命令队列里有货，唤醒睡眠中的消息循环。
 const WM_NEO_CMD: u32 = WM_APP + 1;
 const START_TIMEOUT: Duration = Duration::from_secs(5);
-const DRAW_EX_STYLE: u32 = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+const DRAW_EX_STYLE: u32 =
+    WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
 const NON_RUDE_HWND: windows_sys::core::PCWSTR = windows_sys::w!("NonRudeHWND");
 
 /// Layered + transparent 忽略窗口形状，把鼠标命中交给底层（不限同线程）。
@@ -65,7 +99,10 @@ fn initialize_passive_window(hwnd: HWND, size: (u32, u32)) -> Result<(), String>
     // 属性属于 HWND，跨 hide/resize 保留；WM_NCDESTROY 负责移除。失败不允许露面。
     // https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-itaskbarlist2-markfullscreenwindow
     if unsafe { SetPropW(hwnd, NON_RUDE_HWND, 1usize as _) } == 0 {
-        return Err(format!("SetPropW(NonRudeHWND) 失败，拒绝显示绘图层: {}", unsafe { GetLastError() }));
+        return Err(format!(
+            "SetPropW(NonRudeHWND) 失败，拒绝显示绘图层: {}",
+            unsafe { GetLastError() }
+        ));
     }
     // DComp 在 HWND 自身内容之上合成；交换链 Clear 不能清掉 HWND 底图。
     // 用逐像素透明 DIB 初始化底层，绝不通过全局 alpha=0 隐藏整棵 visual。
@@ -76,63 +113,119 @@ fn initialize_passive_window(hwnd: HWND, size: (u32, u32)) -> Result<(), String>
 
 fn layered_backing(hwnd: HWND, size: (u32, u32), pixel: u32) -> Result<(), String> {
     use windows_sys::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
-        AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, AC_SRC_ALPHA,
+        AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP,
+        HDC, HGDIOBJ,
     };
     let (w, h) = size;
-    let bytes = (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4))
+    let bytes = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_mul(4))
         .filter(|n| *n <= isize::MAX as usize)
         .ok_or("overlay 底图尺寸溢出")?;
     if w == 0 || h == 0 || w > i32::MAX as u32 || h > i32::MAX as u32 {
         return Err("overlay 底图尺寸无效".into());
     }
-    struct BitmapDc { dc: HDC, bitmap: HBITMAP, old: HGDIOBJ }
+    struct BitmapDc {
+        dc: HDC,
+        bitmap: HBITMAP,
+        old: HGDIOBJ,
+    }
     impl Drop for BitmapDc {
         fn drop(&mut self) {
             unsafe {
-                if !self.old.is_null() { SelectObject(self.dc, self.old); }
-                if !self.bitmap.is_null() { DeleteObject(self.bitmap); }
+                if !self.old.is_null() {
+                    SelectObject(self.dc, self.old);
+                }
+                if !self.bitmap.is_null() {
+                    DeleteObject(self.bitmap);
+                }
                 DeleteDC(self.dc);
             }
         }
     }
     let dc = unsafe { CreateCompatibleDC(std::ptr::null_mut()) };
-    if dc.is_null() { return Err(format!("CreateCompatibleDC: {}", unsafe { GetLastError() })); }
-    let mut backing = BitmapDc { dc, bitmap: std::ptr::null_mut(), old: std::ptr::null_mut() };
+    if dc.is_null() {
+        return Err(format!("CreateCompatibleDC: {}", unsafe { GetLastError() }));
+    }
+    let mut backing = BitmapDc {
+        dc,
+        bitmap: std::ptr::null_mut(),
+        old: std::ptr::null_mut(),
+    };
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w as i32, biHeight: -(h as i32), biPlanes: 1,
-            biBitCount: 32, biCompression: BI_RGB, ..Default::default()
+            biWidth: w as i32,
+            biHeight: -(h as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..Default::default()
         },
         ..Default::default()
     };
     let mut bits = std::ptr::null_mut();
-    backing.bitmap = unsafe { CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0) };
-    if backing.bitmap.is_null() { return Err(format!("CreateDIBSection: {}", unsafe { GetLastError() })); }
+    backing.bitmap = unsafe {
+        CreateDIBSection(
+            dc,
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if backing.bitmap.is_null() {
+        return Err(format!("CreateDIBSection: {}", unsafe { GetLastError() }));
+    }
     // DIB owns bytes until BitmapDc drops; 32bpp rows need no extra padding.
-    unsafe { std::slice::from_raw_parts_mut(bits.cast::<u32>(), bytes / 4).fill(pixel); }
+    unsafe {
+        std::slice::from_raw_parts_mut(bits.cast::<u32>(), bytes / 4).fill(pixel);
+    }
     backing.old = unsafe { SelectObject(dc, backing.bitmap) };
     if backing.old.is_null() || backing.old as isize == -1 {
         backing.old = std::ptr::null_mut();
         return Err(format!("SelectObject: {}", unsafe { GetLastError() }));
     }
-    let size = SIZE { cx: w as i32, cy: h as i32 };
+    let size = SIZE {
+        cx: w as i32,
+        cy: h as i32,
+    };
     let source = POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION {
-        BlendOp: AC_SRC_OVER as u8, BlendFlags: 0,
-        SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8,
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
     };
-    if unsafe { UpdateLayeredWindow(hwnd, std::ptr::null_mut(), std::ptr::null(), &size,
-        dc, &source, 0, &blend, ULW_ALPHA) } == 0 {
-        return Err(format!("UpdateLayeredWindow 失败，拒绝显示绘图层: {}", unsafe { GetLastError() }));
+    if unsafe {
+        UpdateLayeredWindow(
+            hwnd,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &size,
+            dc,
+            &source,
+            0,
+            &blend,
+            ULW_ALPHA,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "UpdateLayeredWindow 失败，拒绝显示绘图层: {}",
+            unsafe { GetLastError() }
+        ));
     }
     Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RenderOutcome { Skipped, Presented }
+enum RenderOutcome {
+    Skipped,
+    Presented,
+}
 
 #[derive(Default)]
 struct Presentation {
@@ -141,7 +234,10 @@ struct Presentation {
 }
 
 impl Presentation {
-    fn invalidate(&mut self) { self.ready = false; self.shown = false; }
+    fn invalidate(&mut self) {
+        self.ready = false;
+        self.shown = false;
+    }
     fn can_show(&self, outcome: RenderOutcome) -> bool {
         self.ready && !self.shown && outcome == RenderOutcome::Presented
     }
@@ -188,7 +284,9 @@ fn hide_for_desktop(hwnd: HWND) -> Result<(), String> {
     if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(hwnd) == 0 } {
         return Err("浮层窗口已失效，拒绝执行桌面工具".into());
     }
-    unsafe { ShowWindow(hwnd, SW_HIDE); }
+    unsafe {
+        ShowWindow(hwnd, SW_HIDE);
+    }
     if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd) == 0 } {
         Ok(())
     } else {
@@ -210,7 +308,9 @@ pub struct DesktopGuard(DesktopGate, Arc<AtomicBool>);
 impl DesktopGate {
     fn wake(&self) {
         if self.tid != 0 {
-            unsafe { PostThreadMessageW(self.tid, WM_NEO_CMD, 0, 0); }
+            unsafe {
+                PostThreadMessageW(self.tid, WM_NEO_CMD, 0, 0);
+            }
         }
     }
 
@@ -226,7 +326,9 @@ impl DesktopGate {
         }
         let guard = self.reserve();
         let (tx, rx) = channel();
-        self.tx.send(Cmd::Suspend(tx, deadline, guard.1.clone())).map_err(|_| "桌面屏障窗口线程已退出")?;
+        self.tx
+            .send(Cmd::Suspend(tx, deadline, guard.1.clone()))
+            .map_err(|_| "桌面屏障窗口线程已退出")?;
         self.wake();
         loop {
             if cancel.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
@@ -239,7 +341,10 @@ impl DesktopGate {
             match rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
                 Ok(result) => {
                     result?;
-                    if cancel.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    if cancel.load(Ordering::Acquire)
+                        || self.stop.load(Ordering::Acquire)
+                        || Instant::now() >= deadline
+                    {
                         return Err("桌面屏障已取消、超时或窗口线程已退出".into());
                     }
                     return Ok(guard);
@@ -270,6 +375,7 @@ struct CaptureState {
     exclude_ok: bool,
     generation: u64,
     frame: Option<(DesktopBounds, Shot)>,
+    changed: Arc<Condvar>,
 }
 
 impl CaptureState {
@@ -287,6 +393,7 @@ impl CaptureState {
     fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.frame = None;
+        self.changed.notify_all();
     }
 
     /// 取得许可即进入在途阶段。随后系统采集不可撤销，Hide 只阻止下一次
@@ -305,6 +412,73 @@ impl CaptureState {
         let (captured, shot) = self.frame.take()?;
         (self.begin().is_some() && captured == bounds && (shot.width, shot.height) == bounds.size)
             .then_some(shot)
+    }
+}
+
+/// 与许可共用同一把锁，避免 Show / shutdown 落在检查与入睡之间而丢失唤醒。
+fn wait_for_capture(slot: &FrameSlot, stop: &AtomicBool) -> Option<u64> {
+    let state = slot.lock().ok()?;
+    let changed = state.changed.clone();
+    let state = changed
+        .wait_while(state, |state| {
+            !stop.load(Ordering::Acquire) && state.begin().is_none()
+        })
+        .ok()?;
+    if stop.load(Ordering::Acquire) {
+        None
+    } else {
+        state.begin()
+    }
+}
+
+const DESKTOP_CACHE_BUDGET: usize = 8 * 1024 * 1024;
+
+fn cacheable_desktop(shot: &Shot) -> bool {
+    // capacity 也受限，不能通过保留过度分配的 Vec 绕过常驻内存预算。
+    shot.rgba.capacity() <= DESKTOP_CACHE_BUDGET
+}
+
+/// 精确比较而非哈希；超预算直接上传，避免在呈现线程扫描多屏像素。
+fn same_desktop_frame(previous: Option<&Shot>, shot: &Shot) -> bool {
+    cacheable_desktop(shot)
+        && previous.is_some_and(|previous| {
+            cacheable_desktop(previous)
+                && previous.width == shot.width
+                && previous.height == shot.height
+                && previous.rgba == shot.rgba
+        })
+}
+
+#[derive(Default)]
+struct DesktopUploadState {
+    last: Option<Shot>,
+    // GPU 是否含真实帧与 CPU 是否允许缓存无关（包括真实的 1x1 帧）。
+    has_uploaded_desktop: bool,
+}
+
+impl DesktopUploadState {
+    fn uploaded(&mut self, shot: Shot) {
+        self.clear_cache();
+        self.has_uploaded_desktop = true;
+        if cacheable_desktop(&shot) {
+            self.last = Some(shot);
+        }
+    }
+
+    fn clear_cache(&mut self) {
+        // 释放所有权，不承诺堆内存安全擦除；也不额外扫描像素做清零。
+        self.last = None;
+    }
+
+    fn reset(&mut self) -> bool {
+        self.clear_cache();
+        std::mem::take(&mut self.has_uploaded_desktop)
+    }
+}
+
+impl Drop for DesktopUploadState {
+    fn drop(&mut self) {
+        self.clear_cache();
     }
 }
 
@@ -364,7 +538,9 @@ impl DesktopBounds {
 fn validate_dimensions(size: (u32, u32), max_dimension: u32) -> Result<(), String> {
     let (width, height) = size;
     if width == 0 || height == 0 || width > max_dimension || height > max_dimension {
-        return Err(format!("overlay 尺寸 {width}x{height} 超出有效范围 1..={max_dimension}"));
+        return Err(format!(
+            "overlay 尺寸 {width}x{height} 超出有效范围 1..={max_dimension}"
+        ));
     }
     Ok(())
 }
@@ -380,9 +556,12 @@ fn overlay_limits(supported: &wgpu::Limits, size: (u32, u32)) -> Result<wgpu::Li
     Ok(limits)
 }
 
-fn transparent_alpha(modes: &[wgpu::CompositeAlphaMode]) -> Result<wgpu::CompositeAlphaMode, String> {
+fn transparent_alpha(
+    modes: &[wgpu::CompositeAlphaMode],
+) -> Result<wgpu::CompositeAlphaMode, String> {
     // shader 和 egui 都输出预乘 alpha；PostMultiplied 不能直接替代。
-    modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+    modes
+        .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
         .then_some(wgpu::CompositeAlphaMode::PreMultiplied)
         .ok_or_else(|| "overlay surface 不支持预乘透明合成".into())
 }
@@ -397,20 +576,27 @@ fn windows_version() -> Option<(u32, u32, u32)> {
         ..Default::default()
     };
     // RtlGetVersion 不受应用兼容 manifest 的版本谎报影响；查询失败即禁采。
-    (unsafe { RtlGetVersion(&mut info) } >= 0)
-        .then_some((info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber))
+    (unsafe { RtlGetVersion(&mut info) } >= 0).then_some((
+        info.dwMajorVersion,
+        info.dwMinorVersion,
+        info.dwBuildNumber,
+    ))
 }
 
 fn valid_upload(size: (u32, u32), len: usize, max_dimension: u32) -> bool {
     validate_dimensions(size, max_dimension).is_ok()
         && size.0.checked_mul(4).is_some()
-        && (size.0 as usize).checked_mul(size.1 as usize)
-            .and_then(|pixels| pixels.checked_mul(4)) == Some(len)
+        && (size.0 as usize)
+            .checked_mul(size.1 as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            == Some(len)
 }
 
 fn capture_rest(elapsed: Duration) -> Duration {
     // 慢采集也留出原来的休息时间，不追赶欠帧、不因限频优化反而增加工作量。
-    CAPTURE_INTERVAL.saturating_sub(elapsed).max(Duration::from_millis(33))
+    CAPTURE_INTERVAL
+        .saturating_sub(elapsed)
+        .max(Duration::from_millis(33))
 }
 
 fn fade_complete(fading: bool, intensity: f32) -> bool {
@@ -488,7 +674,10 @@ pub struct OverlayHandle {
 impl OverlayHandle {
     pub fn desktop_gate(&self) -> DesktopGate {
         DesktopGate {
-            tx: self.tx.clone(), tid: self.tid, count: self.suspended.clone(), stop: self.stop.clone(),
+            tx: self.tx.clone(),
+            tid: self.tid,
+            count: self.suspended.clone(),
+            stop: self.stop.clone(),
         }
     }
 
@@ -505,12 +694,16 @@ impl OverlayHandle {
 
     /// 设置音频电平（0.0..=1.0，通常取 RMS），驱动光带起伏。
     pub fn set_level(&self, v: f32) {
-        self.level.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        self.level
+            .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn is_alive(&self) -> bool {
         !self.stop.load(Ordering::Acquire)
-            && self.thread.as_ref().is_some_and(|thread| !thread.is_finished())
+            && self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())
     }
 
     pub fn is_visible(&self) -> bool {
@@ -548,7 +741,9 @@ impl OverlayHandle {
             return;
         }
         if self.tid != 0 {
-            unsafe { PostThreadMessageW(self.tid, WM_NEO_CMD, 0, 0); }
+            unsafe {
+                PostThreadMessageW(self.tid, WM_NEO_CMD, 0, 0);
+            }
         }
     }
 
@@ -565,8 +760,13 @@ impl OverlayHandle {
         }
     }
 
-    fn await_ready(mut self, ready: Receiver<Result<u32, String>>, timeout: Duration) -> Result<Self, String> {
-        self.tid = ready.recv_timeout(timeout)
+    fn await_ready(
+        mut self,
+        ready: Receiver<Result<u32, String>>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        self.tid = ready
+            .recv_timeout(timeout)
             .map_err(|e| format!("neo-overlay 初始化未完成: {e}"))??;
         Ok(self)
     }
@@ -620,7 +820,9 @@ pub fn start() -> Result<OverlayHandle, String> {
             .name("neo-overlay".into())
             .spawn(move || {
                 let _lease = lease;
-                run(ready_tx, cmd_rx, level, visible, stop, capture, cards, suspended);
+                run(
+                    ready_tx, cmd_rx, level, visible, stop, capture, cards, suspended,
+                );
             })
             .map_err(|e| format!("创建 neo-overlay 线程失败: {e}"))?
     };
@@ -636,7 +838,8 @@ pub fn start() -> Result<OverlayHandle, String> {
         thread: Some(thread),
         #[cfg(test)]
         wake_count: None,
-    }.await_ready(ready_rx, START_TIMEOUT)
+    }
+    .await_ready(ready_rx, START_TIMEOUT)
 }
 
 /// 窗口线程主函数。
@@ -656,7 +859,10 @@ fn run(
     impl Drop for StopGuard {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Relaxed);
-            self.1.lock().unwrap_or_else(|p| p.into_inner()).set_enabled(false);
+            self.1
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .set_enabled(false);
         }
     }
     let _stop_guard = StopGuard(stop.clone(), slot.clone());
@@ -673,10 +879,8 @@ fn run(
             .spawn(move || {
                 screen::ensure_dpi_aware();
                 while !stop.load(Ordering::Relaxed) {
-                    let generation = slot.lock().ok().and_then(|s| s.begin());
-                    let Some(generation) = generation else {
-                        std::thread::sleep(Duration::from_millis(80));
-                        continue;
+                    let Some(generation) = wait_for_capture(&slot, &stop) else {
+                        break;
                     };
                     let started = Instant::now();
                     let rect = screen::virtual_screen();
@@ -774,7 +978,9 @@ fn msg_loop(
                     DispatchMessageW(&msg);
                 }
             }
-            if shutdown || stop.load(Ordering::Acquire) { break; }
+            if shutdown || stop.load(Ordering::Acquire) {
+                break;
+            }
             if !gfx.presentation.shown {
                 gfx.wnd.display_dirty.store(true, Ordering::Relaxed);
             }
@@ -792,8 +998,10 @@ fn msg_loop(
             };
             visible.store(gfx.presentation.shown, Ordering::Release);
             // 仅本轮真正提交当前 surface 帧才允许露面；成功重配不是 present。
-            if gfx.presentation.can_show(outcome) && desktop_can_show(&suspended)
-                && !stop.load(Ordering::Acquire) {
+            if gfx.presentation.can_show(outcome)
+                && desktop_can_show(&suspended)
+                && !stop.load(Ordering::Acquire)
+            {
                 gfx.presentation.shown = true;
                 visible.store(true, Ordering::Release);
                 unsafe {
@@ -813,13 +1021,7 @@ fn msg_loop(
             // 淡出只清理渲染状态；不能覆盖调用线程刚投递的下一轮 Show 许可。
             if ripple.finish_fade(gfx.cur_i) {
                 gfx.cur_i = 0.0;
-                gfx.desktop = Gfx::placeholder_desktop(
-                    &gfx.device,
-                    &gfx.queue,
-                    &gfx.bind_layout,
-                    &gfx.uniform_buf,
-                    &gfx.sampler,
-                );
+                gfx.reset_desktop();
                 if !have_cards {
                     unsafe {
                         ShowWindow(hwnd, SW_HIDE);
@@ -852,7 +1054,10 @@ fn msg_loop(
     }
     stop.store(true, Ordering::Release);
     visible.store(false, Ordering::Relaxed);
-    gfx.slot.lock().unwrap_or_else(|p| p.into_inner()).set_enabled(false);
+    gfx.slot
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .set_enabled(false);
 }
 
 /// 窗口线程与窗口过程共享的显示状态；绘图层没有输入状态。
@@ -873,7 +1078,9 @@ unsafe extern "system" fn overlay_wnd_proc(
 ) -> LRESULT {
     if msg == WM_NCDESTROY {
         // SetPropW 合约要求在 WM_NCDESTROY 返回前移除本应用添加的属性。
-        unsafe { RemovePropW(hwnd, NON_RUDE_HWND); }
+        unsafe {
+            RemovePropW(hwnd, NON_RUDE_HWND);
+        }
     }
     if msg == WM_NCHITTEST {
         return HTTRANSPARENT as LRESULT;
@@ -900,7 +1107,7 @@ struct DesktopTex {
     h: u32,
 }
 
-/// 0.6x 离屏光环纹理（blit 放大上屏）。
+/// 预算受限的离屏光环纹理（blit 放大上屏）。
 struct Offscreen {
     _tex: wgpu::Texture,
     view: wgpu::TextureView,
@@ -952,6 +1159,7 @@ struct Gfx {
     sampler: wgpu::Sampler,
     uniform_buf: wgpu::Buffer,
     desktop: DesktopTex,
+    desktop_upload: DesktopUploadState,
     offscreen: Offscreen,
     slot: FrameSlot,
     /// 防截屏是否设置成功；失败时禁用折射（抓屏拍到的是自己，会反馈循环）。
@@ -992,13 +1200,16 @@ impl Drop for Gfx {
 }
 
 impl Gfx {
-    /// 透镜渲染管线与绑定布局（输出 0.6x 离屏 Rgba8Unorm）。
+    /// 透镜渲染管线与绑定布局（输出预算受限的离屏 Rgba8Unorm）。
     /// 抽成独立函数：离屏测试不建窗口/surface，只验证 shader 的折射行为。
     fn lens_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
         Self::lens_pipeline_source(device, include_str!("shader.wgsl"))
     }
 
-    fn lens_pipeline_source(device: &wgpu::Device, source: &str) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    fn lens_pipeline_source(
+        device: &wgpu::Device,
+        source: &str,
+    ) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("overlay-bgl"),
             entries: &[
@@ -1186,11 +1397,11 @@ impl Gfx {
         }))
         .map_err(|e| e.to_string())?;
         let required_limits = overlay_limits(&adapter.limits(), bounds.size)?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                required_limits,
-                ..Default::default()
-            })).map_err(|e| e.to_string())?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits,
+            ..Default::default()
+        }))
+        .map_err(|e| e.to_string())?;
         validate_dimensions(bounds.size, device.limits().max_texture_dimension_2d)?;
 
         // 交换链配置：BGRA + 预乘 alpha
@@ -1206,7 +1417,10 @@ impl Gfx {
         let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
             wgpu::PresentMode::Fifo
         } else {
-            *caps.present_modes.first().ok_or("overlay surface 没有可用呈现模式")?
+            *caps
+                .present_modes
+                .first()
+                .ok_or("overlay surface 没有可用呈现模式")?
         };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1261,7 +1475,7 @@ impl Gfx {
             ..Default::default()
         });
 
-        // 透镜管线输出到 0.6x 离屏纹理（Rgba8Unorm）
+        // 透镜管线输出到预算受限的离屏纹理（Rgba8Unorm）
         let (pipeline, bind_layout) = Self::lens_pipeline(&device);
 
         // blit 管线：离屏纹理线性放大到交换链
@@ -1304,13 +1518,9 @@ impl Gfx {
         let desktop =
             Self::placeholder_desktop(&device, &queue, &bind_layout, &uniform_buf, &sampler);
 
-        let offscreen = Self::make_offscreen(
-            &device,
-            &blit_layout,
-            &sampler,
-            ((config.width as f32) * RENDER_SCALE).max(1.0) as u32,
-            ((config.height as f32) * RENDER_SCALE).max(1.0) as u32,
-        )?;
+        let (offscreen_w, offscreen_h) = offscreen_size((config.width, config.height));
+        let offscreen =
+            Self::make_offscreen(&device, &blit_layout, &sampler, offscreen_w, offscreen_h)?;
 
         // 内嵌 egui：独立上下文 + 中文字体装配（卡片 UI 用它绘制）。
         let egui_ctx = egui::Context::default();
@@ -1335,6 +1545,7 @@ impl Gfx {
             sampler,
             uniform_buf,
             desktop,
+            desktop_upload: DesktopUploadState::default(),
             offscreen,
             slot,
             exclude_ok,
@@ -1486,9 +1697,7 @@ impl Gfx {
         }
         let full = self.egui_ctx.end_pass();
 
-        let jobs = self
-            .egui_ctx
-            .tessellate(full.shapes, full.pixels_per_point);
+        let jobs = self.egui_ctx.tessellate(full.shapes, full.pixels_per_point);
         let sd = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point: full.pixels_per_point,
@@ -1549,6 +1758,19 @@ impl Gfx {
         }
     }
 
+    fn reset_desktop(&mut self) {
+        // Lost / Occluded 重试可能反复刷新拓扑；已有占位时无需再分配/上传。
+        if self.desktop_upload.reset() {
+            self.desktop = Self::placeholder_desktop(
+                &self.device,
+                &self.queue,
+                &self.bind_layout,
+                &self.uniform_buf,
+                &self.sampler,
+            );
+        }
+    }
+
     /// 上传最新抓屏帧；尺寸变化时重建纹理与 bind group。
     fn upload_desktop(&mut self, shot: Shot) {
         // 防截屏失败的帧是"自拍"，上传只会喂养折射反馈循环；丢弃。
@@ -1556,8 +1778,17 @@ impl Gfx {
             return;
         }
         // 跨线程来的数据，长度不符时 write_texture 会直接 panic —— 宁可丢帧。
-        if !valid_upload((shot.width, shot.height), shot.rgba.len(),
-            self.device.limits().max_texture_dimension_2d) {
+        if !valid_upload(
+            (shot.width, shot.height),
+            shot.rgba.len(),
+            self.device.limits().max_texture_dimension_2d,
+        ) {
+            return;
+        }
+        if !cacheable_desktop(&shot) {
+            self.desktop_upload.clear_cache();
+        }
+        if same_desktop_frame(self.desktop_upload.last.as_ref(), &shot) {
             return;
         }
         if shot.width != self.desktop.w || shot.height != self.desktop.h {
@@ -1609,6 +1840,7 @@ impl Gfx {
                 depth_or_array_layers: 1,
             },
         );
+        self.desktop_upload.uploaded(shot);
     }
 
     fn refresh_display(&mut self, force: bool) -> Result<(), String> {
@@ -1631,12 +1863,18 @@ impl Gfx {
             self.wnd.ppp.store(ppp.to_bits(), Ordering::Relaxed);
             // SetWindowPos 会重入窗口过程，不能持有任何 WndState 锁。
             unsafe {
-                SetWindowPos(self.hwnd, HWND_TOPMOST, bounds.origin.0, bounds.origin.1,
-                    bounds.size.0 as i32, bounds.size.1 as i32, SWP_NOACTIVATE);
+                SetWindowPos(
+                    self.hwnd,
+                    HWND_TOPMOST,
+                    bounds.origin.0,
+                    bounds.origin.1,
+                    bounds.size.0 as i32,
+                    bounds.size.1 as i32,
+                    SWP_NOACTIVATE,
+                );
             }
             self.slot.lock().unwrap().invalidate();
-            self.desktop = Self::placeholder_desktop(&self.device, &self.queue,
-                &self.bind_layout, &self.uniform_buf, &self.sampler);
+            self.reset_desktop();
         }
         if bounds.size != old.size {
             initialize_passive_window(self.hwnd, bounds.size)?;
@@ -1647,17 +1885,23 @@ impl Gfx {
             self.surface.configure(&self.device, &self.config);
         }
         if bounds.size != old.size {
-            self.offscreen = Self::make_offscreen(&self.device,
-                &self.blit_pipeline.get_bind_group_layout(0), &self.sampler,
-                ((bounds.size.0 as f32) * RENDER_SCALE).max(1.0) as u32,
-                ((bounds.size.1 as f32) * RENDER_SCALE).max(1.0) as u32)?;
+            let (offscreen_w, offscreen_h) = offscreen_size(bounds.size);
+            self.offscreen = Self::make_offscreen(
+                &self.device,
+                &self.blit_pipeline.get_bind_group_layout(0),
+                &self.sampler,
+                offscreen_w,
+                offscreen_h,
+            )?;
         }
         Ok(())
     }
 
     fn invalidate_presentation(&mut self) {
         // 必须在 resize/configure 前隐藏旧 surface，重配失败也不能露出未定义底图。
-        unsafe { ShowWindow(self.hwnd, SW_HIDE); }
+        unsafe {
+            ShowWindow(self.hwnd, SW_HIDE);
+        }
         self.presentation.invalidate();
     }
 
@@ -1727,9 +1971,8 @@ impl Gfx {
         }
 
         let frame = match acquire(&self.surface) {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
-                f
-            }
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 // 锁屏 / UAC 安全桌面期间拿不到 surface：直接 return 会让消息
                 // 循环在活跃分支里 100% 空转一个核。睡 50ms 降频等系统回来。
@@ -1741,7 +1984,9 @@ impl Gfx {
                 std::thread::sleep(Duration::from_millis(50));
                 return Ok(RenderOutcome::Skipped);
             }
-            wgpu::CurrentSurfaceTexture::Validation => return Err("overlay surface 校验失败".into()),
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err("overlay surface 校验失败".into())
+            }
         };
         // 获取帧之前不跑 egui：end_pass 会取走 textures_delta，失败重试不能丢字体/图片。
         let egui = self.egui_frame();
@@ -1755,7 +2000,7 @@ impl Gfx {
                 label: Some("overlay-enc"),
             });
         if draw_ripple {
-            // pass 1：光环 → 0.6x 离屏纹理
+            // pass 1：光环 → 预算受限的离屏纹理；整张 clear 清掉未绘制中心的旧像素。
             {
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("overlay-pass"),
@@ -1775,7 +2020,10 @@ impl Gfx {
                 });
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.desktop.bind, &[]);
-                pass.draw(0..3, 0..1);
+                for (x, y, w, h) in edge_scissors((self.offscreen.w, self.offscreen.h)) {
+                    pass.set_scissor_rect(x, y, w, h);
+                    pass.draw(0..3, 0..1);
+                }
             }
             // pass 2：离屏纹理线性放大 → 交换链
             {
@@ -1859,6 +2107,9 @@ impl Gfx {
 
 #[cfg(test)]
 mod native_tests;
+
+#[cfg(test)]
+mod perf_tests;
 
 #[cfg(test)]
 #[path = "regression_tests.rs"]

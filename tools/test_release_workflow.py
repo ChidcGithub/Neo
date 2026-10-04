@@ -107,14 +107,25 @@ class AssemblePackageTests(unittest.TestCase):
                 ".cache/runtime/gitbash/usr/bin/bash.exe": "runtime/gitbash/usr/bin/bash.exe",
                 "resources/lang/zh-CN.lang": "resources/lang/zh-CN.lang",
                 "resources/lang/en-US.lang": "resources/lang/en-US.lang",
-                "docs/distribution/README.md": "docs/README.md", "LICENSE": "LICENSE",
+                "docs/distribution/README.md": "docs/README.md", "LICENSE": "LICENSE", "NOTICE": "NOTICE",
+                "docs/licenses/README.md": "docs/licenses/README.md",
+
+                "docs/licenses/cargo-notices.txt": "docs/licenses/cargo-notices.txt",
+                "docs/licenses/assets/README.md": "docs/licenses/assets/README.md",
+                "docs/licenses/runtime/README.md": "docs/licenses/runtime/README.md",
+                "docs/licenses/assets/font/LICENSE.txt": "docs/licenses/assets/font/LICENSE.txt",
+                "docs/licenses/runtime/onnx/NOTICE.txt": "docs/licenses/runtime/onnx/NOTICE.txt",
             }
             excluded = ["README.md", "crates/neo-wake/assets/README.md", "crates/neo-wake/assets/experimental.onnx",
                         ".cache/stt/sv.tar.bz2", ".cache/stt/extracted/unused.txt",
                         ".cache/runtime/.gitbash-install.lock", ".cache/runtime/other/file.txt",
                         "runtime/gitbash/old-cache.txt", "assets-stt/old-model.onnx",
                         "resources/lang/README.md", "resources/lang/draft.json", "resources/lang/fr-FR.lang",
-                        "resources/lang/nested/zh-CN.lang"]
+                        "resources/lang/nested/zh-CN.lang", "docs-pri/legal-review.md",
+                        "docs-pri/licenses/cargo-inventory.json", "docs-pri/licenses/cargo-inventory.md",
+                        "docs-pri/licenses/assets-audit.md", "docs-pri/licenses/runtime-audit.md",
+                        "docs-pri/licenses/assets/README.md", "docs-pri/licenses/runtime/README.md",
+                        ".cache/licenses/private-evidence.txt"]
             for name in [*sources, *excluded]:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,6 +142,11 @@ class AssemblePackageTests(unittest.TestCase):
             package = root / "dist/neo"
             actual = {p.relative_to(package).as_posix(): p.read_bytes() for p in package.rglob("*") if p.is_file()}
             self.assertEqual(actual, expected)
+            self.assertFalse((package / "docs-pri").exists())
+            for name in ("cargo-inventory.json", "cargo-inventory.md", "assets-audit.md", "runtime-audit.md"):
+                self.assertFalse((package / "docs/licenses" / name).exists())
+            for name in excluded:
+                self.assertNotIn((root / name).read_bytes(), actual.values(), name)
             validate_payload(package)
             # A retry must not merge a dirty package, remove user files or change prior payloads.
             (package / "custom.txt").write_bytes(b"keep")
@@ -140,18 +156,32 @@ class AssemblePackageTests(unittest.TestCase):
             self.assertEqual((package / "custom.txt").read_bytes(), b"keep")
             for name, data in actual.items():
                 self.assertEqual((package / name).read_bytes(), data)
-            # Each required language must independently fail the actual PowerShell copy.
-            for language in ("zh-CN", "en-US"):
-                with self.subTest(missing_language=language):
+            # Explicit copies fail immediately; missing public legal files in a copied directory
+            # must fail the payload check even when PowerShell itself succeeds.
+            required = ["resources/lang/zh-CN.lang", "resources/lang/en-US.lang", "LICENSE", "NOTICE",
+                        "docs/licenses/README.md", "docs/licenses/cargo-notices.txt"]
+            for name in required:
+                with self.subTest(missing_resource=name):
                     shutil.rmtree(package)
-                    name = f"resources/lang/{language}.lang"
                     (root / name).unlink()
                     result = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=30)
-                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn(f"{language}.lang", result.stdout + result.stderr)
-                    with self.assertRaisesRegex(ValueError, "Required release resource missing/empty"):
+                    if name.startswith("docs/licenses/"):
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    else:
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn(Path(name).name, result.stdout + result.stderr)
+                    with self.assertRaisesRegex(ValueError, "Required release resource missing/empty") as error:
                         validate_payload(package)
+                    if name.startswith("docs/licenses/"):
+                        self.assertIn(str(package / name), str(error.exception))
                     (root / name).write_bytes(expected[name])
+            shutil.rmtree(package)
+            shutil.rmtree(root / "docs/licenses")
+            result = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("licenses", result.stdout + result.stderr)
+            with self.assertRaisesRegex(ValueError, "Required release resource missing/empty"):
+                validate_payload(package)
 
 
 @unittest.skipUnless(PWSH, "pwsh is not installed")

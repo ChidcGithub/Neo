@@ -41,7 +41,7 @@ VIAddVersionKey /LANG=2052 "FileDescription" "Neo 安装程序"
 VIAddVersionKey /LANG=2052 "FileVersion" "${VERSION}"
 VIAddVersionKey /LANG=2052 "ProductVersion" "${VERSION}"
 VIAddVersionKey /LANG=2052 "CompanyName" "Neo"
-VIAddVersionKey /LANG=2052 "LegalCopyright" "MIT"
+VIAddVersionKey /LANG=2052 "LegalCopyright" "Apache-2.0"
 
 ; ---- 版式（MUI_* define 必须先于 MUI2.nsh 引入）----
 !ifdef HAVE_ART
@@ -87,6 +87,7 @@ Var ResidueKey
 !include "FileFunc.nsh"
 
 !insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_LICENSE "LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -616,6 +617,7 @@ Section "Uninstall"
   Delete "$INSTDIR\neo.ico"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\LICENSE"
+  Delete "$INSTDIR\NOTICE"
   ; 与 check_release.py 的 CRT_NAMES 对齐；不使用 *.dll，保留未知用户文件。
   Delete "$INSTDIR\vcruntime140.dll"
   Delete "$INSTDIR\vcruntime140_1.dll"
@@ -650,6 +652,9 @@ uninstall_registry_removed:
   RMDir "$INSTDIR\resources\models"
   RMDir "$INSTDIR\resources\lang"
   RMDir "$INSTDIR\resources"
+  RMDir "$INSTDIR\docs\licenses\assets"
+  RMDir "$INSTDIR\docs\licenses\runtime"
+  RMDir "$INSTDIR\docs\licenses"
   RMDir "$INSTDIR\docs"
   RMDir "$INSTDIR\runtime\onnx"
   RMDir "$INSTDIR\runtime\gitbash"

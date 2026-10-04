@@ -1,12 +1,12 @@
-// neo-overlay 全屏跑马灯 — 彩色流光 × 液态玻璃边缘（实时屏幕波纹折射）
-// 视觉：贴屏幕边缘一圈弯月面透镜 —— 厚度场（不对称高斯剖面 × 三层 fbm 液态波纹）
-//       数值梯度得表面法线 → 近轴折射位移采样桌面纹理
+// neo-overlay 全屏跑马灯 — 主题蓝流光 × 液态玻璃边缘（实时屏幕波纹折射）
+// 视觉：贴屏幕边缘一圈弯月面透镜 —— 厚度场（不对称高斯剖面 × 五场四层 fbm 液态波纹）
+//       径向数值差分 + 环向解析梯度得表面法线 → 近轴折射位移采样桌面纹理
 //       + IOR 色散（RGB 三通道不同折射系数，物理彩边）
 //       + 粗糙度磨砂（泊松盘多采样，透镜越厚光程越长越糊）
 //       + Schlick 菲涅尔（波脊斜率大处泛起棱线高光，微染流光同色）
-//       + Apple Intelligence 七色粉彩板沿周长环流 —— 颜色是「光」，
+//       + DeepSeek D500 单色随波场明暗流动 —— 颜色是「光」，
 //         贴波脊亮起、渗进折射与高光；桌面扭曲是「玻璃」，两者各归其位
-// 渲染：0.6x 离屏 + 外层线性放大 blit（低频透镜内容放大几乎无损，省 ~65% GPU）
+// 渲染：最高 0.6x 离屏，受像素预算限制；边缘裁剪后线性放大 blit
 // 输出 premultiplied alpha（交换链 CompositeAlphaMode::PreMultiplied）
 // 坐标：几何在 y-up 空间（对齐旧 GLSL 移植约定）；uv 采样前翻 y
 
@@ -19,7 +19,7 @@ struct Uniforms {
     pad0: f32,
     pad1: f32,
     pad2: f32,
-    resolution: vec2<f32>,  // 渲染分辨率（0.6x 离屏）
+    resolution: vec2<f32>,  // 像素预算约束后的离屏分辨率
     tex_size: vec2<f32>,    // 桌面纹理尺寸
 };
 
@@ -55,7 +55,8 @@ fn hash12(p_in: vec2<f32>) -> f32 {
     return fract(p.x * p.y);
 }
 
-fn vnoise(p: vec2<f32>) -> f32 {
+// (value, ∂value/∂x, ∂value/∂y)：四个格点 hash 同时供插值和解析梯度使用。
+fn vnoise(p: vec2<f32>) -> vec3<f32> {
     let i = floor(p);
     let f = fract(p);
     let k = f * f * (3.0 - 2.0 * f);
@@ -63,19 +64,28 @@ fn vnoise(p: vec2<f32>) -> f32 {
     let b = hash12(i + vec2<f32>(1.0, 0.0));
     let c = hash12(i + vec2<f32>(0.0, 1.0));
     let d = hash12(i + vec2<f32>(1.0, 1.0));
-    return mix(mix(a, b, k.x), mix(c, d, k.x), k.y);
+    let dk = 6.0 * f * (1.0 - f);
+    let lo = mix(a, b, k.x);
+    let hi = mix(c, d, k.x);
+    return vec3<f32>(mix(lo, hi, k.y),
+        mix(b - a, d - c, k.y) * dk.x, (hi - lo) * dk.y);
 }
 
-fn fbm(p_in: vec2<f32>) -> f32 {
+fn fbm(p_in: vec2<f32>) -> vec3<f32> {
     var v = 0.0;
+    var gradient = vec2<f32>(0.0);
+    var frequency = 1.0;
     var a = 0.5;
     var q = p_in;
     for (var i = 0; i < 4; i++) {
-        v = v + a * vnoise(q);
+        let noise = vnoise(q);
+        v = v + a * noise.x;
+        gradient = gradient + a * noise.yz * frequency;
         q = q * 2.02 + vec2<f32>(31.7, 17.3);
+        frequency = frequency * 2.02;
         a = a * 0.5;
     }
-    return v;
+    return vec3<f32>(v, gradient);
 }
 
 // 圆角矩形 SDF：屏幕边缘为基准，透镜贴边
@@ -84,26 +94,8 @@ fn sd_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
     return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
-// Apple Intelligence 七色粉彩板（VCC 社区采样，RGB 插值全程避开浑浊灰区）
-// 8D9FFF 蓝 → C686FF 浅紫 → BC82F3 紫 → F5B9EA 粉 → FFBA71 琥珀 → FF6778 珊瑚 → AA6EEE 紫罗兰
-fn palette(t_in: f32) -> vec3<f32> {
-    let c0 = vec3<f32>(0.553, 0.624, 1.000);
-    let c1 = vec3<f32>(0.776, 0.525, 1.000);
-    let c2 = vec3<f32>(0.737, 0.510, 0.953);
-    let c3 = vec3<f32>(0.961, 0.725, 0.918);
-    let c4 = vec3<f32>(1.000, 0.729, 0.443);
-    let c5 = vec3<f32>(1.000, 0.404, 0.471);
-    let c6 = vec3<f32>(0.667, 0.431, 0.933);
-    let t = fract(t_in) * 7.0;
-    var c = mix(c0, c1, clamp(t, 0.0, 1.0));
-    c = mix(c, c2, clamp(t - 1.0, 0.0, 1.0));
-    c = mix(c, c3, clamp(t - 2.0, 0.0, 1.0));
-    c = mix(c, c4, clamp(t - 3.0, 0.0, 1.0));
-    c = mix(c, c5, clamp(t - 4.0, 0.0, 1.0));
-    c = mix(c, c6, clamp(t - 5.0, 0.0, 1.0));
-    c = mix(c, c0, clamp(t - 6.0, 0.0, 1.0));
-    return c;
-}
+// 固定品牌主题蓝，与 neo-theme::palette::deepseek::D500 同步（由测试校验）。
+const THEME_BLUE: vec3<f32> = vec3<f32>(52.0, 96.0, 180.0) / 255.0;
 
 // 桌面折射采样（uv 截边）
 fn sample_desktop(uv: vec2<f32>) -> vec3<f32> {
@@ -112,16 +104,22 @@ fn sample_desktop(uv: vec2<f32>) -> vec3<f32> {
 }
 
 // 液态波场：核心层（长涌随环流旋转 + 中浪 + 细碎纹）与低频错拍层。
-// 返回 (wave, wave_b)；法线的环向数值差分会重复调用它。
-fn wave_field(dir: vec2<f32>, rdir: vec2<f32>, t: f32, amp: f32) -> vec2<f32> {
-    let w1 = fbm(rdir * 2.2 + vec2<f32>(t * 0.10, 3.0)) - 0.5;
-    let w2 = fbm(dir * 4.5 + vec2<f32>(-t * 0.45, 9.0)) - 0.5;
-    let w3 = fbm(dir * 9.0 + vec2<f32>(t * 0.8, 21.0)) - 0.5;
-    let wave = (w1 * 1.15 + w2 * 0.42 + w3 * 0.14) * amp;
-    let s1 = fbm(rdir * 1.9 + vec2<f32>(t * 0.07 + 0.5, 7.0)) - 0.5;
-    let s2 = fbm(dir * 3.6 + vec2<f32>(-t * 0.33, 15.0)) - 0.5;
-    let wave_b = (s1 * 1.0 + s2 * 0.30) * amp;
-    return vec2<f32>(wave, wave_b);
+// 返回 (wave, wave_b, ∂wave/∂θ, ∂wave_b/∂θ)，一次求值保留五场 × 四层。
+fn wave_field(dir: vec2<f32>, rdir: vec2<f32>, t: f32, amp: f32) -> vec4<f32> {
+    let w1 = fbm(rdir * 2.2 + vec2<f32>(t * 0.10, 3.0));
+    let w2 = fbm(dir * 4.5 + vec2<f32>(-t * 0.45, 9.0));
+    let w3 = fbm(dir * 9.0 + vec2<f32>(t * 0.8, 21.0));
+    let wave = ((w1.x - 0.5) * 1.15 + (w2.x - 0.5) * 0.42 + (w3.x - 0.5) * 0.14) * amp;
+    let s1 = fbm(rdir * 1.9 + vec2<f32>(t * 0.07 + 0.5, 7.0));
+    let s2 = fbm(dir * 3.6 + vec2<f32>(-t * 0.33, 15.0));
+    let wave_b = ((s1.x - 0.5) * 1.0 + (s2.x - 0.5) * 0.30) * amp;
+    let tang = vec2<f32>(-dir.y, dir.x);
+    let rtang = vec2<f32>(-rdir.y, rdir.x);
+    let wave_theta = (dot(w1.yz, rtang) * 2.2 * 1.15
+        + dot(w2.yz, tang) * 4.5 * 0.42 + dot(w3.yz, tang) * 9.0 * 0.14) * amp;
+    let wave_b_theta = (dot(s1.yz, rtang) * 1.9
+        + dot(s2.yz, tang) * 3.6 * 0.30) * amp;
+    return vec4<f32>(wave, wave_b, wave_theta, wave_b_theta);
 }
 
 // 弯月透镜厚度剖面（不对称高斯：贴屏缘薄而陡，向屏心延展但快速收敛 —
@@ -138,6 +136,19 @@ fn thickness(d: f32, wave: f32, wave_b: f32, width: f32, px: f32) -> f32 {
     // 透镜的雾感/折射糊/菲涅尔残光一直拖进屏幕中部。
     let tail = 1.0 - smoothstep(45.0 * px, 105.0 * px, -d);
     return lens_profile(d, center, width) * (0.70 + 0.30 * wave_b) * tail;
+}
+
+// d 冻结：链式求导剖面中心与呼吸项；θ 的导数除以 |q| 才是每渲染像素的导数。
+// 保持径向差分不变。这里是局部解析导数，不等价于旧的 ±2px 环向平均斜率。
+fn thickness_ds(d: f32, waves: vec4<f32>, width: f32, px: f32, radius: f32) -> f32 {
+    let center = -width * (0.45 + 0.60 * waves.x);
+    let sigma = select(width * 0.70, width * 0.55, d > center);
+    let profile = lens_profile(d, center, width);
+    let tail = 1.0 - smoothstep(45.0 * px, 105.0 * px, -d);
+    let center_theta = -width * 0.60 * waves.z;
+    let profile_theta = profile * (2.0 * (d - center) / (sigma * sigma)) * center_theta;
+    return (profile_theta * (0.70 + 0.30 * waves.y)
+        + profile * 0.30 * waves.w) * tail / max(radius, 1e-4);
 }
 
 // 粗糙磨砂采样：泊松 4 点 + 每像素随机旋转（洗掉核方向性）
@@ -185,7 +196,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let width = 46.0 * px;
     let w0 = wave_field(dir, rot * dir, t, amp);
 
-    // ---- 表面法线：厚度场的数值梯度（径向 + 环向分别差分） ----
+    // ---- 表面法线：径向差分 + 环向解析梯度 ----
     let ee = 1.5;
     let gx = sd_box(q + vec2<f32>(ee, 0.0), b, 14.0 * px) - sd_box(q - vec2<f32>(ee, 0.0), b, 14.0 * px);
     let gy = sd_box(q + vec2<f32>(0.0, ee), b, 14.0 * px) - sd_box(q - vec2<f32>(0.0, ee), b, 14.0 * px);
@@ -196,16 +207,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 径向导数：波场冻结，只有剖面随 d 起伏
     let dH_dd = (thickness(d + ee, w0.x, w0.y, width, px)
                - thickness(d - ee, w0.x, w0.y, width, px)) / (2.0 * ee);
-    // 环向导数：d 冻结，波场沿周长传播（方向与环流都从扰动后的位置重算）
-    let ds = 2.0;
-    let q_p = q + tang * ds;
-    let q_m = q - tang * ds;
-    let dir_p = q_p / max(length(q_p), 1e-4);
-    let dir_m = q_m / max(length(q_m), 1e-4);
-    let w_p = wave_field(dir_p, rot * dir_p, t, amp);
-    let w_m = wave_field(dir_m, rot * dir_m, t, amp);
-    let dH_ds = (thickness(d, w_p.x, w_p.y, width, px)
-               - thickness(d, w_m.x, w_m.y, width, px)) / (2.0 * ds);
+    // 环向导数：复用中心波场的解析导数，省去两次五场四层 FBM。
+    let dH_ds = thickness_ds(d, w0, width, px, length(q));
 
     let grad = n_up * dH_dd + tang * dH_ds;  // y-up 平面梯度
     let lift = 30.0 * px;                     // 透镜特征隆起（渲染 px）：斜率 → 法线
@@ -226,15 +229,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let off = -n3.xy * refr_thick * bend;          // y-up
     let uv0 = in.pos.xy / res;                // top-down 0..1（与桌面纹理同向）
     let off_uv = vec2<f32>(off.x, -off.y) / res;  // 几何 y-up → uv 翻 y
-    // 共同位移从 3 倍收敛到 2 倍；色散仍用基准偏移，避免彩边随之变宽。
-    let refraction_gain = 2.0;
+    // 共同位移降至 1.5 倍；色散仍用基准偏移，保持彩边宽度。
+    let refraction_gain = 1.5;
     let refracted_uv = uv0 + off_uv * refraction_gain;
 
-    // 粗糙度：厚度越大光程越长，磨砂越强（薄边保持清晰）
-    let rr = (1.0 + 6.0 * thick) * px;
-    let rough_r = vec2<f32>(rr, rr) / res;
-    let jitter_ang = hash12(fc) * 6.2831853;
-    let jr = mat2x2<f32>(cos(jitter_ang), -sin(jitter_ang), sin(jitter_ang), cos(jitter_ang));
 
     // ---- 菲涅尔（Schlick）：波脊斜率大 → 掠射 → 棱线高光 ----
     let fres = 0.04 + 0.96 * pow(1.0 - n3.z, 5.0);
@@ -249,14 +247,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let vis = max(light_vis,
         outer_refraction * smoothstep(0.22, 0.52, u.intensity));
 
-    // ---- 彩色流光：七色粉彩板沿周长环流（arc 参数 + 环流角速度驱动）----
+    // ---- 单色主题蓝：沿用旋转波场的明暗起伏，不再计算颜色环流 ----
     // 色带贴死物理屏幕边缘（含四角：用锐角屏幕 SDF 而非内缩带圆角的透镜盒），
     // 贴边=1、向内 70px 渐隐；越贴边越鲜艳（去饱和向内渐淡）。
     // 亮度起伏贴波脊（wave 大处更亮），但保底亮度让边缘不断节。
     // 颜色是「光」，折射是「玻璃」。
-    let arc = atan2(q.y, q.x) * 0.1591549 + 0.5;
     let cm = 1.0 - smoothstep(0.0, 70.0 * px, -d_edge);
-    let raw_col = palette(arc - t * (u.spin * 0.45 + 0.02));
+    let raw_col = THEME_BLUE;
     let lum = dot(raw_col, vec3<f32>(0.299, 0.587, 0.114));
     let band_col = mix(vec3<f32>(lum, lum, lum), raw_col, 0.55 + 0.75 * cm);
     let glow = u.intensity * cm * (0.42 + 0.45 * (0.5 + 0.5 * w0.x));
@@ -270,6 +267,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // 色散：RGB 各用不同折射系数（蓝偏折最大），物理彩边
         // 薄裙 vis=0 时桌面项严格为零：省掉 15 次纹理采样，仍保留棱线高光。
         if (vis > 0.0) {
+            // 只在实际采样时计算磨砂核，薄裙/无桌面降级不需要随机旋转。
+            // 厚度越大光程越长，磨砂越强；采样半径与点数保持不变。
+            let rr = (1.0 + 6.0 * thick) * px;
+            let rough_r = vec2<f32>(rr, rr) / res;
+            let jitter_ang = hash12(fc) * 6.2831853;
+            let jr = mat2x2<f32>(cos(jitter_ang), -sin(jitter_ang), sin(jitter_ang), cos(jitter_ang));
             refr_rgb.r = sample_rough(refracted_uv - off_uv * 0.10, rough_r, jr).r;
             refr_rgb.g = sample_rough(refracted_uv, rough_r, jr).g;
             refr_rgb.b = sample_rough(refracted_uv + off_uv * 0.10, rough_r, jr).b;
@@ -284,7 +287,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             alpha = max(alpha, spec * 0.85 * edge);
         }
     } else if (thick > 0.003) {
-        // 无抓屏降级：彩色玻璃边（剖面微光 + 棱线），不假装有折射
+        // 无抓屏降级：主题蓝玻璃边（剖面微光 + 棱线），不假装有折射
         col = col + band_col * (0.10 * thick)
             + mix(vec3<f32>(1.0, 1.0, 1.0), band_col, 0.4) * spec * 0.55;
         alpha = max(alpha, min(vis * 0.35 + spec * 0.50 * edge, 0.65));

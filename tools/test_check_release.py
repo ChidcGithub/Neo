@@ -15,7 +15,8 @@ class ReleaseTests(unittest.TestCase):
     payload_files = (
         "neo.exe", "runtime/onnx/onnxruntime.dll", *(f"resources/models/wake/{name}" for name in MODELS),
         "resources/models/stt/sense-voice/model.int8.onnx", "resources/models/stt/sense-voice/tokens.txt",
-        "resources/models/stt/vad/silero_vad.onnx", "LICENSE", "docs/README.md",
+        "resources/models/stt/vad/silero_vad.onnx", "LICENSE", "NOTICE", "docs/README.md",
+        "docs/licenses/README.md", "docs/licenses/cargo-notices.txt",
         "resources/lang/zh-CN.lang", "resources/lang/en-US.lang",
     )
     bash_paths = ("runtime/gitbash/bin/bash.exe", "runtime/gitbash/usr/bin/bash.exe")
@@ -206,6 +207,9 @@ class ReleaseTests(unittest.TestCase):
                     redirect_stdout(output):
                 self.assertEqual(check_package(package, "unused"), set())
             self.assertIn("payload files exist and are non-empty", output.getvalue())
+            self.assertIn("payload completeness only; license compliance is NOT verified", output.getvalue())
+            self.assertIn("Unresolved legal release blockers still require review", output.getvalue())
+            self.assertIn("private audit reports are not release payloads", output.getvalue())
             self.assertIn("neo.exe, runtime/onnx/*.dll and imported allowlisted CRT only", output.getvalue())
             self.assertIn("Full third-party DLL dependency closure is NOT audited", output.getvalue())
             self.assertIn("MinGit PE images/dependencies and model validity are NOT audited", output.getvalue())

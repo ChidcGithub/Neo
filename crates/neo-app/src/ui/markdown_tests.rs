@@ -172,6 +172,65 @@
     }
 
     #[test]
+    fn math_draw_reuses_layout_across_frames_width_size_and_color() {
+        let ctx = context();
+        math::reset_layout_cache();
+        let latex = r"\frac{x}{y}";
+        let draw = |source: &str, size: f32, display: bool, color: Color32, width: f32| {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                ui.set_width(width);
+                draw_math(ui, source, size, display, color);
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let first = draw(latex, 16.0, false, Color32::RED, 500.0);
+        assert_eq!(
+            math::parse_calls(),
+            1,
+            "measure and render must share one parse"
+        );
+        let second = draw(latex, 32.0, false, Color32::BLUE, 500.0);
+        assert_eq!(math::parse_calls(), 1);
+        let glyph = |output: &egui::FullOutput| {
+            text_shapes(output)
+                .into_iter()
+                .find(|(text, _, _)| text == "x")
+                .unwrap()
+        };
+        let (_, small_rect, small_color) = glyph(&first);
+        let (_, large_rect, large_color) = glyph(&second);
+        assert!(large_rect.height() > small_rect.height());
+        assert_eq!(small_color, Color32::RED);
+        assert_eq!(large_color, Color32::BLUE);
+        let _ = draw(latex, 32.0, false, Color32::BLUE, 5.0);
+        assert_eq!(
+            math::parse_calls(),
+            1,
+            "scroll branch must reuse layout too"
+        );
+        let _ = draw(latex, 32.0, true, Color32::BLUE, 500.0);
+        assert_eq!(math::parse_calls(), 2);
+        let _ = draw(r"\frac{x}{z}", 32.0, true, Color32::BLUE, 500.0);
+        assert_eq!(math::parse_calls(), 3);
+        for _ in 0..3 {
+            let out = draw(r"\frac{x}", 16.0, false, Color32::RED, 500.0);
+            assert!(text_shapes(&out)
+                .iter()
+                .any(|(text, _, _)| text == r"$\frac{x}$"));
+        }
+        assert_eq!(math::parse_calls(), 4, "failed parses must be cached");
+
+        // Even a nonresident formula is only parsed once per draw, not once for
+        // measurement and again for painting. No snapshot or GPU is involved.
+        let oversized_source = format!("x{}", " ".repeat(8192));
+        for expected in [5, 6] {
+            let _ = draw(&oversized_source, 16.0, false, Color32::RED, 500.0);
+            assert_eq!(math::parse_calls(), expected);
+        }
+    }
+
+    #[test]
     fn commonmark_math_reserves_height_and_preserves_invalid_source() {
         let ctx = context();
         let out = frame(

@@ -88,7 +88,7 @@ jobs:
         run: 'cargo test --locked -p neo-app --bin neo updates::tests::'
 
       - name: Installer and release checks (isolated, never install)
-        run: python -m unittest tools.test_installer tools.test_check_release tools.test_fetch_runtime tools.test_release_workflow -v
+        run: python -m unittest tools.test_audit_licenses tools.test_installer tools.test_check_release tools.test_fetch_runtime tools.test_release_workflow -v
 
   release:
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
@@ -178,6 +178,9 @@ jobs:
           Copy-Item resources\lang\zh-CN.lang, resources\lang\en-US.lang "$pkg\resources\lang\"
           Copy-Item docs\distribution\README.md "$pkg\docs\README.md"
           Copy-Item LICENSE $pkg\
+          Copy-Item NOTICE "$pkg\NOTICE"
+          # 仅复制公开法律文件；docs-pri 审计报告与本地证据不随包。
+          Copy-Item -Recurse docs\licenses "$pkg\docs\licenses"
 
       # 只从已授权 VS 的 Redist 目录收集真实导入依赖，不使用 System32 或执行 vc_redist。
       # app-local CRT 安全更新需要随 Neo 重新发布；UCRT/API sets 由 Win10 自带。
@@ -263,7 +266,8 @@ jobs:
           $notes += '- ``runtime/onnx/`` - ONNX Runtime DLLs'
           $notes += '- ``runtime/gitbash/`` - bundled MinGit (bash tool runtime)'
           $notes += '- ``docs/README.md`` - distribution guide'
-          $notes += '- ``LICENSE`` and imported app-local MSVC CRT DLLs remain next to ``neo.exe``'
+          $notes += '- ``LICENSE`` (Neo Apache-2.0), ``NOTICE`` and imported app-local MSVC CRT DLLs remain next to ``neo.exe``'
+          $notes += '- ``docs/licenses/`` - public third-party license texts, notices and indexes; private audit reports are excluded and payload checks are not legal clearance'
           $notes -join "`n" | Out-File -Encoding utf8 dist\notes.md
           Get-Content dist\notes.md
 

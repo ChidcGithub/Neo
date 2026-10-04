@@ -1,0 +1,14 @@
+Neo
+Copyright (c) 2026 Chidc
+
+Neo's original code, including the author's VCC-derived rendering work,
+is licensed under the Apache License, Version 2.0. See LICENSE.
+This does not revoke permissions granted for earlier MIT releases or
+relicense third-party material.
+
+Third-party code, fonts, models and runtimes retain their own copyrights
+and licenses. See docs/licenses/README.md and the license texts there.
+Their inclusion does not certify that all third-party distribution
+obligations have been fulfilled.
+
+This file is informational and does not change third-party license terms.
