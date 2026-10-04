@@ -34,13 +34,13 @@ fn menu_labels_and_idle_invalidation_follow_language_changes() {
     with_language(Language::ZhCn, || {
         let mut previous = crate::i18n::language();
         assert!(!refresh_language(&mut previous));
-        assert_eq!(Target::Ink.label(), "屏幕书写\n未实现");
-        assert_eq!(Target::Board.label(), "画板\n未实现");
+        assert_eq!(Target::Ink.label(), "画板");
+        assert_eq!(Target::Board.label(), "黑板");
         with_language(Language::EnUs, || {
             assert!(refresh_language(&mut previous));
             assert!(!refresh_language(&mut previous));
-            assert_eq!(Target::Ink.label(), "Ink\nNot yet");
-            assert_eq!(Target::Board.label(), "Board\nNot yet");
+            assert_eq!(Target::Ink.label(), tr("画板"));
+            assert_eq!(Target::Board.label(), tr("黑板"));
             assert_eq!(tr("Neo 悬浮按钮"), "Neo floating control");
             assert_eq!(Target::Close.label(), "");
         });
@@ -300,7 +300,7 @@ fn menu_main_click_dismisses_without_wake() {
 }
 
 #[test]
-fn close_dismisses_only_menu_and_placeholders_do_nothing() {
+fn board_buttons_close_menu_and_emit_distinct_actions_without_wake() {
     for target in [Target::Close, Target::Ink, Target::Board] {
         let mut g = Gesture {
             menu: true,
@@ -309,13 +309,14 @@ fn close_dismisses_only_menu_and_placeholders_do_nothing() {
         g.down(target, center(), 1000);
         assert_eq!(
             g.update(center(), false, Some(target), 1100),
-            if target == Target::Close {
-                Effect::MenuChanged
-            } else {
-                Effect::None
+            match target {
+                Target::Close => Effect::MenuChanged,
+                Target::Ink => Effect::OpenDrawing,
+                Target::Board => Effect::OpenBlackboard,
+                Target::Main => unreachable!(),
             }
         );
-        assert_eq!(g.menu, target != Target::Close);
+        assert!(!g.menu);
         if target == Target::Close {
             let remaining: Vec<_> = circles(g.menu).collect();
             assert_eq!(remaining.len(), 1);

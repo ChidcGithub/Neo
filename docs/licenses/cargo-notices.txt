@@ -53933,7 +53933,7 @@ DEALINGS IN THE SOFTWARE.
 
 ===== END ndarray 0.17.2 :: LICENSE-MIT =====
 
-===== BEGIN neo-app 0.0.1-pre8 :: project/LICENSE =====
+===== BEGIN neo-app 0.1.0-pre9 :: project/LICENSE =====
 Source: workspace/path
 Origin: project/crates/neo-app
 Declared license: Apache-2.0
@@ -54143,9 +54143,9 @@ Bytes: 11357
    See the License for the specific language governing permissions and
    limitations under the License.
 
-===== END neo-app 0.0.1-pre8 :: project/LICENSE =====
+===== END neo-app 0.1.0-pre9 :: project/LICENSE =====
 
-===== BEGIN neo-llm 0.0.1-pre8 :: project/LICENSE =====
+===== BEGIN neo-llm 0.1.0-pre9 :: project/LICENSE =====
 Source: workspace/path
 Origin: project/crates/neo-llm
 Declared license: Apache-2.0
@@ -54355,9 +54355,9 @@ Bytes: 11357
    See the License for the specific language governing permissions and
    limitations under the License.
 
-===== END neo-llm 0.0.1-pre8 :: project/LICENSE =====
+===== END neo-llm 0.1.0-pre9 :: project/LICENSE =====
 
-===== BEGIN neo-overlay 0.0.1-pre8 :: project/LICENSE =====
+===== BEGIN neo-overlay 0.1.0-pre9 :: project/LICENSE =====
 Source: workspace/path
 Origin: project/crates/neo-overlay
 Declared license: Apache-2.0
@@ -54567,9 +54567,9 @@ Bytes: 11357
    See the License for the specific language governing permissions and
    limitations under the License.
 
-===== END neo-overlay 0.0.1-pre8 :: project/LICENSE =====
+===== END neo-overlay 0.1.0-pre9 :: project/LICENSE =====
 
-===== BEGIN neo-store 0.0.1-pre8 :: project/LICENSE =====
+===== BEGIN neo-store 0.1.0-pre9 :: project/LICENSE =====
 Source: workspace/path
 Origin: project/crates/neo-store
 Declared license: Apache-2.0
@@ -54779,9 +54779,9 @@ Bytes: 11357
    See the License for the specific language governing permissions and
    limitations under the License.
 
-===== END neo-store 0.0.1-pre8 :: project/LICENSE =====
+===== END neo-store 0.1.0-pre9 :: project/LICENSE =====
 
-===== BEGIN neo-stt 0.0.1-pre8 :: project/LICENSE =====
+===== BEGIN neo-stt 0.1.0-pre9 :: project/LICENSE =====
 Source: workspace/path
 Origin: project/crates/neo-stt
 Declared license: Apache-2.0
@@ -54991,9 +54991,9 @@ Bytes: 11357
    See the License for the specific language governing permissions and
    limitations under the License.
 
-===== END neo-stt 0.0.1-pre8 :: project/LICENSE =====
+===== END neo-stt 0.1.0-pre9 :: project/LICENSE =====
 
-===== BEGIN neo-theme 0.0.1-pre8 :: project/LICENSE =====
+===== BEGIN neo-theme 0.1.0-pre9 :: project/LICENSE =====
 Source: workspace/path
 Origin: project/crates/neo-theme
 Declared license: Apache-2.0
@@ -55203,9 +55203,9 @@ Bytes: 11357
    See the License for the specific language governing permissions and
    limitations under the License.
 
-===== END neo-theme 0.0.1-pre8 :: project/LICENSE =====
+===== END neo-theme 0.1.0-pre9 :: project/LICENSE =====
 
-===== BEGIN neo-tools 0.0.1-pre8 :: project/LICENSE =====
+===== BEGIN neo-tools 0.1.0-pre9 :: project/LICENSE =====
 Source: workspace/path
 Origin: project/crates/neo-tools
 Declared license: Apache-2.0
@@ -55415,9 +55415,9 @@ Bytes: 11357
    See the License for the specific language governing permissions and
    limitations under the License.
 
-===== END neo-tools 0.0.1-pre8 :: project/LICENSE =====
+===== END neo-tools 0.1.0-pre9 :: project/LICENSE =====
 
-===== BEGIN neo-ui 0.0.1-pre8 :: project/LICENSE =====
+===== BEGIN neo-ui 0.1.0-pre9 :: project/LICENSE =====
 Source: workspace/path
 Origin: project/crates/neo-ui
 Declared license: Apache-2.0
@@ -55627,9 +55627,9 @@ Bytes: 11357
    See the License for the specific language governing permissions and
    limitations under the License.
 
-===== END neo-ui 0.0.1-pre8 :: project/LICENSE =====
+===== END neo-ui 0.1.0-pre9 :: project/LICENSE =====
 
-===== BEGIN neo-wake 0.0.1-pre8 :: project/LICENSE =====
+===== BEGIN neo-wake 0.1.0-pre9 :: project/LICENSE =====
 Source: workspace/path
 Origin: project/crates/neo-wake
 Declared license: Apache-2.0
@@ -55839,7 +55839,7 @@ Bytes: 11357
    See the License for the specific language governing permissions and
    limitations under the License.
 
-===== END neo-wake 0.0.1-pre8 :: project/LICENSE =====
+===== END neo-wake 0.1.0-pre9 :: project/LICENSE =====
 
 ===== BEGIN nohash-hasher 0.2.0 :: LICENSE-APACHE =====
 Source: registry+https://github.com/rust-lang/crates.io-index

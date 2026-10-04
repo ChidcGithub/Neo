@@ -3212,7 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "neo-app"
-version = "0.0.1-pre8"
+version = "0.1.0-pre9"
 dependencies = [
  "base64 0.22.1",
  "eframe",
@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "neo-llm"
-version = "0.0.1-pre8"
+version = "0.1.0-pre9"
 dependencies = [
  "neo-tools",
  "reqwest",
@@ -3253,7 +3253,7 @@ dependencies = [
 
 [[package]]
 name = "neo-overlay"
-version = "0.0.1-pre8"
+version = "0.1.0-pre9"
 dependencies = [
  "bytemuck",
  "egui",
@@ -3270,28 +3270,28 @@ dependencies = [
 
 [[package]]
 name = "neo-store"
-version = "0.0.1-pre8"
+version = "0.1.0-pre9"
 dependencies = [
  "rusqlite",
 ]
 
 [[package]]
 name = "neo-stt"
-version = "0.0.1-pre8"
+version = "0.1.0-pre9"
 dependencies = [
  "sherpa-onnx",
 ]
 
 [[package]]
 name = "neo-theme"
-version = "0.0.1-pre8"
+version = "0.1.0-pre9"
 dependencies = [
  "egui",
 ]
 
 [[package]]
 name = "neo-tools"
-version = "0.0.1-pre8"
+version = "0.1.0-pre9"
 dependencies = [
  "base64 0.22.1",
  "cfb",
@@ -3308,7 +3308,7 @@ dependencies = [
 
 [[package]]
 name = "neo-ui"
-version = "0.0.1-pre8"
+version = "0.1.0-pre9"
 dependencies = [
  "egui",
  "neo-theme",
@@ -3316,7 +3316,7 @@ dependencies = [
 
 [[package]]
 name = "neo-wake"
-version = "0.0.1-pre8"
+version = "0.1.0-pre9"
 dependencies = [
  "cpal",
  "ort",

@@ -144,7 +144,7 @@ written to `graphics-help.txt` in the startup log directory on failure.
 
 ## Download & Install
 
-The current workspace version is **`0.0.1-pre8`** (prerelease).
+The current workspace version is **`0.1.0-pre9`** (prerelease).
 Maintainers keep outstanding gates in the local release acceptance checklist
 (`docs-pri/release-0.1.0.md`, not tracked in Git or included in a clone).
 Published versions, when available, are on the
@@ -199,6 +199,89 @@ install/upgrade/uninstall/reinstall acceptance has passed.
 cargo run --release   # release is strongly recommended: 60 fps at 4K
 cargo test            # unit tests + offscreen render snapshots (output: docs-pri/screens/)
 ```
+
+### Drawing and blackboard integration
+
+The floating menu opens **画板 / Drawing** (transparent annotations) or
+**黑板 / Blackboard**. Voice commands `打开画板`, `打开白板`, `打开黑板`,
+`open drawing`, `open whiteboard`, and `open blackboard` are handled locally
+only when no draft, attachment or task would be displaced.
+
+Install trusted, separately built hosted applications at:
+
+```text
+apps/drawing/neo-drawing.exe
+apps/blackboard/neo-blackboard.exe
+```
+
+Paths are relative to `neo.exe`, not the working directory. Each app runs with
+`--gui --hosted` in its own directory. For local development, set
+`NEO_DRAWING_DIR` and `NEO_BLACKBOARD_DIR` to trusted absolute directories
+containing the corresponding executables and required runtime dependencies;
+both may point at the same build directory. Neo does not search neighboring
+repositories or PATH, download models, or start either app at startup.
+
+The integration implements bounded bidirectional JSONL communication, capability
+checks, permission configuration, show/state/close and one process per app. Ready timeout
+is 10 seconds; requests time out after 5 seconds (close: 15 seconds). Timeout
+or EOF is not proof of hidden windows or successful shutdown. Unsaved boards
+block Neo exit; save or close them in their own UI. No force-kill or silent discard.
+
+**Hosted screenshots:** outside classroom safe mode, a board's capture button
+requests Neo's region selector. Neo waits for the requesting board, its own
+windows, floating control and overlay to confirm hiding. PNGs stay in memory,
+are transferred in bounded chunks with CRC32, and are released or expire.
+Esc, right-click, loss of focus, topology changes, disconnect and cancellation
+abort the selection. Window restoration and cancellation acknowledgment wait
+for the capture worker to finish cleanup. Capture currently requires exactly
+one hosted board; close the other board first.
+
+**Board Agent:** uses Neo's selected model and endpoint. A second Neo confirmation
+shows the question, image count and destination before any board image is read
+or uploaded. For images, the user must confirm the selected model supports
+image input; this is not provider capability verification. Requests contain only
+the authorized question/images and, only in structured-edit mode, the authorized
+current-page object snapshot; never Neo history or other pages. Images may be
+resized/transcoded. Up to four static PNGs are accepted, at most 8 MiB each and
+32 MiB total decoded data. Provider errors do not trigger an image-free retry.
+
+**Write-back:** requires permission in both the board and Neo. By default the
+answer is appended as one text object. Enable the separate **read current page
+and add/modify/delete drawing objects** checkbox for structured editing. Neo
+then reads a revision-pinned snapshot of the current page and sends its non-image
+objects to the selected model. This includes existing text: the panel explicitly
+asks for that data-sharing permission before reading.
+
+Structured edits support function plots, 2D shapes/projected 3D wireframes,
+coordinate systems, text, math layouts and strokes. Updates/deletes target only
+IDs from the authorized snapshot; updates retain object type. New IDs are
+assigned locally. Images, connection graph editing, other pages, files, arbitrary
+RPC and executable commands are excluded. All proposed operations are validated
+as strict JSON and submitted atomically with one undo step; any invalid operation
+rejects the entire response, without a text fallback or partial application.
+
+The host limits a page snapshot to 256 objects / 128 KiB (large objects are read
+in chunks), a response to 16 KiB and a batch to 64 operations. Model context limits
+may be lower. Oversized requests fail rather than silently omit content. The
+board remains the final validator of document/page/revision, connections and
+function support. Expression token validation does not guarantee a function can
+be plotted. Neo conservatively cancels on page changes; conflicts never auto-retry edits.
+
+Host jobs use a 60-second cooperative deadline and direct final responses.
+Cancellation suppresses later write-back, but cannot recall uploaded data or
+force-stop a blocked HTTP/system call. Configuration changes revoke queued
+responses until transmission starts. Resources and jobs are isolated per
+connection; disconnect invalidates results and starts cleanup.
+
+Ordinary Neo desktop tools still refuse work while any hosted board is open,
+including hidden/disconnected instances. Hosted region capture uses its separate
+confirmed-hide path; no external board lease is treated as safe across EOF.
+
+The drawing project's current release policy is source-only. Its binaries,
+models and third-party runtime files are **not** added to Neo packaging by this
+integration. Deploy only locally built/trusted or separately approved artifacts;
+ordinary drawing needs no handwriting-recognition model. Native GUI/real-host
+acceptance remains manual; automated tests use synthetic data and fake stdio peers.
 
 ### Interface language
 

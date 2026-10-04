@@ -232,12 +232,7 @@ fn win10_gdi_labels_fit_circular_buttons_at_common_dpi_scales() {
                 }
                 for circle in animated_circles(amount).skip(2) {
                     let bounds = label_bounds(circle, scale);
-                    for text in [
-                        "屏幕书写\n未实现",
-                        "画板\n未实现",
-                        "Ink\nNot yet",
-                        "Board\nNot yet",
-                    ] {
+                    for text in ["画板", "黑板", "Drawing", "Blackboard"] {
                         dib.pixels().fill(0);
                         let measured = draw_label(
                             dib.dc,

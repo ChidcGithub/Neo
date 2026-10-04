@@ -12,6 +12,8 @@ use std::thread::JoinHandle;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Wake,
+    OpenDrawing,
+    OpenBlackboard,
     /// The worker exited unexpectedly. Report once; do not retry every frame.
     Unavailable,
 }
@@ -221,8 +223,8 @@ enum Target {
 impl Target {
     fn label(self) -> &'static str {
         match self {
-            Self::Ink => crate::i18n::tr("屏幕书写\n未实现"),
-            Self::Board => crate::i18n::tr("画板\n未实现"),
+            Self::Ink => crate::i18n::tr("画板"),
+            Self::Board => crate::i18n::tr("黑板"),
             Self::Main | Self::Close => "",
         }
     }
@@ -371,6 +373,8 @@ enum Phase {
 enum Effect {
     None,
     Wake,
+    OpenDrawing,
+    OpenBlackboard,
     MenuChanged,
     Drag(Point),
 }
@@ -454,7 +458,14 @@ impl Gesture {
                             self.menu = false;
                             Effect::MenuChanged
                         }
-                        Target::Ink | Target::Board => Effect::None,
+                        Target::Ink | Target::Board => {
+                            self.menu = false;
+                            if target == Target::Ink {
+                                Effect::OpenDrawing
+                            } else {
+                                Effect::OpenBlackboard
+                            }
+                        }
                     };
                 }
                 if target != Target::Main {

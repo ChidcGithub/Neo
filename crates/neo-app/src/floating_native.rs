@@ -798,6 +798,16 @@ fn apply(
             let _ = send.try_send(Action::Wake);
             ctx.request_repaint();
         }
+        Effect::OpenDrawing | Effect::OpenBlackboard => {
+            surface.dirty = true;
+            let action = if effect == Effect::OpenDrawing {
+                Action::OpenDrawing
+            } else {
+                Action::OpenBlackboard
+            };
+            let _ = send.try_send(action);
+            ctx.request_repaint();
+        }
         Effect::MenuChanged => surface.dirty = true,
         Effect::Drag(delta) => {
             surface.origin.x += delta.x * surface.press_scale;

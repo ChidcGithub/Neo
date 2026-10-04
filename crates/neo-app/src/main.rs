@@ -35,10 +35,16 @@ mod attachments;
 mod brand;
 mod class;
 mod diagnostics;
-mod graphics;
+mod drawing_agent;
+mod drawing_capture;
+mod drawing_commands;
+mod drawing_manager;
+mod drawing_objects;
+mod drawing_runtime;
 mod floating;
-mod manual_audio;
+mod graphics;
 mod i18n;
+mod manual_audio;
 mod notify;
 mod startup;
 mod state;
@@ -75,7 +81,11 @@ fn main() {
         Ok(None) => return,
         Err(_) => {
             // startup::begin exposes only a string, not a concrete error chain.
-            diagnostics::record(diagnostics::Level::Error, "startup", "startup initialization failed");
+            diagnostics::record(
+                diagnostics::Level::Error,
+                "startup",
+                "startup initialization failed",
+            );
             startup::fatal("instance", "startup initialization failed");
             return;
         }
