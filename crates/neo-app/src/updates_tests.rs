@@ -1,6 +1,36 @@
-
 use super::*;
 use serde_json::{json, Value};
+
+#[test]
+fn local_failures_use_current_language_without_network() {
+    use crate::i18n::{with_language, Language};
+    for language in [Language::ZhCn, Language::EnUs] {
+        with_language(language, || {
+            let ctx = egui::Context::default();
+            let mut checker = UpdateChecker::default();
+            checker.start(
+                &ctx,
+                || unreachable!(),
+                |_| Err(io::Error::other("raw OS error")),
+            );
+            assert_eq!(checker.poll(), Some(Status::Failed(tr(SPAWN_ERROR).into())));
+            assert_eq!(checker.poll(), None);
+            checker.start(
+                &ctx,
+                || unreachable!(),
+                |job| {
+                    drop(job);
+                    Ok(())
+                },
+            );
+            assert_eq!(
+                checker.poll(),
+                Some(Status::Failed(tr(RESPONSE_ERROR).into()))
+            );
+            assert_eq!(checker.poll(), None);
+        });
+    }
+}
 
 fn release(tag: &str, prerelease: bool) -> Value {
     json!({

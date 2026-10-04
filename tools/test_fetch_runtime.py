@@ -18,6 +18,11 @@ runtime = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runtime)
 
 
+class RuntimeLayoutTests(unittest.TestCase):
+    def test_default_cache_is_inside_source_cache_not_distribution_runtime(self):
+        self.assertEqual(Path(runtime.DEST), Path(runtime.ROOT) / ".cache/runtime/gitbash")
+
+
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

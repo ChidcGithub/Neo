@@ -144,7 +144,7 @@ written to `graphics-help.txt` in the startup log directory on failure.
 
 ## Download & Install
 
-**0.1.0 is not released yet.** The workspace version is prepared as `0.1.0`.
+The current workspace version is **`0.0.1-pre8`** (prerelease).
 Maintainers keep outstanding gates in the local release acceptance checklist
 (`docs-pri/release-0.1.0.md`, not tracked in Git or included in a clone).
 Published versions, when available, are on the
@@ -177,7 +177,8 @@ Both bundles contain the same payload: `neo.exe`, wake-word models, STT models
   delete a backup needed for recovery.
 - **Uninstall preserves resources:** without a per-file ownership manifest, only
   known top-level program files, shortcuts and the uninstall registration are
-  removed. Nonempty `assets/`, `assets-stt/`, `runtime/` and unknown files remain,
+  removed. Nonempty `resources/`, `runtime/`, `docs/`, legacy `assets/` and
+    `assets-stt/`, and unknown files remain,
   as does user data. Review and back up these leftovers before manual removal.
 - **Reinstall:** the current uninstaller records the retained directory's identity
   in HKCU so the installer can recognize it for the same user. If an older
@@ -199,13 +200,47 @@ cargo run --release   # release is strongly recommended: 60 fps at 4K
 cargo test            # unit tests + offscreen render snapshots (output: docs-pri/screens/)
 ```
 
+### Interface language
+
+Choose **设置 → 通用 → 语言 / Settings → General → Language** to switch between
+简体中文 and English. The choice is saved and applies immediately to interface labels.
+User content, model replies and original diagnostic details are not translated.
+
+Catalogs are UTF-8 JSON objects in `resources/lang/zh-CN.lang` and `en-US.lang`.
+Keys are Chinese source strings; named placeholders such as `{count}` must be
+preserved in translations. Packaged catalogs take precedence over development
+catalogs and embedded defaults. Missing or invalid entries fall back safely;
+restart Neo after editing a file. Both catalogs are required in release packages.
+
+### Directory layout
+
+- `crates/`, `tools/`, `vendor/`: source, development tools and vendored code.
+- `resources/lang/`: Chinese and English interface catalogs.
+- `.cache/`: downloaded runtime and model packaging inputs.
+- `target/package/`: packaging intermediates and installer art; `target/logs/`: local development logs.
+- `dist/`: assembled package, portable archive and installer; `dist/archive/` preserves older local artifacts without modifying their internal layout.
+- `docs/`: public documentation; `docs-pri/` and `wake-training/` retain their existing locations.
+
+The distribution keeps `neo.exe`, `LICENSE` and required MSVC CRT DLLs at its root.
+Models live in `resources/models/wake/` and `resources/models/stt/`; ONNX Runtime
+lives in `runtime/onnx/`, and Git Bash in `runtime/gitbash/`. The short user guide
+is packaged as `docs/README.md` from [docs/distribution/README.md](docs/distribution/README.md).
+The installer additionally provides its icon and uninstaller.
+
+Legacy package `assets/`, `assets-stt/` and repository-root `runtime/gitbash/`
+are no longer auto-discovered. Use the new layout rather than replacing only
+`neo.exe` in an old package. Packaged Git Bash remains at `runtime/gitbash/`
+next to the executable; development uses `.cache/runtime/gitbash/`.
+Environment overrides and crate-local development assets remain supported.
+User data locations and installer backup protections are unchanged.
+
 ### Model & runtime assets
 
 | Asset | Location | Source |
 |---|---|---|
 | Wake-word models (~3 MB) | `crates/neo-wake/assets/` | **Vendored in the repo** — nothing to do |
 | STT models (~240 MB) | `crates/neo-stt/assets/` (git-ignored) | `sense-voice/model.int8.onnx` + `tokens.txt`, and `vad/silero_vad.onnx` from the official sherpa-onnx releases; or point `NEO_STT_MODEL_DIR` at any directory containing them |
-| Portable Git Bash (~91 MB) | `runtime/` (git-ignored) | `python tools/fetch_runtime.py` |
+| Portable Git Bash (~91 MB) | `.cache/runtime/gitbash/` (git-ignored) | `python tools/fetch_runtime.py` |
 
 > [!IMPORTANT]
 > Missing STT models disable only voice transcription; a missing runtime disables only
@@ -385,4 +420,4 @@ flowchart LR
 
 [MIT](LICENSE) — Copyright (c) 2026 Chidc (the workspace author).
 Third-party code, models, fonts and runtimes retain their own licenses; the
-bundled third-party LICENSE/notice review is still pending for 0.1.0.
+bundled third-party LICENSE/notice review is still pending.

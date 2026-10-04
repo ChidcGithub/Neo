@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use sherpa_onnx::{
-    OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
-    SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
+    OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig, SileroVadModelConfig,
+    VadModelConfig, VoiceActivityDetector,
 };
 
 /// 引擎输入采样率（VAD 与 SenseVoice 均按 16kHz 设计）
@@ -40,18 +40,15 @@ pub struct SttConfig {
 
 impl Default for SttConfig {
     fn default() -> Self {
-        // 模型目录优先级：NEO_STT_MODEL_DIR 环境变量 > exe 同级 assets-stt/
-        // （release 打包布局）> crate 自带 assets/（开发布局，约 240MB，不进版本库）
-        let root = std::env::var_os("NEO_STT_MODEL_DIR")
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .or_else(|| {
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|exe| exe.parent().map(|d| d.join("assets-stt")))
-                    .filter(|p| p.is_dir())
-            })
-            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"));
+        // 环境变量 > 发行资源 > crate 自带 assets/。
+        let override_dir = std::env::var_os("NEO_STT_MODEL_DIR").map(PathBuf::from);
+        let exe = std::env::current_exe().ok();
+        let root = resolve_model_dir(
+            override_dir.as_deref(),
+            exe.as_deref().and_then(Path::parent),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            Path::is_dir,
+        );
         Self {
             sense_voice_model: root.join("sense-voice").join("model.int8.onnx"),
             tokens: root.join("sense-voice").join("tokens.txt"),
@@ -60,6 +57,20 @@ impl Default for SttConfig {
             asr_threads: 4,
         }
     }
+}
+
+fn resolve_model_dir(
+    override_dir: Option<&Path>,
+    exe_dir: Option<&Path>,
+    manifest_dir: &Path,
+    is_dir: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    override_dir
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(exe_dir.map(|dir| dir.join("resources/models/stt")))
+        .find(|dir| is_dir(dir))
+        .unwrap_or_else(|| manifest_dir.join("assets"))
 }
 
 /// 一次听写会话：VAD 持续断句，每句交给 SenseVoice 转写
@@ -131,7 +142,8 @@ impl SttEngine {
         // 测试）下逐窗 drain 是 O(n²) —— 10 分钟音频要搬移数十 GB。
         let mut consumed = 0;
         while feed.len() - consumed >= VAD_WINDOW {
-            self.vad.accept_waveform(&feed[consumed..consumed + VAD_WINDOW]);
+            self.vad
+                .accept_waveform(&feed[consumed..consumed + VAD_WINDOW]);
             consumed += VAD_WINDOW;
         }
         if consumed > 0 {

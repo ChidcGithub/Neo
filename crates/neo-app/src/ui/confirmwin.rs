@@ -1,5 +1,6 @@
 //! 工具确认卡：每张卡绑定会话代次和调用身份，旧回调不能回答新请求。
 
+use crate::i18n::tr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -169,7 +170,7 @@ impl ConfirmWin {
         ctx.show_viewport_deferred(
             viewport_id(),
             ViewportBuilder::default()
-                .with_title("Neo 需要许可")
+                .with_title(tr("Neo 需要许可"))
                 .with_decorations(false)
                 .with_resizable(false)
                 .with_taskbar(false)

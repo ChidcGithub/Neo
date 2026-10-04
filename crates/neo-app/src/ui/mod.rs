@@ -25,8 +25,8 @@ pub mod math;
 pub mod miniwin;
 pub mod settings;
 pub mod sidebar;
-pub mod tools;
 pub mod toastwin;
+pub mod tools;
 pub mod waketest;
 
 use neo_theme::Theme;
@@ -106,14 +106,4 @@ pub fn section_label(painter: &egui::Painter, skin: &Skin<'_>, rect: egui::Rect,
 /// 1px 分隔线（`Design` → `Skin` 包装）。
 pub fn divider(painter: &egui::Painter, skin: &Skin<'_>, rect: egui::Rect) {
     neo_ui::divider(painter, &skin.design, rect);
-}
-/// 分段控件（`Design` → `Skin` 包装）。
-pub fn segmented(
-    ui: &mut egui::Ui,
-    skin: &Skin<'_>,
-    width: f32,
-    options: &[&str],
-    selected: usize,
-) -> Option<usize> {
-    neo_ui::Segmented::new(options, selected).show(ui, &skin.design, width)
 }

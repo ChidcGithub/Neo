@@ -4,7 +4,7 @@
 托盘图标、hero 标志是同一份 SVG 路径（上游 FishLogo），这里不复制数据，
 避免两处各自演化。
 
-产物（默认输出到 ``build/installer-art/``，已被 .gitignore 排除）：
+产物（默认输出到 ``target/package/installer-art/``，已被 .gitignore 排除）：
   neo.ico      多尺寸图标（16..256，品牌蓝鲸鱼，透明底）
   welcome.bmp  164x314 欢迎/完成页左侧竖幅（品牌渐变 + 白鲸 + 字标）
   header.bmp   150x57  页眉右侧小图（白底 + 品牌蓝鲸鱼）
@@ -203,7 +203,7 @@ def make_preview(art_dir):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", default=os.path.join(REPO, "build", "installer-art"))
+    ap.add_argument("--out", default=os.path.join(REPO, "target", "package", "installer-art"))
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 

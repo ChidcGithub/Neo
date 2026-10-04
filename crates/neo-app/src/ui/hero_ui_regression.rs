@@ -3,6 +3,14 @@
     use crate::ui::composer::ui_regression::{context, probe};
 
     #[test]
+    fn english_i18n_welcome_and_composer_fit() {
+        crate::i18n::with_language(crate::i18n::Language::EnUs, || {
+            assert_eq!(tr("今天想在课堂上做点什么？"), "What would you like to do in class today?");
+            welcome_column_wraps_and_keeps_workspace_and_send_inside_viewport();
+        });
+    }
+
+    #[test]
     fn welcome_column_wraps_and_keeps_workspace_and_send_inside_viewport() {
         for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
             for (width, height, scale) in [
@@ -38,7 +46,7 @@
                     let mut found_title = false;
                     for shape in output.shapes {
                         if let egui::Shape::Text(text) = shape.shape {
-                            if text.galley.job.text == "今天想在课堂上做点什么？" {
+                            if text.galley.job.text == tr("今天想在课堂上做点什么？") {
                                 found_title = true;
                                 let bounds = Rect::from_min_size(text.pos, text.galley.size());
                                 assert!(area.contains_rect(bounds), "{mode:?} {width}: {bounds:?}");

@@ -36,6 +36,9 @@ mod brand;
 mod class;
 mod diagnostics;
 mod graphics;
+mod floating;
+mod manual_audio;
+mod i18n;
 mod notify;
 mod startup;
 mod state;
@@ -89,7 +92,7 @@ fn main() {
     let (rgba, width, height) = brand::whale_rgba(64);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Neo — 教室大屏 AI 助手")
+            .with_title(i18n::tr("Neo — 教室大屏 AI 助手"))
             .with_inner_size([1600.0, 1000.0])
             .with_min_inner_size([1024.0, 640.0])
             // 一体机是固定安装的，直接最大化铺满，避免老师还要拖窗口边缘。
@@ -116,6 +119,7 @@ fn main() {
                 app.start_overlay();
             }
             app.start_stt(&cc.egui_ctx);
+            app.start_floating(&cc.egui_ctx);
             // 系统托盘：关窗转后台运行，托盘菜单提供「显示主界面 / 退出」。
             // 装配失败只打日志降级为无托盘，不挡启动。
             app.start_tray();

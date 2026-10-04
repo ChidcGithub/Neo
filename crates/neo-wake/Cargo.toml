@@ -10,5 +10,5 @@ authors.workspace = true
 # 麦克风采集（WASAPI 共享模式）
 cpal = "0.18.2"
 # ONNX Runtime 绑定。关闭默认的 download-binaries，改用 load-dynamic
-# 显式加载 assets/onnxruntime.dll（版本 1.30.0，避免重复下载）。
+# 显式加载 runtime/onnx/onnxruntime.dll（兼容模型目录携 DLL，避免重复下载）。
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }

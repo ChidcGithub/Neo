@@ -4,6 +4,7 @@
 //! alignment and prevents model-authored links/images from invoking local files.
 //! There is no lossy intermediate block AST or zero-width formula placeholder.
 
+use crate::i18n::tr;
 use std::sync::{Arc, Mutex};
 
 use egui::{Id, RichText, TextStyle, Ui};
@@ -101,7 +102,7 @@ fn draw_math(ui: &mut Ui, latex: &str, size: f32, display: bool, color: egui::Co
             })
             .code(),
         )
-        .on_hover_text("公式尚未完整或语法不受支持，保留原文");
+        .on_hover_text(tr("公式尚未完整或语法不受支持，保留原文"));
         return;
     };
     // Formula widgets reserve their actual width AND height. Oversized formulas

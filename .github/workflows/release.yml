@@ -146,12 +146,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $base = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models'
-          New-Item -ItemType Directory -Force assets-stt, assets-stt\sense-voice, assets-stt\vad | Out-Null
-          Invoke-WebRequest "$base/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2" -OutFile sv.tar.bz2
-          tar -xjf sv.tar.bz2
-          Copy-Item 'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\model.int8.onnx',
-                    'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\tokens.txt' assets-stt\sense-voice\
-          Invoke-WebRequest "$base/silero_vad.onnx" -OutFile assets-stt\vad\silero_vad.onnx
+          New-Item -ItemType Directory -Force .cache\stt\extracted, .cache\stt\models\sense-voice, .cache\stt\models\vad | Out-Null
+          Invoke-WebRequest "$base/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2" -OutFile .cache\stt\sv.tar.bz2
+          tar -xjf .cache\stt\sv.tar.bz2 -C .cache\stt\extracted
+          if ($LASTEXITCODE -ne 0) { throw 'STT model extraction failed' }
+          Copy-Item '.cache\stt\extracted\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\model.int8.onnx',
+                    '.cache\stt\extracted\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\tokens.txt' .cache\stt\models\sense-voice\
+          Invoke-WebRequest "$base/silero_vad.onnx" -OutFile .cache\stt\models\vad\silero_vad.onnx
 
       - name: Fetch MinGit runtime
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
@@ -166,12 +167,17 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $pkg = "dist\neo"
           if (Test-Path $pkg) { throw "Package directory must be clean: $pkg" }
-          New-Item -ItemType Directory $pkg | Out-Null
+          New-Item -ItemType Directory "$pkg\resources\models\wake", "$pkg\resources\lang", "$pkg\runtime\onnx", "$pkg\docs" | Out-Null
           Copy-Item target\x86_64-pc-windows-msvc\release\neo.exe $pkg\
-          Copy-Item -Recurse crates\neo-wake\assets "$pkg\assets"
-          Copy-Item -Recurse assets-stt "$pkg\assets-stt"
-          Copy-Item -Recurse runtime "$pkg\runtime"
-          Copy-Item README.md, LICENSE $pkg\
+          foreach ($model in @('melspectrogram.onnx', 'embedding_model.onnx', 'hi_neo.onnx')) {
+            Copy-Item "crates\neo-wake\assets\$model" "$pkg\resources\models\wake\"
+          }
+          Copy-Item crates\neo-wake\assets\*.dll "$pkg\runtime\onnx\"
+          Copy-Item -Recurse .cache\stt\models "$pkg\resources\models\stt"
+          Copy-Item -Recurse .cache\runtime\gitbash "$pkg\runtime\gitbash"
+          Copy-Item resources\lang\zh-CN.lang, resources\lang\en-US.lang "$pkg\resources\lang\"
+          Copy-Item docs\distribution\README.md "$pkg\docs\README.md"
+          Copy-Item LICENSE $pkg\
 
       # 只从已授权 VS 的 Redist 目录收集真实导入依赖，不使用 System32 或执行 vc_redist。
       # app-local CRT 安全更新需要随 Neo 重新发布；UCRT/API sets 由 Win10 自带。
@@ -202,7 +208,7 @@ jobs:
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         run: |
           python -m pip install --quiet pillow
-          python tools/make_installer_art.py --out build/installer-art
+          python tools/make_installer_art.py --out target/package/installer-art
 
       - name: Build installer (NSIS)
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
@@ -219,9 +225,9 @@ jobs:
           $p = @(($v -replace '-.*$', '').Split('.')) + @('0', '0', '0')
           $vi = ($p[0..2] -join '.') + '.0'
           # 美术缺失宁可失败也不悄悄出个无品牌安装包
-          if (-not (Test-Path build\installer-art\neo.ico)) { throw "installer art missing" }
+          if (-not (Test-Path target\package\installer-art\neo.ico)) { throw "installer art missing" }
           # makensis 默认把编译工作目录切到脚本所在目录（tools\）：/NOCD 保持
-          # 在仓库根，脚本里的相对路径才找得到 dist\ 与 build\；
+          # 在仓库根，脚本里的相对路径才找得到 dist\ 与 target\；
           # /INPUTCHARSET UTF8：脚本是 UTF-8（中文注释），默认 ACP 会报编码错。
           & $mk /NOCD /INPUTCHARSET UTF8 "/DVERSION=$v" "/DVI_VERSION=$vi" tools\installer.nsi | Select-Object -Last 4
           if ($LASTEXITCODE -ne 0) { throw "makensis exit $LASTEXITCODE" }
@@ -251,9 +257,13 @@ jobs:
           $notes += '两者内容一致：'
           $notes += ''
           $notes += '- ``neo.exe`` - main application'
-          $notes += '- ``assets/`` - wake-word models (melspectrogram / embedding / hi_neo + onnxruntime)'
-          $notes += '- ``assets-stt/`` - SenseVoice int8 ASR + Silero VAD'
+          $notes += '- ``resources/models/wake/`` - wake-word models (melspectrogram / embedding / hi_neo)'
+          $notes += '- ``resources/models/stt/`` - SenseVoice int8 ASR + Silero VAD'
+          $notes += '- ``resources/lang/`` - Chinese and English language resources (zh-CN / en-US)'
+          $notes += '- ``runtime/onnx/`` - ONNX Runtime DLLs'
           $notes += '- ``runtime/gitbash/`` - bundled MinGit (bash tool runtime)'
+          $notes += '- ``docs/README.md`` - distribution guide'
+          $notes += '- ``LICENSE`` and imported app-local MSVC CRT DLLs remain next to ``neo.exe``'
           $notes -join "`n" | Out-File -Encoding utf8 dist\notes.md
           Get-Content dist\notes.md
 

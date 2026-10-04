@@ -274,6 +274,135 @@ fn lens_refracts_desktop_offscreen() {
     );
 }
 
+/// 在黑/白底上合成同一帧：折射主体不得再透出未折射桌面。
+#[test]
+fn refraction_core_replaces_desktop_without_background_leak_offscreen() {
+    const W: u32 = 256;
+    const H: u32 = 144;
+    let source = include_str!("shader.wgsl");
+    let image = [112, 128, 144, 255].repeat((W * H) as usize);
+    let Some(frame) = render_lens_source(&image, W, H, W, H, source) else {
+        eprintln!("无 GPU adapter，跳过折射覆盖率离屏测试");
+        return;
+    };
+    // GPU 直接标记完全覆盖与过渡区域，避免把 UNORM 舍入的近似 1 当成主体。
+    let output = "return vec4<f32>(premultiplied, alpha);";
+    assert_eq!(source.matches(output).count(), 1);
+    let mask_source = source.replace(output,
+        "return vec4<f32>(select(0.0, 1.0, vis >= 1.0), select(0.0, 1.0, vis > 0.0 && vis < 1.0), 0.0, 1.0);");
+    let mask = render_lens_source(&image, W, H, W, H, &mask_source).unwrap();
+    let (mut core, mut transition) = (0, 0);
+    for (pixel, mask) in frame.chunks_exact(4).zip(mask.chunks_exact(4)) {
+        if mask[0] == 255 {
+            core += 1;
+            assert_eq!(pixel[3], 255, "折射主体必须完全遮住未折射桌面，包括负抖动像素");
+            for channel in &pixel[..3] {
+                let over_black = *channel as u16;
+                let over_white = *channel as u16 + 255 - pixel[3] as u16;
+                assert_eq!(over_black, over_white, "主体合成结果不能随底下的桌面变化");
+            }
+        } else if mask[1] == 255 && pixel[3] > 0 && pixel[3] < 255 {
+            transition += 1;
+        }
+    }
+    assert!(core > 100 && transition > 100, "主体和柔和边缘都必须保留: {core}, {transition}");
+    assert_eq!(frame[((H / 2 * W + W / 2) * 4 + 3) as usize], 0,
+        "屏幕中心不应被覆盖");
+
+    // 没有可用桌面纹理时，不能用不透明空白代替半透明流光。
+    let fallback_source = source.replace("u.refr", "0.0");
+    let fallback = render_lens_source(&image, W, H, W, H, &fallback_source).unwrap();
+    assert!(fallback.chunks_exact(4).all(|pixel| pixel[3] < 255));
+    assert!(fallback.chunks_exact(4).any(|pixel| pixel[3] > 0));
+}
+
+/// 折射覆盖四条物理边和四角；扩展不改变流光场及无桌面降级。
+#[test]
+fn refraction_reaches_screen_edges_without_changing_color_band_offscreen() {
+    let source = include_str!("shader.wgsl");
+    let extension = "smoothstep(ridge - width * 0.25, ridge, d)";
+    assert_eq!(source.matches(extension).count(), 1);
+    let baseline = source.replace(extension, "0.0");
+    let output = "return vec4<f32>(premultiplied, alpha);";
+    assert_eq!(source.matches(output).count(), 1);
+    let color_output = "return vec4<f32>(band_col * glow * 0.95, glow * 0.42);";
+    for (w, h, time, level) in [(256u32, 144u32, "1.7", "0.0"), (192, 320, "8.0", "1.0")] {
+        let current = source.replace("u.time", time).replace("u.level", level);
+        let old = baseline.replace("u.time", time).replace("u.level", level);
+        let image = [112, 128, 144, 255].repeat((w * h) as usize);
+        let Some(frame) = render_lens_source(&image, w, h, w, h, &current) else {
+            eprintln!("无 GPU adapter，跳过贴边折射离屏测试");
+            return;
+        };
+        for y in 0..h {
+            for x in 0..w {
+                if x == 0 || y == 0 || x == w - 1 || y == h - 1 {
+                    assert_eq!(frame[((y * w + x) * 4 + 3) as usize], 255,
+                        "物理边界不能漏底: {w}x{h}, ({x}, {y})");
+                }
+            }
+        }
+        assert_eq!(frame[((h / 2 * w + w / 2) * 4 + 3) as usize], 0);
+        let color = render_lens_source(&image, w, h, w, h, &current.replace(output, color_output)).unwrap();
+        let old_color = render_lens_source(&image, w, h, w, h, &old.replace(output, color_output)).unwrap();
+        assert_eq!(color, old_color, "颜色光带的宽度、配色、亮度应逐像素保持不变");
+        // 不只检查独立的光带场：最终预乘输出叠到均匀桌面后也必须一致。
+        // 黑底验证光带/高光亮度，彩色底同时覆盖染色与新增桌面覆盖率。
+        for background in [[0u8, 0, 0, 255], [32, 48, 64, 255]] {
+            let flat = background.repeat((w * h) as usize);
+            for intensity in ["1.0f", "0.4f"] {
+                let actual = render_lens_source(&flat, w, h, w, h,
+                    &current.replace("u.intensity", intensity)).unwrap();
+                let expected = render_lens_source(&flat, w, h, w, h,
+                    &old.replace("u.intensity", intensity)).unwrap();
+                for (index, (a, b)) in actual.chunks_exact(4).zip(expected.chunks_exact(4)).enumerate() {
+                    for channel in 0..3 {
+                        let composite = |p: &[u8]| p[channel] as f32
+                            + background[channel] as f32 * (1.0 - p[3] as f32 / 255.0);
+                        assert!((composite(a) - composite(b)).abs() <= 2.0,
+                            "扩展不能改变最终合成的光带: {w}x{h}, 像素 {index}, 通道 {channel}, 强度 {intensity}");
+                    }
+                }
+            }
+        }
+        let fallback = render_lens_source(&image, w, h, w, h, &current.replace("u.refr", "0.0")).unwrap();
+        let old_fallback = render_lens_source(&image, w, h, w, h, &old.replace("u.refr", "0.0")).unwrap();
+        assert_eq!(fallback, old_fallback, "无桌面纹理时保持原有降级效果");
+    }
+}
+
+/// 合成纹理验收：只减弱共同折射位移，不改变流光/高光/透明度。
+#[test]
+fn weaker_refraction_preserves_color_and_alpha_offscreen() {
+    const W: u32 = 256;
+    const H: u32 = 144;
+    let source = include_str!("shader.wgsl");
+    assert_eq!(source.matches("let refraction_gain = 2.0;").count(), 1);
+    let baseline = source.replace("let refraction_gain = 2.0;", "let refraction_gain = 3.0;");
+    let flat = [112, 128, 144, 255].repeat((W * H) as usize);
+    let Some(current) = render_lens_source(&flat, W, H, W, H, source) else {
+        eprintln!("无 GPU adapter，跳过折射增益离屏测试");
+        return;
+    };
+    let original = render_lens_source(&flat, W, H, W, H, &baseline).unwrap();
+    assert!(current.iter().zip(&original).all(|(a, b)| a.abs_diff(*b) <= 1),
+        "均匀桌面上的流光颜色、高光和透明度不应随折射增益改变");
+
+    let mut patterned = flat;
+    for (i, pixel) in patterned.chunks_exact_mut(4).enumerate() {
+        let value = if (i % W as usize / 4 + i / W as usize / 4) % 2 == 0 { 40 } else { 210 };
+        pixel[..3].fill(value);
+    }
+    let current = render_lens_source(&patterned, W, H, W, H, source).unwrap();
+    let original = render_lens_source(&patterned, W, H, W, H, &baseline).unwrap();
+    let mut changed = 0;
+    for (a, b) in current.chunks_exact(4).zip(original.chunks_exact(4)) {
+        assert_eq!(a[3], b[3], "折射增益不能改变覆盖层透明度");
+        if a[..3].iter().zip(&b[..3]).any(|(x, y)| x.abs_diff(*y) > 2) { changed += 1; }
+    }
+    assert!(changed > 100, "折射减弱应改变纹理采样位置，实际仅 {changed} 像素变化");
+}
+
 /// 手动预览：拟真桌面（壁纸渐变 + 窗口块 + 文字行 + 任务栏），按真实管线
 /// 0.6x 离屏渲一帧再线性放大回全尺寸，落盘 target/lens-preview.png 供人工调参。
 /// `cargo test -p neo-overlay -- --ignored`

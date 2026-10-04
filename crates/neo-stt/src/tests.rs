@@ -1,5 +1,45 @@
 use super::*;
 
+#[test]
+fn release_paths_stt_models_prefer_override_and_reject_legacy() {
+    let custom = Path::new("custom/stt");
+    let exe = Path::new("package");
+    let source = Path::new("source/neo-stt");
+    let new = exe.join("resources/models/stt");
+    let old = exe.join("assets-stt");
+    for (available, expected) in [
+        (
+            vec![custom.to_path_buf(), new.clone(), old.clone()],
+            custom.to_path_buf(),
+        ),
+        (vec![new.clone(), old.clone()], new.clone()),
+        (vec![new.clone()], new),
+        (vec![old], source.join("assets")),
+        (vec![], source.join("assets")),
+    ] {
+        assert_eq!(
+            resolve_model_dir(Some(custom), Some(exe), source, |p| available
+                .iter()
+                .any(|v| v == p)),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn release_paths_stt_models_keep_development_fallback_without_exe() {
+    let source = Path::new("source/neo-stt");
+    let custom = Path::new("custom/stt");
+    assert_eq!(
+        resolve_model_dir(None, None, source, |_| false),
+        source.join("assets")
+    );
+    assert_eq!(
+        resolve_model_dir(Some(custom), None, source, |p| p == custom),
+        custom,
+    );
+}
+
 /// 冒烟测试：加载全部模型，验证转写链路通畅 + VAD 不把静音当语音。
 /// 需要 assets 模型就位（约 240MB），平时跳过：
 /// `cargo test -p neo-stt -- --ignored`
@@ -18,10 +58,7 @@ fn smoke_load_and_decode_silence() {
     engine.accept_waveform(&silence);
     engine.flush();
     assert!(!engine.speech_active(), "静音不应被 VAD 判为语音");
-    assert!(
-        engine.take_segment().is_none(),
-        "静音不应切出语音段"
-    );
+    assert!(engine.take_segment().is_none(), "静音不应切出语音段");
 }
 
 #[test]
@@ -55,7 +92,11 @@ fn transcribe_real_speech_wav() {
     engine.flush();
     let mut text = String::new();
     while let Some(seg) = engine.take_segment() {
-        eprintln!("[neo-stt] 语音段 {:.2}s（{} 样本）", seg.len() as f32 / SAMPLE_RATE as f32, seg.len());
+        eprintln!(
+            "[neo-stt] 语音段 {:.2}s（{} 样本）",
+            seg.len() as f32 / SAMPLE_RATE as f32,
+            seg.len()
+        );
         text.push_str(&engine.transcribe(&seg).expect("转写失败"));
     }
     eprintln!("[neo-stt] 转写结果：{text:?}");
@@ -71,17 +112,17 @@ fn read_wav_16k_mono_i16(path: &Path) -> Vec<f32> {
     let channels = u16::from_le_bytes([data[22], data[23]]);
     let sample_rate = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
     let bits = u16::from_le_bytes([data[34], data[35]]);
-    assert_eq!((channels, sample_rate, bits), (1, 16_000, 16), "只支持 16kHz mono i16");
+    assert_eq!(
+        (channels, sample_rate, bits),
+        (1, 16_000, 16),
+        "只支持 16kHz mono i16"
+    );
     // 找到 data 块（44 字节定长头部是理想情况，稳妥起见扫一遍）
     let mut pos = 12;
     while pos + 8 <= data.len() {
         let tag = &data[pos..pos + 4];
-        let size = u32::from_le_bytes([
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ]) as usize;
+        let size = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+            as usize;
         if tag == b"data" {
             return data[pos + 8..pos + 8 + size]
                 .chunks_exact(2)

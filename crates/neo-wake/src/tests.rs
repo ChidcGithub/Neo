@@ -1,5 +1,88 @@
 use super::*;
 
+#[test]
+fn release_paths_wake_models_prefer_override_and_reject_legacy() {
+    let custom = Path::new("custom/wake");
+    let exe = Path::new("package");
+    let source = Path::new("source/neo-wake");
+    let new = exe.join("resources/models/wake");
+    let old = exe.join("assets");
+    for (available, expected) in [
+        (
+            vec![custom.to_path_buf(), new.clone(), old.clone()],
+            custom.to_path_buf(),
+        ),
+        (vec![new.clone(), old.clone()], new.clone()),
+        (vec![new.clone()], new),
+        (vec![old], source.join("assets")),
+        (vec![], source.join("assets")),
+    ] {
+        assert_eq!(
+            resolve_model_dir(Some(custom), Some(exe), source, |p| available
+                .iter()
+                .any(|v| v == p)),
+            expected,
+        );
+    }
+    assert_eq!(
+        resolve_model_dir(None, None, source, |_| false),
+        source.join("assets")
+    );
+}
+
+#[test]
+fn release_paths_wake_dll_splits_runtime_and_preserves_explicit_model_dir() {
+    // 不使用默认模型路径；覆盖直接赋值 WakeConfig.model_dir 的调用方。
+    let config = WakeConfig {
+        model_dir: PathBuf::from("custom/wake"),
+        threshold: 0.25,
+        debounce: Duration::from_secs(2),
+    };
+    let exe = Path::new("package");
+    let source = Path::new("source/neo-wake");
+    let local = config.model_dir.join("onnxruntime.dll");
+    let new = exe.join("runtime/onnx/onnxruntime.dll");
+    let old = exe.join("assets/onnxruntime.dll");
+    let dev = source.join("assets/onnxruntime.dll");
+    for (available, expected) in [
+        (
+            vec![local.clone(), new.clone(), old.clone(), dev.clone()],
+            local.clone(),
+        ),
+        (vec![new.clone(), old.clone(), dev.clone()], new.clone()),
+        (vec![new.clone()], new.clone()),
+        (vec![old.clone(), dev.clone()], dev.clone()),
+        (vec![old], new.clone()),
+        (vec![dev.clone()], dev),
+        (vec![], new),
+    ] {
+        assert_eq!(
+            resolve_ort_path(&config.model_dir, Some(exe), source, |p| available
+                .iter()
+                .any(|v| v == p)),
+            expected,
+        );
+    }
+    assert_eq!(
+        resolve_ort_path(&config.model_dir, None, source, |_| false),
+        local
+    );
+}
+
+#[test]
+fn release_paths_wake_new_models_use_separate_runtime() {
+    let exe = Path::new("package");
+    let source = Path::new("source/neo-wake");
+    let expected_model = exe.join("resources/models/wake");
+    let expected_dll = exe.join("runtime/onnx/onnxruntime.dll");
+    let model = resolve_model_dir(None, Some(exe), source, |p| p == expected_model);
+    assert_eq!(model, expected_model);
+    assert_eq!(
+        resolve_ort_path(&model, Some(exe), source, |p| p == expected_dll),
+        expected_dll,
+    );
+}
+
 fn run(resampler: &mut Resampler, input: &[i16]) -> Vec<i16> {
     let mut out = Vec::new();
     resampler.process(input, &mut out);

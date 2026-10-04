@@ -433,6 +433,94 @@
         );
     }
 
+    #[test]
+    fn release_paths_gitbash_release_precedes_cache_and_keeps_sh_fallback() {
+        let base = PathBuf::from("package");
+        let candidates = bundled_bash_candidates(runtime_roots_from(None, Some(base.clone()), None));
+        let release = base.join("runtime/gitbash");
+        let cache = base.join(".cache/runtime/gitbash");
+        assert_eq!(
+            &candidates[..6],
+            &[
+                release.join("bin/bash.exe"),
+                release.join("usr/bin/bash.exe"),
+                release.join("usr/bin/sh.exe"),
+                cache.join("bin/bash.exe"),
+                cache.join("usr/bin/bash.exe"),
+                cache.join("usr/bin/sh.exe"),
+            ]
+        );
+        for (available, expected) in [
+            (
+                vec![candidates[0].clone(), candidates[3].clone()],
+                candidates[0].clone(),
+            ),
+            (
+                vec![candidates[2].clone(), candidates[3].clone()],
+                candidates[2].clone(),
+            ),
+            (vec![candidates[3].clone()], candidates[3].clone()),
+            (vec![candidates[5].clone()], candidates[5].clone()),
+        ] {
+            assert_eq!(
+                candidates.iter().find(|p| available.contains(p)),
+                Some(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn release_paths_gitbash_runtime_override_stays_first() {
+        let roots = runtime_roots_from(
+            Some("  custom/gitbash  "),
+            Some(PathBuf::from("package")),
+            None,
+        );
+        assert_eq!(roots[0], Path::new("custom/gitbash"));
+        assert_eq!(roots[1], Path::new("package/runtime/gitbash"));
+        assert_eq!(roots[2], Path::new("package/.cache/runtime/gitbash"));
+        let roots = runtime_roots_from(Some("  "), Some(PathBuf::from("package")), None);
+        assert_eq!(roots[0], Path::new("package/runtime/gitbash"));
+    }
+
+    #[test]
+    fn release_paths_gitbash_searches_only_cache_in_exe_ancestors_and_cwd() {
+        let exe_dir = PathBuf::from("repo/target/debug");
+        let cwd = PathBuf::from("working/nested");
+        let roots = runtime_roots_from(None, Some(exe_dir.clone()), Some(cwd.clone()));
+        assert_eq!(roots[0], exe_dir.join("runtime/gitbash"));
+        assert_eq!(roots[1], exe_dir.join(".cache/runtime/gitbash"));
+        let repo_cache = roots
+            .iter()
+            .position(|p| p == Path::new("repo/.cache/runtime/gitbash"))
+            .unwrap();
+
+        let cwd_cache = roots
+            .iter()
+            .position(|p| p == &cwd.join(".cache/runtime/gitbash"))
+            .unwrap();
+        assert!(repo_cache < cwd_cache);
+        assert!(roots.contains(&PathBuf::from("working/.cache/runtime/gitbash")));
+        for base in exe_dir.ancestors().skip(1).chain(cwd.ancestors()) {
+            assert!(
+                !roots.contains(&base.join("runtime/gitbash")),
+                "旧路径不应被发现：{base:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_paths_gitbash_cwd_does_not_replace_missing_exe_dir() {
+        let cwd = PathBuf::from("repo");
+        let roots = runtime_roots_from(None, None, Some(cwd.clone()));
+        assert_eq!(roots[0], cwd.join(".cache/runtime/gitbash"));
+        assert!(!roots.contains(&cwd.join("runtime/gitbash")));
+        let candidates = bundled_bash_candidates(roots);
+        let old_bash = cwd.join("runtime/gitbash/usr/bin/bash.exe");
+        assert!(!candidates.contains(&old_bash));
+        assert!(runtime_roots_from(None, None, None).is_empty());
+    }
+
     /// 候选表里**不该有** WSL 别名；随包运行时排在 PATH 之前。
     #[test]
     fn candidates_put_bundled_runtime_first_and_drop_wsl() {

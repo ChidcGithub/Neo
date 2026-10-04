@@ -53,7 +53,8 @@ fn now_ms() -> u64 {
 
 #[derive(Debug, Clone)]
 pub struct WakeConfig {
-    /// 含 melspectrogram.onnx / embedding_model.onnx / hi_neo.onnx / onnxruntime.dll 的目录
+    /// 含 melspectrogram.onnx / embedding_model.onnx / hi_neo.onnx 的目录。
+    /// 若同时带有 onnxruntime.dll，优先使用它；否则独立查找运行时。
     pub model_dir: PathBuf,
     pub threshold: f32,
     pub debounce: Duration,
@@ -63,7 +64,7 @@ impl Default for WakeConfig {
     fn default() -> Self {
         Self {
             // 模型目录查找顺序：NEO_WAKE_MODEL_DIR 环境变量
-            // > exe 同级 assets/（release 打包布局）
+            // > exe 同级 resources/models/wake/
             // > 源码内 assets/（cargo run 开发布局）
             model_dir: default_model_dir(),
             // 默认 0.25：混入机主真人录音重训后，实测真唤醒 0.34~0.83，
@@ -80,23 +81,49 @@ impl Default for WakeConfig {
     }
 }
 
-/// 模型目录回退链：环境变量 > exe 同级 assets/ > 源码 assets/
+/// 模型目录回退链：环境变量 > 发行资源 > 源码 assets/
 fn default_model_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("NEO_WAKE_MODEL_DIR") {
-        let dir = PathBuf::from(dir);
-        if dir.is_dir() {
-            return dir;
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let dir = dir.join("assets");
-            if dir.is_dir() {
-                return dir;
-            }
-        }
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("assets")
+    let override_dir = std::env::var_os("NEO_WAKE_MODEL_DIR").map(PathBuf::from);
+    let exe = std::env::current_exe().ok();
+    resolve_model_dir(
+        override_dir.as_deref(),
+        exe.as_deref().and_then(Path::parent),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        Path::is_dir,
+    )
+}
+
+fn resolve_model_dir(
+    override_dir: Option<&Path>,
+    exe_dir: Option<&Path>,
+    manifest_dir: &Path,
+    is_dir: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    override_dir
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(exe_dir.map(|dir| dir.join("resources/models/wake")))
+
+        .find(|dir| is_dir(dir))
+        .unwrap_or_else(|| manifest_dir.join("assets"))
+}
+
+fn resolve_ort_path(
+    model_dir: &Path,
+    exe_dir: Option<&Path>,
+    manifest_dir: &Path,
+    is_file: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    // 必须用实际传给 load_models 的目录，而非重新读取默认配置：调用方可能
+    // 直接设置 WakeConfig.model_dir，并在该目录携带匹配的 DLL。
+    let local = model_dir.join("onnxruntime.dll");
+    let bundled = exe_dir.map(|dir| dir.join("runtime/onnx/onnxruntime.dll"));
+    std::iter::once(local.clone())
+        .chain(bundled.clone())
+
+        .chain(std::iter::once(manifest_dir.join("assets/onnxruntime.dll")))
+        .find(|path| is_file(path))
+        .unwrap_or_else(|| bundled.unwrap_or(local))
 }
 
 #[derive(Debug, Clone)]
@@ -625,7 +652,13 @@ fn init_ort(dir: &Path) -> Result<(), String> {
     if ORT_INIT.get().is_some() {
         return Ok(());
     }
-    let dll = dir.join("onnxruntime.dll");
+    let exe = std::env::current_exe().ok();
+    let dll = resolve_ort_path(
+        dir,
+        exe.as_deref().and_then(Path::parent),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        Path::is_file,
+    );
     // commit() 返回 bool：false 表示 environment 已配置过（幂等，可忽略）
     ort::init_from(&dll)
         .map_err(|e| format!("load {}: {e}", dll.display()))?

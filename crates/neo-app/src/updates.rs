@@ -1,5 +1,6 @@
 //! 只检查公开 release 元数据；不下载更新、不访问应用数据或认证信息。
 
+use crate::i18n::tr;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -81,7 +82,7 @@ impl UpdateChecker {
         let result = match receiver.try_recv() {
             Ok(status) => status,
             Err(mpsc::TryRecvError::Empty) => return None,
-            Err(mpsc::TryRecvError::Disconnected) => Status::Failed(RESPONSE_ERROR.into()),
+            Err(mpsc::TryRecvError::Disconnected) => Status::Failed(tr(RESPONSE_ERROR).into()),
         };
         self.receiver = None;
         if generation != self.generation {
@@ -123,7 +124,7 @@ impl UpdateChecker {
         if spawn(job).is_err() {
             self.running.store(false, Ordering::Release);
             self.receiver = None;
-            self.status = Status::Failed(SPAWN_ERROR.into());
+            self.status = Status::Failed(tr(SPAWN_ERROR).into());
             self.pending = true;
             ctx.request_repaint();
         }
@@ -145,7 +146,7 @@ impl Drop for Completion {
 fn check() -> Status {
     match fetch_release() {
         Ok(status) => status,
-        Err(message) => Status::Failed(message.into()),
+        Err(message) => Status::Failed(tr(message).into()),
     }
 }
 

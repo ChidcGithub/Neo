@@ -9,6 +9,7 @@
 //! 横向偏移必须放进一次左到右布局（见 `draw_messages`），
 //! 且要用 `set_max_width(content_w)` 收窄，否则 Markdown 的代码块会撑到屏边。
 
+use crate::i18n::{tr, tf};
 use egui::{Rect, ScrollArea, Sense, Ui, Vec2};
 use neo_theme::SquirclePaint;
 use neo_ui::{Icon, IconButton};
@@ -69,11 +70,10 @@ pub fn draw(
     );
     // 副标题（模型 · 消息数）同样要 elide：模型商的长 id 不该伸进按钮区。
     let sub_font = skin.prop(skin.t().caption);
-    let sub = format!(
-        "{} · {} 条消息",
-        state.model_display(),
-        state.messages.len()
-    );
+    let sub = tf("{model} · {count} 条消息", &[
+        ("model", state.model_display().to_owned()),
+        ("count", state.messages.len().to_string()),
+    ]);
     let sub = elide(ui.painter(), &sub, &sub_font, header.width() - skin.m().s(44.0));
     text_left(
         ui.painter(),
@@ -253,7 +253,7 @@ fn draw_one(
                 let font = skin.prop(skin.t().caption);
                 let (r, _) =
                     ui.allocate_exact_size(Vec2::new(content_w, m.s(20.0)), Sense::hover());
-                text_left(ui.painter(), r, "（空回复）", font, p.label_tertiary);
+                text_left(ui.painter(), r, tr("（空回复）"), font, p.label_tertiary);
             }
 
             if let Some(err) = &msg.error {
@@ -388,7 +388,7 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     let title = if variant == Variant::Others {
         present::others_title(&tool.name)
     } else {
-        variant.title().to_owned()
+        tr(variant.title()).to_owned()
     };
     // 摘要：待确认时说的是"将要做什么"（工具自己写的 preview），
     // 其余用参数派生（上游的 `deriveSummary`：模型写的一句话 > 命令本身）。
@@ -414,13 +414,15 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     let err_text: Option<String> = if awaiting {
         None
     } else if cancelled {
-        Some("已取消".to_owned())
+        Some(tr("已取消").to_owned())
     } else if failed {
         tool.outcome
             .as_ref()
             .and_then(|o| o.error.as_ref())
             .map(|e| match &e.hint {
-                Some(h) => format!("{}（建议：{h}）", e.message),
+                Some(h) => tf("{error}（建议：{hint}）", &[
+                                    ("error", e.message.clone()), ("hint", h.clone()),
+                                ]),
                 None => e.message.clone(),
             })
     } else {
@@ -527,13 +529,13 @@ fn tool_status(tool: &crate::state::ToolMeta) -> (&'static str, neo_ui::NoticeTo
     use crate::state::ToolState;
     use neo_ui::NoticeTone;
     match tool.state {
-        ToolState::AwaitingConfirm => ("等待确认", NoticeTone::Info),
-        ToolState::Running => ("正在运行…", NoticeTone::Info),
-        ToolState::Denied => ("已拒绝", NoticeTone::Error),
-        ToolState::Cancelled => ("已取消", NoticeTone::Neutral),
-        ToolState::Done if tool.outcome.is_some() && !tool.ok() => ("执行失败", NoticeTone::Error),
-        ToolState::Done if tool.ok() => ("执行成功", NoticeTone::Success),
-        ToolState::Done => ("已结束", NoticeTone::Neutral),
+        ToolState::AwaitingConfirm => (tr("等待确认"), NoticeTone::Info),
+        ToolState::Running => (tr("正在运行…"), NoticeTone::Info),
+        ToolState::Denied => (tr("已拒绝"), NoticeTone::Error),
+        ToolState::Cancelled => (tr("已取消"), NoticeTone::Neutral),
+        ToolState::Done if tool.outcome.is_some() && !tool.ok() => (tr("执行失败"), NoticeTone::Error),
+        ToolState::Done if tool.ok() => (tr("执行成功"), NoticeTone::Success),
+        ToolState::Done => (tr("已结束"), NoticeTone::Neutral),
     }
 }
 

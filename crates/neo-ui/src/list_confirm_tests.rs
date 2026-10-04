@@ -6,7 +6,36 @@ fn design(mode: ThemeMode, viewport_h: f32, distance: Distance) -> Design {
 }
 
 #[test]
+fn injected_labels_keep_chinese_defaults_and_accept_borrowed_text() {
+    let row = ListRow::new(1, "title", "meta");
+    assert_eq!(
+        (row.rename_label, row.delete_label),
+        ("重命名会话", "删除会话")
+    );
+    let bar = ConfirmBar::new("question");
+    assert_eq!((bar.confirm, bar.cancel), ("删除", "取消"));
+    let rename = String::from("Rename chat");
+    let delete = String::from("Delete chat");
+    let row = row.action_labels(&rename, &delete);
+    assert_eq!(
+        (row.rename_label, row.delete_label),
+        (rename.as_str(), delete.as_str())
+    );
+    let bar = bar.labels(&delete, "Cancel");
+    assert_eq!((bar.confirm, bar.cancel), (delete.as_str(), "Cancel"));
+}
+
+#[test]
+fn injected_labels_flow_confirmation_keeps_keyboard_safety() {
+    flow_confirmation_with_labels("Delete permanently", "Cancel");
+}
+
+#[test]
 fn flow_confirmation_wraps_targets_and_keyboard_is_safe() {
+    flow_confirmation_with_labels("删除", "取消");
+}
+
+fn flow_confirmation_with_labels(confirm: &str, cancel: &str) {
     for mode in [ThemeMode::Light, ThemeMode::Dark] {
         for scale in [0.85, 1.0, 1.75, 2.8] {
             for width in [240.0, 320.0, 560.0] {
@@ -18,44 +47,151 @@ fn flow_confirmation_wraps_targets_and_keyboard_is_safe() {
                 let question = "删除这条记忆？此操作无法撤销。Long question ".repeat(5);
                 let draw = |opening, events| {
                     let mut result = None;
-                    let mut output = ctx.run_ui(egui::RawInput {
-                        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 4000.0))),
-                        events, ..Default::default()
-                    }, |ui| {
-                        let parent = Rect::from_min_size(egui::pos2(8.0, 8.0), Vec2::new(width - 16.0, 3984.0));
-                        crate::at(ui, parent, |ui| {
-                            ui.shrink_clip_rect(parent);
-                            let response = ConfirmBar::new(&question).show(ui, &d, "safe-confirm", opening);
-                            for rect in [response.cancel.rect, response.confirm.rect] {
-                                assert!(ui.clip_rect().contains_rect(rect), "确认热区不得越过父级裁剪");
-                            }
-                            result = Some(response);
-                        });
-                    });
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                Vec2::new(width, 4000.0),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let parent = Rect::from_min_size(
+                                egui::pos2(8.0, 8.0),
+                                Vec2::new(width - 16.0, 3984.0),
+                            );
+                            crate::at(ui, parent, |ui| {
+                                ui.shrink_clip_rect(parent);
+                                let response = ConfirmBar::new(&question)
+                                    .labels(confirm, cancel)
+                                    .show(ui, &d, "safe-confirm", opening);
+                                for rect in [response.cancel.rect, response.confirm.rect] {
+                                    assert!(
+                                        ui.clip_rect().contains_rect(rect),
+                                        "确认热区不得越过父级裁剪"
+                                    );
+                                }
+                                result = Some(response);
+                            });
+                        },
+                    );
                     output.textures_delta.clear();
                     result.unwrap()
                 };
-                let key = |key| vec![egui::Event::Key { key, physical_key: None, pressed: true,
-                    repeat: false, modifiers: egui::Modifiers::NONE }];
+                let key = |key| {
+                    vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }]
+                };
                 let first = draw(true, vec![]);
                 assert_eq!(first.outcome, ConfirmOutcome::None);
                 let settled = draw(false, vec![]);
                 assert!(settled.cancel.has_focus());
                 assert_eq!(first.cancel.id, settled.cancel.id);
                 assert!(settled.question.rect.bottom() <= settled.cancel.rect.top());
-                assert!(!settled.cancel.rect.shrink(0.1).intersects(settled.confirm.rect.shrink(0.1)));
+                assert!(!settled
+                    .cancel
+                    .rect
+                    .shrink(0.1)
+                    .intersects(settled.confirm.rect.shrink(0.1)));
                 for rect in [settled.cancel.rect, settled.confirm.rect] {
                     assert!(rect.right() <= width);
                     assert!(rect.height() >= d.m().hit_target(0.0));
                 }
-                assert_eq!(draw(false, key(egui::Key::Enter)).outcome, ConfirmOutcome::Cancel);
+                assert_eq!(
+                    draw(false, key(egui::Key::Enter)).outcome,
+                    ConfirmOutcome::Cancel
+                );
                 draw(true, vec![]);
                 draw(false, key(egui::Key::Tab));
                 let focused = draw(false, vec![]);
                 assert!(focused.confirm.has_focus(), "Tab {width}/{scale}");
-                assert_eq!(draw(false, key(egui::Key::Enter)).outcome, ConfirmOutcome::Confirm);
-                assert_eq!(draw(false, key(egui::Key::Escape)).outcome, ConfirmOutcome::Cancel);
-                assert_eq!(draw(true, key(egui::Key::Enter)).outcome, ConfirmOutcome::None);
+                assert_eq!(
+                    draw(false, key(egui::Key::Enter)).outcome,
+                    ConfirmOutcome::Confirm
+                );
+                assert_eq!(
+                    draw(false, key(egui::Key::Escape)).outcome,
+                    ConfirmOutcome::Cancel
+                );
+                assert_eq!(
+                    draw(true, key(egui::Key::Enter)).outcome,
+                    ConfirmOutcome::None
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn injected_labels_compact_confirmation_measures_text_and_keeps_ids() {
+    for scale in [0.85, 1.0, 1.75, 2.8] {
+        for width in [160.0, 244.0, 480.0] {
+            let ctx = egui::Context::default();
+            neo_theme::fonts::install(&ctx);
+            let theme = Theme::from_metrics(ThemeMode::Dark, neo_theme::Metrics::from_scale(scale));
+            theme.apply(&ctx);
+            let d = Design::new(theme);
+            let rect =
+                Rect::from_min_size(egui::pos2(8.0, 8.0), Vec2::new(width, ListRow::height(&d)));
+            for label in ["删除", "Delete", "Delete permanently"] {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(width + 16.0, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        assert_eq!(
+                            confirm_row(
+                                ui,
+                                &d,
+                                rect,
+                                7,
+                                &ConfirmBar::new("Delete this chat?").labels(label, "Cancel")
+                            ),
+                            ConfirmOutcome::None
+                        );
+                    },
+                );
+                output.textures_delta.clear();
+                let hit = ctx
+                    .read_response(Id::new(("neo-confirm-del", 7i64)))
+                    .unwrap();
+                assert!(rect.contains_rect(hit.rect));
+                let texts: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some((shape.clip_rect, text)),
+                        _ => None,
+                    })
+                    .collect();
+                let (clip, text) = texts.last().unwrap();
+                assert!(rect.contains_rect(*clip));
+                let natural = ctx
+                    .fonts_mut(|fonts| {
+                        fonts.layout_no_wrap(
+                            label.to_owned(),
+                            d.font_bold(d.t().caption),
+                            d.c().on_primary,
+                        )
+                    })
+                    .size()
+                    .x;
+                if natural + d.m().s(48.0) <= width {
+                    assert_eq!(text.galley.text(), label);
+                    assert!(clip
+                        .expand(0.1)
+                        .contains_rect(Rect::from_min_size(text.pos, text.galley.size())));
+                }
             }
         }
     }

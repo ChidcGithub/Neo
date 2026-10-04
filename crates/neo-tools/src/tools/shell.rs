@@ -136,7 +136,8 @@ fn resolve_powershell() -> Result<Host, ToolError> {
 /// Git Bash 的解析顺序（Windows）：
 ///
 /// 1. `NEO_GIT_BASH` —— 显式指定，最高优先；
-/// 2. **随包运行时** `runtime/gitbash/`（由 `tools/fetch_runtime.py` 下载的 MinGit，
+/// 2. `NEO_RUNTIME` 指定的根目录 → exe 同级的**随包运行时** `runtime/gitbash/`
+///    → 开发缓存 `.cache/runtime/gitbash/`（由 `tools/fetch_runtime.py` 下载的 MinGit，
 ///    脚本会把 `usr/bin/sh.exe` 硬链接成 `usr/bin/bash.exe`），
 ///    这样**没装 Git 的机器也能用** —— 这是一体机场景的兜底；
 /// 3. PATH 里的 `bash.exe`（**排除** `WindowsApps\bash.exe` —— 那是 WSL 的
@@ -194,11 +195,7 @@ fn bash_candidates() -> Vec<PathBuf> {
     // 注意 `usr/bin/sh.exe`：MinGit 里**没有 `bash.exe`** —— 它把 bash 装成了
     // `sh.exe`（同一个二进制）。`fetch_runtime.py` 会把它硬链接成 `bash.exe`，
     // 但万一那一步失败，用 `sh.exe` 也能跑（代价是 bash 进 POSIX 模式）。
-    for root in runtime_roots() {
-        out.push(root.join("bin").join("bash.exe"));
-        out.push(root.join("usr").join("bin").join("bash.exe"));
-        out.push(root.join("usr").join("bin").join("sh.exe"));
-    }
+    out.extend(bundled_bash_candidates(runtime_roots()));
 
     // 3) PATH 里的 bash.exe（排除 WSL 的应用执行别名）
     for dir in path_dirs() {
@@ -263,29 +260,47 @@ fn is_wsl_stub(p: &Path) -> bool {
         .contains("windowsapps")
 }
 
-/// `runtime/` 可能在哪。
+fn bundled_bash_candidates(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots.into_iter().flat_map(|root| [
+        root.join("bin/bash.exe"),
+        root.join("usr/bin/bash.exe"),
+        root.join("usr/bin/sh.exe"),
+    ]).collect()
+}
+
+/// 开发缓存 `.cache/runtime/` 和随包 `runtime/` 可能在哪。
 ///
-/// 可执行文件所在目录**及其上溯几层**（`cargo run` 时 exe 在 `target/debug/`，
-/// 往上是仓库根），再加上当前目录 —— 开发时和装好之后都能找到同一份运行时。
-/// `NEO_RUNTIME` 可直接指到 runtime 目录本身。
+/// 随包 `runtime/gitbash/` 只从 exe 同级发现，优先于开发缓存。
+/// 仅开发缓存从 exe 所在目录和当前目录上溯几层（`cargo run` 时可找到仓库根）。
+/// `NEO_RUNTIME` 可直接指到 GitBash 根目录本身（其下含 bin/ 或 usr/bin/）。
 fn runtime_roots() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(dir) = std::env::var("NEO_RUNTIME") {
-        let dir = dir.trim();
-        if !dir.is_empty() {
-            out.push(PathBuf::from(dir));
-        }
-    }
-    let bases = [
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf)),
+    let override_dir = std::env::var("NEO_RUNTIME").ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    runtime_roots_from(
+        override_dir.as_deref(),
+        exe_dir,
         std::env::current_dir().ok(),
-    ];
-    for base in bases.into_iter().flatten() {
+    )
+}
+
+fn runtime_roots_from(
+    override_dir: Option<&str>,
+    exe_dir: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(dir) = override_dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+        out.push(PathBuf::from(dir));
+    }
+    if let Some(dir) = &exe_dir {
+        out.push(dir.join("runtime/gitbash"));
+    }
+    for base in [exe_dir, cwd].into_iter().flatten() {
         let mut dir = base;
         for _ in 0..5 {
-            out.push(dir.join("runtime").join("gitbash"));
+            out.push(dir.join(".cache/runtime/gitbash"));
             let Some(parent) = dir.parent().map(Path::to_path_buf) else {
                 break;
             };

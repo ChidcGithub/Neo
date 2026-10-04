@@ -214,11 +214,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 有效厚度（出场包络在这里生效：show 时透镜从边缘涌起）
     let thick = thickness(d, w0.x, w0.y, width, px) * u.intensity;
 
+    // 仅将折射从波脊向外延续到视口边界（含四角），不移动内侧边界，
+    // 不改变供流光/高光使用的厚度场与法线；没有桌面纹理时不启用。
+    let ridge = -width * (0.45 + 0.60 * w0.x);
+    let outer_refraction = select(0.0,
+        smoothstep(ridge - width * 0.25, ridge, d), u.refr > 0.5);
+    let refr_thick = max(thick, outer_refraction * u.intensity);
+
     // ---- 折射：近轴近似，位移方向垂直于等厚线、幅度随厚度 ----
-    let bend = 64.0 * px;                     // 最大折射位移（渲染 px）
-    let off = -n3.xy * thick * bend;          // y-up
+    let bend = 64.0 * px;                     // 基准折射位移（渲染 px）
+    let off = -n3.xy * refr_thick * bend;          // y-up
     let uv0 = in.pos.xy / res;                // top-down 0..1（与桌面纹理同向）
     let off_uv = vec2<f32>(off.x, -off.y) / res;  // 几何 y-up → uv 翻 y
+    // 共同位移从 3 倍收敛到 2 倍；色散仍用基准偏移，避免彩边随之变宽。
+    let refraction_gain = 2.0;
+    let refracted_uv = uv0 + off_uv * refraction_gain;
 
     // 粗糙度：厚度越大光程越长，磨砂越强（薄边保持清晰）
     let rr = (1.0 + 6.0 * thick) * px;
@@ -235,7 +245,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let edge = 1.0 - smoothstep(-1.0, 1.0, d_edge);
     // 透镜可见度：只认「真正厚」的脊线（薄裙近乎全透）——
     // 低门槛会让宽厚的薄裙变成一层 96% 不透明的脏雾。
-    let vis = smoothstep(0.22, 0.52, thick) * edge;
+    let light_vis = smoothstep(0.22, 0.52, thick) * edge;
+    let vis = max(light_vis,
+        outer_refraction * smoothstep(0.22, 0.52, u.intensity));
 
     // ---- 彩色流光：七色粉彩板沿周长环流（arc 参数 + 环流角速度驱动）----
     // 色带贴死物理屏幕边缘（含四角：用锐角屏幕 SDF 而非内缩带圆角的透镜盒），
@@ -253,23 +265,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 色带不乘 edge —— 最后一行像素也要吃满颜色（贴边无空隙）
     var col = band_col * glow * 0.95;
     var alpha = glow * 0.42;
-    if (u.refr > 0.5 && thick > 0.003) {
+    var refr_rgb = vec3<f32>(0.0);
+    if (u.refr > 0.5 && refr_thick > 0.003) {
         // 色散：RGB 各用不同折射系数（蓝偏折最大），物理彩边
-        var refr_rgb = vec3<f32>(0.0);
         // 薄裙 vis=0 时桌面项严格为零：省掉 15 次纹理采样，仍保留棱线高光。
         if (vis > 0.0) {
-            refr_rgb.r = sample_rough(uv0 + off_uv * 0.90, rough_r, jr).r;
-            refr_rgb.g = sample_rough(uv0 + off_uv * 1.00, rough_r, jr).g;
-            refr_rgb.b = sample_rough(uv0 + off_uv * 1.10, rough_r, jr).b;
+            refr_rgb.r = sample_rough(refracted_uv - off_uv * 0.10, rough_r, jr).r;
+            refr_rgb.g = sample_rough(refracted_uv, rough_r, jr).g;
+            refr_rgb.b = sample_rough(refracted_uv + off_uv * 0.10, rough_r, jr).b;
         }
         // 扭曲桌面为主体（乘 vis：薄裙区不折射），被流光轻微渗色；
         // 菲涅尔处轻微压暗折射（能量守恒感）；棱线高光染一点同色
-        let spec_col = mix(vec3<f32>(1.0, 1.0, 1.0), band_col, 0.30);
-        col = col + refr_rgb * mix(vec3<f32>(1.0, 1.0, 1.0), band_col, 0.16) * (1.0 - 0.20 * fres) * vis
-            + spec_col * spec * 0.60;
-        alpha = max(alpha, vis * 0.88);
-        // 棱线高光更不透明一点，脊线立得住
-        alpha = max(alpha, spec * 0.85 * edge);
+        if (thick > 0.003) {
+            let spec_col = mix(vec3<f32>(1.0, 1.0, 1.0), band_col, 0.30);
+            col = col + refr_rgb * mix(vec3<f32>(1.0, 1.0, 1.0), band_col, 0.16) * (1.0 - 0.20 * fres) * light_vis
+                + spec_col * spec * 0.60;
+            // 棱线高光更不透明一点，脊线立得住
+            alpha = max(alpha, spec * 0.85 * edge);
+        }
     } else if (thick > 0.003) {
         // 无抓屏降级：彩色玻璃边（剖面微光 + 棱线），不假装有折射
         col = col + band_col * (0.10 * thick)
@@ -281,7 +294,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let dith = (hash12(fc + vec2<f32>(fract(t) * 61.7)) - 0.5) * (1.8 / 255.0);
     col = col + vec3<f32>(dith);
     alpha = clamp(alpha + dith, 0.0, 1.0);
+    // 先按扩展前的覆盖率合成光带，避免折射补满边缘时一起放大流光/高光。
+    if (u.refr > 0.5 && thick > 0.003) {
+        alpha = max(alpha, light_vis);
+    }
+    let light_alpha = alpha;
+    var premultiplied = col * light_alpha;
+    if (u.refr > 0.5 && refr_thick > 0.003) {
+        // 新增覆盖只替换原本透出的桌面，不增加染色或高光。
+        // 抖动后补满覆盖率，保证主体及物理边界不会漏出未折射原图。
+        alpha = max(alpha, vis);
+        premultiplied = premultiplied + refr_rgb * (alpha - light_alpha);
+    }
 
     // premultiplied alpha 输出
-    return vec4<f32>(col * alpha, alpha);
+    return vec4<f32>(premultiplied, alpha);
 }

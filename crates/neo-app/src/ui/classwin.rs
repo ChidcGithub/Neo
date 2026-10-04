@@ -5,20 +5,20 @@
 //! 滑入动画在视口自己的回调里自驱（主窗托盘后主视口被节流到 ~10fps，
 //! 动画帧不能指望它）。
 
+use crate::i18n::{tf, tr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{
-    Color32, Context, Pos2, Rect, Vec2, ViewportBuilder, ViewportCommand, ViewportId,
-    WindowLevel,
+    Color32, Context, Pos2, Rect, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel,
 };
 use neo_theme::{SquirclePaint, Theme};
 use neo_ui::{Icon, IconButton};
 
 use crate::brand::WhaleMark;
 use crate::class::{ClassMonitor, SaveState};
-use crate::ui::{Skin, markdown, text_left};
+use crate::ui::{markdown, text_left, Skin};
 
 use super::miniwin::OFFSCREEN;
 
@@ -32,13 +32,21 @@ fn viewport_id() -> ViewportId {
 }
 
 fn save_status(generated: bool, state: SaveState, close_blocked: bool) -> String {
-    let generation = if generated { "总结已生成" } else { "未完成自动整理，已保留素材节选" };
-    let saved = match state {
-        SaveState::Unsaved => "尚未保存，仅在内存中；请重试保存，退出前会再次检查",
-        SaveState::IndexFailed => "总结已保存；记忆索引失败，请重试",
-        SaveState::Saved => "总结及记忆索引已保存",
+    let generation = if generated {
+        tr("总结已生成")
+    } else {
+        tr("未完成自动整理，已保留素材节选")
     };
-    let retained = if close_blocked { "；已保留卡片，未关闭" } else { "" };
+    let saved = match state {
+        SaveState::Unsaved => tr("尚未保存，仅在内存中；请重试保存，退出前会再次检查"),
+        SaveState::IndexFailed => tr("总结已保存；记忆索引失败，请重试"),
+        SaveState::Saved => tr("总结及记忆索引已保存"),
+    };
+    let retained = if close_blocked {
+        tr("；已保留卡片，未关闭")
+    } else {
+        ""
+    };
     format!("{generation} · {saved}{retained}")
 }
 
@@ -75,8 +83,12 @@ impl ClassWin {
             }
             let physical = Rect::from_min_max(rect.min * ppp, rect.max * ppp);
             // 常驻休眠 HWND 仍会报告 1x1 客户区；打开命令尚未落地时也不能排除。
-            (physical.is_finite() && physical.width() > 1.0 && physical.height() > 1.0
-                && rect.width() > 1.0 && rect.height() > 1.0).then_some(physical)
+            (physical.is_finite()
+                && physical.width() > 1.0
+                && physical.height() > 1.0
+                && rect.width() > 1.0
+                && rect.height() > 1.0)
+                .then_some(physical)
         })
     }
 
@@ -101,7 +113,9 @@ impl ClassWin {
         theme: Theme,
         overlay: Option<&neo_overlay::OverlayHandle>,
     ) {
-        if let Some(layer) = overlay { layer.set_card(neo_overlay::card_id::CLASS, None); }
+        if let Some(layer) = overlay {
+            layer.set_card(neo_overlay::card_id::CLASS, None);
+        }
         // 1. 关闭回传先行：dismiss 后 presenting 转 None，本轮即走关闭沿。
         if self.retry_wanted.swap(false, Ordering::Relaxed) {
             monitor.retry_save();
@@ -112,17 +126,20 @@ impl ClassWin {
         let open = monitor.presenting().is_some();
 
         // 2. 位置：屏幕上方居中。
-        let rect = Self::target_rect(
-            theme,
-            super::miniwin::screen_geometry(ctx, false).monitor,
-        );
+        let rect = Self::target_rect(theme, super::miniwin::screen_geometry(ctx, false).monitor);
         let size = rect.size();
         let target = rect.min;
 
         // 3. 内容快照（两条路径共用）。
         let snapshot = monitor.presenting().map(|r| {
-            (r.subject.clone(), r.summary.clone(), r.over_limit, r.date.clone(),
-                save_status(r.generated, r.save_state, r.close_blocked), r.save_state != SaveState::Saved)
+            (
+                r.subject.clone(),
+                r.summary.clone(),
+                r.over_limit,
+                r.date.clone(),
+                save_status(r.generated, r.save_state, r.close_blocked),
+                r.save_state != SaveState::Saved,
+            )
         });
 
         // 正文滚动、关闭和重试始终由独立交互视口处理。
@@ -154,7 +171,7 @@ impl ClassWin {
         ctx.show_viewport_deferred(
             viewport_id(),
             ViewportBuilder::default()
-                .with_title("课堂总结")
+                .with_title(tr("课堂总结"))
                 .with_decorations(false)
                 .with_resizable(false)
                 .with_taskbar(false)
@@ -168,7 +185,9 @@ impl ClassWin {
                 .with_inner_size(if open { size } else { Vec2::new(1.0, 1.0) })
                 .with_position(if open { target } else { OFFSCREEN }),
             move |ui, _class| {
-                if crate::app::desktop_suspended(ui.ctx()) { return; }
+                if crate::app::desktop_suspended(ui.ctx()) {
+                    return;
+                }
                 let Some((subject, summary, over_limit, date, status, retry)) = &snapshot else {
                     return;
                 };
@@ -181,7 +200,11 @@ impl ClassWin {
                     // 即使两帧间停顿跨过终点，也要显式落到最终位置。
                     ui.ctx().send_viewport_cmd_to(
                         viewport_id(),
-                        ViewportCommand::OuterPosition(if t < 1.0 { Pos2::new(target.x, y) } else { target }),
+                        ViewportCommand::OuterPosition(if t < 1.0 {
+                            Pos2::new(target.x, y)
+                        } else {
+                            target
+                        }),
                     );
                     if t < 1.0 {
                         ui.ctx().request_repaint_after(POLL);
@@ -193,7 +216,17 @@ impl ClassWin {
 
                 let whale = WhaleMark::cached(ui.ctx());
                 let skin = Skin::new(theme, &whale);
-                if paint(ui, &skin, subject, summary, *over_limit, date, status, *retry, &retry_wanted) {
+                if paint(
+                    ui,
+                    &skin,
+                    subject,
+                    summary,
+                    *over_limit,
+                    date,
+                    status,
+                    *retry,
+                    &retry_wanted,
+                ) {
                     close_wanted.store(true, Ordering::Relaxed);
                     ui.ctx().request_repaint_of(ViewportId::ROOT);
                 }
@@ -225,11 +258,8 @@ fn paint(
     ui.painter()
         .squircle_filled(shadow, m.s(18.0), Color32::from_black_alpha(26));
     ui.painter().squircle_filled(rect, m.s(18.0), p.bg_layer_1);
-    ui.painter().squircle_stroked(
-        rect,
-        m.s(18.0),
-        egui::Stroke::new(1.0, p.border_l1),
-    );
+    ui.painter()
+        .squircle_stroked(rect, m.s(18.0), egui::Stroke::new(1.0, p.border_l1));
 
     let pad = m.s(18.0);
     let inner = rect.shrink(pad);
@@ -243,13 +273,17 @@ fn paint(
         .id_salt("neo-classwin-close")
         .show_at(ui, &d, close_center);
     #[cfg(test)]
-    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-classwin-close-probe"), close.rect));
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(egui::Id::new("neo-classwin-close-probe"), close.rect));
     let close = close.clicked();
 
     let title = if date.is_empty() {
-        format!("课堂总结 · {subject}")
+        tf("课堂总结 · {subject}", &[("subject", subject.to_owned())])
     } else {
-        format!("课堂总结 · {subject} · {date}")
+        tf(
+            "课堂总结 · {subject} · {date}",
+            &[("subject", subject.to_owned()), ("date", date.to_owned())],
+        )
     };
     // 科目名来自视觉模型输出，不守规矩时会画穿关闭钮 —— 超宽 elide。
     let title_max_w = close_center.x - close_d - title_rect.left();
@@ -257,7 +291,10 @@ fn paint(
     let title = super::elide(ui.painter(), &title, &title_font, title_max_w);
     text_left(
         ui.painter(),
-        Rect::from_min_max(title_rect.min, Pos2::new(close_center.x - close_d, title_rect.bottom())),
+        Rect::from_min_max(
+            title_rect.min,
+            Pos2::new(close_center.x - close_d, title_rect.bottom()),
+        ),
         &title,
         title_font,
         p.label_primary,
@@ -266,14 +303,15 @@ fn paint(
 
     // 超限提醒（提醒而不强制：总结太长只标出来）。
     if over_limit {
-        let warn_rect = Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(inner.width(), m.s(16.0)));
-        text_left(
-            ui.painter(),
-            warn_rect,
-            "总结超过建议的 1500 字",
+        let warning = ui.painter().layout(
+            tr("总结超过建议的 1500 字").to_owned(),
             skin.prop(skin.t().caption),
             p.label_tertiary,
+            inner.width(),
         );
+        let warn_rect = Rect::from_min_size(Pos2::new(inner.left(), y), warning.size());
+        ui.painter()
+            .galley(warn_rect.min, warning, p.label_tertiary);
         y = warn_rect.bottom() + m.s(4.0);
     }
 
@@ -296,8 +334,12 @@ fn paint(
         .id_salt("neo-classwin-body")
         .auto_shrink([false, false])
         .show(&mut body_ui, |ui| {
-            ui.label(egui::RichText::new(status).color(if retry { p.error } else { p.label_tertiary }));
-            if retry && ui.button("重试保存 / 索引").clicked() {
+            ui.label(egui::RichText::new(status).color(if retry {
+                p.error
+            } else {
+                p.label_tertiary
+            }));
+            if retry && ui.button(tr("重试保存 / 索引")).clicked() {
                 retry_wanted.store(true, Ordering::Relaxed);
                 ui.ctx().request_repaint_of(ViewportId::ROOT);
             }
@@ -351,8 +393,10 @@ impl ClassDot {
                 let c = ui.max_rect().center();
                 let r = ui.max_rect().width() * 0.5;
                 // 外圈微光晕 + 实心红点。
-                ui.painter().circle_filled(c, r, p.error.gamma_multiply(0.16 * a));
-                ui.painter().circle_filled(c, r * 0.62, p.error.gamma_multiply(a));
+                ui.painter()
+                    .circle_filled(c, r, p.error.gamma_multiply(0.16 * a));
+                ui.painter()
+                    .circle_filled(c, r * 0.62, p.error.gamma_multiply(a));
             })
         });
         layer.set_card(neo_overlay::card_id::DOT, card);

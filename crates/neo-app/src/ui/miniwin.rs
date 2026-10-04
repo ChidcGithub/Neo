@@ -16,6 +16,7 @@
 //!   小窗视口自己的回调里自驱**（避让 / 淡入 / 边缘流光），主视口只管
 //!   10fps 的内容快照；窗口位置也由回调发 `OuterPosition`，builder 不碰。
 
+use crate::i18n::tr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -67,7 +68,10 @@ pub(crate) struct ScreenGeometry {
 
 impl ScreenGeometry {
     fn from_physical(size: Vec2, ppp: f32) -> Self {
-        Self { monitor: size / ppp, ppp }
+        Self {
+            monitor: size / ppp,
+            ppp,
+        }
     }
 
     fn point(self, physical: Pos2) -> Pos2 {
@@ -88,7 +92,10 @@ fn primary_geometry() -> ScreenGeometry {
     let _dpi = neo_tools::tools::screen::physical_pixels().ok();
     let ppp = neo_tools::tools::screen::dpi_scale_at(0, 0).unwrap_or(1.0) as f32;
     let size = unsafe {
-        Vec2::new(GetSystemMetrics(SM_CXSCREEN) as f32, GetSystemMetrics(SM_CYSCREEN) as f32)
+        Vec2::new(
+            GetSystemMetrics(SM_CXSCREEN) as f32,
+            GetSystemMetrics(SM_CYSCREEN) as f32,
+        )
     };
     ScreenGeometry::from_physical(size, ppp)
 }
@@ -103,7 +110,10 @@ pub(crate) fn screen_geometry(ctx: &Context, using_overlay: bool) -> ScreenGeome
         primary_geometry()
     } else {
         ctx.input(|i| ScreenGeometry {
-            monitor: i.viewport().monitor_size.unwrap_or(Vec2::new(1920.0, 1080.0)),
+            monitor: i
+                .viewport()
+                .monitor_size
+                .unwrap_or(Vec2::new(1920.0, 1080.0)),
             ppp: i.viewport().native_pixels_per_point.unwrap_or(1.0),
         })
     }
@@ -123,34 +133,40 @@ impl FallbackGeometry {
 
     fn screen(ctx: &Context) -> ScreenGeometry {
         let zoom = ctx.zoom_factor();
-        ctx.input(|i| i.raw.viewports.get(&viewport_id()).and_then(|v| {
-            Some(ScreenGeometry {
-                monitor: v.monitor_size?,
-                ppp: v.native_pixels_per_point? * zoom,
+        ctx.input(|i| {
+            i.raw.viewports.get(&viewport_id()).and_then(|v| {
+                Some(ScreenGeometry {
+                    monitor: v.monitor_size?,
+                    ppp: v.native_pixels_per_point? * zoom,
+                })
             })
-        })).or_else(|| {
+        })
+        .or_else(|| {
             ctx.data(|d| d.get_temp::<Self>(Id::new("neo-miniwin-pos")))
                 .map(|cached| cached.screen)
-        }).unwrap_or_else(|| {
+        })
+        .unwrap_or_else(|| {
             let primary = primary_geometry();
-            ScreenGeometry { monitor: primary.monitor / zoom, ppp: primary.ppp * zoom }
+            ScreenGeometry {
+                monitor: primary.monitor / zoom,
+                ppp: primary.ppp * zoom,
+            }
         })
     }
-
 
     fn store(self, ctx: &Context) {
         let id = Id::new("neo-miniwin-pos");
         let last = ctx.data(|d| d.get_temp::<Self>(id));
         // 相同点坐标在 DPI / egui zoom 变化后不是同一个物理位置，必须重发。
-        let moved = last.is_none_or(|last|
-            last.position != self.position || last.screen.ppp != self.screen.ppp);
+        let moved = last.is_none_or(|last| {
+            last.position != self.position || last.screen.ppp != self.screen.ppp
+        });
         ctx.data_mut(|d| d.insert_temp(id, self));
         if moved {
             ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(self.position));
         }
     }
 }
-
 
 /// 缓出三次方：避让与淡入共用这条「先快后慢」的曲线。
 fn ease_out_cubic(t: f32) -> f32 {
@@ -215,7 +231,9 @@ impl GlobalInput {
 }
 
 static GLOBAL_INPUT: Mutex<GlobalInput> = Mutex::new(GlobalInput {
-    cursor: None, down: false, edge: None,
+    cursor: None,
+    down: false,
+    edge: None,
 });
 
 fn poll_global_input() -> GlobalInput {
@@ -336,15 +354,14 @@ impl Snapshot {
         // 正文只放正式回复；content 还空着时给占位。
         let (body_src, body_dim) = match last_assistant {
             Some(msg) if !msg.content.trim().is_empty() => (msg.content.trim(), false),
-            _ => ("正在处理…", true),
+            _ => (tr("正在处理…"), true),
         };
         // 本轮工具流水（自最后一条用户消息起）：最近 MAX_STEPS 步，旧的在上。
         // 倒序收集到量即停，再翻回正序 —— 老消息成堆时不全扫。
         let m = theme.metrics;
         let inner_w = m.s(340.0 - 28.0);
         let step_px = theme.typo.caption.max(1.0);
-        let step_chars =
-            ((inner_w - m.s(12.0)) / step_px).floor().max(6.0) as usize;
+        let step_chars = ((inner_w - m.s(12.0)) / step_px).floor().max(6.0) as usize;
         let mut steps: Vec<Step> = Vec::new();
         for msg in state.messages.iter().rev() {
             if msg.role == Role::User {
@@ -400,10 +417,11 @@ impl Snapshot {
 
 fn interrupt_builder(theme: Theme, monitor: Vec2) -> ViewportBuilder {
     let m = theme.metrics;
-    let size = Vec2::new(m.s(380.0), m.s(280.0)).min((monitor - Vec2::splat(m.s(32.0))).max(Vec2::splat(1.0)));
+    let size = Vec2::new(m.s(380.0), m.s(280.0))
+        .min((monitor - Vec2::splat(m.s(32.0))).max(Vec2::splat(1.0)));
     let position = Pos2::new((monitor.x - size.x - m.s(16.0)).max(0.0), m.s(16.0));
     ViewportBuilder::default()
-        .with_title("Neo · 打断执行？")
+        .with_title(tr("Neo · 打断执行？"))
         .with_decorations(false)
         .with_resizable(false)
         .with_taskbar(false)
@@ -425,20 +443,36 @@ fn paint_interrupt(ui: &mut egui::Ui, theme: Theme, generation: u64, answer: &At
     ui.painter().rect_filled(rect, 0.0, d.p().bg_layer_1);
     let inner = rect.shrink(m.s(18.0));
     super::at(ui, inner, |ui| {
-        ui.label(egui::RichText::new("打断执行？").font(d.font_bold(d.t().headline)));
+        ui.label(egui::RichText::new(tr("打断执行？")).font(d.font_bold(d.t().headline)));
         ui.add_space(m.s(12.0));
-        ui.label(egui::RichText::new("AI 本轮正在执行任务。打断会立即取消当前任务。")
-            .font(d.font(d.t().body)).color(d.p().label_secondary));
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(tr("AI 本轮正在执行任务。打断会立即取消当前任务。"))
+                    .font(d.font(d.t().body))
+                    .color(d.p().label_secondary),
+            )
+            .wrap(),
+        );
     });
-    let footer = Rect::from_min_max(Pos2::new(inner.left(), inner.bottom() - m.s(48.0)), inner.max);
+    let footer = Rect::from_min_max(
+        Pos2::new(inner.left(), inner.bottom() - m.s(48.0)),
+        inner.max,
+    );
     super::at(ui, footer, |ui| {
         ui.spacing_mut().item_spacing.x = m.s(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            for (button, value) in [(Button::new("打断").danger(), 1u8), (Button::new("继续").elevated(), 2u8)] {
-                let response = button.id_salt(("neo-interrupt", generation, value))
-                    .enabled(answer.load(Ordering::Acquire) == 0).show(ui, &d);
+            for (button, value) in [
+                (Button::new(tr("打断")).danger(), 1u8),
+                (Button::new(tr("继续")).elevated(), 2u8),
+            ] {
+                let response = button
+                    .id_salt(("neo-interrupt", generation, value))
+                    .enabled(answer.load(Ordering::Acquire) == 0)
+                    .show(ui, &d);
                 #[cfg(test)]
-                ui.ctx().data_mut(|data| data.insert_temp(Id::new(("neo-interrupt-button", value)), response.rect));
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(Id::new(("neo-interrupt-button", value)), response.rect)
+                });
                 if response.clicked() {
                     let _ = answer.compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire);
                 }
@@ -451,12 +485,7 @@ fn paint_interrupt(ui: &mut egui::Ui, theme: Theme, generation: u64, answer: &At
 ///
 /// 正文用组件布局（不再是纯 painter 排版），量到的内容高写进 `measure`
 /// 槽 —— tick 下一帧据此算卡片目标高（自适应最后一段正文）。
-fn paint(
-    ui: &mut egui::Ui,
-    snap: &Snapshot,
-    fade: f32,
-    measure: &Arc<Mutex<f32>>,
-) {
+fn paint(ui: &mut egui::Ui, snap: &Snapshot, fade: f32, measure: &Arc<Mutex<f32>>) {
     let d = Design::new(snap.theme);
     let p = d.p();
     let m = d.m();
@@ -475,7 +504,6 @@ fn paint(
     painter.squircle_filled(rect, m.s(18.0), tint(p.bg_layer_1));
     painter.squircle_stroked(rect, m.s(18.0), Stroke::new(1.0, tint(p.border_l1)));
 
-
     let inner = rect.shrink(m.s(14.0));
     let step_lh = d.t().caption * 1.55;
     super::at(ui, inner, |ui| {
@@ -485,10 +513,8 @@ fn paint(
 
         // 工具流水：状态圆点 + 单行摘要，最近的在最下。
         for step in &snap.steps {
-            let (row, _) = ui.allocate_exact_size(
-                Vec2::new(inner.width(), step_lh),
-                egui::Sense::hover(),
-            );
+            let (row, _) =
+                ui.allocate_exact_size(Vec2::new(inner.width(), step_lh), egui::Sense::hover());
             let dot = match step.tone {
                 StepTone::Active => p.accent,
                 StepTone::Ok => p.success,
@@ -584,8 +610,10 @@ impl BeamGeometry {
         self.cumulative.reserve(self.points.len() + 1);
         self.cumulative.push(0.0);
         for i in 0..self.points.len() {
-            self.cumulative.push(self.cumulative[i]
-                + self.points[i].distance(self.points[(i + 1) % self.points.len()]));
+            self.cumulative.push(
+                self.cumulative[i]
+                    + self.points[i].distance(self.points[(i + 1) % self.points.len()]),
+            );
         }
         self.total = *self.cumulative.last().unwrap();
         self.key = Some(key);
@@ -594,11 +622,14 @@ impl BeamGeometry {
 
     fn at(&self, s: f32) -> Pos2 {
         let s = s.rem_euclid(self.total);
-        let idx = match self.cumulative.binary_search_by(|c|
-            c.partial_cmp(&s).unwrap_or(std::cmp::Ordering::Equal)) {
+        let idx = match self
+            .cumulative
+            .binary_search_by(|c| c.partial_cmp(&s).unwrap_or(std::cmp::Ordering::Equal))
+        {
             Ok(i) => i,
             Err(i) => i.saturating_sub(1),
-        }.min(self.points.len() - 1);
+        }
+        .min(self.points.len() - 1);
         let seg = (self.cumulative[idx + 1] - self.cumulative[idx]).max(f32::EPSILON);
         let t = ((s - self.cumulative[idx]) / seg).clamp(0.0, 1.0);
         self.points[idx] + (self.points[(idx + 1) % self.points.len()] - self.points[idx]) * t
@@ -719,7 +750,9 @@ impl Drop for MiniWin {
 
 impl MiniWin {
     fn consume_click(&mut self, input: GlobalInput, now: u64) -> bool {
-        let Some((at, _)) = input.edge else { return false };
+        let Some((at, _)) = input.edge else {
+            return false;
+        };
         if at == 0 || at == self.lmb_edge_consumed {
             return false;
         }
@@ -748,7 +781,9 @@ impl MiniWin {
     fn physical_click(&mut self, state: &AppState, click: Option<mouse_hook::Click>) -> bool {
         let armed = self.arm_input(state);
         let Some(click) = click else { return false };
-        if click.sequence == self.physical_sequence { return false; }
+        if click.sequence == self.physical_sequence {
+            return false;
+        }
         // 不使用毫秒时间戳/250ms过期窗口：UI 暂避或忙碌不能丢掉真实请求。
         self.physical_sequence = click.sequence;
         armed
@@ -758,7 +793,9 @@ impl MiniWin {
     #[cfg(any(windows, test))]
     fn hook_click(&mut self) -> Option<Option<mouse_hook::Click>> {
         #[cfg(test)]
-        if let Some(slot) = &self.mock_clicks { return Some(slot.latest()); }
+        if let Some(slot) = &self.mock_clicks {
+            return Some(slot.latest());
+        }
         if !self.hook_attempted {
             self.hook_attempted = true;
             #[cfg(all(windows, not(test)))]
@@ -767,10 +804,16 @@ impl MiniWin {
                     self.mouse_hook = Some(hook);
                     self.input_armed = false;
                 }
-                Err(error) => eprintln!("{error}；退回鼠标轮询（注入后 1s 内的真实点击可能被忽略）"),
+                Err(error) => {
+                    eprintln!("{error}；退回鼠标轮询（注入后 1s 内的真实点击可能被忽略）")
+                }
             }
         }
-        if self.mouse_hook.as_ref().is_some_and(mouse_hook::MouseHook::finished) {
+        if self
+            .mouse_hook
+            .as_ref()
+            .is_some_and(mouse_hook::MouseHook::finished)
+        {
             eprintln!("鼠标 hook 线程已退出；退回鼠标轮询（注入后 1s 内的真实点击可能被忽略）");
             self.mouse_hook = None;
             self.input_armed = false; // 切换输入源不能重放回退采样器的旧沿。
@@ -781,11 +824,22 @@ impl MiniWin {
     fn poll_task_click(&mut self, state: &AppState) -> (Option<Pos2>, bool, bool) {
         #[cfg(any(windows, test))]
         if let Some(click) = self.hook_click() {
-            return (click.map(|c| c.position), self.physical_click(state, click), false);
+            return (
+                click.map(|c| c.position),
+                self.physical_click(state, click),
+                false,
+            );
         }
         let input = poll_global_input();
-        let synthetic = synthetic_click_at(now_ms(), neo_tools::tools::screen::SYNTHETIC_INPUT_AT.load(Ordering::Relaxed));
-        (input.edge.map(|(_, pos)| pos), self.task_click(state, input, now_ms()), synthetic)
+        let synthetic = synthetic_click_at(
+            now_ms(),
+            neo_tools::tools::screen::SYNTHETIC_INPUT_AT.load(Ordering::Relaxed),
+        );
+        (
+            input.edge.map(|(_, pos)| pos),
+            self.task_click(state, input, now_ms()),
+            synthetic,
+        )
     }
 
     fn request_interrupt(&mut self, state: &AppState, armed: bool, on_card: bool, synthetic: bool) {
@@ -810,7 +864,9 @@ impl MiniWin {
             self.shown = false;
             self.legacy_sent = Vec2::ZERO;
             *self.layer_rect.lock().unwrap() = [0.0; 4];
-            ctx.data_mut(|d| { d.remove::<FallbackGeometry>(Id::new("neo-miniwin-pos")); });
+            ctx.data_mut(|d| {
+                d.remove::<FallbackGeometry>(Id::new("neo-miniwin-pos"));
+            });
             if using_overlay {
                 ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Close);
             }
@@ -848,9 +904,11 @@ impl MiniWin {
         let screen = primary_geometry();
         let builder = interrupt_builder(theme, screen.monitor / ctx.zoom_factor());
         ctx.show_viewport_deferred(id, builder, move |ui, _| {
-            if crate::app::desktop_suspended(ui.ctx()) || answer.load(Ordering::Acquire) == u8::MAX {
+            if crate::app::desktop_suspended(ui.ctx()) || answer.load(Ordering::Acquire) == u8::MAX
+            {
                 suspend_answer(&answer);
-                ui.ctx().send_viewport_cmd_to(id, ViewportCommand::Visible(false));
+                ui.ctx()
+                    .send_viewport_cmd_to(id, ViewportCommand::Visible(false));
                 ui.ctx().request_repaint_of(ViewportId::ROOT);
                 return;
             }
@@ -966,7 +1024,6 @@ impl MiniWin {
         }
         drop(fadeout);
 
-
         // 3. hook 记录真实按下的物理位置/序号，桌面工具注入期间也能触发。
         //    安装失败才退回原采样；回调仍轮询光标用于避让，不负责打断来源。
         let (cursor, lmb_edge, synthetic) = self.poll_task_click(state);
@@ -1001,13 +1058,29 @@ impl MiniWin {
         let can_show = !shot_hiding && !crate::app::desktop_suspended(ctx);
         // 先验证任务，再消费回执；桌面挂起/截图/审批不能抹掉已经有效的回答。
         if self.interrupt_open {
-            if can_show && state.awaiting_tool().is_none()
-                && self.interrupt_viewport.is_some_and(|id| ctx.input(|i|
-                    i.raw.viewports.get(&id).is_some_and(|v| v.close_requested()))) {
-                let _ = self.interrupt_result.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+            if can_show
+                && state.awaiting_tool().is_none()
+                && self.interrupt_viewport.is_some_and(|id| {
+                    ctx.input(|i| {
+                        i.raw
+                            .viewports
+                            .get(&id)
+                            .is_some_and(|v| v.close_requested())
+                    })
+                })
+            {
+                let _ = self.interrupt_result.compare_exchange(
+                    0,
+                    2,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
             }
             match self.interrupt_result.load(Ordering::Acquire) {
-                1 => { state.cancel(); self.interrupt_open = false; }
+                1 => {
+                    state.cancel();
+                    self.interrupt_open = false;
+                }
                 2 => self.interrupt_open = false,
                 _ => {}
             }
@@ -1026,7 +1099,9 @@ impl MiniWin {
         }
 
         // 状态牌和弹窗互斥，不能在同一位置叠两种输入角色。
-        let open = can_show && !self.interrupt_open && hidden_to_tray
+        let open = can_show
+            && !self.interrupt_open
+            && hidden_to_tray
             && (busy || lingering || (fading && !faded));
 
         // 6. 显隐与内容。
@@ -1087,9 +1162,7 @@ impl MiniWin {
                         let fade_out = fadeout
                             .lock()
                             .unwrap()
-                            .map(|t0| {
-                                (t0.elapsed().as_secs_f32() / FADEOUT_SECS).clamp(0.0, 1.0)
-                            })
+                            .map(|t0| (t0.elapsed().as_secs_f32() / FADEOUT_SECS).clamp(0.0, 1.0))
                             .unwrap_or(0.0);
                         let fade = fade_in * (1.0 - ease_out_cubic(fade_out));
                         // 避让：只盯「静止位」判定（卡片移动本身不会让光标
@@ -1104,12 +1177,11 @@ impl MiniWin {
                             HEIGHT_ANIM_SECS,
                         );
                         let size = Vec2::new(snap.width, h);
-                        let home =
-                            Pos2::new((monitor.x - size.x - margin).max(margin), margin);
+                        let home = Pos2::new((monitor.x - size.x - margin).max(margin), margin);
                         let away = Pos2::new(margin, margin);
                         let cursor = poll_global_input().cursor.map(|p| geometry.point(p));
-                        let dodge = cursor
-                                .is_some_and(|c| Rect::from_min_size(home, size).contains(c));
+                        let dodge =
+                            cursor.is_some_and(|c| Rect::from_min_size(home, size).contains(c));
                         let t = ctx.animate_value_with_time(
                             Id::new("neo-miniwin-avoid"),
                             if dodge { 1.0 } else { 0.0 },
@@ -1150,7 +1222,9 @@ impl MiniWin {
         //    露面，`is_viewport_or_descendant_visible` 反向强制主窗跑真 pass，
         //    内容快照的增量更新随之恢复（但被托盘节流到 10fps，只够刷文字）。
         if open != self.shown {
-            ctx.data_mut(|d| { d.remove::<FallbackGeometry>(Id::new("neo-miniwin-pos")); });
+            ctx.data_mut(|d| {
+                d.remove::<FallbackGeometry>(Id::new("neo-miniwin-pos"));
+            });
             if open {
                 // 先落位再恢复尺寸，免得在屏幕内从 1x1 长大被瞥见；
                 // 每次露面都重新提到顶层，盖过同屏后到的其它 topmost 窗口。
@@ -1164,7 +1238,10 @@ impl MiniWin {
                 *self.refade_since.lock().unwrap() = Some(Instant::now());
                 self.legacy_sent = size;
             } else {
-                ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::InnerSize(Vec2::new(1.0, 1.0)));
+                ctx.send_viewport_cmd_to(
+                    viewport_id(),
+                    ViewportCommand::InnerSize(Vec2::new(1.0, 1.0)),
+                );
                 ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(OFFSCREEN));
                 self.legacy_sent = Vec2::ZERO;
             }
@@ -1184,7 +1261,9 @@ impl MiniWin {
             viewport_id(),
             Self::builder(size, open).with_visible(!suspended),
             move |ui, _class| {
-                if crate::app::desktop_suspended(ui.ctx()) { return; }
+                if crate::app::desktop_suspended(ui.ctx()) {
+                    return;
+                }
                 let Some(snapshot) = &snapshot else { return };
                 let ctx = ui.ctx().clone();
                 // ---- 回调自驱的动画（主视口托盘态被 eframe 节流到 10fps，
@@ -1218,7 +1297,8 @@ impl MiniWin {
                 let size = Vec2::new(snapshot.width, snapshot.target_h);
                 let margin = m.s(16.0);
                 let geometry = ScreenGeometry {
-                    monitor: ctx.input(|i| i.viewport().monitor_size)
+                    monitor: ctx
+                        .input(|i| i.viewport().monitor_size)
                         .unwrap_or(snapshot.monitor),
                     ppp: ctx.pixels_per_point(),
                 };
@@ -1276,7 +1356,9 @@ struct FlashClock {
 impl FlashClock {
     fn now(&self) -> Instant {
         #[cfg(test)]
-        if let Some(now) = *self.time.lock().unwrap() { return now; }
+        if let Some(now) = *self.time.lock().unwrap() {
+            return now;
+        }
         Instant::now()
     }
 
@@ -1340,7 +1422,10 @@ impl ShotFlash {
             }
         }
         // 上一帧可能还没清理已到期动画；不能把它误当成被新租约打断的反馈。
-        if self.flashing_since.is_some_and(|t0| now.duration_since(t0).as_secs_f32() >= FLASH_SECS) {
+        if self
+            .flashing_since
+            .is_some_and(|t0| now.duration_since(t0).as_secs_f32() >= FLASH_SECS)
+        {
             self.flashing_since = None;
             self.frame_generation.fetch_add(1, Ordering::AcqRel);
         }
@@ -1364,7 +1449,8 @@ impl ShotFlash {
         let expected = generation.load(Ordering::Acquire);
         let clock = self.clock.clone();
         neo_overlay::Card::passive(rect, move |ui| {
-            if crate::app::desktop_suspended(&ctx) || generation.load(Ordering::Acquire) != expected {
+            if crate::app::desktop_suspended(&ctx) || generation.load(Ordering::Acquire) != expected
+            {
                 return;
             }
             paint_flash_at(ui, Some((ui.max_rect(), t0)), clock.now());
@@ -1426,7 +1512,10 @@ impl ShotFlash {
         //    起闪 = 恢复全屏尺寸 + 挪到虚拟屏原点；熄闪 = 缩 1x1 回 OFFSCREEN。
         if on != self.shown {
             if on {
-                ctx.send_viewport_cmd_to(flash_viewport_id(), ViewportCommand::OuterPosition(origin));
+                ctx.send_viewport_cmd_to(
+                    flash_viewport_id(),
+                    ViewportCommand::OuterPosition(origin),
+                );
                 ctx.send_viewport_cmd_to(flash_viewport_id(), ViewportCommand::InnerSize(vs_size));
                 ctx.send_viewport_cmd_to(
                     flash_viewport_id(),
@@ -1437,7 +1526,10 @@ impl ShotFlash {
                     flash_viewport_id(),
                     ViewportCommand::InnerSize(Vec2::new(1.0, 1.0)),
                 );
-                ctx.send_viewport_cmd_to(flash_viewport_id(), ViewportCommand::OuterPosition(OFFSCREEN));
+                ctx.send_viewport_cmd_to(
+                    flash_viewport_id(),
+                    ViewportCommand::OuterPosition(OFFSCREEN),
+                );
             }
             self.shown = on;
         }
@@ -1472,7 +1564,8 @@ impl ShotFlash {
                 .with_inner_size(if on { vs_size } else { Vec2::new(1.0, 1.0) })
                 .with_position(if on { origin } else { OFFSCREEN }),
             move |ui, _class| {
-                if crate::app::desktop_suspended(ui.ctx()) || frame.is_none()
+                if crate::app::desktop_suspended(ui.ctx())
+                    || frame.is_none()
                     || generation.load(Ordering::Acquire) != expected
                 {
                     return;
@@ -1492,7 +1585,9 @@ impl ShotFlash {
 fn paint_flash_at(ui: &mut egui::Ui, frame: Option<(Rect, Instant)>, now: Instant) {
     let Some((rect, t0)) = frame else { return };
     let elapsed = now.saturating_duration_since(t0).as_secs_f32();
-    if elapsed >= FLASH_SECS { return; }
+    if elapsed >= FLASH_SECS {
+        return;
+    }
     // 子视口自行拉帧；到期即停止绘制/重绘，不依赖可能被托盘节流的 ROOT tick。
     ui.ctx().request_repaint_after(POLL);
     let k = (elapsed / FLASH_SECS).clamp(0.0, 1.0);

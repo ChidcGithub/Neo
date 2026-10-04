@@ -3,7 +3,7 @@
 
 Neo 的 `bash` 工具需要一个**类 Unix 命令行环境**。一体机上不一定装了 Git，
 所以运行时随包提供：下载 Git for Windows 的 **MinGit**（官方最小发行版），
-解到 `runtime/gitbash/`，工具就能在没装 Git 的机器上跑起来。
+缓存到 `.cache/runtime/gitbash/`，发行时复制到 `runtime/gitbash/`。
 
     python tools/fetch_runtime.py                 # 拉最新版（按镜像顺序试）
     python tools/fetch_runtime.py --version 2.55.0.windows.5
@@ -12,7 +12,7 @@ Neo 的 `bash` 工具需要一个**类 Unix 命令行环境**。一体机上不�
 
 产物（不进版本库，见 .gitignore）：
 
-    runtime/gitbash/
+    .cache/runtime/gitbash/
       bin/bash.exe        ← 工具优先用这个
       usr/bin/bash.exe
       mingw64/…
@@ -49,7 +49,7 @@ import zipfile
 
 REPO = "git-for-windows/git"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEST = os.path.join(ROOT, "runtime", "gitbash")
+DEST = os.path.join(ROOT, ".cache", "runtime", "gitbash")
 
 UA = {"User-Agent": "neo-fetch-runtime"}
 

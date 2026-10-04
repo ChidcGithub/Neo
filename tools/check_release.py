@@ -1,9 +1,10 @@
 """检查发行必需载荷非空，核验有限范围的 x64 PE 导入并收集获授权的 MSVC CRT。
 
-PE 范围仅为 neo.exe、assets/*.dll 及其递归导入的白名单 CRT；
+PE 范围仅为 neo.exe、runtime/onnx/*.dll 及其递归导入的白名单 CRT；
 不验证完整第三方 DLL 依赖闭包、模型有效性或 MinGit 运行能力。
 """
 import argparse
+import json
 from pathlib import Path
 import re
 import shutil
@@ -18,10 +19,12 @@ CRT_NAMES = (
 CRT_NAME = re.compile("(?:" + "|".join(re.escape(name) for name in CRT_NAMES) + ")", re.I)
 CRT_FAMILY = re.compile(r"(?:vcruntime|msvcp|msvcr|concrt|vccorlib).*\.dll", re.I)
 MODELS = ("melspectrogram.onnx", "embedding_model.onnx", "hi_neo.onnx")
+LANGUAGES = ("zh-CN", "en-US")
 REQUIRED_FILES = (
-    "neo.exe", *(f"assets/{name}" for name in MODELS), "assets/onnxruntime.dll",
-    "assets-stt/sense-voice/model.int8.onnx", "assets-stt/sense-voice/tokens.txt",
-    "assets-stt/vad/silero_vad.onnx", "LICENSE", "README.md",
+    "neo.exe", *(f"resources/models/wake/{name}" for name in MODELS), "runtime/onnx/onnxruntime.dll",
+    "resources/models/stt/sense-voice/model.int8.onnx", "resources/models/stt/sense-voice/tokens.txt",
+    "resources/models/stt/vad/silero_vad.onnx", "LICENSE", "docs/README.md",
+    *(f"resources/lang/{language}.lang" for language in LANGUAGES),
 )
 # fetch_runtime.ensure_bash_named 将 MinGit 的 usr/bin/sh.exe 补名为 usr/bin/bash.exe；
 # find_bash 也接受 bin/bash.exe，不能按脚本顶端的布局示意只检查 bin/。
@@ -33,9 +36,34 @@ def require_nonempty_file(path):
         raise ValueError(f"Required release resource missing/empty: {path}")
 
 
+def validate_languages(package):
+    directory = package / "resources/lang"
+    unexpected = {path.name for path in directory.glob("*.lang")} - {f"{language}.lang" for language in LANGUAGES}
+    if unexpected:
+        raise ValueError(f"Unsupported release language resources: {sorted(unexpected)}")
+    catalogs = {}
+    for language in LANGUAGES:
+        path = directory / f"{language}.lang"
+        require_nonempty_file(path)
+        try:
+            catalog = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError as error:
+            raise ValueError(f"Invalid UTF-8 JSON language resource: {path}: {error}") from error
+        if (not isinstance(catalog, dict) or not catalog
+                or any(not isinstance(key, str) or not key.strip() or not isinstance(value, str)
+                       for key, value in catalog.items())):
+            raise ValueError(f"Language resource must be a non-empty JSON object of str:str with non-empty keys: {path}")
+        if language == "en-US" and any(not value.strip() for value in catalog.values()):
+            raise ValueError(f"English translations must not be empty: {path}")
+        catalogs[language] = catalog
+    if catalogs["zh-CN"].keys() != catalogs["en-US"].keys():
+        raise ValueError(f"Language resource keys differ: {directory / 'zh-CN.lang'} and {directory / 'en-US.lang'}")
+
+
 def validate_payload(package):
     for name in REQUIRED_FILES:
         require_nonempty_file(package / name)
+    validate_languages(package)
     candidates = [package / name for name in BASH_PATHS]
     present = [path for path in candidates if path.exists() or path.is_symlink()]
     if not present:
@@ -82,9 +110,9 @@ def validate_redist_dir(directory):
 
 def check_package(package, dumpbin, redist_dir=None):
     package = Path(package)
-    assets = package / "assets"
+    onnx = package / "runtime/onnx"
     validate_payload(package)
-    pending = [package / "neo.exe", *sorted(assets.glob("*.dll"))]
+    pending = [package / "neo.exe", *sorted(onnx.glob("*.dll"))]
     for binary in pending:
         require_nonempty_file(binary)
     redist = validate_redist_dir(Path(redist_dir)) if redist_dir else None
@@ -112,7 +140,7 @@ def check_package(package, dumpbin, redist_dir=None):
                 raise ValueError(f"Missing app-local CRT or empty file: {target}; supply licensed VS redistributables")
             pending.append(target)
     print("Required release payload files exist and are non-empty (including bundled Bash).")
-    print("Verified x64 PE images (neo.exe, assets/*.dll and imported allowlisted CRT only):", len(inspected))
+    print("Verified x64 PE images (neo.exe, runtime/onnx/*.dll and imported allowlisted CRT only):", len(inspected))
     print("Required app-local CRT:", ", ".join(sorted(required)) or "none")
     print("Full third-party DLL dependency closure is NOT audited; MinGit PE images/dependencies "
           "and model validity are NOT audited.")

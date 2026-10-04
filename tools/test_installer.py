@@ -535,6 +535,55 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("RMDir /r", body)
         self.assertLess(body.index("DeleteRegKey"), body.index('Delete "$INSTDIR\\uninstall.exe"'))
 
+    def test_uninstall_cleans_only_empty_new_and_legacy_resource_directories(self):
+        paths = [r"assets", r"assets-stt\sense-voice", r"assets-stt\vad", r"assets-stt",
+                 r"resources\models\wake", r"resources\models\stt\sense-voice",
+                 r"resources\models\stt\vad", r"resources\models\stt", r"resources\models",
+                 r"resources\lang", r"resources", r"docs", r"runtime\onnx", r"runtime\gitbash", r"runtime"]
+        for populated in (False, True):
+            with self.subTest(populated=populated):
+                m = NsModel()
+                root = m.value("$INSTDIR")
+                m.files.update({root + r"\neo.exe": b"app", root + r"\uninstall.exe": b"uninstaller",
+                                root + r"\README.md": b"legacy readme", root + r"\LICENSE": b"license"})
+                m.directories.update(root + "\\" + path for path in paths)
+                retained = {root + "\\" + path + r"\custom.txt": b"custom" for path in paths} if populated else {}
+                m.files.update(retained)
+                if populated:
+                    m.files[root + r"\docs\README.md"] = b"distribution guide"
+                    retained[root + r"\docs\README.md"] = b"distribution guide"
+                    for name in ("zh-CN.lang", "en-US.lang", "custom.lang"):
+                        path = root + "\\resources\\lang\\" + name
+                        m.files[path] = retained[path] = b'{"key": "user translation"}'
+                m.execute("Uninstall")
+                self.assertFalse(m.aborted, m.messages)
+                self.assertEqual(m.files, retained)
+                for path in paths:
+                    self.assertEqual(m.is_directory(root + "\\" + path), populated, path)
+                self.assertEqual(bool(m.residues), populated)
+
+    def test_legacy_upgrade_preserves_complete_old_layout_in_backup(self):
+        m = NsModel()
+        root = m.value("$INSTDIR")
+        old = {name: name.encode() for name in [r"neo.exe", r"uninstall.exe", r"README.md",
+               r"assets\hi_neo.onnx", r"assets\onnxruntime.dll", r"assets\custom.dll",
+               r"assets-stt\sense-voice\model.int8.onnx", r"assets-stt\custom.txt",
+               r"runtime\gitbash\usr\bin\bash.exe", "vcruntime140.dll"]}
+        m.files.update({root + "\\" + name: data for name, data in old.items()})
+        m.payload.update({r"resources\models\wake\hi_neo.onnx": b"new model",
+                          r"resources\models\stt\sense-voice\model.int8.onnx": b"new stt",
+                          r"runtime\onnx\onnxruntime.dll": b"new dll", r"docs\README.md": b"new guide",
+                          r"resources\lang\zh-CN.lang": b'{"key": "zh"}',
+                          r"resources\lang\en-US.lang": b'{"key": "en"}'})
+        m.execute("Install")
+        self.assertFalse(m.aborted, m.messages)
+        for name, data in old.items():
+            self.assertEqual(m.files[m.value("$BackupDir") + "\\" + name], data)
+        for name, data in m.payload.items():
+            self.assertEqual(m.files[root + "\\" + name], data)
+        self.assertNotIn(root + r"\assets\onnxruntime.dll", m.files)
+        self.assertNotIn(root + r"\README.md", m.files)
+
     def test_crt_whitelist_is_installed_and_uninstalled_without_unknown_files(self):
         self.assertIn('File /r "dist\\neo\\*.*"', SOURCE)
         body = SOURCE.split('Section "Uninstall"', 1)[1]
@@ -571,7 +620,12 @@ class InstallerTests(unittest.TestCase):
         m = NsModel()
         for name in ["neo.exe", "uninstall.exe", "assets\\hi_neo.onnx",
                      "assets-stt\\model.int8.onnx", "runtime\\gitbash\\bin\\bash.exe",
-                     "assets\\custom.txt", "assets-stt\\custom.txt", "runtime\\custom.txt", "notes.txt"]:
+                     "assets\\custom.txt", "assets-stt\\custom.txt", "runtime\\custom.txt", "notes.txt",
+                     "resources\\models\\wake\\hi_neo.onnx", "resources\\models\\wake\\custom.onnx",
+                     "resources\\models\\stt\\sense-voice\\model.int8.onnx", "resources\\custom.txt",
+                     "resources\\lang\\zh-CN.lang", "resources\\lang\\en-US.lang", "resources\\lang\\custom.lang",
+                     "runtime\\onnx\\onnxruntime.dll", "runtime\\onnx\\custom.dll",
+                     "docs\\README.md", "docs\\custom.md"]:
             m.files[m.value("$INSTDIR") + "\\" + name] = name.encode()
         m.registry = {"DisplayVersion": "old"}
         return m
@@ -742,6 +796,8 @@ class InstallerTests(unittest.TestCase):
                     self.model_instructions(m, 'RMDir /r "$INSTDIR\\assets"\n'
                                            'RMDir /r "$INSTDIR\\assets-stt"\n'
                                            'RMDir /r "$INSTDIR\\runtime"\n'
+                                           'RMDir /r "$INSTDIR\\resources"\n'
+                                           'RMDir /r "$INSTDIR\\docs"\n'
                                            'Delete "$INSTDIR\\notes.txt"\nRMDir "$INSTDIR"')
                 self.assertFalse(m.error)
                 self.assertNotIn(root, m.directory_ids)
@@ -896,7 +952,9 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("cargo build --locked --release -p neo-app --target x86_64-pc-windows-msvc", workflow)
         self.assertIn(r"Copy-Item target\x86_64-pc-windows-msvc\release\neo.exe", workflow)
         self.assertNotIn(r"Copy-Item target\release\neo.exe", workflow)
-        self.assertIn(r'Copy-Item -Recurse crates\neo-wake\assets "$pkg\assets"', workflow)
+        self.assertIn(r'Copy-Item "crates\neo-wake\assets\$model" "$pkg\resources\models\wake\"', workflow)
+        self.assertIn(r'Copy-Item crates\neo-wake\assets\*.dll "$pkg\runtime\onnx\"', workflow)
+        self.assertNotIn(r'Copy-Item -Recurse crates\neo-wake\assets', workflow)
         self.assertNotIn("wake-training", workflow)
         self.assertLess(workflow.index("python tools/check_release.py"), workflow.index("- name: Zip portable package"))
         wake = (root / "crates/neo-wake/src/lib.rs").read_text(encoding="utf-8")
@@ -916,6 +974,9 @@ class InstallerTests(unittest.TestCase):
             payload = Path(td) / "dist/neo"
             payload.mkdir(parents=True)
             (payload / "neo.exe").write_bytes(b"inert test payload; never execute")
+            (payload / "resources/lang").mkdir(parents=True)
+            for language in ("zh-CN", "en-US"):
+                (payload / f"resources/lang/{language}.lang").write_bytes(b'{"key": "translation"}')
             result = subprocess.run(
                 [compiler, "/NOCD", "/INPUTCHARSET", "UTF8", "/DVERSION=1.2.3", "/DVI_VERSION=1.2.3.0", str(script)],
                 cwd=td, capture_output=True, timeout=60,

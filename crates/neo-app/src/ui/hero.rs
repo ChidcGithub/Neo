@@ -8,6 +8,7 @@
 //! .stack    { flex-direction: column; gap: 12px; max-width: --dsh-composer-card-max-width }
 //! ```
 
+use crate::i18n::tr;
 use egui::{Rect, Ui, Vec2};
 use neo_theme::SquirclePaint;
 use neo_ui::Icon;
@@ -34,7 +35,7 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
 
     let fish_w = t.fish;
     let title = ui.painter().layout(
-        "今天想在课堂上做点什么？".to_owned(),
+        tr("今天想在课堂上做点什么？").to_owned(),
         skin.bold(t.headline),
         p.label_primary,
         (card_w - fish_w - m.s(16.0)).max(1.0),
@@ -77,7 +78,7 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
     // ---- workspace chip（宽度随内容收缩，不撑满也不留白）----
     let chip_top = gy + headline_h + head_gap;
     let chip_font = skin.bold(skin.t().label);
-    let label = state.workspace.as_deref().unwrap_or("选择工作区");
+    let label = state.workspace.as_deref().unwrap_or(tr("选择工作区"));
     let text_w = ui
         .painter()
         .layout_no_wrap(label.to_owned(), chip_font.clone(), p.label_primary)
@@ -110,7 +111,7 @@ fn workspace_chip(ui: &Ui, skin: &Skin<'_>, rect: Rect, label: Option<&str>) -> 
     let p = skin.p();
     let m = skin.m();
     let chip_resp = super::tap(ui, rect, ui.id().with("neo-workspace-chip"));
-    let resp = chip_resp.on_hover_text("选择文件夹作为工作区");
+    let resp = chip_resp.on_hover_text(tr("选择文件夹作为工作区"));
     let st = super::State::of(&resp);
     let painter = ui.painter();
 
@@ -130,7 +131,7 @@ fn workspace_chip(ui: &Ui, skin: &Skin<'_>, rect: Rect, label: Option<&str>) -> 
         egui::pos2(icon_r.right() + m.s(4.0), rect.top()),
         egui::pos2(rect.right() - chevron_w, rect.bottom()),
     );
-    let text = label.unwrap_or("选择工作区");
+    let text = label.unwrap_or(tr("选择工作区"));
     let shown = elide(painter, text, &label_font, text_rect.width());
     text_left(
         painter,

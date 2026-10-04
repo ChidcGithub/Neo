@@ -16,6 +16,7 @@
 //! - **触控热区**：28/34px 的圆形控件视觉不变，命中区扩到 48pt 下限；
 //! - **字号**：整卡跟随 `Metrics::scale` 放大，远距仍可读。
 
+use crate::i18n::tr;
 use egui::{Frame, Margin, Rect, Sense, TextEdit, Ui, Vec2};
 use neo_theme::SquirclePaint;
 use neo_ui::flex::{item, Flex, FlexAlign};
@@ -44,10 +45,20 @@ pub struct Outcome {
 ///
 /// 对应 Harness `InputBar.module.css` 的 `.notice`：宽度撑满、下边距 6px、
 /// 12/18 的次级文字。它画在**卡片外、卡片上方**，与上游一致。
-pub fn notice_height(skin: &Skin<'_>, state: &AppState) -> f32 {
+pub fn notice_height(ui: &Ui, skin: &Skin<'_>, state: &AppState, width: f32) -> f32 {
     let m = skin.m();
     if state.plan_mode || state.read_only || missing_model(state) {
-        m.s(18.0) + m.s(6.0)
+        ui.painter()
+            .layout(
+                notice_text(state).to_owned(),
+                skin.prop(skin.t().caption),
+                skin.p().label_secondary,
+                (width - m.s(16.0)).max(1.0),
+            )
+            .size()
+            .y
+            .max(m.s(18.0))
+            + m.s(6.0)
     } else {
         0.0
     }
@@ -61,7 +72,7 @@ fn missing_model(state: &AppState) -> bool {
 
 /// 整块高度 = 提示条 + 输入卡。调用方据此分配空间。
 pub fn block_height(ui: &Ui, skin: &Skin<'_>, state: &AppState, width: f32, hero: bool) -> f32 {
-    notice_height(skin, state)
+    notice_height(ui, skin, state, width)
         + attachment_area_height(skin, state)
         + card_height(ui, skin, &state.draft, width, hero)
 }
@@ -89,11 +100,11 @@ fn attachment_area_height(skin: &Skin<'_>, state: &AppState) -> f32 {
 /// 当前提示条文案。
 fn notice_text(state: &AppState) -> &'static str {
     if state.plan_mode {
-        "Plan 模式 · 只规划，不执行操作；关闭计划模式后再执行"
+        tr("计划模式 · 只规划，不执行")
     } else if state.read_only {
-        "只读模式 · 本次对话不会改动工作区文件"
+        tr("只读模式 · 不修改工作区文件")
     } else {
-        "还没有可用模型 · 到「设置 → 模型」点「从模型商刷新」"
+        tr("暂无模型 · 设置 → 模型 → 从模型商刷新")
     }
 }
 
@@ -199,9 +210,9 @@ fn draw_attachment_area(
                 egui::pos2(row.right() - m.s(24.0), row.center().y),
             )
             .on_hover_text(if is_error {
-                "关闭错误提示"
+                tr("关闭错误提示")
             } else {
-                "取消附件导入"
+                tr("取消附件导入")
             });
         if response.clicked() {
             if is_error {
@@ -341,7 +352,7 @@ pub(super) fn attachment_card(
                 &skin.d(),
                 egui::pos2(rect.right() - m.s(24.0), rect.top() + m.s(30.0)),
             )
-            .on_hover_text("移除此附件")
+            .on_hover_text(tr("移除此附件"))
             .clicked();
     }
     false
@@ -423,24 +434,22 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
     let mut out = Outcome::default();
 
     // `rect` 是"提示条 + 卡片"整块；两者在这里切开。
-    let notice_h = notice_height(skin, state);
+    let notice_h = notice_height(ui, skin, state, rect.width());
     let notice_rect = Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.top() + notice_h));
     let rect = Rect::from_min_max(egui::pos2(rect.left(), notice_rect.bottom()), rect.max);
 
     // ---- 模式提示条（卡片上方，随开关出现）----
     if notice_h > 0.0 {
         let font = skin.prop(skin.t().caption);
-        let shown = elide(
-            &ui.painter().clone(),
-            notice_text(state),
-            &font,
-            notice_rect.width(),
-        );
-        ui.painter().text(
-            egui::pos2(notice_rect.left() + m.s(8.0), notice_rect.top()),
-            egui::Align2::LEFT_TOP,
-            shown,
+        let text = ui.painter().layout(
+            notice_text(state).to_owned(),
             font,
+            p.label_secondary,
+            (notice_rect.width() - m.s(16.0)).max(1.0),
+        );
+        ui.painter().galley(
+            egui::pos2(notice_rect.left() + m.s(8.0), notice_rect.top()),
+            text,
             p.label_secondary,
         );
     }
@@ -452,9 +461,12 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
 
     // 聚焦环：键盘焦点落在编辑区时，卡片外沿浮出一圈 accent 描边（0.1s 缓动，
     // 对应 spec fast 档）。画在卡片本体之上、内容之下；失焦淡出到 0 即不画。
-    let focused =
-        ui.ctx().memory(|mem| mem.focused()) == Some(egui::Id::new(super::COMPOSER_ID));
-    let focus_k = ease(ui, ui.id().with("focus-ring"), if focused { 1.0 } else { 0.0 });
+    let focused = ui.ctx().memory(|mem| mem.focused()) == Some(egui::Id::new(super::COMPOSER_ID));
+    let focus_k = ease(
+        ui,
+        ui.id().with("focus-ring"),
+        if focused { 1.0 } else { 0.0 },
+    );
     if focus_k > 0.0 {
         let expand = m.s(0.5);
         painter.squircle_stroked(
@@ -482,8 +494,8 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
     // 剩余高度（TextEdit 内部可滚动），工具栏行才不会被算成负高、被
     // clip 整行裁掉 —— 发送钮「不可见也不可点」的事故就是这么来的。
     let min_text_h = text_height(ui, skin, "", text_rect.width(), hero);
-    let avail_h = (rect.bottom() - m.card_gap() - toolbar_height(skin) - text_rect.top())
-        .max(min_text_h);
+    let avail_h =
+        (rect.bottom() - m.card_gap() - toolbar_height(skin) - text_rect.top()).max(min_text_h);
     let text_h = text_h.min(avail_h);
     let text_rect = Rect::from_min_size(text_rect.min, Vec2::new(text_rect.width(), text_h));
 
@@ -495,9 +507,9 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
         let font = skin.prop(skin.t().body);
         let ph_rect = inset(text_rect, 0.0, m.s(4.0), 0.0, 0.0);
         let hint = if hero {
-            "问点什么…"
+            tr("问点什么…")
         } else {
-            "继续追问…"
+            tr("继续追问…")
         };
         let shown = elide(&painter, hint, &font, ph_rect.width());
         painter.text(
@@ -552,14 +564,17 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
     let send_center = egui::pos2(row.right() - send_w * 0.5, row.center().y);
     let controls = Rect::from_min_max(
         row.min,
-        egui::pos2((row.right() - send_w - m.toolbar_gap()).max(row.left()), row.bottom()),
+        egui::pos2(
+            (row.right() - send_w - m.toolbar_gap()).max(row.left()),
+            row.bottom(),
+        ),
     );
     let model_budget = (controls.width()
         - m.s(28.0)
-        - Chip::width(ui.painter(), &d, "Plan", false)
-        - Chip::width(ui.painter(), &d, "只读", false)
+        - Chip::width(ui.painter(), &d, tr("计划"), false)
+        - Chip::width(ui.painter(), &d, tr("只读"), false)
         - 4.0 * m.toolbar_gap())
-        .max(0.0);
+    .max(0.0);
     let model = state.model_display();
     let model_w = Chip::width(ui.painter(), &d, model, true).min(model_budget);
     super::at(ui, controls, |ui| {
@@ -578,13 +593,13 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
                         .enabled(can_attach)
                         .id_salt("neo-composer-add")
                         .show(ui, &d)
-                        .on_hover_text("添加图片、Word、PowerPoint 或文本文件")
+                        .on_hover_text(tr("添加图片、Word、PowerPoint 或文本文件"))
                 });
                 if add.inner.clicked() {
                     out.attach = true;
                 }
                 let plan = flex.add_ui(item(), |ui| {
-                    Chip::new("Plan")
+                    Chip::new(tr("计划"))
                         .active(state.plan_mode)
                         .id_salt("neo-composer-plan")
                         .show(ui, &d)
@@ -593,7 +608,7 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
                     out.toggle_plan = true;
                 }
                 let ro = flex.add_ui(item(), |ui| {
-                    Chip::new("只读")
+                    Chip::new(tr("只读"))
                         .active(state.read_only)
                         .id_salt("neo-composer-readonly")
                         .show(ui, &d)
@@ -617,7 +632,10 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
                             ui.shrink_clip_rect(rect);
                             #[cfg(test)]
                             ui.ctx().data_mut(|data| {
-                                data.insert_temp(egui::Id::new("neo-composer-model-probe"), (rect, ui.clip_rect()));
+                                data.insert_temp(
+                                    egui::Id::new("neo-composer-model-probe"),
+                                    (rect, ui.clip_rect()),
+                                );
                             });
                             Chip::new(model)
                                 .chevron(true)
@@ -641,7 +659,10 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
         .show_at(ui, &d, send_center);
     #[cfg(test)]
     ui.ctx().data_mut(|data| {
-        data.insert_temp(egui::Id::new("neo-composer-send-probe"), (send.rect, ui.clip_rect()));
+        data.insert_temp(
+            egui::Id::new("neo-composer-send-probe"),
+            (send.rect, ui.clip_rect()),
+        );
     });
     if send.clicked() {
         if busy {

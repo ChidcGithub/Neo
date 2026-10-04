@@ -147,7 +147,10 @@ fn write_then_read_roundtrip() {
 #[test]
 fn write_file_new_path_cannot_escape_via_dir_link() {
     let (dir, scope) = workspace("link-escape");
-    let outside = dir.parent().unwrap().join(format!("neo-tools-outside-{}", std::process::id()));
+    let outside = dir
+        .parent()
+        .unwrap()
+        .join(format!("neo-tools-outside-{}", std::process::id()));
     std::fs::create_dir_all(&outside).unwrap();
 
     #[cfg(windows)]
@@ -666,19 +669,17 @@ fn bash_and_the_other_shell_share_parameter_shape() {
 fn bundled_runtime_wins_when_present() {
     use neo_tools::tools::shell::{resolve, ShellKind};
 
-    let runtime_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
-        .join("..")
-        .join("runtime")
-        .join("gitbash");
-    // MinGit 没有 `bin/`，壳在 `usr/bin/` —— 两处都要认，否则这条测试会
-    // 永远走"跳过"分支，看着是绿的其实什么都没断言。
-    let present = ["bin/bash.exe", "usr/bin/bash.exe"]
+        .join("..");
+    let runtime_root = repo.join(".cache/runtime/gitbash");
+    // MinGit 的壳在 `usr/bin/`，也要认未创建 bash.exe 硬链接时的 sh.exe 回退。
+    let present = ["bin/bash.exe", "usr/bin/bash.exe", "usr/bin/sh.exe"]
         .iter()
         .any(|rel| runtime_root.join(rel).is_file());
     if !present {
         eprintln!(
-            "跳过：随包运行时还没下载（python tools/fetch_runtime.py）；\
+            "跳过：开发缓存 .cache/runtime/gitbash 不存在（python tools/fetch_runtime.py）；\
              当前解析到系统安装的 bash 也没问题"
         );
         return;

@@ -1,6 +1,7 @@
 """通过合成报告与临时载荷测试发行校验，绝不执行 PE 文件。"""
 from contextlib import redirect_stdout
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,9 +13,10 @@ from tools.check_release import CRT_NAMES, MODELS, check_package, parse_pe_repor
 class ReleaseTests(unittest.TestCase):
     # 独立列出发行契约，避免 fixture 随校验清单一起漏掉新资源。
     payload_files = (
-        "neo.exe", "assets/onnxruntime.dll", *(f"assets/{name}" for name in MODELS),
-        "assets-stt/sense-voice/model.int8.onnx", "assets-stt/sense-voice/tokens.txt",
-        "assets-stt/vad/silero_vad.onnx", "LICENSE", "README.md",
+        "neo.exe", "runtime/onnx/onnxruntime.dll", *(f"resources/models/wake/{name}" for name in MODELS),
+        "resources/models/stt/sense-voice/model.int8.onnx", "resources/models/stt/sense-voice/tokens.txt",
+        "resources/models/stt/vad/silero_vad.onnx", "LICENSE", "docs/README.md",
+        "resources/lang/zh-CN.lang", "resources/lang/en-US.lang",
     )
     bash_paths = ("runtime/gitbash/bin/bash.exe", "runtime/gitbash/usr/bin/bash.exe")
 
@@ -36,6 +38,9 @@ class ReleaseTests(unittest.TestCase):
             path = package / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"inert")
+        for language, translation in (("zh-CN", "你好，{name}"), ("en-US", "Hello, {name}")):
+            (package / f"resources/lang/{language}.lang").write_text(
+                json.dumps({"你好，{name}": translation}, ensure_ascii=False), encoding="utf-8")
         return package
 
     def make_redist(self, root):
@@ -73,6 +78,55 @@ class ReleaseTests(unittest.TestCase):
                     audit.assert_not_called()
                     copy.assert_not_called()
 
+    def test_invalid_language_catalog_fails_before_binary_audit(self):
+        invalid = [b"not json", b"\xff", b"{}", b"[]", b"null", b'"text"',
+                   b'{"key": null}', b'{"key": 1}', b'{"key": true}',
+                   b'{"key": []}', b'{"key": {}}', b'{"": "value"}', b'{"  ": "value"}']
+        for language in ("zh-CN", "en-US"):
+            for data in invalid:
+                with self.subTest(language=language, data=data), tempfile.TemporaryDirectory() as td:
+                    package = self.make_package(Path(td))
+                    path = package / f"resources/lang/{language}.lang"
+                    path.write_bytes(data)
+                    with patch("tools.check_release.inspect_pe") as audit, \
+                            patch("tools.check_release.shutil.copy2") as copy:
+                        with self.assertRaises(ValueError) as error:
+                            check_package(package, "unused")
+                        self.assertIn(str(path), str(error.exception))
+                    audit.assert_not_called()
+                    copy.assert_not_called()
+
+    def test_language_key_mismatch_and_blank_english_fail(self):
+        for catalog, message in [({"other": "Other"}, "keys differ"),
+                                 ({"你好，{name}": ""}, "English translations must not be empty"),
+                                 ({"你好，{name}": " \t\n"}, "English translations must not be empty")]:
+            with self.subTest(catalog=catalog), tempfile.TemporaryDirectory() as td:
+                package = self.make_package(Path(td))
+                (package / "resources/lang/en-US.lang").write_text(json.dumps(catalog), encoding="utf-8")
+                with patch("tools.check_release.inspect_pe") as audit:
+                    with self.assertRaisesRegex(ValueError, message):
+                        check_package(package, "unused")
+                audit.assert_not_called()
+
+    def test_unexpected_release_language_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            package = self.make_package(Path(td))
+            (package / "resources/lang/fr-FR.lang").write_text('{"key": "value"}', encoding="utf-8")
+            with patch("tools.check_release.inspect_pe") as audit:
+                with self.assertRaisesRegex(ValueError, "Unsupported release language resources.*fr-FR"):
+                    check_package(package, "unused")
+            audit.assert_not_called()
+
+    def test_language_key_order_does_not_matter(self):
+        with tempfile.TemporaryDirectory() as td:
+            package = self.make_package(Path(td))
+            for language, catalog in (("zh-CN", {"设置": "设置", "取消": "取消"}),
+                                      ("en-US", {"取消": "Cancel", "设置": "Settings"})):
+                (package / f"resources/lang/{language}.lang").write_text(
+                    json.dumps(catalog, ensure_ascii=False), encoding="utf-8")
+            with patch("tools.check_release.inspect_pe", return_value={"kernel32.dll"}):
+                self.assertEqual(check_package(package, "unused"), set())
+
     def test_both_fetch_runtime_bash_layouts_are_accepted(self):
         for name in self.bash_paths:
             with self.subTest(path=name), tempfile.TemporaryDirectory() as td:
@@ -80,7 +134,7 @@ class ReleaseTests(unittest.TestCase):
                 with patch("tools.check_release.inspect_pe", return_value={"kernel32.dll"}) as audit:
                     self.assertEqual(check_package(package, "unused"), set())
                 self.assertEqual({call.args[0] for call in audit.call_args_list},
-                                 {package / "neo.exe", package / "assets/onnxruntime.dll"})
+                                 {package / "neo.exe", package / "runtime/onnx/onnxruntime.dll"})
 
     def test_sh_alone_is_not_a_bundled_bash(self):
         with tempfile.TemporaryDirectory() as td:
@@ -108,14 +162,41 @@ class ReleaseTests(unittest.TestCase):
                             check_package(package, "unused")
                     audit.assert_not_called()
 
-    def test_additional_asset_dll_must_be_nonempty(self):
+    def test_additional_onnx_dll_must_be_nonempty(self):
         with tempfile.TemporaryDirectory() as td:
             package = self.make_package(Path(td))
-            (package / "assets/onnxruntime_providers_shared.dll").touch()
+            (package / "runtime/onnx/onnxruntime_providers_shared.dll").touch()
             with patch("tools.check_release.inspect_pe") as audit:
                 with self.assertRaisesRegex(ValueError, "onnxruntime_providers_shared"):
                     check_package(package, "unused")
             audit.assert_not_called()
+
+    def test_audits_all_onnx_dlls_but_not_gitbash(self):
+        with tempfile.TemporaryDirectory() as td:
+            package = self.make_package(Path(td))
+            provider = package / "runtime/onnx/onnxruntime_providers_shared.dll"
+            provider.write_bytes(b"inert provider")
+            (package / "runtime/gitbash/usr/bin/msys-2.0.dll").write_bytes(b"inert gitbash")
+            with patch("tools.check_release.inspect_pe", return_value={"kernel32.dll"}) as audit:
+                check_package(package, "unused")
+            self.assertEqual({call.args[0] for call in audit.call_args_list},
+                             {package / "neo.exe", package / "runtime/onnx/onnxruntime.dll", provider})
+
+    def test_legacy_layout_does_not_satisfy_new_payload_contract(self):
+        pairs = [("runtime/onnx/onnxruntime.dll", "assets/onnxruntime.dll"),
+                 ("resources/models/wake/hi_neo.onnx", "assets/hi_neo.onnx"),
+                 ("resources/models/stt/sense-voice/tokens.txt", "assets-stt/sense-voice/tokens.txt"),
+                 ("docs/README.md", "README.md")]
+        for current, legacy in pairs:
+            with self.subTest(path=current), tempfile.TemporaryDirectory() as td:
+                package = self.make_package(Path(td))
+                old = package / legacy
+                old.parent.mkdir(parents=True, exist_ok=True)
+                (package / current).rename(old)
+                with patch("tools.check_release.inspect_pe") as audit:
+                    with self.assertRaisesRegex(ValueError, "Required release resource missing/empty"):
+                        check_package(package, "unused")
+                audit.assert_not_called()
 
     def test_success_reports_limited_audit_scope(self):
         with tempfile.TemporaryDirectory() as td:
@@ -125,6 +206,7 @@ class ReleaseTests(unittest.TestCase):
                     redirect_stdout(output):
                 self.assertEqual(check_package(package, "unused"), set())
             self.assertIn("payload files exist and are non-empty", output.getvalue())
+            self.assertIn("neo.exe, runtime/onnx/*.dll and imported allowlisted CRT only", output.getvalue())
             self.assertIn("Full third-party DLL dependency closure is NOT audited", output.getvalue())
             self.assertIn("MinGit PE images/dependencies and model validity are NOT audited", output.getvalue())
             self.assertIn("Windows 10 19041 runtime validation is still required", output.getvalue())
@@ -148,7 +230,8 @@ class ReleaseTests(unittest.TestCase):
             for name in required:
                 self.assertEqual((package / name).read_bytes(), (redist / name).read_bytes())
             self.assertFalse((package / "concrt140.dll").exists())
-            self.assertFalse((package / "assets/vcruntime140.dll").exists())
+            self.assertFalse((package / "runtime/onnx/vcruntime140.dll").exists())
+            self.assertFalse((package / "resources/models/wake/vcruntime140.dll").exists())
             with patch("tools.check_release.inspect_pe", side_effect=lambda p, _: imports[p.name]):
                 self.assertEqual(check_package(package, "unused"), required)
 

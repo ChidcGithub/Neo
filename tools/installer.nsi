@@ -2,9 +2,9 @@
 ; 由 .github/workflows/release.yml 调用（本地手动编译同）：
 ;   makensis /NOCD /INPUTCHARSET UTF8 /DVERSION=1.2.3 /DVI_VERSION=1.2.3.0 tools\installer.nsi
 ; ⚠️ 两个开关都不能省：/NOCD 保持工作目录在仓库根（默认会切到 tools\，
-; dist\ 与 build\ 的相对路径会全找不到）；/INPUTCHARSET UTF8 读本脚本的
+; dist\ 与 target\ 的相对路径会全找不到）；/INPUTCHARSET UTF8 读本脚本的
 ; 中文注释（默认 ACP 直接报 Bad text encoding）。
-; 输入：dist\neo\（已装配好的发行目录）+ build\installer-art\（美术资源，
+; 输入：dist\neo\（已装配好的发行目录）+ target\package\installer-art\（美术资源，
 ; 由 tools/make_installer_art.py 生成；缺失时自动退化为无图标版式，
 ; 本地不生成美术也能编译通过）
 ; 输出：dist\neo-<VERSION>-installer-x64.exe
@@ -17,7 +17,7 @@
   !define VI_VERSION "${VERSION}.0"
 !endif
 
-!define ART "build\installer-art"
+!define ART "target\package\installer-art"
 !if /FileExists "${ART}\neo.ico"
   !define HAVE_ART
 !endif
@@ -547,7 +547,7 @@ publish:
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Neo" "NoRepair" 1
   IfErrors install_failed
   ; 提交后保留完整旧目录（包括载荷子目录内的未知文件），移到本次唯一暂存路径。
-  ; 无清单时不能将 assets/runtime 整棵目录当成可删除的已知文件。
+  ; 无清单时不能将 resources/docs/runtime 或旧 assets/assets-stt 整棵目录删除。
   StrCpy $Published "0"
   StrCmp $OldMoved "1" 0 committed
   StrCpy $OldMoved "0"
@@ -638,8 +638,21 @@ uninstall_registry_removed:
   ClearErrors
   Delete "$INSTDIR\uninstall.exe"
   IfErrors uninstall_failed
+  ; 新旧布局均仅自底向上清理空目录；模型、文档及自定义文件不递归删除。
   RMDir "$INSTDIR\assets"
+  RMDir "$INSTDIR\assets-stt\sense-voice"
+  RMDir "$INSTDIR\assets-stt\vad"
   RMDir "$INSTDIR\assets-stt"
+  RMDir "$INSTDIR\resources\models\wake"
+  RMDir "$INSTDIR\resources\models\stt\sense-voice"
+  RMDir "$INSTDIR\resources\models\stt\vad"
+  RMDir "$INSTDIR\resources\models\stt"
+  RMDir "$INSTDIR\resources\models"
+  RMDir "$INSTDIR\resources\lang"
+  RMDir "$INSTDIR\resources"
+  RMDir "$INSTDIR\docs"
+  RMDir "$INSTDIR\runtime\onnx"
+  RMDir "$INSTDIR\runtime\gitbash"
   RMDir "$INSTDIR\runtime"
   ClearErrors
   RMDir "$INSTDIR"

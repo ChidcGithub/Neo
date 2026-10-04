@@ -17,6 +17,7 @@ use neo_theme::{fonts::LoadedFonts, Distance, Theme, ThemeMode};
 
 use crate::brand::WhaleMark;
 use crate::diagnostics::{record, Failure, Level, Phase};
+use crate::i18n::{self, tf, tr, Language};
 use crate::state::{AppState, Role, Stage, StreamSource};
 use crate::ui::{self, Skin};
 
@@ -107,13 +108,25 @@ struct UpdateSchedule {
 }
 
 impl UpdateSchedule {
-    fn request_due(&mut self, now: std::time::Instant, enabled: bool, manual: bool, checking: bool) -> Option<bool> {
-        let ready = *self.ready_at.get_or_insert(now + std::time::Duration::from_secs(3));
+    fn request_due(
+        &mut self,
+        now: std::time::Instant,
+        enabled: bool,
+        manual: bool,
+        checking: bool,
+    ) -> Option<bool> {
+        let ready = *self
+            .ready_at
+            .get_or_insert(now + std::time::Duration::from_secs(3));
         if !enabled {
             self.auto_done = true;
         }
         self.manual_pending |= manual;
-        if checking || self.last_request.is_some_and(|last| now.saturating_duration_since(last) < std::time::Duration::from_secs(10)) {
+        if checking
+            || self.last_request.is_some_and(|last| {
+                now.saturating_duration_since(last) < std::time::Duration::from_secs(10)
+            })
+        {
             return None;
         }
         let automatic = !self.manual_pending;
@@ -133,7 +146,10 @@ impl UpdateSchedule {
             return None;
         }
         if self.manual_pending {
-            return Some(self.last_request.map_or(now, |last| last + std::time::Duration::from_secs(10)));
+            return Some(
+                self.last_request
+                    .map_or(now, |last| last + std::time::Duration::from_secs(10)),
+            );
         }
         if !self.auto_done {
             return self.ready_at;
@@ -143,7 +159,8 @@ impl UpdateSchedule {
 }
 
 pub(crate) fn desktop_suspended(ctx: &egui::Context) -> bool {
-    ctx.data(|data| data.get_temp::<bool>(egui::Id::new("neo-desktop-suspended"))).unwrap_or(false)
+    ctx.data(|data| data.get_temp::<bool>(egui::Id::new("neo-desktop-suspended")))
+        .unwrap_or(false)
 }
 
 pub(crate) fn desktop_viewport(ctx: &egui::Context, viewport: egui::ViewportId) -> bool {
@@ -189,7 +206,9 @@ impl DesktopWindows {
 
     #[cfg(all(windows, not(test)))]
     fn visible_windows(&self) -> Result<Vec<isize>, String> {
-        use windows_sys::Win32::{Foundation::*, UI::WindowsAndMessaging::*, System::Threading::GetCurrentThreadId};
+        use windows_sys::Win32::{
+            Foundation::*, System::Threading::GetCurrentThreadId, UI::WindowsAndMessaging::*,
+        };
         unsafe extern "system" fn visit(hwnd: HWND, data: LPARAM) -> i32 {
             unsafe {
                 if desktop_window_obstructs(IsWindowVisible(hwnd) != 0, IsIconic(hwnd) != 0) {
@@ -199,7 +218,14 @@ impl DesktopWindows {
             1
         }
         let mut windows = Vec::<isize>::new();
-        if unsafe { EnumThreadWindows(GetCurrentThreadId(), Some(visit), &mut windows as *mut _ as isize) } == 0 {
+        if unsafe {
+            EnumThreadWindows(
+                GetCurrentThreadId(),
+                Some(visit),
+                &mut windows as *mut _ as isize,
+            )
+        } == 0
+        {
             return Err("无法枚举 Neo 窗口，拒绝派发桌面工具".into());
         }
         Ok(windows)
@@ -207,9 +233,15 @@ impl DesktopWindows {
 
     #[cfg(all(windows, not(test)))]
     fn hide(&mut self, avoid_main: bool) -> Result<(), String> {
-        use windows_sys::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*, System::Threading::GetCurrentThreadId};
+        use windows_sys::Win32::{
+            Foundation::HWND, System::Threading::GetCurrentThreadId, UI::WindowsAndMessaging::*,
+        };
         let main = self.main as HWND;
-        if main.is_null() || unsafe { GetWindowThreadProcessId(main, std::ptr::null_mut()) != GetCurrentThreadId() } {
+        if main.is_null()
+            || unsafe {
+                GetWindowThreadProcessId(main, std::ptr::null_mut()) != GetCurrentThreadId()
+            }
+        {
             return Err("无法确认 Neo 主窗口归属，拒绝派发桌面工具".into());
         }
         let windows = self.visible_windows()?;
@@ -228,9 +260,13 @@ impl DesktopWindows {
         }
         for hwnd in windows {
             if hwnd == self.main {
-                unsafe { ShowWindow(main, SW_MINIMIZE); }
+                unsafe {
+                    ShowWindow(main, SW_MINIMIZE);
+                }
             } else {
-                unsafe { ShowWindow(hwnd as HWND, SW_HIDE); }
+                unsafe {
+                    ShowWindow(hwnd as HWND, SW_HIDE);
+                }
             }
         }
         Ok(())
@@ -259,7 +295,9 @@ impl DesktopWindows {
             return Err("Neo 窗口尚未完成暂避，拒绝派发桌面工具".into());
         }
         #[cfg(test)]
-        if self.fail_verify { return Err("模拟窗口暂避失败".into()); }
+        if self.fail_verify {
+            return Err("模拟窗口暂避失败".into());
+        }
         Ok(())
     }
 
@@ -271,7 +309,10 @@ impl DesktopWindows {
             unsafe {
                 use windows_sys::Win32::UI::WindowsAndMessaging::*;
                 let hwnd = self.main as windows_sys::Win32::Foundation::HWND;
-                if IsWindow(hwnd) != 0 && GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) == windows_sys::Win32::System::Threading::GetCurrentThreadId() {
+                if IsWindow(hwnd) != 0
+                    && GetWindowThreadProcessId(hwnd, std::ptr::null_mut())
+                        == windows_sys::Win32::System::Threading::GetCurrentThreadId()
+                {
                     let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
                     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE as isize);
                     if placement.showCmd == SW_SHOWNORMAL as u32 {
@@ -287,7 +328,9 @@ impl DesktopWindows {
 }
 
 impl Drop for DesktopWindows {
-    fn drop(&mut self) { self.restore(); }
+    fn drop(&mut self) {
+        self.restore();
+    }
 }
 
 pub struct NeoApp {
@@ -301,11 +344,18 @@ pub struct NeoApp {
     /// 上次落库的接口配置，用于把「每帧读输入框」节流成「变化时才写」。
     saved_api: (String, String),
     saved_context_tokens: usize,
+    saved_language: Language,
+    applied_language: Option<Language>,
     /// 上次落库的活跃会话 id，作用同上。
     saved_active: Option<i64>,
     saved_classroom_safe: bool,
     saved_silent_startup_errors: bool,
     saved_auto_check_updates: bool,
+    saved_floating_enabled: bool,
+    floating: Option<crate::floating::FloatingHandle>,
+    floating_attempted: bool,
+    manual_audio: Option<crate::manual_audio::ManualAudio>,
+    manual_dictation: bool,
     update_checker: crate::updates::UpdateChecker,
     update_schedule: UpdateSchedule,
     applied_classroom_safe: bool,
@@ -338,6 +388,7 @@ pub struct NeoApp {
     wake_broken: bool,
     /// 系统托盘图标。只在真实客户端装配（`start_tray`），离屏测试没有托盘。
     tray: Option<tray_icon::TrayIcon>,
+    tray_labels: Option<(tray_icon::menu::MenuItem, tray_icon::menu::MenuItem)>,
     /// 托盘菜单「显示主界面」的 id。
     tray_show_id: tray_icon::menu::MenuId,
     /// 托盘菜单「退出」的 id。
@@ -425,7 +476,11 @@ impl NeoApp {
         let (store, store_ok) = match Store::open(&db_path) {
             Ok(s) => (Some(s), true),
             Err(_) => {
-                record(Level::Error, "storage", "数据库打开失败，将以纯内存模式运行");
+                record(
+                    Level::Error,
+                    "storage",
+                    "数据库打开失败，将以纯内存模式运行",
+                );
                 crate::startup::record_error("database", "数据库打开失败，将以纯内存模式运行");
                 (None, false)
             }
@@ -435,7 +490,9 @@ impl NeoApp {
         let mut state = AppState::with_store(store_ok, Some(db_path));
         let (requests, desktop_rx) = std::sync::mpsc::channel();
         state.desktop_execution = Some(crate::state::DesktopExecution {
-            requests, active: Default::default(), overlay: None,
+            requests,
+            active: Default::default(),
+            overlay: None,
         });
 
         let mut app = Self {
@@ -447,10 +504,17 @@ impl NeoApp {
             store,
             saved_api: (String::new(), String::new()),
             saved_context_tokens: neo_llm::CONTEXT_TOKENS,
+            saved_language: Language::default(),
+            applied_language: None,
             saved_active: None,
             saved_classroom_safe: true,
             saved_silent_startup_errors: false,
             saved_auto_check_updates: true,
+            saved_floating_enabled: false,
+            floating: None,
+            floating_attempted: false,
+            manual_audio: None,
+            manual_dictation: false,
             update_checker: Default::default(),
             update_schedule: Default::default(),
             applied_classroom_safe: true,
@@ -462,6 +526,7 @@ impl NeoApp {
             wake_epoch: 0,
             wake_broken: false,
             tray: None,
+            tray_labels: None,
             tray_show_id: tray_icon::menu::MenuId::new("neo-tray-show"),
             tray_quit_id: tray_icon::menu::MenuId::new("neo-tray-quit"),
             hidden_to_tray: false,
@@ -511,12 +576,16 @@ impl NeoApp {
         };
 
         app.load_settings();
+        app.saved_language = app.state.language;
+        app.sync_language(ctx);
         app.saved_api = (app.state.api_base.clone(), app.state.api_key.clone());
         // 模型启动只读本地缓存；更新检查由独立调度器延后执行。
         app.saved_classroom_safe = app.state.classroom_safe;
         app.saved_silent_startup_errors = app.state.silent_startup_errors;
         app.saved_auto_check_updates = app.state.auto_check_updates;
-        app.state.sync_startup_policy(crate::startup::set_silent_policy);
+        app.saved_floating_enabled = app.state.floating_enabled;
+        app.state
+            .sync_startup_policy(crate::startup::set_silent_policy);
         app.applied_classroom_safe = app.state.classroom_safe;
         record(Level::Info, "app", "应用已启动");
         // 装载之后同步一次基准值，否则第一帧会把"从库里读到的"当成"用户刚改的"。
@@ -547,6 +616,133 @@ impl NeoApp {
         app.prev_show_settings = app.state.show_settings;
 
         app
+    }
+
+    /// 只在真实客户端开启原生悬浮窗；设置关闭后可再次开启以重试故障。
+    pub fn start_floating(&mut self, ctx: &egui::Context) {
+        if !self.state.floating_enabled || self.floating_attempted {
+            return;
+        }
+        self.floating_attempted = true;
+        match crate::floating::FloatingHandle::start(ctx.clone(), !self.state.classroom_safe) {
+            Ok(handle) => self.floating = Some(handle),
+            Err(error) => {
+                record(Level::Warn, "floating", &error);
+                self.floating_notice(tr("悬浮按钮启动失败，可关闭后重新开启"));
+            }
+        }
+    }
+
+    fn floating_notice(&mut self, message: &str) {
+        self.pending_toasts.push((
+            neo_ui::ToastKind::Warning,
+            message.into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        ));
+    }
+
+    fn floating_blocked(&self, ctx: &egui::Context) -> bool {
+        self.quitting
+            || self.exit_blocked
+            || self.dictating
+            || self.state.wake_test.requested
+            || self.state.generating
+            || self.state.tool_open
+            || self.state.tool_round
+            || self.state.compaction.is_some()
+            || self.state.compaction_resume
+            || self.state.wants_demo_reply
+            || desktop_suspended(ctx)
+    }
+
+    fn handle_floating_wake(&mut self, ctx: &egui::Context, overlay_alive: bool) {
+        if !self.state.floating_enabled || self.floating_blocked(ctx) {
+            return;
+        }
+        if self.state.classroom_safe {
+            self.show_window(ctx);
+            self.floating_notice(tr(
+                "课堂安全模式已暂停听写，请在设置 → 通用中明确关闭安全模式后使用",
+            ));
+            return;
+        }
+        // 显示、STT 复位、静默超时及结果处理均复用语音唤醒路径。
+        self.handle_wake_detected(ctx, 1.0, overlay_alive);
+        if self.dictating {
+            if let Some(handle) = &self.floating {
+                handle.set_visible(false);
+            }
+            self.manual_dictation = true;
+            #[cfg(not(test))]
+            match crate::manual_audio::ManualAudio::start(ctx.clone()) {
+                Ok(audio) => self.manual_audio = Some(audio),
+                Err(error) => {
+                    self.cancel_dictation();
+                    self.floating_notice(&error);
+                }
+            }
+        }
+    }
+
+    fn sync_floating(&mut self, ctx: &egui::Context) {
+        if !self.state.floating_enabled {
+            if let Some(handle) = &self.floating {
+                handle.set_visible(false);
+            }
+            // 保留句柄直到隐藏被确认，让桌面工具屏障仍能检查它。
+            if self.floating.as_ref().is_some_and(|h| h.is_hidden()) {
+                self.floating = None;
+            }
+            self.floating_attempted = false;
+            if self.manual_dictation {
+                self.cancel_dictation();
+            }
+        } else if !self.quitting && !self.exit_blocked && !desktop_suspended(ctx) {
+            #[cfg(not(test))]
+            if self.floating.is_none() {
+                self.start_floating(ctx);
+            }
+        }
+        if let Some(handle) = &self.floating {
+            handle.set_capture_allowed(!self.state.classroom_safe);
+            handle.set_visible(
+                self.state.floating_enabled
+                    && !self.quitting
+                    && !self.exit_blocked
+                    && !self.dictating
+                    && !desktop_suspended(ctx),
+            );
+        }
+        while let Some(action) = self.floating.as_ref().and_then(|h| h.try_recv()) {
+            match action {
+                crate::floating::Action::Wake => {
+                    self.handle_floating_wake(ctx, self.overlay_alive())
+                }
+                crate::floating::Action::Unavailable => {
+                    // 退出事件在原生窗口销毁后发布，回收句柄但不自动重试。
+                    self.floating = None;
+                    self.floating_notice(tr("悬浮按钮已停止，可在设置中关闭后重新开启"));
+                    break;
+                }
+            }
+        }
+    }
+
+    fn poll_manual_audio(&mut self, ctx: &egui::Context) {
+        while let Some(event) = self
+            .manual_audio
+            .as_mut()
+            .and_then(|audio| audio.try_recv())
+        {
+            match event {
+                crate::manual_audio::Event::Frame(frame) => self.on_dictation_audio(ctx, frame),
+                crate::manual_audio::Event::Error(error) => {
+                    self.cancel_dictation();
+                    self.floating_notice(&error);
+                    break;
+                }
+            }
+        }
     }
 
     /// 启动语音唤醒（"Hi, Neo"）。
@@ -580,7 +776,7 @@ impl NeoApp {
             }
             Err(error) => {
                 crate::diagnostics::record_error("wake", "唤醒转发线程启动失败", &error);
-                self.fail_wake("无法启动唤醒事件转发线程".into());
+                self.fail_wake(tr("无法启动唤醒事件转发线程").into());
             }
         }
     }
@@ -598,10 +794,11 @@ impl NeoApp {
                     record(Level::Error, "overlay", overlay_failure_summary(&reason));
                     self.pending_toasts.push((
                         neo_ui::ToastKind::Warning,
-                        "覆盖层不可用，提示已改用独立窗口；语音唤醒将打开输入框，不启动听写".into(),
+                        tr("覆盖层不可用，提示已改用独立窗口；语音唤醒将打开输入框，不启动听写")
+                            .into(),
                         std::time::Instant::now() + std::time::Duration::from_secs(8),
                     ));
-                },
+                }
             }
         }
     }
@@ -676,8 +873,8 @@ impl NeoApp {
             return;
         }
         let menu = Menu::new();
-        let show = MenuItem::with_id(self.tray_show_id.clone(), "显示主界面", true, None);
-        let quit = MenuItem::with_id(self.tray_quit_id.clone(), "退出 Neo", true, None);
+        let show = MenuItem::with_id(self.tray_show_id.clone(), tr("显示主界面"), true, None);
+        let quit = MenuItem::with_id(self.tray_quit_id.clone(), tr("退出 Neo"), true, None);
         if menu.append(&show).is_err() || menu.append(&quit).is_err() {
             record(Level::Error, "tray", "托盘菜单创建失败");
             return;
@@ -692,11 +889,14 @@ impl NeoApp {
         };
         match TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Neo — 教室大屏 AI 助手")
+            .with_tooltip(tr("Neo — 教室大屏 AI 助手"))
             .with_icon(icon)
             .build()
         {
-            Ok(tray) => self.tray = Some(tray),
+            Ok(tray) => {
+                self.tray = Some(tray);
+                self.tray_labels = Some((show, quit));
+            }
             Err(_) => record(Level::Error, "tray", "系统托盘创建失败"),
         }
     }
@@ -749,30 +949,59 @@ impl NeoApp {
         let messages_saved = Self::prepare_session_change(&mut self.state, self.store.as_ref());
         let preferences_saved = self.persist_preferences();
         let selection_saved = self.store.as_ref().is_some_and(|store| {
-            let active = self.state.active_session.map(|id| id.to_string()).unwrap_or_default();
+            let active = self
+                .state
+                .active_session
+                .map(|id| id.to_string())
+                .unwrap_or_default();
             Self::save_setting(Some(store), "active_session", &active)
-                && Self::save_setting(Some(store), "models", &self.state.models.iter()
-                    .map(|model| model.id.as_str()).collect::<Vec<_>>().join("\n"))
+                && Self::save_setting(
+                    Some(store),
+                    "models",
+                    &self
+                        .state
+                        .models
+                        .iter()
+                        .map(|model| model.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
                 && Self::save_setting(Some(store), "model", self.state.model_id())
         });
         // 纯内存模式的游标只代表已处理，绝不是落盘成功。
-        if self.store.is_some() && messages_saved && preferences_saved && selection_saved && classes_saved {
+        if self.store.is_some()
+            && messages_saved
+            && preferences_saved
+            && selection_saved
+            && classes_saved
+        {
             self.finish_exit(ctx);
         } else {
             self.exit_blocked = true;
             self.confirm_discard = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.show_window(ctx);
-            record(Level::Error, "storage", "退出保存失败，已保留应用及内存数据");
+            record(
+                Level::Error,
+                "storage",
+                "退出保存失败，已保留应用及内存数据",
+            );
         }
     }
 
     fn finish_exit(&mut self, ctx: &egui::Context) {
         self.quitting = true;
         self.exit_blocked = false;
-        if self.state.desktop_execution.as_ref().is_some_and(|gate| gate.active.load(std::sync::atomic::Ordering::Acquire) != 0) {
+        if self
+            .state
+            .desktop_execution
+            .as_ref()
+            .is_some_and(|gate| gate.active.load(std::sync::atomic::Ordering::Acquire) != 0)
+        {
             self.state.cancel();
-            for cancel in &self.desktop_cancels { cancel.store(true, std::sync::atomic::Ordering::Release); }
+            for cancel in &self.desktop_cancels {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
             self.desktop_exit_pending = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.request_repaint_after(std::time::Duration::from_millis(10));
@@ -807,36 +1036,36 @@ impl NeoApp {
     }
 
     fn exit_dialog(&mut self, ctx: &egui::Context) {
-        egui::Window::new("退出前保存失败")
+        egui::Window::new(tr("退出前保存失败"))
             .collapsible(false).resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label("消息、设置或课堂资料尚未保存，应用已暂停新任务。请修复存储权限或磁盘空间后重试。");
+                ui.label(tr("消息、设置或课堂资料尚未保存，应用已暂停新任务。请修复存储权限或磁盘空间后重试。"));
                 if self.class.pending_saves() > 0 {
-                    ui.label(format!("仍有 {} 节课堂素材或记忆索引未保存，已保留全部卡片。", self.class.pending_saves()));
+                    ui.label(tf("仍有 {count} 节课堂素材或记忆索引未保存，已保留全部卡片。", &[("count", self.class.pending_saves().to_string())]));
                 }
                 if self.state.preferences_unsaved {
-                    ui.label("安全偏好尚未保存：本次运行的限制不保证重启后仍然生效。");
+                    ui.label(tr("安全偏好尚未保存：本次运行的限制不保证重启后仍然生效。"));
                 }
                 if self.store.is_none() {
-                    ui.label("当前为纯内存模式；退出会丢失本次会话和设置变更。");
+                    ui.label(tr("当前为纯内存模式；退出会丢失本次会话和设置变更。"));
                 }
                 if self.confirm_discard {
-                    ui.colored_label(egui::Color32::RED, "确认丢弃未保存的消息、设置、课堂素材和记忆索引？重启可能恢复旧的安全偏好。");
-                    if ui.button("确认丢弃并退出").clicked() {
+                    ui.colored_label(egui::Color32::RED, tr("确认丢弃未保存的消息、设置、课堂素材和记忆索引？重启可能恢复旧的安全偏好。"));
+                    if ui.button(tr("确认丢弃并退出")).clicked() {
                         self.finish_exit(ctx);
                     }
-                    if ui.button("返回保存选项").clicked() {
+                    if ui.button(tr("返回保存选项")).clicked() {
                         self.confirm_discard = false;
                     }
                 } else {
-                    if ui.button("重试保存并退出").clicked() {
+                    if ui.button(tr("重试保存并退出")).clicked() {
                         self.request_exit(ctx);
                     }
-                    if ui.button("保持打开").clicked() {
+                    if ui.button(tr("保持打开")).clicked() {
                         self.exit_blocked = false;
                     }
-                    if ui.button("退出不保存…").clicked() {
+                    if ui.button(tr("退出不保存…")).clicked() {
                         self.confirm_discard = true;
                     }
                 }
@@ -845,14 +1074,20 @@ impl NeoApp {
 
     /// 消费显式打开请求；同一信号不能在轮询或 multipass 中重复打断/聚焦。
     fn handle_show_signal(&mut self, ctx: &egui::Context, show_at: u64) {
-        if show_at == 0 || show_at == self.show_window_seen { return; }
+        if show_at == 0 || show_at == self.show_window_seen {
+            return;
+        }
         self.show_window_seen = show_at;
         self.show_window(ctx);
     }
 
     /// 显式唤回主窗口，包括普通最小化和被其他应用遮挡的窗口。
     fn show_window(&mut self, ctx: &egui::Context) {
-        let active = self.state.desktop_execution.as_ref().is_some_and(|gate| gate.active.load(std::sync::atomic::Ordering::Acquire) != 0);
+        let active = self
+            .state
+            .desktop_execution
+            .as_ref()
+            .is_some_and(|gate| gate.active.load(std::sync::atomic::Ordering::Acquire) != 0);
         if (self.desktop_windows.main_avoided || active) && !self.desktop_show_pending {
             self.state.cancel();
         }
@@ -878,7 +1113,9 @@ impl NeoApp {
         self.desktop_show_pending = false;
         self.desktop_windows.main_avoided = false;
         #[cfg(all(windows, not(test)))]
-        { self.desktop_windows.placement = None; }
+        {
+            self.desktop_windows.placement = None;
+        }
         self.hidden_to_tray = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -886,7 +1123,9 @@ impl NeoApp {
     }
 
     fn overlay_alive(&self) -> bool {
-        self.overlay.as_ref().is_some_and(|overlay| overlay.is_alive())
+        self.overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.is_alive())
     }
 
     fn check_overlay_health(&mut self, ctx: &egui::Context) {
@@ -898,7 +1137,7 @@ impl NeoApp {
             self.show_window(ctx);
             self.pending_toasts.push((
                 neo_ui::ToastKind::Warning,
-                "听写显示层不可用，已停止听写；请直接输入".into(),
+                tr("听写显示层不可用，已停止听写；请直接输入").into(),
                 std::time::Instant::now() + std::time::Duration::from_secs(4),
             ));
         }
@@ -941,7 +1180,10 @@ impl NeoApp {
             ctx.memory_mut(|m| m.request_focus(Id::new(ui::COMPOSER_ID)));
             self.pending_toasts.push((
                 neo_ui::ToastKind::Success,
-                format!("已唤醒（置信度 {score:.2}），请直接输入"),
+                tf(
+                    "已唤醒（置信度 {score}），请直接输入",
+                    &[("score", format!("{score:.2}"))],
+                ),
                 std::time::Instant::now() + std::time::Duration::from_secs(3),
             ));
         }
@@ -969,6 +1211,8 @@ impl NeoApp {
     fn end_dictation(&mut self) {
         self.dictation_epoch = self.dictation_epoch.wrapping_add(1);
         self.dictating = false;
+        self.manual_dictation = false;
+        self.manual_audio = None;
         self.dictation_since = None;
         if let Some(overlay) = &self.overlay {
             overlay.set_level(0.0);
@@ -1003,12 +1247,18 @@ impl NeoApp {
                 }
             }
         };
-        self.state.context_tokens = neo_llm::restored_context_tokens(get("context_tokens").as_deref());
+        if let Some(code) = get("language") {
+            self.state.language = Language::from_code(&code);
+        }
+        self.state.context_tokens =
+            neo_llm::restored_context_tokens(get("context_tokens").as_deref());
         self.saved_context_tokens = self.state.context_tokens;
         self.state.classroom_safe = get("classroom_safe").as_deref() != Some("0");
         self.state.silent_startup_errors = get("silent_startup_errors").as_deref() == Some("1");
         self.state.auto_check_updates = get("auto_check_updates").as_deref() != Some("0");
-        self.state.sync_startup_policy(crate::startup::set_silent_policy);
+        self.state.floating_enabled = get("floating_enabled").as_deref() == Some("1");
+        self.state
+            .sync_startup_policy(crate::startup::set_silent_policy);
         if let Some(v) = get("theme") {
             if v == "light" {
                 self.state.theme_mode = ThemeMode::Light;
@@ -1080,13 +1330,17 @@ impl NeoApp {
                 match serde_json::from_str(&r.attachments) {
                     Ok(attachments) => msg.attachments = attachments,
                     Err(_) => {
-                        state.attachment_error =
-                            Some("此会话有附件记录损坏，已保留可读消息，请重新添加对应文件".into())
+                        state.attachment_error = Some(
+                            tr("此会话有附件记录损坏，已保留可读消息，请重新添加对应文件").into(),
+                        )
                     }
                 }
                 match serde_json::from_str(&r.tool_calls) {
                     Ok(calls) => msg.tool_calls = calls,
-                    Err(_) => state.attachment_error = Some("历史工具协议损坏，结果按低信任参考资料恢复".into()),
+                    Err(_) => {
+                        state.attachment_error =
+                            Some(tr("历史工具协议损坏，结果按低信任参考资料恢复").into())
+                    }
                 }
                 if role == Role::Tool {
                     let mut tool = crate::state::ToolMeta::restored(&msg.meta);
@@ -1100,9 +1354,9 @@ impl NeoApp {
             match serde_json::from_str::<crate::state::ContextCheckpoint>(&json) {
                 Ok(c) if c.covered == covered && c.valid(&state.messages) => {
                     state.checkpoint = Some(c);
-                    state.compaction_status = Some("已恢复历史摘要，原聊天记录保留".into());
+                    state.compaction_status = Some(tr("已恢复历史摘要，原聊天记录保留").into());
                 }
-                _ => state.compaction_status = Some("历史摘要校验失败，已恢复完整原文".into()),
+                _ => state.compaction_status = Some(tr("历史摘要校验失败，已恢复完整原文").into()),
             }
         }
         state.active_session = Some(id);
@@ -1135,7 +1389,7 @@ impl NeoApp {
             .iter()
             .find(|m| m.role == Role::User)
             .map(|m| m.title().chars().take(18).collect())
-            .unwrap_or_else(|| "新对话".to_owned());
+            .unwrap_or_else(|| tr("新对话").to_owned());
         let id = store.create_session(&title).ok()?;
         state.active_session = Some(id);
         Some(id)
@@ -1186,11 +1440,12 @@ impl NeoApp {
             return;
         }
         if !state.draft_attachments.is_empty() && !state.can_call_real() {
-            state.attachment_error = Some("附件已准备好；请先配置 API 密钥并选择可用模型。图片需要视觉模型，当前未发送任何附件。".into());
+            state.attachment_error = Some(tr("附件已准备好；请先配置 API 密钥并选择可用模型。图片需要视觉模型，当前未发送任何附件。").into());
             return;
         }
         if state.needs_model_list() {
-            state.attachment_error = Some("请在设置中核对接口地址和密钥，再点击「从模型商刷新」".into());
+            state.attachment_error =
+                Some(tr("请在设置中核对接口地址和密钥，再点击「从模型商刷新」").into());
             state.show_settings = true;
             state.settings_tab = crate::state::SettingsTab::Model;
             return;
@@ -1210,14 +1465,27 @@ impl NeoApp {
                     let mut latest = if rejected_history {
                         state.latest_input_messages()
                     } else {
-                        vec![neo_llm::Msg::new(neo_llm::Role::System, state.system_prompt()), messages.pop().expect("刚提交的用户消息")]
+                        vec![
+                            neo_llm::Msg::new(neo_llm::Role::System, state.system_prompt()),
+                            messages.pop().expect("刚提交的用户消息"),
+                        ]
                     };
-                    let latest_check = neo_llm::budget_messages(&state.llm_config(), &mut latest, &neo_tools::tool_declarations());
-                    if !rejected_history { messages.push(latest.pop().unwrap()); }
+                    let latest_check = neo_llm::budget_messages(
+                        &state.llm_config(),
+                        &mut latest,
+                        &neo_tools::tool_declarations(),
+                    );
+                    if !rejected_history {
+                        messages.push(latest.pop().unwrap());
+                    }
                     latest_check?;
                     compaction_plan = state.compaction_plan(&messages)?;
                     if compaction_plan.is_none() {
-                        neo_llm::budget_messages(&state.llm_config(), &mut messages, &neo_tools::tool_declarations())?;
+                        neo_llm::budget_messages(
+                            &state.llm_config(),
+                            &mut messages,
+                            &neo_tools::tool_declarations(),
+                        )?;
                     }
                     Ok::<(), String>(())
                 })();
@@ -1269,13 +1537,18 @@ impl NeoApp {
     fn start_real_stream(state: &mut AppState) {
         if state.task_limit_reached || state.task_tool_calls >= crate::state::TASK_TOOL_LIMIT {
             state.finish_task_diagnostic(Phase::Rejected, Some(Failure::ToolLimit));
-            state.attachment_error = Some("本任务已达到500次工具调用上限，已停止自动续轮".into());
+            state.attachment_error =
+                Some(tr("本任务已达到500次工具调用上限，已停止自动续轮").into());
             return;
         }
         let mut messages = state.api_messages(usize::MAX);
         match state.compaction_plan(&messages) {
             Ok(Some(plan)) => Self::launch_compaction(state, plan),
-            Ok(None) => match neo_llm::budget_messages(&state.llm_config(), &mut messages, &neo_tools::tool_declarations()) {
+            Ok(None) => match neo_llm::budget_messages(
+                &state.llm_config(),
+                &mut messages,
+                &neo_tools::tool_declarations(),
+            ) {
                 Ok(()) => Self::start_real_stream_with_messages(state, messages),
                 Err(e) => {
                     state.finish_task_diagnostic(Phase::Rejected, Some(Failure::Budget));
@@ -1284,7 +1557,8 @@ impl NeoApp {
             },
             Err(e) => {
                 state.finish_task_diagnostic(Phase::Rejected, Some(Failure::Budget));
-                state.compaction_status = Some(format!("压缩失败：{e}")); state.attachment_error = Some(e);
+                state.compaction_status = Some(tf("压缩失败：{error}", &[("error", e.clone())]));
+                state.attachment_error = Some(e);
             }
         }
     }
@@ -1294,7 +1568,8 @@ impl NeoApp {
         #[cfg(not(test))]
         let stream = neo_llm::start(state.llm_config(), messages);
         #[cfg(test)]
-        let stream = STREAM_START.with(|start| start.get()(state.llm_config(), messages, Vec::new()));
+        let stream =
+            STREAM_START.with(|start| start.get()(state.llm_config(), messages, Vec::new()));
         state.start_compaction(plan, stream);
     }
 
@@ -1320,36 +1595,65 @@ impl NeoApp {
 
     /// 与通知分开：无托盘也记录终态；压缩续轮/离线回复排队期间不能提前结案。
     fn finish_idle_task_diagnostic(state: &mut AppState) {
-        if state.generating || state.tool_open || state.tool_round || state.tools_running()
-            || state.compaction.is_some() || state.compaction_resume || state.wants_demo_reply
-        { return; }
-        let failed = state.messages.iter().rev().find(|msg| msg.role == Role::Assistant)
-            .is_some_and(|msg| msg.error.is_some()) || state.attachment_error.is_some();
-        state.finish_task_diagnostic(if state.round_cancelled { Phase::CancelRequested }
-            else if failed { Phase::Failed } else { Phase::Completed }, None);
+        if state.generating
+            || state.tool_open
+            || state.tool_round
+            || state.tools_running()
+            || state.compaction.is_some()
+            || state.compaction_resume
+            || state.wants_demo_reply
+        {
+            return;
+        }
+        let failed = state
+            .messages
+            .iter()
+            .rev()
+            .find(|msg| msg.role == Role::Assistant)
+            .is_some_and(|msg| msg.error.is_some())
+            || state.attachment_error.is_some();
+        state.finish_task_diagnostic(
+            if state.round_cancelled {
+                Phase::CancelRequested
+            } else if failed {
+                Phase::Failed
+            } else {
+                Phase::Completed
+            },
+            None,
+        );
     }
 
     fn resume_compaction(state: &mut AppState, persistence_ok: bool) {
         // 保存失败仍可重试；保留续轮身份，不能把等待保存误记为任务结束。
-        if !state.compaction_resume || !persistence_ok { return; }
+        if !state.compaction_resume || !persistence_ok {
+            return;
+        }
         state.compaction_resume = false;
-        let config_matches = state.compaction_resume_config.take().as_ref() == Some(&state.llm_config());
+        let config_matches =
+            state.compaction_resume_config.take().as_ref() == Some(&state.llm_config());
         if state.round_cancelled {
             state.finish_task_diagnostic(Phase::CancelRequested, None);
             return;
         }
         if !config_matches || !state.can_call_real() {
-            state.compaction_status = Some("配置已改变或模型不可用，摘要后的自动续轮已取消".into());
+            state.compaction_status =
+                Some(tr("配置已改变或模型不可用，摘要后的自动续轮已取消").into());
             state.finish_task_diagnostic(Phase::Failed, Some(Failure::Configuration));
             return;
         }
         if state.task_limit_reached || state.task_tool_calls >= crate::state::TASK_TOOL_LIMIT {
-            state.attachment_error = Some("本任务已达到500次工具调用上限，已停止自动续轮".into());
+            state.attachment_error =
+                Some(tr("本任务已达到500次工具调用上限，已停止自动续轮").into());
             state.finish_task_diagnostic(Phase::Rejected, Some(Failure::ToolLimit));
             return;
         }
         let mut messages = state.api_messages(usize::MAX);
-        match neo_llm::budget_messages(&state.llm_config(), &mut messages, &neo_tools::tool_declarations()) {
+        match neo_llm::budget_messages(
+            &state.llm_config(),
+            &mut messages,
+            &neo_tools::tool_declarations(),
+        ) {
             Ok(()) => Self::start_real_stream_with_messages(state, messages),
             Err(error) => {
                 state.attachment_error = Some(error);
@@ -1388,7 +1692,8 @@ impl NeoApp {
                 true
             }
             Err(error) => {
-                state.attachment_error = Some(format!("删除会话失败：{error}"));
+                state.attachment_error =
+                    Some(tf("删除会话失败：{error}", &[("error", error.to_string())]));
                 false
             }
         }
@@ -1417,7 +1722,7 @@ impl NeoApp {
         };
         let had_session = state.active_session.is_some();
         let Some(session) = Self::ensure_session(state, store) else {
-            state.attachment_error = Some("无法保存会话，请检查数据库位置及磁盘空间".into());
+            state.attachment_error = Some(tr("无法保存会话，请检查数据库位置及磁盘空间").into());
             return false;
         };
         let mut wrote = false;
@@ -1428,7 +1733,8 @@ impl NeoApp {
             let result = serde_json::to_string(&msg.attachments)
                 .map_err(|e| e.to_string())
                 .and_then(|json| {
-                    let calls = serde_json::to_string(&msg.tool_calls).map_err(|e| e.to_string())?;
+                    let calls =
+                        serde_json::to_string(&msg.tool_calls).map_err(|e| e.to_string())?;
                     store
                         .append_message_with_protocol(
                             session,
@@ -1444,18 +1750,25 @@ impl NeoApp {
                 });
             if result.is_err() {
                 record(Level::Error, "storage", "消息写入失败，已保留未保存数据");
-                state.attachment_error = Some("消息尚未保存，请检查数据库权限及磁盘空间；请勿关闭或切换会话".into());
+                state.attachment_error =
+                    Some(tr("消息尚未保存，请检查数据库权限及磁盘空间；请勿关闭或切换会话").into());
                 return false;
             }
             state.pending_persist += 1;
             wrote = true;
         }
         if state.checkpoint_dirty {
-            let saved = state.checkpoint.as_ref().filter(|c| c.valid(&state.messages))
+            let saved = state
+                .checkpoint
+                .as_ref()
+                .filter(|c| c.valid(&state.messages))
                 .and_then(|c| serde_json::to_string(c).ok().map(|json| (c.covered, json)))
-                .is_some_and(|(covered, json)| store.save_checkpoint(session, covered, &json).is_ok());
+                .is_some_and(|(covered, json)| {
+                    store.save_checkpoint(session, covered, &json).is_ok()
+                });
             if !saved {
-                state.attachment_error = Some("历史摘要尚未保存，暂停续轮；请检查数据库后重试".into());
+                state.attachment_error =
+                    Some(tr("历史摘要尚未保存，暂停续轮；请检查数据库后重试").into());
                 return false;
             }
             state.checkpoint_dirty = false;
@@ -1476,7 +1789,8 @@ impl NeoApp {
             }
         }
         record(Level::Error, "storage", "会话重命名保存失败");
-        state.attachment_error = Some("会话重命名未保存，请检查数据库权限及磁盘空间后重试".into());
+        state.attachment_error =
+            Some(tr("会话重命名未保存，请检查数据库权限及磁盘空间后重试").into());
         state.renaming = Some(id);
         state.rename_draft = title.to_owned();
         state.rename_request_focus = true;
@@ -1506,18 +1820,94 @@ impl NeoApp {
                 }
             };
         }
-        save_pref!(state.context_tokens, self.saved_context_tokens, "context_tokens", &state.context_tokens.to_string());
-        save_pref!(state.show_reasoning, self.saved_prefs.0, "show_reasoning", if state.show_reasoning { "1" } else { "0" });
-        save_pref!(state.thinking, self.saved_prefs.1, "thinking", state.thinking.key());
-        save_pref!(state.theme_mode, self.saved_prefs.2, "theme", theme_mode_key(state.theme_mode));
-        save_pref!(state.distance, self.saved_prefs.3, "distance", distance_key(state.distance));
-        save_pref!(state.minimize_to_tray, self.saved_prefs.4, "minimize_to_tray", if state.minimize_to_tray { "1" } else { "0" });
-        save_pref!(state.wake_enabled, self.saved_prefs.5, "wake_enabled", if state.wake_enabled { "1" } else { "0" });
-        save_pref!(state.start_in_tray, self.saved_prefs.6, "start_in_tray", if state.start_in_tray { "1" } else { "0" });
-        save_pref!(state.class_enabled, self.saved_prefs.7, "class_enabled", if state.class_enabled { "1" } else { "0" });
-        save_pref!(state.classroom_safe, self.saved_classroom_safe, "classroom_safe", if state.classroom_safe { "1" } else { "0" });
-        save_pref!(state.silent_startup_errors, self.saved_silent_startup_errors, "silent_startup_errors", if state.silent_startup_errors { "1" } else { "0" });
-        save_pref!(state.auto_check_updates, self.saved_auto_check_updates, "auto_check_updates", if state.auto_check_updates { "1" } else { "0" });
+        save_pref!(
+            state.language,
+            self.saved_language,
+            "language",
+            state.language.code()
+        );
+        save_pref!(
+            state.context_tokens,
+            self.saved_context_tokens,
+            "context_tokens",
+            &state.context_tokens.to_string()
+        );
+        save_pref!(
+            state.show_reasoning,
+            self.saved_prefs.0,
+            "show_reasoning",
+            if state.show_reasoning { "1" } else { "0" }
+        );
+        save_pref!(
+            state.thinking,
+            self.saved_prefs.1,
+            "thinking",
+            state.thinking.key()
+        );
+        save_pref!(
+            state.theme_mode,
+            self.saved_prefs.2,
+            "theme",
+            theme_mode_key(state.theme_mode)
+        );
+        save_pref!(
+            state.distance,
+            self.saved_prefs.3,
+            "distance",
+            distance_key(state.distance)
+        );
+        save_pref!(
+            state.minimize_to_tray,
+            self.saved_prefs.4,
+            "minimize_to_tray",
+            if state.minimize_to_tray { "1" } else { "0" }
+        );
+        save_pref!(
+            state.wake_enabled,
+            self.saved_prefs.5,
+            "wake_enabled",
+            if state.wake_enabled { "1" } else { "0" }
+        );
+        save_pref!(
+            state.floating_enabled,
+            self.saved_floating_enabled,
+            "floating_enabled",
+            if state.floating_enabled { "1" } else { "0" }
+        );
+        save_pref!(
+            state.start_in_tray,
+            self.saved_prefs.6,
+            "start_in_tray",
+            if state.start_in_tray { "1" } else { "0" }
+        );
+        save_pref!(
+            state.class_enabled,
+            self.saved_prefs.7,
+            "class_enabled",
+            if state.class_enabled { "1" } else { "0" }
+        );
+        save_pref!(
+            state.classroom_safe,
+            self.saved_classroom_safe,
+            "classroom_safe",
+            if state.classroom_safe { "1" } else { "0" }
+        );
+        save_pref!(
+            state.silent_startup_errors,
+            self.saved_silent_startup_errors,
+            "silent_startup_errors",
+            if state.silent_startup_errors {
+                "1"
+            } else {
+                "0"
+            }
+        );
+        save_pref!(
+            state.auto_check_updates,
+            self.saved_auto_check_updates,
+            "auto_check_updates",
+            if state.auto_check_updates { "1" } else { "0" }
+        );
         if (state.api_base.as_str(), state.api_key.as_str())
             != (self.saved_api.0.as_str(), self.saved_api.1.as_str())
         {
@@ -1533,8 +1923,29 @@ impl NeoApp {
         saved
     }
 
+    fn sync_language(&mut self, ctx: &egui::Context) {
+        if self.applied_language == Some(self.state.language) {
+            return;
+        }
+        i18n::set_language(self.state.language);
+        self.applied_language = Some(self.state.language);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+            tr("Neo — 教室大屏 AI 助手").into(),
+        ));
+        if let Some((show, quit)) = &self.tray_labels {
+            show.set_text(tr("显示主界面"));
+            quit.set_text(tr("退出 Neo"));
+        }
+        if let Some(tray) = &self.tray {
+            let _ = tray.set_tooltip(Some(tr("Neo — 教室大屏 AI 助手")));
+        }
+        ctx.request_repaint();
+    }
+
     fn sync_safety(&mut self, ctx: &egui::Context) {
-        self.state.sync_startup_policy(crate::startup::set_silent_policy);
+        self.sync_language(ctx);
+        self.state
+            .sync_startup_policy(crate::startup::set_silent_policy);
         if self.applied_classroom_safe == self.state.classroom_safe {
             return;
         }
@@ -1560,12 +1971,20 @@ impl NeoApp {
             match event {
                 Some(Ok(event)) if !event.is_current(self.wake_epoch) => continue,
                 Some(Ok(neo_wake::WakeEvent::Detected { score, .. })) => {
-                    if !suppress && self.state.effective_wake_enabled() && !self.wake_broken {
+                    if !suppress
+                        && !self.dictating
+                        && self.state.effective_wake_enabled()
+                        && !self.wake_broken
+                    {
                         self.on_wake_detected(ctx, score);
                     }
                 }
                 Some(Ok(neo_wake::WakeEvent::Audio { frame, .. })) => {
-                    if !suppress && self.state.effective_wake_enabled() && !self.wake_broken {
+                    if !suppress
+                        && !self.manual_dictation
+                        && self.state.effective_wake_enabled()
+                        && !self.wake_broken
+                    {
                         self.on_dictation_audio(ctx, frame);
                     }
                 }
@@ -1574,7 +1993,7 @@ impl NeoApp {
                     break;
                 }
                 Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                    self.fail_wake("唤醒线程已断开，请检查设备或学校部署的模型资源".into());
+                    self.fail_wake(tr("唤醒线程已断开，请检查设备或学校部署的模型资源").into());
                     break;
                 }
                 Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => break,
@@ -1585,14 +2004,16 @@ impl NeoApp {
     fn fail_wake(&mut self, msg: String) {
         self.capture_wake_diagnostics();
         self.stop_wake_test();
-        self.cancel_dictation();
+        if !self.manual_dictation {
+            self.cancel_dictation();
+        }
         self.state.wake_test.error = Some(msg.chars().take(512).collect());
         self.state.wake_test.broken = true;
         self.wake_broken = true;
         record(Level::Warn, "wake", "语音唤醒发生错误，已停用");
         self.pending_toasts.push((
             neo_ui::ToastKind::Warning,
-            "语音唤醒不可用：请在设置 → 麦克风测试查看错误，关闭再打开语音唤醒可重试".into(),
+            tr("语音唤醒不可用：请在设置 → 麦克风测试查看错误，关闭再打开语音唤醒可重试").into(),
             std::time::Instant::now() + std::time::Duration::from_secs(4),
         ));
         self.wake_rx = None;
@@ -1626,15 +2047,22 @@ impl NeoApp {
     // 返回值覆盖进出测试的整批队列；错误事件始终保留。
     fn sync_wake_test(&mut self, engine_available: bool) -> bool {
         let was_running = self.state.wake_test.running;
-        self.state.wake_test.busy = self.dictating || self.state.generating
-            || self.state.tool_open || self.state.tool_round || self.state.compaction.is_some()
-            || self.state.compaction_resume || self.state.wants_demo_reply;
+        self.state.wake_test.busy = self.dictating
+            || self.state.generating
+            || self.state.tool_open
+            || self.state.tool_round
+            || self.state.compaction.is_some()
+            || self.state.compaction_resume
+            || self.state.wants_demo_reply;
         self.state.wake_test.broken = self.wake_broken;
         let allowed = self.state.show_settings
             && self.state.settings_tab == crate::state::SettingsTab::WakeTest
             && self.state.effective_wake_enabled()
-            && !self.state.wake_test.busy && !self.wake_broken
-            && !self.hidden_to_tray && !self.quitting && !self.exit_blocked;
+            && !self.state.wake_test.busy
+            && !self.wake_broken
+            && !self.hidden_to_tray
+            && !self.quitting
+            && !self.exit_blocked;
         if !allowed || !self.state.wake_test.requested {
             self.stop_wake_test();
         } else if !was_running && engine_available {
@@ -1671,7 +2099,7 @@ impl NeoApp {
         if duplicate {
             self.pending_toasts.push((
                 neo_ui::ToastKind::Info,
-                "Neo 已经在运行".into(),
+                tr("Neo 已经在运行").into(),
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
             ));
         }
@@ -1699,12 +2127,17 @@ impl NeoApp {
         let manual = std::mem::take(&mut self.state.update_check_requested);
         let checking = self.update_checker.is_running()
             || matches!(self.state.update_status, Status::Checking);
-        if self.update_schedule.request_due(now, self.state.auto_check_updates, manual, checking).is_some() {
+        if self
+            .update_schedule
+            .request_due(now, self.state.auto_check_updates, manual, checking)
+            .is_some()
+        {
             #[cfg(not(test))]
             self.update_checker.request(ctx);
             // 测试走同一 single-flight/结果通道，只替换 worker，绝不接触网络。
             #[cfg(test)]
-            self.update_checker.request_controlled(ctx, Status::UpToDate)();
+            self.update_checker
+                .request_controlled(ctx, Status::UpToDate)();
             self.state.update_status = self.update_checker.status().clone();
         }
         let checking = self.update_checker.is_running()
@@ -1720,13 +2153,17 @@ impl NeoApp {
             record(Level::Warn, "updates", "更新检查失败，可稍后手动重试");
             crate::startup::record_error("updates", "更新检查失败，可稍后手动重试");
         }
-        if self.update_schedule.auto_inflight && self.state.auto_check_updates
-            && !self.update_schedule.notified && matches!(status, Status::Available { .. })
+        if self.update_schedule.auto_inflight
+            && self.state.auto_check_updates
+            && !self.update_schedule.notified
+            && matches!(status, Status::Available { .. })
         {
             self.update_schedule.notified = true;
-            self.pending_toasts.push((neo_ui::ToastKind::Info,
-                "Neo 有新版本，可在设置 → 关于查看；不会自动下载".into(),
-                std::time::Instant::now() + std::time::Duration::from_secs(8)));
+            self.pending_toasts.push((
+                neo_ui::ToastKind::Info,
+                tr("Neo 有新版本，可在设置 → 关于查看；不会自动下载").into(),
+                std::time::Instant::now() + std::time::Duration::from_secs(8),
+            ));
         }
         self.update_schedule.auto_inflight = false;
         self.state.update_status = status;
@@ -1735,9 +2172,15 @@ impl NeoApp {
     /// 每次 logic pass 推进一次屏障；hide 与 verify 之间留出原生事件处理机会。
     fn tick_desktop_barrier(&mut self, ctx: &egui::Context) {
         // request_discard 会在返回原生事件循环前重跑 logic/ui，不能在该 pass 放行。
-        if ctx.current_pass_index() != 0 { return; }
+        if ctx.current_pass_index() != 0 {
+            return;
+        }
         use std::sync::atomic::Ordering;
-        let active = self.state.desktop_execution.as_ref().is_some_and(|gate| gate.active.load(Ordering::Acquire) != 0);
+        let active = self
+            .state
+            .desktop_execution
+            .as_ref()
+            .is_some_and(|gate| gate.active.load(Ordering::Acquire) != 0);
         if self.desktop_windows.manually_restored() {
             self.show_window(ctx);
             if active {
@@ -1745,24 +2188,40 @@ impl NeoApp {
                 let _ = self.desktop_windows.hide(true);
             }
         }
-        let blocked = self.desktop_show_pending || self.quitting || self.exit_blocked
+        let blocked = self.desktop_show_pending
+            || self.quitting
+            || self.exit_blocked
             || self.state.awaiting_tool().is_some();
         // hide 与 verify 分属两帧；verify 不再补 hide，避免把失败当作成功。
         for request in std::mem::take(&mut self.desktop_pending) {
+            if request.live() && !blocked && self.floating.as_ref().is_some_and(|h| !h.is_hidden())
+            {
+                self.desktop_pending.push(request);
+                continue;
+            }
             let result = if !request.live() || blocked {
                 Err("桌面请求已取消、超时或仍待审批，未派发".into())
             } else {
                 self.desktop_windows.verify()
             };
-            if result.is_err() { self.desktop_restore_pending = true; }
-            if request.ack.send(result).is_err() { self.desktop_restore_pending = true; }
+            if result.is_err() {
+                self.desktop_restore_pending = true;
+            }
+            if request.ack.send(result).is_err() {
+                self.desktop_restore_pending = true;
+            }
         }
         for request in self.desktop_rx.try_iter() {
             if !request.live() || blocked {
-                let _ = request.ack.send(Err("旧桌面请求已失效或仍待审批，未暂避".into()));
+                let _ = request
+                    .ack
+                    .send(Err("旧桌面请求已失效或仍待审批，未暂避".into()));
                 continue;
             }
             self.desktop_cancels.push(request.cancel.clone());
+            if let Some(handle) = &self.floating {
+                handle.set_visible(false);
+            }
             match self.desktop_windows.hide(!self.hidden_to_tray) {
                 Ok(()) => self.desktop_pending.push(request),
                 Err(error) => {
@@ -1774,19 +2233,24 @@ impl NeoApp {
         // 同一轮观察→操作之间不恢复主窗，不让 snapshot 的真实前台被 Neo 改变。
         // 新审批则在所有旧 UIA 租约结束后恢复，以保持审批界面可见。
         let round_busy = self.state.generating || self.state.tool_open || self.state.tool_round;
-        let hold_main = self.desktop_windows.main_avoided && round_busy && !blocked
+        let hold_main = self.desktop_windows.main_avoided
+            && round_busy
+            && !blocked
             && !self.desktop_restore_pending;
         // 主窗可整轮暂避，但确认卡只在实际桌面租约/暂避验证期间挂起。
-        let suspended = active && !self.desktop_cancels.is_empty()
-            || !self.desktop_pending.is_empty();
+        let suspended =
+            active && !self.desktop_cancels.is_empty() || !self.desktop_pending.is_empty();
         ctx.data_mut(|data| data.insert_temp(egui::Id::new("neo-desktop-suspended"), suspended));
 
         if !active && self.desktop_pending.is_empty() && !hold_main {
             self.desktop_windows.restore();
             self.desktop_cancels.clear();
             self.desktop_restore_pending = false;
-            if self.desktop_exit_pending { self.finish_exit(ctx); }
-            else if self.desktop_show_pending { self.show_window(ctx); }
+            if self.desktop_exit_pending {
+                self.finish_exit(ctx);
+            } else if self.desktop_show_pending {
+                self.show_window(ctx);
+            }
         }
         if suspended || active {
             ctx.request_repaint_after(std::time::Duration::from_millis(10));
@@ -1814,11 +2278,17 @@ impl NeoApp {
             self.handle_close(&ctx);
         }
         self.poll_tray(&ctx);
+        self.sync_floating(&ctx);
         // 保存失败等待用户选择时，不得再启动生成、工具或音频采集。
         if self.quitting || self.exit_blocked {
             self.stop_wake_test();
             if !self.quitting {
-                self.toastwin.tick(&ctx, &mut self.pending_toasts, self.theme, self.overlay.as_ref());
+                self.toastwin.tick(
+                    &ctx,
+                    &mut self.pending_toasts,
+                    self.theme,
+                    self.overlay.as_ref(),
+                );
             }
             return;
         }
@@ -1842,7 +2312,9 @@ impl NeoApp {
             self.start_wake(&ctx);
         } else if !self.state.effective_wake_enabled() {
             self.stop_wake_test();
-            self.cancel_dictation();
+            if !self.manual_dictation {
+                self.cancel_dictation();
+            }
             // Drop 会 join 引擎线程，而引擎加载模型/开麦克风流不可中断
             //（首次 0.5~3s）——在 UI 线程 join 就是冻结界面。转交后台线程等。
             if let Some(engine) = self.wake.take() {
@@ -1883,6 +2355,7 @@ impl NeoApp {
         let suppress_wake = self.sync_wake_test(self.wake.is_some());
         self.check_overlay_health(&ctx);
         self.poll_wake_events(&ctx, suppress_wake);
+        self.poll_manual_audio(&ctx);
         // STT 转写结果：只有空编辑器才直接发送；有未提交输入则唤回主窗确认。
         let stt_out = self.stt_rx.as_ref().map(|rx| rx.try_recv());
         match stt_out {
@@ -1892,7 +2365,6 @@ impl NeoApp {
                 ctx.request_repaint();
             }
             Some(Ok(SttResult::Transcript(_, Ok(text)))) => {
-
                 let text = text.trim().to_owned();
                 if self.dictating && !text.is_empty() {
                     self.end_dictation();
@@ -1909,7 +2381,7 @@ impl NeoApp {
                         self.show_window(&ctx);
                         self.pending_toasts.push((
                             neo_ui::ToastKind::Warning,
-                            "语音已保留在草稿，尚未发送；请核对文字和附件后手动发送".into(),
+                            tr("语音已保留在草稿，尚未发送；请核对文字和附件后手动发送").into(),
                             std::time::Instant::now() + std::time::Duration::from_secs(6),
                         ));
                     }
@@ -1925,7 +2397,7 @@ impl NeoApp {
                 self.stt_tx = None;
                 self.pending_toasts.push((
                     neo_ui::ToastKind::Warning,
-                    format!("语音转写未启用：{msg}"),
+                    tf("语音转写未启用：{message}", &[("message", msg)]),
                     std::time::Instant::now() + std::time::Duration::from_secs(4),
                 ));
             }
@@ -1945,7 +2417,7 @@ impl NeoApp {
                 self.cancel_dictation();
                 self.pending_toasts.push((
                     neo_ui::ToastKind::Info,
-                    "已取消本次听写".to_owned(),
+                    tr("已取消本次听写").to_owned(),
                     std::time::Instant::now() + std::time::Duration::from_secs(2),
                 ));
             }
@@ -1978,7 +2450,8 @@ impl NeoApp {
         self.confirmwin
             .tick(&ctx, &mut self.state, self.theme, overlay);
         // 课堂总结：最大化监听 / 转写 / 打磨状态机（默认关，设置里开）。
-        self.class.tick(&ctx, &self.state, self.state.effective_class_enabled());
+        self.class
+            .tick(&ctx, &self.state, self.state.effective_class_enabled());
         // 课堂总结弹窗：打磨就绪后从屏幕上方滑入。
         self.classwin
             .tick(&ctx, &mut self.class, self.theme, overlay);
@@ -2042,17 +2515,26 @@ impl NeoApp {
                 let (kind, text) = match msg {
                     crate::state::MemoryIoMsg::Imported(Ok((added, skipped))) => (
                         neo_ui::ToastKind::Success,
-                        format!("已导入 {added} 条记忆（跳过 {skipped} 条重复）"),
+                        tf(
+                            "已导入 {added} 条记忆（跳过 {skipped} 条重复）",
+                            &[
+                                ("added", added.to_string()),
+                                ("skipped", skipped.to_string()),
+                            ],
+                        ),
                     ),
-                    crate::state::MemoryIoMsg::Imported(Err(e)) => {
-                        (neo_ui::ToastKind::Error, format!("导入失败：{e}"))
-                    }
-                    crate::state::MemoryIoMsg::Exported(Ok(n)) => {
-                        (neo_ui::ToastKind::Success, format!("已导出 {n} 条记忆"))
-                    }
-                    crate::state::MemoryIoMsg::Exported(Err(e)) => {
-                        (neo_ui::ToastKind::Error, format!("导出失败：{e}"))
-                    }
+                    crate::state::MemoryIoMsg::Imported(Err(e)) => (
+                        neo_ui::ToastKind::Error,
+                        tf("导入失败：{error}", &[("error", e)]),
+                    ),
+                    crate::state::MemoryIoMsg::Exported(Ok(n)) => (
+                        neo_ui::ToastKind::Success,
+                        tf("已导出 {count} 条记忆", &[("count", n.to_string())]),
+                    ),
+                    crate::state::MemoryIoMsg::Exported(Err(e)) => (
+                        neo_ui::ToastKind::Error,
+                        tf("导出失败：{error}", &[("error", e)]),
+                    ),
                 };
                 self.pending_toasts.push((
                     kind,
@@ -2136,10 +2618,10 @@ impl NeoApp {
                     } else {
                         // 工具跑完了但接口配置已被清空：不说一声的话
                         // 这轮「无声结束」，用户会以为卡死。
-                        self.state.finish_task_diagnostic(Phase::Failed, Some(Failure::Configuration));
+                        self.state
+                            .finish_task_diagnostic(Phase::Failed, Some(Failure::Configuration));
                         self.state.attachment_error = Some(
-                            "工具已执行完，但模型接口未配置，结果未回灌；配置好后发条消息即可继续。"
-                                .into(),
+                            tr("工具已执行完，但模型接口未配置，结果未回灌；配置好后发条消息即可继续。").into(),
                         );
                     }
                 }
@@ -2159,7 +2641,12 @@ impl NeoApp {
                 self.saved_active = self.state.active_session;
             }
         }
-        self.toastwin.tick(&ctx, &mut self.pending_toasts, self.theme, self.overlay.as_ref());
+        self.toastwin.tick(
+            &ctx,
+            &mut self.pending_toasts,
+            self.theme,
+            self.overlay.as_ref(),
+        );
         if self.state.wake_test.running {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
@@ -2187,28 +2674,35 @@ impl NeoApp {
             return;
         }
         if let Some(status) = self.state.compaction_status.clone() {
-            egui::Window::new("上下文状态").collapsible(false).resizable(false)
+            egui::Window::new(tr("上下文状态"))
+                .collapsible(false)
+                .resizable(false)
                 .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 8.0))
                 .show(&ctx, |ui| {
                     ui.label(status);
                     if self.state.compaction.is_some() {
-                        if ui.button("取消压缩").clicked() { self.state.cancel(); }
-                    } else if ui.button("关闭提示").clicked() {
+                        if ui.button(tr("取消压缩")).clicked() {
+                            self.state.cancel();
+                        }
+                    } else if ui.button(tr("关闭提示")).clicked() {
                         self.state.compaction_status = None;
                     }
                 });
         }
         if self.state.preferences_unsaved {
-            egui::Window::new("设置未保存")
-                .collapsible(false).resizable(false)
+            egui::Window::new(tr("设置未保存"))
+                .collapsible(false)
+                .resizable(false)
                 .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 8.0))
                 .show(&ctx, |ui| {
-                ui.colored_label(egui::Color32::RED,
-                    "设置尚未保存；安全限制仅对本次运行生效，重启可能恢复旧值。");
-                if ui.button("重试保存设置").clicked() {
-                    self.persist_preferences();
-                }
-            });
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        tr("设置尚未保存；安全限制仅对本次运行生效，重启可能恢复旧值。"),
+                    );
+                    if ui.button(tr("重试保存设置")).clicked() {
+                        self.persist_preferences();
+                    }
+                });
         }
         let modal_open = self.state.show_settings
             || self.workspace_picker.is_some()
@@ -2388,7 +2882,7 @@ impl NeoApp {
             match std::thread::Builder::new()
                 .name("neo-workspace-picker".into())
                 .spawn(move || {
-                    let mut dialog = rfd::FileDialog::new().set_title("选择工作区");
+                    let mut dialog = rfd::FileDialog::new().set_title(tr("选择工作区"));
                     if let Some(path) = initial {
                         dialog = dialog.set_directory(path);
                     }
@@ -2399,7 +2893,9 @@ impl NeoApp {
                     self.workspace_picker = Some(rx);
                     ctx.request_repaint();
                 }
-                Err(error) => crate::diagnostics::record_error("workspace", "工作区选择器启动失败", &error),
+                Err(error) => {
+                    crate::diagnostics::record_error("workspace", "工作区选择器启动失败", &error)
+                }
             }
         }
         if sb.new_session || new_session {
@@ -2414,7 +2910,7 @@ impl NeoApp {
                     // 库读失败不能无声：用户看到的是「点了没反应」。
                     self.pending_toasts.push((
                         neo_ui::ToastKind::Error,
-                        "无法读取该会话，数据库文件可能已损坏".into(),
+                        tr("无法读取该会话，数据库文件可能已损坏").into(),
                         std::time::Instant::now() + std::time::Duration::from_secs(4),
                     ));
                 }
@@ -2513,6 +3009,14 @@ mod tests;
 #[cfg(test)]
 #[path = "app_diagnostics_tests.rs"]
 mod diagnostics_tests;
+
+#[cfg(test)]
+#[path = "app_floating_tests.rs"]
+mod floating_tests;
+
+#[cfg(test)]
+#[path = "app_language_tests.rs"]
+mod language_tests;
 
 fn theme_mode_key(m: ThemeMode) -> &'static str {
     match m {

@@ -8,9 +8,12 @@
 Thumbs.db
 desktop.ini
 
-# 仅公开 MOD 接口文档；其余文档与截图仅保留本地
+# 仅公开 MOD 接口与发行说明；其余文档与截图仅保留本地
 /docs/*
 !/docs/mod-api.md
+!/docs/distribution/
+/docs/distribution/*
+!/docs/distribution/README.md
 /docs-pri/
 
 # 本地临时文件
@@ -18,12 +21,14 @@ desktop.ini
 /.tmp/
 *.log
 
-# 打包与安装包美术产物（CI 重新生成，不进版本库）
+# 发行产物；打包中间文件位于已忽略的 target/package/
 /dist/
-/build/
 
-# 随包运行时（由 tools/fetch_runtime.py 下载，约 91 MB）
-# 能从 npmmirror 重新获取，不进版本库 —— 复制仓库时不该带着一份二进制发行版
+# 下载缓存、随包运行时原料（不进版本库）
+/.cache/
+
+# 兼容旧开发目录，避免旧产物被意外提交
+/build/
 /runtime/
 
 # STT 模型资产（约 240 MB，从 hf-mirror 重新下载，不进版本库）

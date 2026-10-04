@@ -50,6 +50,38 @@ pub struct MessageRow {
 
 pub type Result<T> = std::result::Result<T, rusqlite::Error>;
 
+/// Existing settings only: no directory creation, journal changes, schema setup or migrations.
+pub struct ReadOnlySettings {
+    conn: Connection,
+    has_settings: bool,
+}
+
+impl ReadOnlySettings {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        // Do not enable URI parsing: the caller supplies a literal filesystem path.
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_millis(200))?;
+        let has_settings = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(Self { conn, has_settings })
+    }
+
+    /// An absent settings table or key is an unset preference, not a reason to migrate.
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        if !self.has_settings {
+            return Ok(None);
+        }
+        self.conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+    }
+}
+
 /// SQLite 存储。
 pub struct Store {
     conn: Mutex<Connection>,
@@ -95,14 +127,20 @@ impl Store {
             }
         }
         for (name, default) in [("tool_calls", "[]"), ("tool_call_id", "")] {
-            let columns = conn.prepare("PRAGMA table_info(messages)")?
+            let columns = conn
+                .prepare("PRAGMA table_info(messages)")?
                 .query_map([], |row| row.get::<_, String>(1))?
                 .collect::<Result<Vec<_>>>()?;
             if !columns.iter().any(|column| column == name) {
-                if let Err(error) = conn.execute(&format!(
-                    "ALTER TABLE messages ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'"
-                ), []) {
-                    if !error.to_string().contains("duplicate column") { return Err(error); }
+                if let Err(error) = conn.execute(
+                    &format!(
+                        "ALTER TABLE messages ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'"
+                    ),
+                    [],
+                ) {
+                    if !error.to_string().contains("duplicate column") {
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -222,7 +260,16 @@ impl Store {
         meta: &str,
         attachments: &str,
     ) -> Result<i64> {
-        self.append_message_with_protocol(session_id, role, content, reasoning, meta, attachments, "[]", "")
+        self.append_message_with_protocol(
+            session_id,
+            role,
+            content,
+            reasoning,
+            meta,
+            attachments,
+            "[]",
+            "",
+        )
     }
 
     /// 原文与工具协议同事务保存，避免重开后丢失配对结果。
@@ -258,9 +305,15 @@ impl Store {
     /// 检查点只允许覆盖已持久化消息；原消息不被删除。
     pub fn save_checkpoint(&self, session: i64, covered: usize, data: &str) -> Result<()> {
         let conn = self.conn();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM messages WHERE session_id=?1", [session], |r| r.get(0))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id=?1",
+            [session],
+            |r| r.get(0),
+        )?;
         if covered == 0 || covered > count as usize {
-            return Err(rusqlite::Error::InvalidParameterName("checkpoint boundary".into()));
+            return Err(rusqlite::Error::InvalidParameterName(
+                "checkpoint boundary".into(),
+            ));
         }
         conn.execute("INSERT INTO context_checkpoints(session_id,covered,data) VALUES(?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET covered=excluded.covered,data=excluded.data", params![session, covered as i64, data])?;
         Ok(())
@@ -357,3 +410,7 @@ pub fn default_db_path() -> PathBuf {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "readonly_settings_tests.rs"]
+mod readonly_settings_tests;

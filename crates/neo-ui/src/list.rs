@@ -118,6 +118,8 @@ pub struct ListRow<'a> {
     meta: &'a str,
     active: bool,
     mode: RowMode,
+    rename_label: &'a str,
+    delete_label: &'a str,
 }
 
 impl<'a> ListRow<'a> {
@@ -128,12 +130,21 @@ impl<'a> ListRow<'a> {
             meta,
             active: false,
             mode: RowMode::Normal,
+            rename_label: "重命名会话",
+            delete_label: "删除会话",
         }
     }
     pub fn active(mut self, on: bool) -> Self {
         self.active = on;
         self
     }
+    /// Inject action tooltips and accessible names without changing widget IDs.
+    pub fn action_labels(mut self, rename: &'a str, delete: &'a str) -> Self {
+        self.rename_label = rename;
+        self.delete_label = delete;
+        self
+    }
+
     pub fn mode(mut self, m: RowMode) -> Self {
         self.mode = m;
         self
@@ -175,9 +186,16 @@ impl<'a> ListRow<'a> {
             egui::pos2(rect.right() - target * 0.5, rect.center().y),
             act_size,
         );
-        let pen = tap(ui, pen_rect, Id::new(("neo-row-pen", self.id))).on_hover_text("重命名会话");
-        let trash =
-            tap(ui, trash_rect, Id::new(("neo-row-trash", self.id))).on_hover_text("删除会话");
+        let pen =
+            tap(ui, pen_rect, Id::new(("neo-row-pen", self.id))).on_hover_text(self.rename_label);
+        let trash = tap(ui, trash_rect, Id::new(("neo-row-trash", self.id)))
+            .on_hover_text(self.delete_label);
+        pen.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), self.rename_label)
+        });
+        trash.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), self.delete_label)
+        });
         let idle = if self.active {
             p.label_secondary
         } else {
@@ -240,6 +258,7 @@ impl<'a> ListRow<'a> {
 pub struct ConfirmBar<'a> {
     pub question: &'a str,
     pub confirm: &'a str,
+    pub cancel: &'a str,
 }
 
 impl<'a> ConfirmBar<'a> {
@@ -247,42 +266,96 @@ impl<'a> ConfirmBar<'a> {
         Self {
             question,
             confirm: "删除",
+            cancel: "取消",
         }
     }
 
+    /// Inject button labels; the compact row uses only the confirm label.
+    pub fn labels(mut self, confirm: &'a str, cancel: &'a str) -> Self {
+        self.confirm = confirm;
+        self.cancel = cancel;
+        self
+    }
+
     /// 布局流入口；`opening` 表示本次确认首次展示，该帧不会提交删除。
-    pub fn show(&self, ui: &mut Ui, d: &Design, id: impl std::hash::Hash, opening: bool) -> ConfirmResponse {
+    pub fn show(
+        &self,
+        ui: &mut Ui,
+        d: &Design,
+        id: impl std::hash::Hash,
+        opening: bool,
+    ) -> ConfirmResponse {
         let id = crate::hash_id(id);
         let inner = ui.push_id(id, |ui| {
             ui.spacing_mut().item_spacing = Vec2::splat(d.m().s(8.0));
-            let question = ui.add(egui::Label::new(egui::RichText::new(self.question)
-                .font(d.font(d.t().label)).color(d.p().label_primary)).wrap());
+            let question = ui.add(
+                egui::Label::new(
+                    egui::RichText::new(self.question)
+                        .font(d.font(d.t().label))
+                        .color(d.p().label_primary),
+                )
+                .wrap(),
+            );
             // 整行或两行按钮都按实际热区排版，不再外扩覆盖问句。
             let available = ui.available_width();
-            let button_w = ["取消", self.confirm].map(|text| {
-                d.m().hit_target(ui.painter().layout_no_wrap(text.to_owned(),
-                    d.font_bold(d.t().label), d.p().label_primary).size().x + d.m().s(32.0))
+            let button_w = [self.cancel, self.confirm].map(|text| {
+                d.m().hit_target(
+                    ui.painter()
+                        .layout_no_wrap(
+                            text.to_owned(),
+                            d.font_bold(d.t().label),
+                            d.p().label_primary,
+                        )
+                        .size()
+                        .x
+                        + d.m().s(32.0),
+                )
             });
             let stacked = button_w[0] + button_w[1] + d.m().s(8.0) > available;
-            let buttons = ui.with_layout(if stacked { egui::Layout::top_down(egui::Align::Min) }
-                else { egui::Layout::left_to_right(egui::Align::Center) }, |ui| {
-                let cancel = crate::Button::new("取消").elevated().touch_layout()
-                    .id_salt(id.with("cancel")).show(ui, d);
-                let confirm = crate::Button::new(self.confirm).danger().touch_layout()
-                    .id_salt(id.with("confirm")).show(ui, d);
-                (cancel, confirm)
-            }).inner;
+            let buttons = ui
+                .with_layout(
+                    if stacked {
+                        egui::Layout::top_down(egui::Align::Min)
+                    } else {
+                        egui::Layout::left_to_right(egui::Align::Center)
+                    },
+                    |ui| {
+                        let cancel = crate::Button::new(self.cancel)
+                            .elevated()
+                            .touch_layout()
+                            .id_salt(id.with("cancel"))
+                            .show(ui, d);
+                        let confirm = crate::Button::new(self.confirm)
+                            .danger()
+                            .touch_layout()
+                            .id_salt(id.with("confirm"))
+                            .show(ui, d);
+                        (cancel, confirm)
+                    },
+                )
+                .inner;
             (question, buttons.0, buttons.1)
         });
         let (question, cancel, confirm) = inner.inner;
-        if opening { cancel.request_focus(); }
-        let escaped = ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if opening {
+            cancel.request_focus();
+        }
+        let escaped =
+            ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let outcome = if escaped || (!opening && cancel.clicked()) {
             ConfirmOutcome::Cancel
         } else if !opening && confirm.clicked() {
             ConfirmOutcome::Confirm
-        } else { ConfirmOutcome::None };
-        ConfirmResponse { response: inner.response, question, cancel, confirm, outcome }
+        } else {
+            ConfirmOutcome::None
+        };
+        ConfirmResponse {
+            response: inner.response,
+            question,
+            cancel,
+            confirm,
+            outcome,
+        }
     }
 }
 
@@ -309,6 +382,10 @@ pub enum ConfirmOutcome {
 /// 「删除这条会话？」上面（截图里一眼能看到）。这类"两个数字各自对、合起来错"
 /// 的问题，只有把关系写成断言才挡得住。
 pub fn confirm_geometry(d: &Design, rect: Rect) -> (Rect, Rect) {
+    confirm_geometry_with_width(d, rect, d.m().s(56.0))
+}
+
+fn confirm_geometry_with_width(d: &Design, rect: Rect, button_width: f32) -> (Rect, Rect) {
     let m = d.m();
     let pad_x = m.s(12.0);
     let gap = m.s(8.0);
@@ -316,7 +393,7 @@ pub fn confirm_geometry(d: &Design, rect: Rect) -> (Rect, Rect) {
     // 可用宽度扣掉左右内边距；按钮**最多占满可用宽度**（窄行时收缩），
     // 这样"按钮留在行内"与"文案区非负"两件事都是构造保证的，不靠调用方守规矩。
     let avail = (rect.width() - pad_x * 2.0).max(0.0);
-    let btn_w = m.s(56.0).min(avail).max(m.s(16.0).min(avail));
+    let btn_w = button_width.min(avail).max(m.s(16.0).min(avail));
     let chip_h = m.s(24.0);
 
     let btn = Rect::from_center_size(
@@ -372,19 +449,40 @@ pub fn confirm_row(
     );
 
     // ---- 几何：文案区 + 唯一的按键（删除，占原取消键的位置）----
-    let (label_rect, del_rect) = confirm_geometry(d, rect);
+    let button_font = d.font_bold(d.t().caption);
+    let button_width = ui
+        .painter()
+        .layout_no_wrap(bar.confirm.to_owned(), button_font.clone(), c.on_primary)
+        .size()
+        .x
+        + m.s(24.0);
+    let (label_rect, del_rect) = confirm_geometry_with_width(d, rect, button_width.max(m.s(56.0)));
 
     // ---- 文案：按算出来的宽度截断，再窄也压不到按钮上 ----
     let font = d.font(d.t().label);
     let shown = elide(ui.painter(), bar.question, &font, label_rect.width());
-    text_left(ui.painter(), label_rect, &shown, font, p.label_primary);
+    text_left(
+        &ui.painter()
+            .with_clip_rect(ui.clip_rect().intersect(label_rect)),
+        label_rect,
+        &shown,
+        font,
+        p.label_primary,
+    );
 
     // 保留紧凑的视觉按钮，命中高度补足触控下限且不跨到相邻会话行。
     let hit_rect = Rect::from_center_size(
         del_rect.center(),
-        Vec2::new(m.hit_target(del_rect.width()), m.hit_target(del_rect.height())),
-    ).intersect(rect);
-    let del = tap(ui, hit_rect, Id::new(("neo-confirm-del", id)));
+        Vec2::new(
+            m.hit_target(del_rect.width()),
+            m.hit_target(del_rect.height()),
+        ),
+    )
+    .intersect(rect);
+    let del = tap(ui, hit_rect, Id::new(("neo-confirm-del", id))).on_hover_text(bar.confirm);
+    del.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), bar.confirm)
+    });
     ui.painter().squircle_filled(
         del_rect,
         m.radius_chip(),
@@ -394,11 +492,18 @@ pub fn confirm_row(
             crate::base::translucent(c.error, 0.85)
         },
     );
-    text_center(
+    let shown = elide(
         ui.painter(),
-        del_rect,
         bar.confirm,
-        d.font_bold(d.t().caption),
+        &button_font,
+        (del_rect.width() - m.s(12.0)).max(0.0),
+    );
+    text_center(
+        &ui.painter()
+            .with_clip_rect(ui.clip_rect().intersect(del_rect)),
+        del_rect,
+        &shown,
+        button_font,
         c.on_primary,
     );
 

@@ -9,6 +9,7 @@
 //! 导航行、会话行（含恒显动作钮）、删除确认条、行内重命名容器全部来自
 //! [`neo_ui::list`] —— 本文件只做编排（哪一行处于哪种形态、动作落到哪个状态）。
 
+use crate::i18n::tr;
 use egui::{Id, Rect, ScrollArea, Ui, Vec2};
 use neo_theme::SquirclePaint;
 use neo_ui::list::{ConfirmBar, ConfirmOutcome, ListRow, NavItem, RowAction};
@@ -114,7 +115,7 @@ pub fn draw(
     );
     // NavItem 走布局流，侧栏是绝对定位坐标系 —— 包进 `at()` 定位。
     let new_clicked = at(ui, new_rect, |ui| {
-        NavItem::new("新对话", Icon::Plus)
+        NavItem::new(tr("新对话"), Icon::Plus)
             .id_salt("neo-new-session")
             .show(ui, &d, new_rect.width())
             .clicked()
@@ -139,7 +140,7 @@ pub fn draw(
                 egui::pos2(content.left() + m.s(8.0), y),
                 Vec2::new(content.width(), m.s(20.0)),
             ),
-            "最近会话",
+            tr("最近会话"),
         );
         let list_rect = Rect::from_min_max(
             egui::pos2(content.left(), list_top),
@@ -190,7 +191,7 @@ pub fn draw(
     text_left(
         ui.painter(),
         inset(settings_row, m.s(36.0), 0.0, m.s(8.0), 0.0),
-        "设置",
+        tr("设置"),
         skin.prop(skin.t().label),
         if sst.hovered || state.show_settings {
             p.label_primary
@@ -252,7 +253,7 @@ fn draw_session_list(
                             &d,
                             r,
                             row.id,
-                            &ConfirmBar::new("删除这条会话？"),
+                            &ConfirmBar::new(tr("删除这条会话？")).labels(tr("删除"), tr("取消")),
                         ) {
                             ConfirmOutcome::Confirm => {
                                 out.delete_confirmed = Some(row.id);
@@ -304,6 +305,7 @@ fn draw_session_list(
                     // ---- 常规行（组件库：动作钮恒显）----
                     let meta = time_label(row.updated_ms);
                     match ListRow::new(row.id, &row.title, &meta)
+                        .action_labels(tr("重命名会话"), tr("删除会话"))
                         .active(active)
                         .show_normal(ui, &d, rect.width())
                     {
@@ -334,11 +336,7 @@ fn draw_session_list(
 /// 结算进行中的行内重命名：草稿非空且与旧标题不同才提交。
 /// 与「点击别处 lost_focus 提交」「点了另一行的动作钮」共用同一条路径，
 /// 与行序无关 —— 草稿什么时候被覆盖，都先把旧的那笔落账。
-fn settle_rename(
-    state: &mut AppState,
-    rows: &[neo_store::SessionRow],
-    out: &mut Outcome,
-) {
+fn settle_rename(state: &mut AppState, rows: &[neo_store::SessionRow], out: &mut Outcome) {
     let Some(id) = state.renaming else { return };
     let title = state.rename_draft.trim().to_owned();
     state.renaming = None;

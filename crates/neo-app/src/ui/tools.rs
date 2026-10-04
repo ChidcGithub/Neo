@@ -3,6 +3,7 @@
 //! 标题和操作区固定，工具元信息、动作预览及完整 JSON 在中间独立滚动。
 //! 不截断待授权内容，也不依赖 JSON 行数估计实际换行高度。
 
+use crate::i18n::{tf, tr};
 use egui::{Rect, Ui, Vec2};
 use neo_theme::SquirclePaint;
 use neo_ui::{Button, Panel};
@@ -42,8 +43,14 @@ impl Geometry {
             egui::pos2(inner.left(), title.bottom() + gap),
             egui::pos2(inner.right(), footer.top() - gap),
         );
-        debug_assert!(panel.contains_rect(title), "panel={panel:?} title={title:?} pad={pad} title_h={title_h} footer_h={footer_h}");
-        debug_assert!(panel.contains_rect(footer), "panel={panel:?} footer={footer:?}");
+        debug_assert!(
+            panel.contains_rect(title),
+            "panel={panel:?} title={title:?} pad={pad} title_h={title_h} footer_h={footer_h}"
+        );
+        debug_assert!(
+            panel.contains_rect(footer),
+            "panel={panel:?} footer={footer:?}"
+        );
         debug_assert!(body.height() > 0.0, "body={body:?}");
         Self {
             panel,
@@ -79,7 +86,13 @@ fn panel_rect(ui: &mut Ui, m: neo_theme::Metrics) -> Rect {
 /// **内联渲染，不开模态**：渲染层里这张卡就是全部可点区域（命中测试只认
 /// 卡矩形）；`egui::Modal` 会把面板居中到整层屏幕、逃出命中区 —— 按钮
 /// 看着在，点击全穿透。
-pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize, allow_batch: bool) -> Option<Answer> {
+pub fn confirm(
+    ui: &mut Ui,
+    skin: &Skin<'_>,
+    meta: &ToolMeta,
+    remaining: usize,
+    allow_batch: bool,
+) -> Option<Answer> {
     let d = skin.d();
     let p = skin.p();
     let m = skin.m();
@@ -91,21 +104,24 @@ pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize, 
     let scroll_w = m.s(16.0);
     let body_w = (inner_w - scroll_w).max(1.0);
     let title = ui.painter().layout(
-        "需要你的许可".into(),
+        tr("需要你的许可").into(),
         skin.bold(skin.t().headline),
         p.label_primary,
         inner_w,
     );
     let risk = match meta.risk {
-        "exec" => "执行命令",
-        "write" => "修改文件",
-        "open" => "打开内容",
-        "read" => "读取内容",
+        "exec" => tr("执行命令"),
+        "write" => tr("修改文件"),
+        "open" => tr("打开内容"),
+        "read" => tr("读取内容"),
         other => other,
     };
-    let mut badge = format!("{} · {} · {}", meta.title, meta.name, risk);
+    let mut badge = format!("{} · {} · {}", tr(meta.title), meta.name, risk);
     if remaining > 1 {
-        badge.push_str(&format!("\n另有 {} 个调用等待确认", remaining - 1));
+        badge.push_str(&tf(
+            "\n另有 {count} 个调用等待确认",
+            &[("count", (remaining - 1).to_string())],
+        ));
     }
     let badge = ui
         .painter()
@@ -122,7 +138,7 @@ pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize, 
         (body_w - m.s(20.0)).max(1.0),
     );
     let args_label = ui.painter().layout_no_wrap(
-        "完整参数".into(),
+        tr("完整参数").into(),
         skin.prop(skin.t().caption),
         p.label_caption,
     );
@@ -135,7 +151,7 @@ pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize, 
     let preview_h = preview.size().y + m.s(16.0);
     let args_h = args.size().y + m.s(16.0);
     let button_h = m.s(36.0);
-    let labels = ["允许", "本会话都允许", "拒绝"];
+    let labels = [tr("允许"), tr("本会话都允许"), tr("拒绝")];
     let button_width: f32 = labels
         .iter()
         .map(|label| {
@@ -165,16 +181,12 @@ pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize, 
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 ui.set_width(body_w);
-                let (r, _) = ui.allocate_exact_size(
-                    Vec2::new(body_w, badge.size().y),
-                    egui::Sense::hover(),
-                );
+                let (r, _) =
+                    ui.allocate_exact_size(Vec2::new(body_w, badge.size().y), egui::Sense::hover());
                 ui.painter().galley(r.min, badge, p.label_caption);
                 ui.add_space(gap);
-                let (r, _) = ui.allocate_exact_size(
-                    Vec2::new(body_w, preview_h),
-                    egui::Sense::hover(),
-                );
+                let (r, _) =
+                    ui.allocate_exact_size(Vec2::new(body_w, preview_h), egui::Sense::hover());
                 ui.painter().squircle_filled(r, m.s(10.0), p.bg_layer_1);
                 ui.painter().galley(
                     r.min + egui::vec2(m.s(10.0), m.s(8.0)),
@@ -220,15 +232,22 @@ pub fn confirm(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta, remaining: usize, 
         };
         ui.with_layout(layout, |ui| {
             for (button, answer) in [
-                (Button::new("允许").primary(), Answer::Once),
-                (Button::new("本会话都允许").elevated().enabled(allow_batch), Answer::Always),
-                (Button::new("拒绝").ghost(), Answer::Deny),
+                (Button::new(tr("允许")).primary(), Answer::Once),
+                (
+                    Button::new(tr("本会话都允许"))
+                        .elevated()
+                        .enabled(allow_batch),
+                    Answer::Always,
+                ),
+                (Button::new(tr("拒绝")).ghost(), Answer::Deny),
             ] {
                 let response = button.show(ui, &d);
                 #[cfg(test)]
                 ui.ctx().data_mut(|data| {
-                    data.insert_temp(egui::Id::new(("neo-confirm-button-probe", answer as u8)),
-                        (response.rect, ui.clip_rect()));
+                    data.insert_temp(
+                        egui::Id::new(("neo-confirm-button-probe", answer as u8)),
+                        (response.rect, ui.clip_rect()),
+                    );
                 });
                 debug_assert!(g.panel.expand(0.5).contains_rect(response.rect));
                 if response.clicked() {
@@ -277,7 +296,7 @@ pub fn ask(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta) -> Option<AskAnswer> {
     let options = neo_tools::tools::ask_user::parse_options(options_raw);
 
     let title = ui.painter().layout(
-        "Neo 想问".into(),
+        tr("Neo 想问").into(),
         skin.bold(skin.t().headline),
         p.label_primary,
         inner_w,
@@ -317,7 +336,11 @@ pub fn ask(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta) -> Option<AskAnswer> {
                 for (i, opt) in options.iter().enumerate() {
                     ui.add_space(gap);
                     // 完整排版选项，按实际换行高度分配触控区域，不省略待选择内容。
-                    let color = if i == 0 { d.c().on_info } else { p.label_primary };
+                    let color = if i == 0 {
+                        d.c().on_info
+                    } else {
+                        p.label_primary
+                    };
                     let text = ui.painter().layout(
                         opt.clone(),
                         d.font_bold(d.t().label),
@@ -325,16 +348,25 @@ pub fn ask(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta) -> Option<AskAnswer> {
                         (body_w - m.s(32.0)).max(1.0),
                     );
                     let height = (text.size().y + m.s(20.0)).max(m.hit_target(m.s(36.0)));
-                    let (r, _) = ui.allocate_exact_size(
-                        Vec2::new(body_w, height),
-                        egui::Sense::hover(),
-                    );
-                    let response = super::tap(ui, r, ui.id().with(("ask-option", &meta.call_id, i)));
-                    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), opt));
+                    let (r, _) =
+                        ui.allocate_exact_size(Vec2::new(body_w, height), egui::Sense::hover());
+                    let response =
+                        super::tap(ui, r, ui.id().with(("ask-option", &meta.call_id, i)));
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), opt)
+                    });
                     #[cfg(test)]
                     ui.ctx().data_mut(|data| {
-                        data.insert_temp(egui::Id::new(("neo-ask-option-probe", i)),
-                            (r, ui.clip_rect(), text.size(), text.rows.len(), response.enabled()));
+                        data.insert_temp(
+                            egui::Id::new(("neo-ask-option-probe", i)),
+                            (
+                                r,
+                                ui.clip_rect(),
+                                text.size(),
+                                text.rows.len(),
+                                response.enabled(),
+                            ),
+                        );
                     });
                     let fill = match (i == 0, response.hovered()) {
                         (true, true) => d.c().btn_info_hover,
@@ -356,10 +388,13 @@ pub fn ask(ui: &mut Ui, skin: &Skin<'_>, meta: &ToolMeta) -> Option<AskAnswer> {
     });
     super::at(ui, g.footer, |ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let skip = Button::new("跳过").ghost().show(ui, &d);
+            let skip = Button::new(tr("跳过")).ghost().show(ui, &d);
             #[cfg(test)]
             ui.ctx().data_mut(|data| {
-                data.insert_temp(egui::Id::new("neo-ask-skip-probe"), (skip.rect, ui.clip_rect()));
+                data.insert_temp(
+                    egui::Id::new("neo-ask-skip-probe"),
+                    (skip.rect, ui.clip_rect()),
+                );
             });
             if skip.clicked() {
                 out = Some(AskAnswer::Skip);

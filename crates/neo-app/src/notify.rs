@@ -52,12 +52,23 @@ fn toast(_title: &str, _body: &str) -> Result<(), String> {
 
 /// 一轮任务执行完成。`line` 取最后一条回复的首行（已裁好长度）。
 pub fn task_done(line: &str) {
-    let body = if line.is_empty() {
-        "本轮任务已完成。".to_owned()
-    } else {
-        line.to_owned()
-    };
-    if let Err(e) = toast("Neo · 任务完成", &body) {
+    let (title, body) = task_done_text(line);
+    if let Err(e) = toast(title, body) {
         eprintln!("[neo] 完成通知失败（忽略）: {e}");
     }
 }
+
+fn task_done_text(line: &str) -> (&'static str, &str) {
+    (
+        crate::i18n::tr("Neo · 任务完成"),
+        if line.is_empty() {
+            crate::i18n::tr("本轮任务已完成。")
+        } else {
+            line
+        },
+    )
+}
+
+#[cfg(test)]
+#[path = "notify_tests.rs"]
+mod tests;

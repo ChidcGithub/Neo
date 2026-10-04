@@ -1,5 +1,6 @@
 //! 独立轻提示：同一份绝对 deadline 队列在 overlay / deferred viewport 间迁移。
 
+use crate::i18n::tr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -179,7 +180,7 @@ impl ToastWin {
 
     fn builder(rect: Option<Rect>) -> ViewportBuilder {
         ViewportBuilder::default()
-            .with_title("Neo 提示")
+            .with_title(tr("Neo 提示"))
             .with_decorations(false)
             .with_resizable(false)
             .with_taskbar(false)
