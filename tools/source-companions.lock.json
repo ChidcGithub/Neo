@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "scope": "Exact external source delivery inputs only; not approval. Null URLs block CI. Native binding is the recorded local build, not arbitrary CI output; ORT producer correspondence remains unconfirmed.",
+  "sources": [
+    {
+      "kind": "gitbash",
+      "sha256": "999c56ee597ba1071d62e474522487b1b7727d530550966b16de1b99c331282a",
+      "size": 791265102,
+      "expected_runtime_files_sha256": "ea7f28118cd09f9be62f40f6637a5444c10b2a950f162b615e491275916e9bdc",
+      "download_url": null
+    },
+    {
+      "kind": "native",
+      "sha256": "757fed6d081ea23a2862d5ebb90c7fe57ded08f842724a199bcc454df07a2a8a",
+      "size": 7570574,
+      "expected_runtime_files_sha256": "ea937d215c41b1c9ca0a1c84c5d0451ba25215b5e19e8074a6d1c3594d9a0f95",
+      "native_binding": {
+        "manifest_sha256": "042914d1d3c427986d34343e40926e782694ba5cf8f06049783b103127239d5e",
+        "receipt_sha256": "5fef57cc8591730386b76fa7d1b7c78439258066026e030459f714dc2f9c81bb"
+      },
+      "download_url": null
+    }
+  ]
+}

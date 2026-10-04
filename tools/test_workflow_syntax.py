@@ -101,6 +101,28 @@ class WorkflowSyntaxTests(unittest.TestCase):
         drawing = workflow["jobs"]["drawing-check"]["steps"]
         self.assertFalse(any("prepare_sherpa_ci" in step.get("run", "") for step in drawing))
 
+    def test_source_delivery_is_required_before_archives_and_uses_only_publish_step_token(self):
+        workflow = parse_workflow((WORKFLOWS / "release.yml").read_text(encoding="utf-8"))
+        steps = workflow["jobs"]["release"]["steps"]
+        names = [step.get("name") for step in steps]
+        stage = steps[names.index("Stage pinned source companions (fail closed)")]
+        publish = steps[names.index("Create release")]
+        self.assertLess(names.index(stage["name"]), names.index("Zip portable package"))
+        self.assertLess(names.index(stage["name"]), names.index("Build installer (NSIS)"))
+        self.assertNotIn("if", stage)
+        self.assertNotIn("continue-on-error", stage)
+        self.assertNotIn("continue-on-error", publish)
+        self.assertEqual(stage["timeout-minutes"], "30")
+        self.assertNotIn("GH_TOKEN", stage["env"])
+        self.assertEqual(publish["env"]["GH_TOKEN"], "${{ secrets.GITHUB_TOKEN }}")
+        for step in (stage, publish):
+            self.assertEqual(step["env"]["RELEASE_REPOSITORY"], "${{ github.repository }}")
+            self.assertEqual(step["env"]["RELEASE_TAG"], "${{ steps.ver.outputs.tag }}")
+        check = workflow["jobs"]["check"]["steps"]
+        tests = next(step for step in check if step.get("name") == "Source delivery offline regressions")
+        self.assertEqual(tests["run"], "python -B -m unittest tools.test_stage_source_companions -v")
+        self.assertNotIn("if", tests)
+
     def test_parser_rejects_regressed_root_package_step_indentation(self):
         text = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
         old = "      - name: Drawing release root-package regressions\n"

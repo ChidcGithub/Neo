@@ -61,8 +61,12 @@ Speech Data. Google model attribution is not a newly invented copyright year.
 Modification notice: openWakeWord manually reimplemented/separated the Google
 backbone and distributed the ONNX frontend subsequently carried by LiveKit.
 Neo redistributes those frontend files without additional weight changes.
-The recovered original card has no explicit license field; Apache-2.0 is the
-specific upstream openWakeWord attribution, not inferred from a dataset.
+The recovered TFHub card has no explicit license field. Google's official
+Kaggle model listing separately declares Apache 2.0 for model
+`google/speech-embedding`, TensorFlow1 instance `speech-embedding`, version 1
+(instance ID 1293, version ID 1535), consistent with openWakeWord's attribution.
+Source: https://www.kaggle.com/models/google/speech-embedding/TensorFlow1/speech-embedding
+This model license is not inferred from a training dataset.
 Complete license texts: openwakeword-LICENSE and CC-BY-NC-SA-4.0.txt.
 
 Silero VAD

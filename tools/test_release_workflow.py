@@ -232,15 +232,29 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
                       (root / "tools/installer.nsi").read_text(encoding="utf-8"))
         self.assertNotIn("build/installer-art", workflow)
 
-    def test_gh_release_create_verifies_existing_tag(self):
-        # Inspect the actual argument array; a comment mentioning the flag is not enough.
-        script = pwsh_step("Create release")
-        code = "\n".join(line for line in script.splitlines() if not line.lstrip().startswith("#"))
-        args = re.search(r"\$args\s*=\s*@\((.*?)\)", code, re.DOTALL)
-        self.assertIsNotNone(args, "Missing gh argument array")
-        self.assertRegex(args[1], r"^\s*'release'\s*,\s*'create'\s*,")
-        self.assertRegex(args[1], r"(?:^|,)\s*'--verify-tag'\s*(?:,|$)")
-        self.assertRegex(code, r"(?m)^\s*gh\s+@args\s*$")
+    def test_source_stage_precedes_binaries_and_publish_uses_verified_draft_helper(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        release = workflow.split("\n  release:\n", 1)[1]
+        order = ["Assemble approved drawing release", "Stage pinned source companions (fail closed)",
+                 "Zip portable package", "Build installer (NSIS)", "Create release"]
+        self.assertEqual([release.index(name) for name in order], sorted(release.index(name) for name in order))
+        stage = pwsh_step("Stage pinned source companions (fail closed)")
+        publish = pwsh_step("Create release")
+        self.assertIn("tools/stage_source_companions.py stage", stage)
+        self.assertIn("--distribution target/package/runtime-distribution", stage)
+        self.assertIn("--native-lib target/sherpa-asr/native/install/lib", stage)
+        self.assertIn("--work-root target/source-delivery", stage)
+        self.assertIn("--budget-seconds 600 --max-download-mib 1024 --max-expanded-mib 2048", stage)
+        self.assertIn("tools/stage_source_companions.py publish", publish)
+        self.assertIn('--prerelease "$env:RELEASE_PRERELEASE"', publish)
+        for script in (stage, publish):
+            self.assertIn("--lock tools/source-companions.lock.json --package dist/neo --output dist", script)
+            self.assertIn('--repository "$env:RELEASE_REPOSITORY" --tag "$env:RELEASE_TAG" --version "$env:RELEASE_VERSION"', script)
+            self.assertIn("if ($LASTEXITCODE -ne 0) { throw", script)
+        self.assertNotRegex(release, r"(?m)^\s+gh (?:release|@args)")
+        self.assertIn("python -B -m unittest tools.test_stage_source_companions -v", workflow)
+        self.assertNotIn("target/runtime-distribution/mingit-", release)
+        self.assertNotIn("target/native-source/neo-native-sources.zip", release)
 
 
 @unittest.skipUnless(PWSH, "pwsh is not installed")

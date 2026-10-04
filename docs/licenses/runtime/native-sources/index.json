@@ -3,8 +3,8 @@
   "scope": "Native license texts and Eigen source supply; not release approval",
   "texts": {
     "BUILD-MODIFICATIONS.md": {
-      "size": 4817,
-      "sha256": "7bfa66be0bc12c330c16357f885f3b9d92e526f4c1824e008d22b010dd582ecf"
+      "size": 8714,
+      "sha256": "3ebef87421c5a9420aa92a5afb52c72557098fbe891c4c48af19f2b2fe4a96a2"
     },
     "eigen-1d8b82b-COPYING.APACHE": {
       "size": 11362,
@@ -99,8 +99,8 @@
       "sha256": "6d41f4504f665bc591336c668a1aa16ffc5e0f02fe9c2f9c46c6f5660b54c849"
     },
     "README.md": {
-      "size": 7874,
-      "sha256": "4ff7acfd47728203d393aea8716a0a3f55fbf1ec957e8a230234ce4c2935743f"
+      "size": 10255,
+      "sha256": "0715249e9fc0d46ec7d3839d7ee5c2d87cee4ea54746481e7e78e91edcae658b"
     },
     "sherpa-LICENSE": {
       "size": 11358,
@@ -216,7 +216,31 @@
   "source_companion": "neo-native-sources.zip",
   "binding": {
     "eigen_5_0_1": "verified local no-TTS build source input",
-    "ort_eigen": "verified source identity and upstream recipe patches; inferred default dependency; precise producer binding unconfirmed",
-    "ort_1_30_0_dll": "separate notices in parent directory; not covered by this source companion"
+    "ort_eigen": "verified source identity and static ORT 1.28.2 baseline patches; historical run 33741118114 / builder 6314c7b252578dc0b8ddd3919b593c4359812818 recovered; release-to-recipe correspondence strongly inferred, inner artifact digest equality not verified",
+    "ort_1_30_0_dll": "official PyPI wheel-to-assets DLL and parent-directory license/notice byte equality verified; fixed Windows packaging vcpkg recipe selects the supplied unpatched Eigen base, without static ORT's s390x patches; exact Azure run not recovered; source delivery is still required",
+    "pyke_1_22_0": "independent child producer/source binding remains unconfirmed; no extrapolation from either main ORT input"
+  },
+  "producer_evidence": {
+    "static_ort_1_28_2": {
+      "run_url": "https://github.com/csukuangfj/onnxruntime-build/actions/runs/33741118114",
+      "builder_commit": "6314c7b252578dc0b8ddd3919b593c4359812818",
+      "actions_artifact_id": 9889408216,
+      "actions_archive_size": 106572207,
+      "actions_archive_sha256": "60b5c3bbc1f2cd885fa2624bb6f64e64b603e64857613ae467844272657524f5",
+      "release_asset_id": 542612895,
+      "release_archive_sha256": "77c6cc2a419828f450a570851d7d6d2385523c411dbe858f841a4c7338a78881",
+      "release_to_recipe_binding": "strongly-inferred; outer Actions digest is not the inner release digest"
+    },
+    "wake_ort_1_30_0": {
+      "wheel": "onnxruntime-1.30.0-cp311-cp311-win_amd64.whl",
+      "wheel_size": 14309136,
+      "wheel_sha256": "0edd0145a6e3fce8a1276491dc784d615e3c58bcb952c9b4e5c876d5c6a12ad7",
+      "wheel_to_assets_and_parent_notices": "verified-byte-identical",
+      "upstream_commit": "f2c39fe2f838cf35ce7da92824f5a5e3ee6e88a7",
+      "eigen_revision": "1d8b82b0740839c0de7f1242a3585e3390ff5f33",
+      "eigen_recipe_url": "https://github.com/microsoft/onnxruntime/blob/f2c39fe2f838cf35ce7da92824f5a5e3ee6e88a7/cmake/vcpkg-ports/eigen3/portfile.cmake",
+      "eigen_header_patches_in_recipe": [],
+      "exact_azure_run_recovered": false
+    }
   }
 }

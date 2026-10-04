@@ -74,6 +74,9 @@ jobs:
       - name: Native preparation offline regressions
         run: python -B -m unittest tools.test_prepare_sherpa_ci -v
 
+      - name: Source delivery offline regressions
+        run: python -B -m unittest tools.test_stage_source_companions -v
+
       - name: Prepare mandatory no-TTS Sherpa native
         timeout-minutes: 30
         run: python -B tools/prepare_sherpa_ci.py --budget-seconds 600 --validation-seconds 180 --max-download-mib 256
@@ -358,6 +361,17 @@ jobs:
       - name: Assemble approved drawing release
         run: python tools/assemble_drawing_release.py assemble --source target/package/drawing-src --target-dir target/package/drawing-build --package dist/neo
 
+      - name: Stage pinned source companions (fail closed)
+        timeout-minutes: 30
+        shell: pwsh
+        env:
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.ver.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python -B tools/stage_source_companions.py stage --lock tools/source-companions.lock.json --package dist/neo --output dist --distribution target/package/runtime-distribution --native-lib target/sherpa-asr/native/install/lib --work-root target/source-delivery --repository "$env:RELEASE_REPOSITORY" --tag "$env:RELEASE_TAG" --version "$env:RELEASE_VERSION" --budget-seconds 600 --max-download-mib 1024 --max-expanded-mib 2048
+          if ($LASTEXITCODE -ne 0) { throw 'Matching source delivery required before binary archives; release remains BLOCKED' }
+
       - name: Zip portable package
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: pwsh
@@ -439,11 +453,10 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.ver.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+          RELEASE_PRERELEASE: ${{ steps.ver.outputs.prerelease }}
         run: |
-          $tag = "${{ steps.ver.outputs.tag }}"
-          $installer = "dist\neo-${{ steps.ver.outputs.version }}-installer-x64.exe"
-          $args = @('release', 'create', $tag, $installer, "${{ steps.zip.outputs.zip }}",
-                    '--verify-tag', '--title', "Neo $tag", '--notes-file', 'dist\notes.md')
-          if ("${{ steps.ver.outputs.prerelease }}" -eq 'true') { $args += '--prerelease' }
-          gh @args
-          if ($LASTEXITCODE -ne 0) { throw "gh release create exit $LASTEXITCODE" }
+          python -B tools/stage_source_companions.py publish --lock tools/source-companions.lock.json --package dist/neo --output dist --repository "$env:RELEASE_REPOSITORY" --tag "$env:RELEASE_TAG" --version "$env:RELEASE_VERSION" --notes dist/notes.md --prerelease "$env:RELEASE_PRERELEASE"
+          if ($LASTEXITCODE -ne 0) { throw 'Source/binary asset verification failed; do not publish or automatically retry the draft' }
