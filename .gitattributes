@@ -8,3 +8,6 @@
 /tools/native_source_bundle.py text eol=lf
 /tools/native_source_binding.py text eol=lf
 /tools/runtime_sources.py text eol=lf
+
+# Must match the immutable Git Bash source companion's policy bytes.
+/tools/gitbash-distribution-policy.json text eol=lf

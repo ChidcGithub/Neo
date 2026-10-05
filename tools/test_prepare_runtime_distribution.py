@@ -1,4 +1,5 @@
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,29 @@ def minimal_pe(import_name=b'shared.dll', delay=False):
 
 
 class ConfigAndPolicyTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('git'), 'Git required for checkout regression')
+    def test_windows_checkout_preserves_companion_policy_bytes(self):
+        name = 'tools/gitbash-distribution-policy.json'
+        expected = 'd917b4be48541b64c0e099e87bd30a275732c3f80aca1f96301660b495934679'
+        original = (ROOT / name).read_bytes()
+        self.assertEqual(hashlib.sha256(original).hexdigest(), expected)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+
+            def git(*args):
+                return subprocess.run(['git', '--no-pager', '-c', 'core.autocrlf=true', *args],
+                                      cwd=root, capture_output=True, check=True, timeout=15)
+
+            git('init', '-q')
+            (root / 'tools').mkdir()
+            (root / '.gitattributes').write_bytes((ROOT / '.gitattributes').read_bytes())
+            (root / name).write_bytes(original)
+            git('add', '.gitattributes', name)
+            (root / name).unlink()
+            git('checkout-index', '--force', '--', name)
+            self.assertEqual((root / name).read_bytes(), original)
+            self.assertEqual(hashlib.sha256((root / name).read_bytes()).hexdigest(), expected)
+
     def test_exact_multivalue_helpers_and_unrelated_bytes(self):
         raw = (b'# preserve\r\n[credential]\r\n helper = manager\r\n'
                b' helper = "manager-core" # remove\r\n helper = selector\r\n'
