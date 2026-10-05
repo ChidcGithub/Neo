@@ -477,7 +477,7 @@ class VariantTests(unittest.TestCase):
             link.symlink_to(source)
         except OSError:
             return  # Windows may not grant symbolic link privileges.
-        with self.assertRaisesRegex(ValueError, 'Link/reparse'):
+        with self.assertRaisesRegex(ValueError, 'Symlink/reparse input or output is forbidden'):
             self.verify()
 
     def test_duplicate_json_keys_rejected(self):
