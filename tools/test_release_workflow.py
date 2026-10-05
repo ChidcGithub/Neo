@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
+
 import shutil
 import subprocess
 import tempfile
@@ -14,56 +14,46 @@ from unittest.mock import patch
 
 if __package__:
     from .check_release import validate_payload
+    from .test_workflow_syntax import parse_workflow, yaml
 else:
     from check_release import validate_payload
+    from test_workflow_syntax import parse_workflow, yaml
 
 
-WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml"
+WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "build.yml"
 PWSH = shutil.which("pwsh")
 GIT = shutil.which("git")
 
 
-def pwsh_step(name):
-    """Extract a named literal run block, not a general-purpose YAML parser."""
-    lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
-    matches = [
-        (index, match)
-        for index, line in enumerate(lines)
-        if (match := re.fullmatch(r"( *)- name: " + re.escape(name), line))
-    ]
+RELEASE_IF = "inputs.publish"
+
+
+def workflow_steps():
+    if yaml is None:
+        raise unittest.SkipTest("Development test needs PyYAML==6.0.3")
+    return parse_workflow(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["check"]["steps"]
+
+
+def workflow_step(name):
+    matches = [step for step in workflow_steps() if step.get("name") == name]
     if len(matches) != 1:
         raise AssertionError(f"Expected exactly one workflow step named {name!r}")
-    start, match = matches[0]
-    step_indent = len(match[1])
-    end = start + 1
-    while end < len(lines):
-        line = lines[end]
-        if line.strip() and len(line) - len(line.lstrip()) <= step_indent:
-            break
-        end += 1
-    step = lines[start + 1:end]
-    field_prefix = " " * (step_indent + 2)
-    if field_prefix + "shell: pwsh" not in step:
-        raise AssertionError(f"{name!r} must use pwsh")
-    run_header = field_prefix + "run: |"
-    if step.count(run_header) != 1:
-        raise AssertionError(f"{name!r} must have one literal run block")
-    body = []
-    for line in step[step.index(run_header) + 1:]:
-        if line.strip() and len(line) - len(line.lstrip()) <= len(field_prefix):
-            break
-        body.append(line)
-    script = textwrap.dedent("\n".join(body)).strip() + "\n"
-    if not script.strip():
-        raise AssertionError(f"{name!r} has an empty run block")
-    return script
+    return matches[0]
+
+
+def pwsh_step(name):
+    """Execute fixtures from the actual parsed workflow, not indentation heuristics."""
+    step = workflow_step(name)
+    if step.get("shell") != "pwsh" or not step.get("run", "").strip():
+        raise AssertionError(f"{name!r} must have a nonempty pwsh run block")
+    return step["run"]
 
 
 class ReleaseWorkflowStaticTests(unittest.TestCase):
     def test_filtered_runtime_preparation_precedes_copy_and_never_falls_back(self):
-        text = WORKFLOW.read_text(encoding='utf-8')
-        self.assertLess(text.index('name: Fetch MinGit runtime'), text.index('name: Prepare GCM-free MinGit distribution'))
-        self.assertLess(text.index('name: Prepare GCM-free MinGit distribution'), text.index('name: Assemble package'))
+        names = [step.get('name') for step in workflow_steps()]
+        self.assertLess(names.index('Fetch MinGit runtime'), names.index('Prepare GCM-free MinGit distribution'))
+        self.assertLess(names.index('Prepare GCM-free MinGit distribution'), names.index('Assemble package'))
         prepare = pwsh_step('Prepare GCM-free MinGit distribution')
         self.assertIn('--source .cache/runtime/gitbash --output target/package/runtime-distribution --trusted-output-root target/package', prepare)
         self.assertNotIn('--source-companion', prepare)
@@ -74,26 +64,30 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
             self.assertIn(name, assembly)
 
     def test_release_uses_technical_checks_without_approval_policy_calls(self):
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        check, release = workflow.split("\n  release:\n", 1)
-        steps = re.split(r"(?m)^      - name: ", release)[1:]
-        self.assertTrue(steps[0].startswith("Checkout\n"))
-        source = next(step for step in steps if step.startswith("Verify pinned drawing source and legal bodies\n"))
-        self.assertIn("        run: python tools/assemble_drawing_release.py verify-source --source target/package/drawing-src\n", source)
-        self.assertNotRegex(source, r"(?m)^\s+(?:if|continue-on-error):")
+        steps = workflow_steps()
+        names = [step.get('name') for step in steps]
+        workflow = json.dumps(steps)
+        check = '\n'.join(step.get('run', '') for step in steps if 'if' not in step)
+        release = '\n'.join(step.get('run', '') for step in steps if RELEASE_IF in step.get('if', ''))
+        self.assertEqual(names[0], 'Checkout')
+        source = workflow_step('Verify pinned drawing source and legal bodies')
+        self.assertEqual(source['run'], 'python tools/assemble_drawing_release.py verify-source --source target/package/drawing-src')
+        self.assertNotIn('if', source)
+        self.assertNotIn('continue-on-error', source)
         for forbidden in ("check_distribution_review.py", "distribution-review.json", "check-approval", "verify-review",
                           "Verify distribution approval", "Verify drawing lock approval"):
             self.assertNotIn(forbidden, workflow)
         self.assertNotRegex(release, r"--(?:policy|skip)[\w-]*\b")
-        self.assertNotIn("continue-on-error:", release)
-        self.assertNotIn("always()", release)
+        for step in steps:
+            self.assertNotIn('continue-on-error', step)
+            self.assertNotIn('always()', step.get('if', ''))
 
         for name in ("Build", "Download STT models", "Fetch MinGit runtime", "Assemble package",
                      "Zip portable package", "Build installer (NSIS)", "Create release"):
-            self.assertGreater(release.index("- name: " + name + "\n"), release.index("- name: Verify pinned drawing source and legal bodies\n"))
+            self.assertGreater(names.index(name), names.index('Verify pinned drawing source and legal bodies'))
         for module in ("tools.test_distribution_review", "tools.test_audit_native_link", "tools.test_check_release"):
             self.assertIn(module, check)
-        self.assertIn("PYTHONPATH: tools", check)
+        self.assertEqual(workflow_step('Installer and release checks (isolated, never install)')['env']['PYTHONPATH'], 'tools')
 
     def test_workflow_does_not_depend_on_private_descriptions(self):
         workflow = WORKFLOW.read_text(encoding="utf-8").replace("\\", "/")
@@ -103,71 +97,73 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
         self.assertIn('Copy-Item -Recurse docs/licenses "$pkg/docs/licenses"', workflow)
 
     def test_native_preparation_is_required_and_download_cache_only(self):
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        check = workflow.split("\n  check:\n", 1)[1].split("\n  drawing-check:\n", 1)[0]
-        release = workflow.split("\n  release:\n", 1)[1]
-        for job in (check, release):
-            steps = re.split(r"(?m)^      - name: ", job)[1:]
-            prepare = next(step for step in steps if step.startswith("Prepare mandatory no-TTS Sherpa native\n"))
-            self.assertIn("--budget-seconds 1500 --validation-seconds 180 --max-download-mib 256", prepare)
-            self.assertNotRegex(prepare, r"(?m)^\s+(?:if|continue-on-error):")
-            first_cargo = re.search(r"\bcargo\s+(?:check|test|build)\b", job)
-            self.assertIsNotNone(first_cargo)
-            self.assertLess(job.index("tools/prepare_sherpa_ci.py"), first_cargo.start())
-            cache = next(step for step in steps if step.startswith("Cache Sherpa download archives and CMake wheel\n"))
-            self.assertNotIn("target/", cache)
-            self.assertNotIn("source-lock.json", cache)
-            self.assertNotIn("native/install", cache)
-            self.assertNotIn("restore-keys", cache)
-            for forbidden in ("SHERPA_ONNX_LIB_DIR", "NEO_SHERPA_ASR_ONLY", "GITHUB_PATH", "upload-artifact", "download-artifact"):
-                self.assertNotIn(forbidden, job)
-        self.assertIn("python -B -m unittest tools.test_prepare_sherpa_ci -v", check)
-        self.assertLess(check.index("tools.test_prepare_sherpa_ci"), check.index("tools/prepare_sherpa_ci.py --"))
-        self.assertLess(release.index("assemble_drawing_release.py verify-source"), release.index("tools/prepare_sherpa_ci.py --"))
+        steps = workflow_steps()
+        names = [step.get('name') for step in steps]
+        prepare = workflow_step('Prepare mandatory no-TTS Sherpa native')
+        self.assertIn('--budget-seconds 1500 --validation-seconds 180 --max-download-mib 256', prepare['run'])
+        self.assertNotIn('if', prepare)
+        self.assertNotIn('continue-on-error', prepare)
+        index = names.index(prepare['name'])
+        for i, step in enumerate(steps):
+            if 'cargo ' in step.get('run', ''):
+                self.assertLess(index, i)
+        cache = workflow_step('Restore Sherpa download archives and CMake wheel')['with']
+        for forbidden in ('target/', 'source-lock.json', 'native/install'):
+            self.assertNotIn(forbidden, cache['path'])
+        self.assertNotIn('restore-keys', cache)
+        for forbidden in ('SHERPA_ONNX_LIB_DIR', 'NEO_SHERPA_ASR_ONLY', 'GITHUB_PATH', 'upload-artifact', 'download-artifact'):
+            self.assertNotIn(forbidden, json.dumps(steps))
+        self.assertEqual(workflow_step('Native preparation offline regressions')['run'],
+                         'python -B -m unittest tools.test_prepare_sherpa_ci -v')
+        self.assertLess(names.index('Native preparation offline regressions'), index)
+        self.assertLess(names.index('Verify pinned drawing source and legal bodies'), index)
 
     def test_drawing_root_package_tests_do_not_use_pythonpath_workaround(self):
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        step = workflow.split("      - name: Drawing release root-package regressions\n", 1)[1].split("\n  #", 1)[0]
-        self.assertIn("python -B -m unittest tools.test_assemble_drawing_release tools.test_release_workflow -v", step)
-        self.assertNotIn("PYTHONPATH", step)
-        self.assertNotIn("env:", step)
+        step = workflow_step('Drawing release root-package regressions')
+        self.assertEqual(step['run'], 'python -B -m unittest tools.test_assemble_drawing_release tools.test_release_workflow -v')
+        self.assertNotIn('env', step)
 
     def test_drawing_check_uses_lock_pin_without_release_approval_or_upload(self):
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        drawing = workflow.split("\n  drawing-check:\n", 1)[1].split("\n  release:\n", 1)[0]
-        self.assertIn("runs-on: windows-2022", drawing)
-        self.assertLess(drawing.index("Checkout main for drawing lock"), drawing.index("lock-outputs"))
-        self.assertLess(drawing.index("lock-outputs"), drawing.index("Checkout pinned drawing for CI"))
-        self.assertIn("ref: ${{ steps.drawing-pin.outputs.commit }}", drawing)
-        self.assertIn("repository: ${{ steps.drawing-pin.outputs.repository }}", drawing)
-        self.assertIn("path: target/package/drawing-src", drawing)
-        self.assertIn("cargo +${{ steps.drawing-pin.outputs.rust }} test --locked -p board-protocol --lib --target x86_64-pc-windows-msvc", drawing)
-        self.assertIn('target/package/drawing-tests"', drawing)
-        self.assertIn("rustup toolchain install ${{ steps.drawing-pin.outputs.rust }}", drawing)
-        self.assertIn("assemble_drawing_release.py build --source target/package/drawing-src --target-dir target/package/drawing-build", drawing)
-        for forbidden in ("upload-artifact", "check-approval", "verify-review", "--ignored", "--include-ignored", "--workspace", "--gui", "continue-on-error", "models/"):
-            self.assertNotIn(forbidden, drawing)
-        self.assertNotRegex(drawing, r"(?m)^\s+if:")
+        steps = workflow_steps()
+        names = [step.get('name') for step in steps]
+        self.assertLess(names.index('Checkout'), names.index('Read drawing pin'))
+        self.assertLess(names.index('Read drawing pin'), names.index('Checkout pinned drawing'))
+        checkout = workflow_step('Checkout pinned drawing')['with']
+        self.assertEqual(checkout['ref'], '${{ steps.drawing-pin.outputs.commit }}')
+        self.assertEqual(checkout['repository'], '${{ steps.drawing-pin.outputs.repository }}')
+        self.assertEqual(checkout['path'], 'target/package/drawing-src')
+        protocol = workflow_step('Drawing synthetic protocol tests')
+        self.assertEqual(protocol['working-directory'], 'target/package/drawing-src')
+        self.assertIn('cargo +${{ steps.drawing-pin.outputs.rust }} test --locked -p board-protocol --lib --target x86_64-pc-windows-msvc', protocol['run'])
+        self.assertIn('target/package/drawing-tests"', protocol['run'])
+        self.assertIn('rustup toolchain install ${{ steps.drawing-pin.outputs.rust }}', workflow_step('Install drawing toolchain')['run'])
+        build = workflow_step('Build drawing and check both windowless versions')
+        self.assertEqual(build['run'], 'python tools/assemble_drawing_release.py build --source target/package/drawing-src --target-dir target/package/drawing-build')
+        for name in ('Read drawing pin', 'Checkout pinned drawing', 'Verify pinned drawing source and legal bodies',
+                     'Install drawing toolchain', protocol['name'], build['name']):
+            step = workflow_step(name)
+            self.assertNotIn('if', step)
+            for forbidden in ('upload-artifact', 'check-approval', 'verify-review', '--ignored', '--include-ignored', '--workspace', '--gui', 'continue-on-error', 'models/'):
+                self.assertNotIn(forbidden, json.dumps(step))
 
     def test_release_drawing_source_check_precedes_build_and_assembly_precedes_archive(self):
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        release = workflow.split("\n  release:\n", 1)[1]
-        self.assertIn("needs: [check, drawing-check]", release)
-        self.assertIn("runs-on: windows-2022", release)
-        steps = re.split(r"(?m)^      - name: ", release)[1:]
-        order = ["assemble_drawing_release.py lock-outputs", "Checkout pinned drawing for release",
-                 "assemble_drawing_release.py verify-source", "Determine version", "Build\n",
-                 "assemble_drawing_release.py build", "Assemble package\n",
-                 "Audit packaged PE imports (external CRT prerequisite)", "assemble_drawing_release.py assemble", "Zip portable package"]
-        self.assertEqual([release.index(value) for value in order], sorted(release.index(value) for value in order))
-        self.assertIn("ref: ${{ steps.drawing-pin.outputs.commit }}", release)
-        self.assertIn("path: target/package/drawing-src", release)
-        for name in ("Verify pinned drawing source and legal bodies", "Assemble pinned drawing release"):
-            step = next(step for step in steps if step.startswith(name))
-            self.assertNotRegex(step, r"(?m)^\s+(?:if|continue-on-error):")
-        for forbidden in ("package_combined.py", "download-artifact", "--mode evaluation", "public_approved =", "--force", "--skip"):
-            self.assertNotIn(forbidden, release)
-        self.assertIn("tools.test_assemble_drawing_release", workflow)
+        steps = workflow_steps()
+        names = [step.get('name') for step in steps]
+        order = ['Determine version', 'Read drawing pin', 'Checkout pinned drawing',
+                 'Verify pinned drawing source and legal bodies', 'Drawing synthetic protocol tests',
+                 'Build drawing and check both windowless versions', 'Build', 'Assemble package',
+                 'Audit packaged PE imports (external CRT prerequisite)', 'Assemble pinned drawing release', 'Zip portable package']
+        self.assertEqual([names.index(value) for value in order], sorted(names.index(value) for value in order))
+        source = workflow_step('Verify pinned drawing source and legal bodies')
+        self.assertNotIn('if', source)
+        assembly = workflow_step('Assemble pinned drawing release')
+        self.assertEqual(assembly['if'], RELEASE_IF)
+        for step in steps:
+            self.assertNotIn('continue-on-error', step)
+            if RELEASE_IF in step.get('if', ''):
+                for forbidden in ('package_combined.py', 'download-artifact', '--mode evaluation', 'public_approved =', '--force', '--skip'):
+                    self.assertNotIn(forbidden, step.get('run', ''))
+        self.assertIn('tools.test_assemble_drawing_release', workflow_step('Drawing release root-package regressions')['run'])
 
     def test_release_audits_external_crt_without_collecting_or_installing_it(self):
         script = pwsh_step("Audit packaged PE imports (external CRT prerequisite)")
@@ -186,18 +182,27 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
         self.assertNotIn("解压即用", notes)
 
     def test_stt_download_and_extraction_stay_in_cache(self):
+        step = workflow_step("Download STT models")
         script = pwsh_step("Download STT models")
-        self.assertIn(r"-OutFile .cache\stt\sv.tar.bz2", script)
+        self.assertEqual(int(step["timeout-minutes"]), 20)
+        self.assertIn("$ProgressPreference = 'SilentlyContinue'", script)
+        self.assertIn("curl.exe --fail --location --connect-timeout 20 --max-time 600 "
+                      "--retry 2 --retry-max-time 900 --progress-bar --output $part $Uri", script)
+        self.assertNotIn("Invoke-WebRequest", script)
         self.assertIn(r"tar -xjf .cache\stt\sv.tar.bz2 -C .cache\stt\extracted", script)
         self.assertIn("if ($LASTEXITCODE -ne 0)", script)
-        self.assertIn(r"-OutFile .cache\stt\silero_vad.onnx", script)
         self.assertNotIn("assets-stt", script)
+        self.assertNotIn("Invoke-Expression", script)
+        for name in ("Restore STT raw downloads", "Save STT raw downloads"):
+            cache = workflow_step(name)["with"]
+            self.assertEqual(cache["path"].splitlines(),
+                             [".cache/stt/sv.tar.bz2", ".cache/stt/silero_vad.onnx"])
 
     def test_release_runtime_and_stt_pins_are_exact_and_checked_before_use(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(
             "        run: python tools/fetch_runtime.py --mirror github --version 2.55.0.windows.5 "
-            "--sha256 56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e\n", workflow)
+            "--sha256 56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e --archive-cache .cache/runtime-archives\n", workflow)
         script = pwsh_step("Download STT models")
         self.assertIn("$ErrorActionPreference = 'Stop'", script)
         for variable, path, digest, failure in (
@@ -205,14 +210,18 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
             ("vad", r".cache\stt\silero_vad.onnx", "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6", "Silero"),
         ):
             self.assertIn(f"${variable}Expected = '{digest}'", script)
-            hash_line = f"${variable}Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath {path}).Hash.ToLowerInvariant()"
-            check = f"if (${variable}Hash -cne ${variable}Expected) {{ throw '{failure} SHA-256 mismatch' }}"
+            call = f"{path} ${variable}Expected '{failure}'"
+            self.assertIn(call, script)
+            self.assertIn(f"${variable}Hash = Get-SttDownload", script)
+            self.assertLess(script.index(call), script.index("tar -xjf"))
+            self.assertLess(script.index(call), script.index("Copy-Item"))
+        for path in ("$Path", "$part"):
+            hash_line = f"$hash = (Get-FileHash -Algorithm SHA256 -LiteralPath {path}).Hash.ToLowerInvariant()"
             self.assertIn(hash_line, script)
-            self.assertIn(check, script)
-            self.assertLess(script.index("-OutFile " + path), script.index(hash_line))
-            self.assertLess(script.index(hash_line), script.index(check))
-            self.assertLess(script.index(check), script.index("tar -xjf"))
-            self.assertLess(script.index(check), script.index("Copy-Item"))
+            self.assertLess(script.index(hash_line), script.index("Move-Item"))
+        self.assertEqual(script.count("if ($hash -cne $Expected)"), 2)
+        self.assertLess(script.index("if ($hash -cne $Expected)", script.index("curl.exe")),
+                        script.index("Move-Item"))
         self.assertIn(r"Set-Content -Encoding utf8 .cache\stt\member-sha256.json", script)
         self.assertIn("Get-ChildItem -LiteralPath $extracted -Recurse -File", script)
         self.assertIn("Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName", script)
@@ -234,11 +243,13 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
         self.assertNotIn("build/installer-art", workflow)
 
     def test_source_stage_precedes_binaries_and_publish_uses_verified_draft_helper(self):
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        release = workflow.split("\n  release:\n", 1)[1]
+        steps = workflow_steps()
+        names = [step.get('name') for step in steps]
+        workflow = '\n'.join(step.get('run', '') for step in steps)
+        release = '\n'.join(step.get('run', '') for step in steps if RELEASE_IF in step.get('if', ''))
         order = ["Assemble pinned drawing release", "Stage pinned source companions (fail closed)",
                  "Zip portable package", "Build installer (NSIS)", "Create release"]
-        self.assertEqual([release.index(name) for name in order], sorted(release.index(name) for name in order))
+        self.assertEqual([names.index(name) for name in order], sorted(names.index(name) for name in order))
         stage = pwsh_step("Stage pinned source companions (fail closed)")
         publish = pwsh_step("Create release")
         self.assertIn("tools/stage_source_companions.py stage", stage)
@@ -259,18 +270,100 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
 
 
 @unittest.skipUnless(PWSH, "pwsh is not installed")
+class SherpaCleanTests(unittest.TestCase):
+    def test_both_profiles_are_cleaned_and_each_failure_stops_the_step(self):
+        for fail_call in (0, 1, 2):
+            with self.subTest(fail_call=fail_call), tempfile.TemporaryDirectory(prefix='neo-clean-') as td:
+                root = Path(td)
+                mocks = '''
+                    $script:calls = 0
+                    function cargo {
+                      Add-Content -LiteralPath calls.txt -Value ($args -join ' ')
+                      $script:calls += 1
+                      $global:LASTEXITCODE = if ($script:calls -eq FAIL_CALL) { 7 } else { 0 }
+                    }
+                '''.replace('FAIL_CALL', str(fail_call))
+                script = root / 'clean.ps1'
+                script.write_text(textwrap.dedent(mocks) + pwsh_step('Invalidate cached Sherpa Rust bindings'), encoding='utf-8')
+                result = subprocess.run([PWSH, '-NoLogo', '-NoProfile', '-NonInteractive', '-File', str(script)],
+                                        cwd=root, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 7 if fail_call else 0, result.stdout + result.stderr)
+                command = 'clean -p sherpa-onnx-sys -p sherpa-onnx --target x86_64-pc-windows-msvc'
+                expected = [command] if fail_call == 1 else [command, command + ' --release']
+                self.assertEqual((root / 'calls.txt').read_text(encoding='utf-8-sig').splitlines(), expected)
+
+
+@unittest.skipUnless(PWSH, "pwsh is not installed")
 class SttDownloadTests(unittest.TestCase):
-    def test_actual_script_checks_downloads_before_extract_and_copy(self):
-        fixtures = {"sv": b"mock archive", "vad": b"mock vad"}
-        pins = {"sv": "7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e",
-                "vad": "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"}
+    fixtures = {"sv": b"mock archive", "vad": b"mock vad"}
+    filenames = {"sv": "sv.tar.bz2", "vad": "silero_vad.onnx"}
+    pins = {"sv": "7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e",
+            "vad": "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"}
+
+    def run_script(self, *, cached=(), bad_cache=None, bad_download=None, network=None,
+                   extract_failure=False, uppercase_pin=None, dirty=None, stale_part=False):
+        temporary = tempfile.TemporaryDirectory(prefix="neo-stt-pins-")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        cache = root / ".cache/stt"
+        cache.mkdir(parents=True)
+        for name in cached:
+            (cache / self.filenames[name]).write_bytes(
+                b"corrupt cache" if name == bad_cache else self.fixtures[name])
+        if dirty:
+            (cache / dirty).mkdir()
+            (cache / dirty / "sentinel").write_bytes(b"do not reuse")
+        if stale_part:
+            (cache / "sv.tar.bz2.part").write_bytes(b"interrupted download")
+        script = pwsh_step("Download STT models")
+        # Read the original workflow each time; only upstream pins become fixture pins.
+        for name, pin in self.pins.items():
+            digest = hashlib.sha256(self.fixtures[name]).hexdigest()
+            script = script.replace(pin, digest.upper() if name == uppercase_pin else digest)
+        (root / "config.json").write_text(json.dumps({
+            "bad_download": bad_download, "network": network, "extract_failure": extract_failure,
+        }), encoding="utf-8")
         mocks = r'''
-            function Invoke-WebRequest {
-              param($Uri, $OutFile)
-              $content = if ($Uri.EndsWith('.tar.bz2')) { 'mock archive' } else { 'mock vad' }
-              [IO.File]::WriteAllText((Join-Path $PWD $OutFile), $content)
+            $config = Get-Content config.json -Raw | ConvertFrom-Json
+            function Get-FileHash {
+              param($Algorithm, $LiteralPath)
+              $name = ($LiteralPath.Replace('\', '/') -split '/')[-1]
+              Add-Content events.txt "hash:$name"
+              Microsoft.PowerShell.Utility\Get-FileHash -Algorithm $Algorithm -LiteralPath $LiteralPath
+            }
+            function Move-Item {
+              param($LiteralPath, $Destination)
+              $name = ($Destination.Replace('\', '/') -split '/')[-1]
+              Add-Content events.txt "move:$name"
+              if (-not $LiteralPath.EndsWith('.part')) { throw 'Expected partial source' }
+              if (Test-Path -LiteralPath $Destination) { throw 'Raw destination already exists' }
+              Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $Destination
+            }
+            function Invoke-WebRequest { throw 'Unexpected Invoke-WebRequest' }
+            function curl.exe {
+              $expected = @('--fail', '--location', '--connect-timeout', '20', '--max-time', '600',
+                            '--retry', '2', '--retry-max-time', '900', '--progress-bar', '--output')
+              if ($args.Count -ne 14) { throw 'Unexpected curl argument count' }
+              for ($i = 0; $i -lt $expected.Count; $i++) {
+                if ($args[$i] -cne $expected[$i]) { throw "Unexpected curl argument at $i" }
+              }
+              $outFile = $args[12]
+              $uri = $args[13]
+              $name = if ($uri.EndsWith('.tar.bz2')) { 'sv' } else { 'vad' }
+              Add-Content events.txt "curl:$name"
+              $leaf = if ($name -eq 'sv') { 'sv.tar.bz2' } else { 'silero_vad.onnx' }
+              if (-not $outFile.EndsWith("$leaf.part")) { throw 'Expected partial output' }
+              if (Test-Path -LiteralPath $outFile) { throw 'Stale partial not removed' }
+              if (Test-Path -LiteralPath ".cache/stt/$leaf") { throw 'Cache hit downloaded again' }
+              $content = if ($name -eq 'sv') { 'mock archive' } else { 'mock vad' }
+              if ($config.bad_download -eq $name) { $content = 'corrupt download' }
+              [IO.File]::WriteAllText((Join-Path $PWD $outFile), $content)
+              # Even a complete-looking body must be rejected after a network error.
+              $global:LASTEXITCODE = if ($config.network -eq $name) { 28 } else { 0 }
             }
             function tar {
+              Add-Content events.txt 'tar'
+              if ($config.extract_failure) { $global:LASTEXITCODE = 2; return }
               $root = '.cache/stt/extracted/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17'
               New-Item -ItemType Directory $root | Out-Null
               [IO.File]::WriteAllText((Join-Path $PWD "$root/model.int8.onnx"), 'mock model')
@@ -279,44 +372,122 @@ class SttDownloadTests(unittest.TestCase):
               $global:LASTEXITCODE = 0
             }
         '''
+        local = root / "assets-stt/local.onnx"
+        local.parent.mkdir()
+        local.write_bytes(b"local input unchanged")
+        path = root / "download.ps1"
+        path.write_text(textwrap.dedent(mocks) + script, encoding="utf-8")
+        result = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(path)],
+                                cwd=root, capture_output=True, text=True, errors="replace", timeout=30)
+        self.assertEqual(local.read_bytes(), b"local input unchanged")
+        events = root / "events.txt"
+        return cache, result, events.read_text(encoding="utf-8-sig").splitlines() if events.exists() else []
+
+    def assert_success(self, cache, result):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(list(cache.glob("*.part")), [])
+        manifest = json.loads((cache / "member-sha256.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(manifest["sense_voice_archive_sha256"], hashlib.sha256(self.fixtures["sv"]).hexdigest())
+        self.assertEqual(manifest["silero_sha256"], hashlib.sha256(self.fixtures["vad"]).hexdigest())
+        self.assertEqual(len(manifest["members"]), 4)
+        for member in manifest["members"]:
+            base = cache / "extracted" if member["archive"] else cache
+            data = (base / member["path"]).read_bytes()
+            self.assertEqual(member["size"], len(data))
+            self.assertEqual(member["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual({p.relative_to(cache / "models").as_posix(): p.read_bytes()
+                          for p in (cache / "models").rglob("*") if p.is_file()},
+                         {"sense-voice/model.int8.onnx": b"mock model", "sense-voice/tokens.txt": b"mock tokens",
+                          "vad/silero_vad.onnx": self.fixtures["vad"]})
+
+    def assert_download_failure(self, cache, result, events, message):
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(message, result.stdout + result.stderr)
+        self.assertNotIn("tar", events)
+        self.assertFalse((cache / "extracted").exists())
+        self.assertFalse((cache / "models").exists())
+        self.assertFalse((cache / "member-sha256.json").exists())
+        self.assertEqual(list(cache.glob("*.part")), [])
+
+    def test_actual_script_checks_downloads_before_extract_and_copy(self):
         for bad in ("sv", "vad", None):
-            with self.subTest(bad=bad), tempfile.TemporaryDirectory(prefix="neo-stt-pins-") as td:
-                root = Path(td)
-                script = pwsh_step("Download STT models")
-                # Static tests above pin real upstream hashes; only fixture hashes change here.
-                for name, pin in pins.items():
-                    if name != bad:
-                        script = script.replace(pin, hashlib.sha256(fixtures[name]).hexdigest())
-                local = root / "assets-stt/local.onnx"
-                local.parent.mkdir()
-                local.write_bytes(b"local input unchanged")
-                path = root / "download.ps1"
-                path.write_text(textwrap.dedent(mocks) + script, encoding="utf-8")
-                result = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(path)],
-                                        cwd=root, capture_output=True, text=True, errors="replace", timeout=30)
-                self.assertEqual(local.read_bytes(), b"local input unchanged")
-                cache = root / ".cache/stt"
+            with self.subTest(bad=bad):
+                cache, result, events = self.run_script(bad_download=bad)
                 if bad:
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("SHA-256 mismatch", result.stdout + result.stderr)
-                    self.assertFalse((cache / "extracted").exists())
-                    self.assertFalse((cache / "models").exists())
-                    self.assertFalse((cache / "member-sha256.json").exists())
+                    self.assert_download_failure(cache, result, events, "SHA-256 mismatch")
+                    self.assertFalse((cache / self.filenames[bad]).exists())
+                    self.assertNotIn("move:" + self.filenames[bad], events)
+                    self.assertEqual([e for e in events if e.startswith("curl:")],
+                                     ["curl:sv"] if bad == "sv" else ["curl:sv", "curl:vad"])
                     continue
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                manifest = json.loads((cache / "member-sha256.json").read_text(encoding="utf-8-sig"))
-                self.assertEqual(manifest["sense_voice_archive_sha256"], hashlib.sha256(fixtures["sv"]).hexdigest())
-                self.assertEqual(manifest["silero_sha256"], hashlib.sha256(fixtures["vad"]).hexdigest())
-                self.assertEqual(len(manifest["members"]), 4)
-                for member in manifest["members"]:
-                    base = cache / "extracted" if member["archive"] else cache
-                    data = (base / member["path"]).read_bytes()
-                    self.assertEqual(member["size"], len(data))
-                    self.assertEqual(member["sha256"], hashlib.sha256(data).hexdigest())
-                self.assertEqual({p.relative_to(cache / "models").as_posix(): p.read_bytes()
-                                  for p in (cache / "models").rglob("*") if p.is_file()},
-                                 {"sense-voice/model.int8.onnx": b"mock model", "sense-voice/tokens.txt": b"mock tokens",
-                                  "vad/silero_vad.onnx": fixtures["vad"]})
+                self.assert_success(cache, result)
+                self.assertEqual(events[:7], ["curl:sv", "hash:sv.tar.bz2.part", "move:sv.tar.bz2",
+                                             "curl:vad", "hash:silero_vad.onnx.part", "move:silero_vad.onnx", "tar"])
+
+    def test_cache_hits_are_rehashed_without_curl(self):
+        for cached in (("sv", "vad"), ("sv",), ("vad",)):
+            with self.subTest(cached=cached):
+                cache, result, events = self.run_script(cached=cached)
+                self.assert_success(cache, result)
+                self.assertEqual([e for e in events if e.startswith("curl:")],
+                                 ["curl:" + name for name in self.fixtures if name not in cached])
+                for name in cached:
+                    self.assertLess(events.index("hash:" + self.filenames[name]), events.index("tar"))
+                    self.assertNotIn("move:" + self.filenames[name], events)
+
+    def test_bad_cache_fails_without_redownload_or_extraction(self):
+        for bad in self.fixtures:
+            with self.subTest(bad=bad):
+                cache, result, events = self.run_script(cached=("sv", "vad"), bad_cache=bad)
+                self.assert_download_failure(cache, result, events, "cached SHA-256 mismatch")
+                self.assertIn("hash:" + self.filenames[bad], events)
+                self.assertFalse(any(e.startswith(("curl:", "move:")) for e in events))
+                self.assertEqual((cache / self.filenames[bad]).read_bytes(), b"corrupt cache")
+
+    def test_network_exit_fails_before_hash_promotion_or_extraction(self):
+        for failed in self.fixtures:
+            with self.subTest(failed=failed):
+                cache, result, events = self.run_script(network=failed)
+                self.assert_download_failure(cache, result, events, "download failed (curl exit 28)")
+                self.assertFalse((cache / self.filenames[failed]).exists())
+                self.assertNotIn("hash:" + self.filenames[failed] + ".part", events)
+                self.assertNotIn("move:" + self.filenames[failed], events)
+                self.assertEqual([e for e in events if e.startswith("curl:")],
+                                 ["curl:sv"] if failed == "sv" else ["curl:sv", "curl:vad"])
+
+    def test_extract_failure_stops_before_manifest_and_copy(self):
+        cache, result, events = self.run_script(extract_failure=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("STT model extraction failed", result.stdout + result.stderr)
+        self.assertEqual(events[-1], "tar")
+        self.assertFalse((cache / "member-sha256.json").exists())
+        self.assertEqual([p for p in (cache / "models").rglob("*") if p.is_file()], [])
+        self.assertEqual(list(cache.glob("*.part")), [])
+        for name, content in self.fixtures.items():
+            self.assertEqual((cache / self.filenames[name]).read_bytes(), content)
+
+    def test_sha_comparison_is_case_sensitive_for_cache_and_download(self):
+        for cached in ((), ("sv", "vad")):
+            for name in self.fixtures:
+                with self.subTest(cached=cached, name=name):
+                    cache, result, events = self.run_script(cached=cached, uppercase_pin=name)
+                    self.assert_download_failure(cache, result, events, "SHA-256 mismatch")
+                    self.assertNotIn("move:" + self.filenames[name], events)
+
+    def test_dirty_extraction_and_model_directories_are_rejected(self):
+        for dirty in ("extracted", "models"):
+            with self.subTest(dirty=dirty):
+                cache, result, events = self.run_script(cached=("sv", "vad"), dirty=dirty)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("STT extraction and model directories must be clean", result.stdout + result.stderr)
+                self.assertEqual(events, [])
+                self.assertEqual((cache / dirty / "sentinel").read_bytes(), b"do not reuse")
+                self.assertFalse((cache / "member-sha256.json").exists())
+
+    def test_stale_partial_is_discarded_not_resumed(self):
+        cache, result, events = self.run_script(stale_part=True)
+        self.assert_success(cache, result)
+        self.assertEqual(events[0], "curl:sv")
 
 
 @unittest.skipUnless(PWSH, "pwsh is not installed")
@@ -326,7 +497,7 @@ class AssemblePackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="neo-package-layout-") as td:
             root = Path(td)
             sources = {
-                "target/x86_64-pc-windows-msvc/release/neo.exe": "neo.exe",
+                "target/ci-rust/x86_64-pc-windows-msvc/release/neo.exe": "neo.exe",
                 "crates/neo-wake/assets/melspectrogram.onnx": "resources/models/wake/melspectrogram.onnx",
                 "crates/neo-wake/assets/embedding_model.onnx": "resources/models/wake/embedding_model.onnx",
                 "crates/neo-wake/assets/hi_neo.onnx": "resources/models/wake/hi_neo.onnx",

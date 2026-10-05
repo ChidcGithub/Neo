@@ -159,6 +159,253 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual((self.dest / ".neo-archive-sha256").read_text(), self.archive_sha256)
         self.assertEqual(download.call_count, len(cases))
 
+    def archive_cache(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        cache = Path(temporary.name) / "archives"
+        cache.mkdir()
+        # Windows 的只读文件需要先清除只读属性才能清理测试目录。
+        def writable():
+            for path in cache.glob("*"):
+                if path.is_file() and not path.is_symlink():
+                    path.chmod(0o600)
+        self.addCleanup(writable)
+        return cache
+
+    def archive_args(self, cache):
+        return ("--archive-cache", str(cache), "--version", "9", "--sha256", self.archive_sha256)
+
+    def test_archive_cache_miss_stores_only_readonly_zip_then_hit_skips_network(self):
+        cache = self.archive_cache()
+        download = self.mock_release()
+        pick = runtime.pick_asset
+        with patch.object(runtime, "smoke_test", return_value="5.2"):
+            self.assertEqual(self.main(*self.archive_args(cache), "--mirror", "github"), 0)
+        pick.assert_called_once_with("9")
+        self.assertEqual(download.call_args.args[:3], ("v9", "runtime.zip", "github"))
+        entry = cache / (self.archive_sha256 + ".zip")
+        original = entry.read_bytes()
+        self.assertEqual(hashlib.sha256(original).hexdigest(), self.archive_sha256)
+        self.assertFalse(entry.stat().st_mode & 0o222)
+        self.assertEqual(list(cache.iterdir()), [entry])
+        # 即使 marker 完全匹配也要重新校验归档、重新解压，不能沿用已修改运行时。
+        for force in (False, True):
+            (self.dest / "usr/bin/bash.exe").write_bytes(b"tampered")
+            (self.dest / "gcm-credentials").write_bytes(b"private")
+            with patch.object(runtime, "pick_asset", side_effect=AssertionError("API forbidden")), \
+                    patch.object(runtime, "download", side_effect=AssertionError("download forbidden")), \
+                    patch.object(runtime, "smoke_test", return_value="5.2") as smoke:
+                self.assertEqual(self.main(*self.archive_args(cache), *(["--force"] if force else [])), 0)
+                smoke.assert_called_once()
+            self.assertEqual((self.dest / "usr/bin/bash.exe").read_bytes(), b"mock bash")
+            self.assertFalse((self.dest / "gcm-credentials").exists())
+            self.assertEqual((self.dest / ".neo-version").read_text(), "v9")
+            self.assertEqual(entry.read_bytes(), original)
+            self.assertEqual(list(cache.iterdir()), [entry])
+        download.assert_called_once()
+
+    def test_archive_cache_hit_without_markers_uses_pinned_tag(self):
+        cache = self.archive_cache()
+        download = self.mock_release()
+        entry = cache / (self.archive_sha256 + ".zip")
+        download("v9", "runtime.zip", None, str(entry))
+        with patch.object(runtime, "pick_asset", side_effect=AssertionError("API forbidden")), \
+                patch.object(runtime, "download", side_effect=AssertionError("download forbidden")), \
+                patch.object(runtime, "smoke_test", return_value="5.2"):
+            self.assertEqual(self.main(*self.archive_args(cache)), 0)
+        self.assertEqual((self.dest / ".neo-version").read_text(), "v9")
+
+    def test_archive_cache_hash_failure_rejects_matching_markers_without_overwrite(self):
+        cache = self.archive_cache()
+        self.archive_sha256 = "a" * 64
+        entry = cache / (self.archive_sha256 + ".zip")
+        entry.write_bytes(b"corrupt")
+        (self.dest / "bin").mkdir()
+        (self.dest / "bin/bash.exe").write_bytes(b"cached")
+        (self.dest / ".neo-version").write_text("v9")
+        (self.dest / ".neo-archive-sha256").write_text(self.archive_sha256)
+        with patch.object(runtime, "pick_asset", side_effect=AssertionError("API forbidden")), \
+                patch.object(runtime, "download", side_effect=AssertionError("download forbidden")), \
+                patch.object(runtime.zipfile, "ZipFile", side_effect=AssertionError("unverified ZIP")):
+            self.assertEqual(self.main(*self.archive_args(cache)), 1)
+        self.assertEqual(entry.read_bytes(), b"corrupt")
+        self.assertEqual(list(cache.iterdir()), [entry])
+        self.old_intact()
+
+    def test_archive_cache_invalid_args_rejected_before_io(self):
+        with patch.object(runtime, "check_local_path") as check, patch.object(runtime, "pick_asset") as pick:
+            for args in [("--archive-cache", "cache"),
+                         ("--archive-cache", "cache", "--version", "9"),
+                         ("--archive-cache", "cache", "--sha256", "a" * 64),
+                         ("--archive-cache", "", "--version", "9", "--sha256", "a" * 64),
+                         ("--archive-cache", "cache", "--version", "v", "--sha256", "a" * 64),
+                         ("--archive-cache", "cache", "--version", "9", "--sha256", "bad")]:
+                with self.subTest(args=args), self.assertRaises(SystemExit) as error:
+                    self.main(*args)
+                self.assertEqual(error.exception.code, 2)
+            check.assert_not_called()
+            pick.assert_not_called()
+        self.old_intact()
+
+    def test_archive_cache_reparse_and_symlink_paths_rejected_before_network(self):
+        from types import SimpleNamespace
+        cache = self.archive_cache()
+        self.archive_sha256 = "a" * 64
+        entry = cache / (self.archive_sha256 + ".zip")
+        entry.write_bytes(b"untouched")
+        original = runtime.os.lstat
+        for target in (cache.parent, cache, entry):
+            for mode, attributes in ((0o100600, 0x400), (0o120777, 0)):
+                def lstat(path, *args, **kwargs):
+                    if os.path.normcase(os.path.abspath(path)) == os.path.normcase(str(target)):
+                        return SimpleNamespace(st_mode=mode, st_file_attributes=attributes)
+                    return original(path, *args, **kwargs)
+                with self.subTest(target=target, mode=mode), \
+                        patch.object(runtime.os, "lstat", side_effect=lstat), \
+                        patch.object(runtime, "pick_asset", side_effect=AssertionError("API forbidden")):
+                    self.assertEqual(self.main(*self.archive_args(cache)), 1)
+        self.assertEqual(entry.read_bytes(), b"untouched")
+        self.old_intact()
+
+    def test_archive_cache_rejects_nonregular_oversized_and_overlapping_paths(self):
+        cache = self.archive_cache()
+        self.archive_sha256 = "a" * 64
+        entry = cache / (self.archive_sha256 + ".zip")
+        with patch.object(runtime, "pick_asset", side_effect=AssertionError("API forbidden")):
+            entry.mkdir()
+            self.assertEqual(self.main(*self.archive_args(cache)), 1)
+            entry.rmdir()
+            entry.write_bytes(b"too large")
+            with patch.object(runtime, "MAX_DOWNLOAD_BYTES", 1):
+                self.assertEqual(self.main(*self.archive_args(cache)), 1)
+            for path in (self.dest, self.dest / "archives", self.parent, entry):
+                with self.subTest(path=path):
+                    self.assertEqual(self.main(*self.archive_args(path)), 1)
+        self.old_intact()
+
+    def test_archive_cache_verification_time_and_stream_size_bounded(self):
+        cache = self.archive_cache()
+        entry = cache / "archive.zip"
+        entry.write_bytes(b"test")
+        digest = hashlib.sha256(b"test").hexdigest()
+        with patch.object(runtime.time, "monotonic", side_effect=[0, 901]):
+            with self.assertRaisesRegex(ValueError, "预算"):
+                runtime.verify_archive(str(entry), digest)
+        # 文件打开后增长也不能突破预算（不能仅依赖 stat 大小）。
+        from types import SimpleNamespace
+        with patch.object(runtime.os, "fstat", return_value=SimpleNamespace(st_mode=0o100600, st_size=0)), \
+                patch.object(runtime, "MAX_DOWNLOAD_BYTES", 1):
+            with self.assertRaisesRegex(ValueError, "预算"):
+                runtime.verify_archive(str(entry), digest)
+
+    def test_archive_cache_partial_download_and_hash_failure_cleanup(self):
+        cache = self.archive_cache()
+        self.mock_release()
+        def partial(tag, asset, mirror, path):
+            Path(path).write_bytes(b"partial download")
+            raise SystemExit("all mirrors failed")
+        with patch.object(runtime, "download", side_effect=partial):
+            with self.assertRaisesRegex(SystemExit, "all mirrors failed"):
+                self.main(*self.archive_args(cache))
+        self.assertEqual(list(cache.iterdir()), [])
+        self.old_intact()
+        self.archive_sha256 = "0" * 64
+        with patch.object(runtime.zipfile, "ZipFile", side_effect=AssertionError("unverified ZIP")):
+            self.assertEqual(self.main(*self.archive_args(cache)), 1)
+        self.assertEqual(list(cache.iterdir()), [])
+        self.old_intact()
+
+    def test_archive_cache_miss_queries_pinned_asset_even_with_matching_markers(self):
+        cache = self.archive_cache()
+        pick_asset = runtime.pick_asset
+        download = self.mock_release()
+        (self.dest / "bin").mkdir()
+        (self.dest / "bin/bash.exe").write_bytes(b"cached")
+        (self.dest / ".neo-version").write_text("v9")
+        (self.dest / ".neo-archive-sha256").write_text(self.archive_sha256)
+        metadata = {"tag_name": "v9", "assets": [
+            {"name": "MinGit-9-64-bit.zip", "browser_download_url": "mock://asset"}]}
+        with patch.object(runtime, "pick_asset", wraps=pick_asset), \
+                patch.object(runtime, "fetch_bytes", return_value=json.dumps(metadata).encode()) as fetch, \
+                patch.object(runtime, "smoke_test", return_value="5.2"):
+            self.assertEqual(self.main(*self.archive_args(cache)), 0)
+        fetch.assert_called_once_with(
+            "https://api.github.com/repos/git-for-windows/git/releases/tags/v9", timeout=60)
+        self.assertEqual(download.call_args.args[:2], ("v9", "MinGit-9-64-bit.zip"))
+
+    def test_archive_cache_partial_store_is_removed_on_verification_failure(self):
+        cache = self.archive_cache()
+        source = self.parent / "source.zip"
+        source.write_bytes(b"not the pinned archive")
+        target = cache / ("a" * 64 + ".zip")
+        try:
+            with self.assertRaisesRegex(ValueError, "SHA-256"):
+                runtime.store_archive(str(source), str(target), "a" * 64)
+            self.assertEqual(list(cache.iterdir()), [])
+        finally:
+            source.unlink()
+        self.old_intact()
+
+    def test_archive_cache_verified_snapshot_not_shared_entry_is_extracted(self):
+        cache = self.archive_cache()
+        download = self.mock_release()
+        entry = cache / (self.archive_sha256 + ".zip")
+        download("v9", "runtime.zip", None, str(entry))
+        verify = runtime.verify_archive
+        def changed_after_verification(path, expected, snapshot=None):
+            digest = verify(path, expected, snapshot)
+            entry.write_bytes(b"changed after verification")
+            return digest
+        with patch.object(runtime, "verify_archive", side_effect=changed_after_verification), \
+                patch.object(runtime, "pick_asset", side_effect=AssertionError("API forbidden")), \
+                patch.object(runtime, "smoke_test", return_value="5.2"):
+            self.assertEqual(self.main(*self.archive_args(cache)), 0)
+        self.assertEqual((self.dest / "usr/bin/bash.exe").read_bytes(), b"mock bash")
+        with patch.object(runtime, "pick_asset", side_effect=AssertionError("API forbidden")), \
+                patch.object(runtime.zipfile, "ZipFile", side_effect=AssertionError("unverified ZIP")):
+            self.assertEqual(self.main(*self.archive_args(cache)), 1)
+
+    def test_archive_cache_atomic_store_failure_and_interrupt_cleanup(self):
+        cache = self.archive_cache()
+        self.mock_release()
+        publication = "rename" if os.name == "nt" else "link"
+        for failure in (OSError("publish failed"), KeyboardInterrupt()):
+            with self.subTest(failure=failure), patch.object(runtime.os, publication, side_effect=failure):
+                if isinstance(failure, KeyboardInterrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.main(*self.archive_args(cache))
+                else:
+                    self.assertEqual(self.main(*self.archive_args(cache)), 1)
+            self.assertEqual(list(cache.iterdir()), [])
+            self.old_intact()
+
+    def test_archive_cache_concurrent_store_never_overwrites_existing_file(self):
+        cache = self.archive_cache()
+        self.mock_release()
+        entry = cache / (self.archive_sha256 + ".zip")
+        publication = "rename" if os.name == "nt" else "link"
+        def raced(source, target):
+            Path(target).write_bytes(b"other writer")
+            raise FileExistsError("already exists")
+        with patch.object(runtime.os, publication, side_effect=raced):
+            self.assertEqual(self.main(*self.archive_args(cache)), 1)
+        self.assertEqual(entry.read_bytes(), b"other writer")
+        self.assertEqual(list(cache.iterdir()), [entry])
+        self.old_intact()
+
+    def test_archive_cache_store_rechecks_reparse_after_download(self):
+        cache = self.archive_cache()
+        self.mock_release()
+        check = runtime.check_local_path
+        def changed(path):
+            if os.path.dirname(str(path)) == str(cache) and runtime.download.called:
+                raise ValueError("cache replaced by junction")
+            check(path)
+        with patch.object(runtime, "check_local_path", side_effect=changed):
+            self.assertEqual(self.main(*self.archive_args(cache)), 1)
+        self.assertEqual(list(cache.iterdir()), [])
+        self.old_intact()
+
     def test_pinned_version_api_failure_never_uses_latest(self):
         with patch.object(runtime, "fetch_bytes", side_effect=OSError("mock API failure")) as fetch:
             with self.assertRaisesRegex(SystemExit, "指定版本"):

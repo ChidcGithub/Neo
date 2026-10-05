@@ -1,0 +1,547 @@
+# 同一 runner 完成所有检查和构建；发布仅由受控 caller 开启。
+# 权限继承 caller，不在 reusable workflow 中提升或覆盖。
+# checkout 不持久化凭据，GH_TOKEN 仅注入通过全部检查后的发布 step。
+name: Build and check
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: Package and publish after all checks pass
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci-rust
+  PYTHONUTF8: "1"
+
+
+jobs:
+  check:
+    runs-on: windows-2022
+
+    timeout-minutes: ${{ inputs.publish && 180 || 90 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 版本校验和 changelog 需要 tag 与完整历史
+          persist-credentials: false
+
+      - name: Determine version
+        if: inputs.publish
+        id: ver
+        shell: pwsh
+        run: |
+          $m = @(Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"')
+          if ($m.Count -ne 1) { throw "cannot determine workspace Cargo version" }
+          $v = $m[0].Matches.Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$v") {
+            throw "Tag '$env:GITHUB_REF_NAME' does not match Cargo version 'v$v'"
+          }
+          if (-not $v) { throw "cannot determine version" }
+          # 手动运行也只发布已存在且与构建提交一致的版本 tag，绝不隐式从默认分支建 tag。
+          $tagCommit = git --no-pager rev-parse --verify "refs/tags/v$v^{commit}"
+          if ($LASTEXITCODE -ne 0) { throw "Create tag v$v at the intended release commit before dispatching" }
+          $buildCommit = git --no-pager rev-parse --verify HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot determine checkout commit' }
+          if ($tagCommit -cne $buildCommit -or $buildCommit -cne $env:GITHUB_SHA) {
+            throw "Tag v$v must point at the checked-out workflow commit $env:GITHUB_SHA"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "tag=v$v" >> $env:GITHUB_OUTPUT
+          $pre = if ($v -match '-') { 'true' } else { 'false' }
+          "prerelease=$pre" >> $env:GITHUB_OUTPUT
+          echo "version=$v prerelease=$pre"
+
+      # Development-test dependency only; no package/runtime dependency.
+      - name: Install pinned workflow YAML parser
+        run: python -m pip install PyYAML==6.0.3
+
+      - name: Parse complete workflow YAML
+        shell: pwsh
+        run: |
+          python -c "import yaml; assert yaml.__version__ == '6.0.3'"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest tools.test_workflow_syntax -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Read drawing pin
+        id: drawing-pin
+        run: python tools/assemble_drawing_release.py lock-outputs
+
+      - name: Checkout pinned drawing
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.drawing-pin.outputs.repository }}
+          ref: ${{ steps.drawing-pin.outputs.commit }}
+          path: target/package/drawing-src
+          persist-credentials: false
+
+      - name: Verify pinned drawing source and legal bodies
+        run: python tools/assemble_drawing_release.py verify-source --source target/package/drawing-src
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update --target x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x64-msvc-${{ hashFiles('tools/build_sherpa_asr.py', 'tools/prepare_sherpa_ci.py', 'vendor/sherpa-onnx-sys/build.rs', 'vendor/sherpa-onnx-sys/neo_asr.rs', 'tools/source-companions.lock.json') }}
+          # Never cache target/sherpa-asr evidence or clean-only drawing build output.
+          workspaces: . -> target/ci-rust
+          cache-targets: true
+          cache-workspace-crates: true
+          cache-on-failure: false
+
+      # Only immutable downloads, never native installs/build trees or receipts.
+      - name: Restore Sherpa download archives and CMake wheel
+        id: sherpa-downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .cache/sherpa-asr/*.tar.gz
+            .cache/sherpa-asr/*.tar.bz2
+            .cache/sherpa-asr/*.zip
+            .cache/tools/cmake-4.2.3-py3-none-win_amd64.whl
+          key: sherpa-downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build_sherpa_asr.py', 'tools/prepare_sherpa_ci.py', 'tools/source-companions.lock.json') }}
+
+      - name: Native preparation offline regressions
+        run: python -B -m unittest tools.test_prepare_sherpa_ci -v
+
+      - name: Source delivery offline regressions
+        run: python -B -m unittest tools.test_stage_source_companions -v
+
+      - name: Native source binding regressions
+        run: python -B -m unittest tools.test_native_source_binding -v
+
+      - name: ORT Eigen source notice regressions
+        run: python -B -m unittest tools.test_verify_ort_sources -v
+
+      - name: Verify pinned ORT Eigen source notices
+        run: python -B tools/verify_ort_sources.py
+
+      - name: SenseVoice notice regressions
+        run: python -B -m unittest tools.test_verify_sensevoice_notices -v
+
+      - name: Verify SenseVoice license materials
+        run: python -B tools/verify_sensevoice_notices.py
+
+      - name: Math model download regressions
+        run: python -B -m unittest tools.test_prepare_math_models -v
+
+      - name: Complete release variant regressions
+        run: python -B -m unittest tools.test_verify_release_variants -v
+
+      - name: Prepare mandatory no-TTS Sherpa native
+        timeout-minutes: 30
+        run: python -B tools/prepare_sherpa_ci.py --budget-seconds 1500 --validation-seconds 180 --max-download-mib 256
+
+      # Save validated downloads now, even if a later Rust/package check fails.
+      - name: Save Sherpa download archives and CMake wheel
+        if: steps.sherpa-downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cache/sherpa-asr/*.tar.gz
+            .cache/sherpa-asr/*.tar.bz2
+            .cache/sherpa-asr/*.zip
+            .cache/tools/cmake-4.2.3-py3-none-win_amd64.whl
+          key: ${{ steps.sherpa-downloads.outputs.cache-primary-key }}
+
+      # Restored Rust link metadata must bind to this runner's freshly validated native tree.
+      - name: Invalidate cached Sherpa Rust bindings
+        shell: pwsh
+        run: |
+          cargo clean -p sherpa-onnx-sys -p sherpa-onnx --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clean -p sherpa-onnx-sys -p sherpa-onnx --target x86_64-pc-windows-msvc --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Show native failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-ChildItem target/sherpa-asr/native -File -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Output $_.Name
+            Get-Content -LiteralPath $_.FullName -Tail 80
+          }
+
+      - name: Check all workspace targets
+        run: cargo check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
+
+      # 仅运行纯逻辑/临时数据库测试；不运行真实截图、麦克风或 GUI 工具测试。
+      - name: Safe library tests
+        run: cargo test --locked -p neo-llm -p neo-store -p neo-theme -p neo-ui --lib -- --skip local_http_eof_and_normal_completion
+
+      - name: Tool policy tests
+        run: 'cargo test --locked -p neo-tools --lib policy::tests::'
+
+      - name: UIA validation and search contracts (no live desktop probe)
+        run: 'cargo test --locked -p neo-tools --lib --target x86_64-pc-windows-msvc -- screen_uia:: screen_elements:: screen_element_search:: click::tests:: --test-threads=1'
+
+      # 原生命中测试使用从不激活的私有 desktop，无截图/输入注入；GPU 测试仍 opt-in。
+      - name: Overlay contracts and native hit testing
+        run: 'cargo test --locked -p neo-overlay --lib --target x86_64-pc-windows-msvc'
+
+      - name: App overlay fallback tests (no GUI or audio)
+        shell: pwsh
+        run: |
+          cargo test --locked -p neo-app --bin neo graphics --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo startup:: --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo --target x86_64-pc-windows-msvc -- ui::miniwin:: ui::confirmwin:: ui::classwin:: ui::toastwin::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo task_epoch --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo --target x86_64-pc-windows-msvc -- app::restore_tests:: --test-threads=1 --skip attachment_and_text_sends_reach_local_mock_model
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo desktop_barrier --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo safety_overlay_loss_reopens_fallback_and_invalidates_old_answer --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo toast_overlay_loss_keeps_deadline_and_registers_passive_fallback_each_frame --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neo-app --bin neo backend_switch_resets_positions_but_preserves_local_beam_cache --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Update metadata policy tests (no network)
+        run: 'cargo test --locked -p neo-app --bin neo updates::tests::'
+
+      - name: Installer and release checks (isolated, never install)
+        env:
+          PYTHONPATH: tools
+        run: python -m unittest tools.test_audit_licenses tools.test_audit_native_link tools.test_installer tools.test_check_release tools.test_distribution_review tools.test_fetch_runtime tools.test_prepare_runtime_distribution tools.test_package_combined -v
+
+      # Deliberately no PYTHONPATH workaround: package imports must work from repo root.
+      - name: Drawing release root-package regressions
+        run: python -B -m unittest tools.test_assemble_drawing_release tools.test_release_workflow -v
+
+
+      - name: Install drawing toolchain
+        run: rustup toolchain install ${{ steps.drawing-pin.outputs.rust }} --profile minimal --no-self-update --target x86_64-pc-windows-msvc
+
+      # Only in-memory JSON-lines protocol tests; no GUI, models or ignored tests.
+      - name: Drawing synthetic protocol tests
+        working-directory: target/package/drawing-src
+        run: cargo +${{ steps.drawing-pin.outputs.rust }} test --locked -p board-protocol --lib --target x86_64-pc-windows-msvc --target-dir "${{ github.workspace }}/target/package/drawing-tests"
+
+      - name: Build drawing and check both windowless versions
+        run: python tools/assemble_drawing_release.py build --source target/package/drawing-src --target-dir target/package/drawing-build
+
+      - name: Build
+        if: inputs.publish
+        run: cargo build --locked --release -p neo-app --target x86_64-pc-windows-msvc
+
+      # ---- 以下全部为打包/发布步骤：分支推送及 PR 不执行 ----
+
+      - name: Restore STT raw downloads
+        if: inputs.publish
+        id: stt-downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .cache/stt/sv.tar.bz2
+            .cache/stt/silero_vad.onnx
+          key: stt-raw-v1-7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e-9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6
+
+      - name: Download STT models
+        if: inputs.publish
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $base = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models'
+          # 官方 release 资产摘要只固定字节，不表示模型许可或来源审查已通过。
+          $svExpected = '7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e'
+          $vadExpected = '9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6'
+          if ((Test-Path .cache\stt\extracted) -or (Test-Path .cache\stt\models)) {
+            throw 'STT extraction and model directories must be clean'
+          }
+          New-Item -ItemType Directory -Force .cache\stt | Out-Null
+          function Get-SttDownload($Uri, $Path, $Expected, $Label) {
+            if (Test-Path -LiteralPath $Path) {
+              $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+              if ($hash -cne $Expected) { throw "$Label cached SHA-256 mismatch" }
+              return $hash
+            }
+            $part = "$Path.part"
+            try {
+              # Only verified raw files enter the cache; never resume an untrusted partial.
+              Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+              # retry-max-time only limits starting retries, not an in-flight transfer.
+              # The 20-minute step timeout bounds both downloads and extraction together.
+              curl.exe --fail --location --connect-timeout 20 --max-time 600 --retry 2 --retry-max-time 900 --progress-bar --output $part $Uri
+              if ($LASTEXITCODE -ne 0) { throw "$Label download failed (curl exit $LASTEXITCODE)" }
+              $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $part).Hash.ToLowerInvariant()
+              if ($hash -cne $Expected) { throw "$Label SHA-256 mismatch" }
+              Move-Item -LiteralPath $part -Destination $Path
+              return $hash
+            } finally {
+              Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+            }
+          }
+          $svHash = Get-SttDownload "$base/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2" .cache\stt\sv.tar.bz2 $svExpected 'SenseVoice archive'
+          $vadHash = Get-SttDownload "$base/silero_vad.onnx" .cache\stt\silero_vad.onnx $vadExpected 'Silero'
+          New-Item -ItemType Directory .cache\stt\extracted, .cache\stt\models\sense-voice, .cache\stt\models\vad | Out-Null
+          tar -xjf .cache\stt\sv.tar.bz2 -C .cache\stt\extracted
+          if ($LASTEXITCODE -ne 0) { throw 'STT model extraction failed' }
+          # 构建证据留在 cache 根，不复制进 models 或发行包；不读取本地开发模型。
+          $extracted = (Resolve-Path .cache\stt\extracted).Path
+          $members = @(Get-ChildItem -LiteralPath $extracted -Recurse -File | Sort-Object FullName | ForEach-Object {
+            [ordered]@{
+              archive = 'sv.tar.bz2'
+              path = [IO.Path]::GetRelativePath($extracted, $_.FullName).Replace('\', '/')
+              size = $_.Length
+              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            }
+          })
+          $members += [ordered]@{ archive = $null; path = 'silero_vad.onnx'; size = (Get-Item .cache\stt\silero_vad.onnx).Length; sha256 = $vadHash }
+          [ordered]@{ sense_voice_archive_sha256 = $svHash; silero_sha256 = $vadHash; members = $members } |
+            ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 .cache\stt\member-sha256.json
+          Copy-Item '.cache\stt\extracted\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\model.int8.onnx',
+                    '.cache\stt\extracted\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\tokens.txt' .cache\stt\models\sense-voice\
+          Copy-Item .cache\stt\silero_vad.onnx .cache\stt\models\vad\silero_vad.onnx
+
+      - name: Save STT raw downloads
+        if: inputs.publish && steps.stt-downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cache/stt/sv.tar.bz2
+            .cache/stt/silero_vad.onnx
+          key: ${{ steps.stt-downloads.outputs.cache-primary-key }}
+
+      - name: Restore MinGit raw archive
+        if: inputs.publish
+        id: mingit-downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/runtime-archives
+          key: mingit-raw-v1-56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e
+
+      - name: Fetch MinGit runtime
+        if: inputs.publish
+        env:
+          PYTHONUTF8: "1" # runner 默认 cp1252，脚本输出中文会炸
+        # 固定已核对的官方资产；对应源码完整性与交付仍未决，不能解除 distribution gate。
+        run: python tools/fetch_runtime.py --mirror github --version 2.55.0.windows.5 --sha256 56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e --archive-cache .cache/runtime-archives
+
+      - name: Save MinGit raw archive
+        if: inputs.publish && steps.mingit-downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/runtime-archives
+          key: ${{ steps.mingit-downloads.outputs.cache-primary-key }}
+
+      # Pure runtime copy only: no remote source archives are available here.
+      # This does NOT satisfy the matching source companion/publication gate.
+      - name: Prepare GCM-free MinGit distribution
+        if: inputs.publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force target/package | Out-Null
+          python tools/prepare_runtime_distribution.py --source .cache/runtime/gitbash --output target/package/runtime-distribution --trusted-output-root target/package
+          if ($LASTEXITCODE -ne 0) { throw 'Filtered MinGit preparation failed; no raw cache fallback' }
+
+      - name: Assemble package
+        if: inputs.publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = "dist\neo"
+          if (Test-Path $pkg) { throw "Package directory must be clean: $pkg" }
+          New-Item -ItemType Directory "$pkg\resources\models\wake", "$pkg\resources\lang", "$pkg\runtime\onnx", "$pkg\docs" | Out-Null
+          Copy-Item target\ci-rust\x86_64-pc-windows-msvc\release\neo.exe $pkg\
+          foreach ($model in @('melspectrogram.onnx', 'embedding_model.onnx', 'hi_neo.onnx')) {
+            Copy-Item "crates\neo-wake\assets\$model" "$pkg\resources\models\wake\"
+          }
+          Copy-Item crates\neo-wake\assets\*.dll "$pkg\runtime\onnx\"
+          Copy-Item -Recurse .cache\stt\models "$pkg\resources\models\stt"
+          Copy-Item -Recurse target\package\runtime-distribution\runtime\gitbash "$pkg\runtime\gitbash"
+          New-Item -ItemType Directory "$pkg\docs\runtime-distribution" | Out-Null
+          foreach ($record in @('MANIFEST.json', 'MODIFICATIONS.md', 'gitbash-distribution-policy.json')) {
+            Copy-Item "target\package\runtime-distribution\$record" "$pkg\docs\runtime-distribution\"
+          }
+          Copy-Item resources\lang\zh-CN.lang, resources\lang\en-US.lang "$pkg\resources\lang\"
+
+          Copy-Item LICENSE $pkg\
+          Copy-Item NOTICE "$pkg\NOTICE"
+          # 仅复制公开法律文件；docs-pri 审计报告与本地证据不随包。
+          Copy-Item -Recurse docs\licenses "$pkg\docs\licenses"
+
+      - name: Verify packaged SenseVoice identity and notices
+        if: inputs.publish
+        run: python -B tools/verify_sensevoice_notices.py --package dist/neo
+
+      # 外部官方 x64 CRT prerequisite：只审计 PE，不收集 DLL，不下载或执行 vc_redist。
+      - name: Audit packaged PE imports (external CRT prerequisite)
+        if: inputs.publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Licensed Visual Studio C++ tools not found' }
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin) { throw 'MSVC dumpbin missing; no system DLL fallback' }
+          python tools/check_release.py --package dist/neo --dumpbin "$($dumpbin.FullName)" --crt-policy external
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged PE / CRT audit failed' }
+
+      # Drawing has its own PE audit; both applications use an external CRT prerequisite.
+      - name: Assemble pinned drawing release
+        if: inputs.publish
+        run: python tools/assemble_drawing_release.py assemble --source target/package/drawing-src --target-dir target/package/drawing-build --package dist/neo
+
+      - name: Stage pinned source companions (fail closed)
+        if: inputs.publish
+        timeout-minutes: 30
+        shell: pwsh
+        env:
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.ver.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python -B tools/stage_source_companions.py stage --lock tools/source-companions.lock.json --package dist/neo --output dist --distribution target/package/runtime-distribution --native-lib target/sherpa-asr/native/install/lib --work-root target/source-delivery --repository "$env:RELEASE_REPOSITORY" --tag "$env:RELEASE_TAG" --version "$env:RELEASE_VERSION" --budget-seconds 600 --max-download-mib 1024 --max-expanded-mib 2048
+          if ($LASTEXITCODE -ne 0) { throw 'Matching source delivery required before binary archives; release remains BLOCKED' }
+
+      - name: Restore math model raw downloads
+        if: inputs.publish
+        id: math-downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/math-models
+          key: math-raw-v1-${{ hashFiles('tools/math-models.lock.json') }}
+
+      - name: Prepare math model variants
+        if: inputs.publish
+        timeout-minutes: 60
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($variant in @('int8', 'fp32')) {
+            $pkg = "dist/neo-$variant"
+            if (Test-Path $pkg) { throw "Variant package must be clean: $pkg" }
+            Copy-Item -Recurse dist/neo $pkg
+            python -B tools/prepare_math_models.py --variant $variant --package $pkg --cache .cache/math-models
+            if ($LASTEXITCODE -ne 0) { throw "Math model preparation failed: $variant" }
+            python -B tools/verify_release_variants.py package --package $pkg --variant $variant --version "${{ steps.ver.outputs.version }}"
+            if ($LASTEXITCODE -ne 0) { throw "Complete package validation failed: $variant" }
+            python -B tools/stage_source_companions.py inventory --package $pkg --variant $variant --version "${{ steps.ver.outputs.version }}"
+            if ($LASTEXITCODE -ne 0) { throw "Final package inventory failed: $variant" }
+          }
+
+      - name: Save math model raw downloads
+        if: inputs.publish && steps.math-downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/math-models
+          key: ${{ steps.math-downloads.outputs.cache-primary-key }}
+
+      - name: Zip portable package
+        if: inputs.publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($variant in @('int8', 'fp32')) {
+            $zip = "dist/neo-${{ steps.ver.outputs.version }}-$variant-portable-x64.zip"
+            if (Test-Path $zip) { throw "Archive already exists: $zip" }
+            7z a -tzip -mx=5 $zip "./dist/neo-$variant" | Select-Object -Last 2
+            if ($LASTEXITCODE -ne 0) { throw "7z exit $LASTEXITCODE" }
+            python -B tools/verify_release_variants.py archive --package "dist/neo-$variant" --variant $variant --version "${{ steps.ver.outputs.version }}" --archive $zip
+            if ($LASTEXITCODE -ne 0) { throw "Portable archive verification failed: $variant" }
+          }
+
+      - name: Generate installer art
+        if: inputs.publish
+        run: |
+          python -m pip install --quiet pillow
+          python tools/make_installer_art.py --out target/package/installer-art
+
+      - name: Build installer (NSIS)
+        if: inputs.publish
+        shell: pwsh
+        run: |
+          # runner 镜像自带 NSIS；没有则走 choco 兜底
+          $mk = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+          if (-not $mk) {
+            choco install nsis -y --no-progress | Select-Object -Last 1
+            $mk = "C:\Program Files (x86)\NSIS\makensis.exe"
+          }
+          # VIProductVersion 要四段纯数字：剥掉预发布后缀再补零
+          $v = "${{ steps.ver.outputs.version }}"
+          $p = @(($v -replace '-.*$', '').Split('.')) + @('0', '0', '0')
+          $vi = ($p[0..2] -join '.') + '.0'
+          # 美术缺失宁可失败也不悄悄出个无品牌安装包
+          if (-not (Test-Path target\package\installer-art\neo.ico)) { throw "installer art missing" }
+          # makensis 默认把编译工作目录切到脚本所在目录（tools\）：/NOCD 保持
+          # 在仓库根，脚本里的相对路径才找得到 dist\ 与 target\；
+          # /INPUTCHARSET UTF8：脚本是 UTF-8（中文注释），默认 ACP 会报编码错。
+          foreach ($variant in @('int8', 'fp32')) {
+            $out = "dist\neo-$v-$variant-installer-x64.exe"
+            if (Test-Path $out) { throw "Installer already exists: $out" }
+            & $mk /NOCD /INPUTCHARSET UTF8 "/DVERSION=$v" "/DVI_VERSION=$vi" "/DPACKAGE_DIR=dist\neo-$variant" "/DOUTPUT_FILE=$out" tools\installer.nsi | Select-Object -Last 4
+            if ($LASTEXITCODE -ne 0) { throw "makensis exit $LASTEXITCODE" }
+            python -B tools/verify_release_variants.py installer --package "dist/neo-$variant" --variant $variant --version $v --archive $out --extractor 7z --work-root target/verify-release-variants
+            if ($LASTEXITCODE -ne 0) { throw "Installer payload verification failed: $variant" }
+          }
+
+      - name: Generate changelog
+        if: inputs.publish
+        id: log
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $prev = git --no-pager tag --merged HEAD --sort=-v:refname --list 'v[0-9]*' | Where-Object { $_ -ne $tag } | Select-Object -First 1
+          $range = if ($prev) { "$prev..HEAD" } else { 'HEAD' }
+          $commits = git --no-pager log $range --pretty=format:'- %h %s (@%an)' --no-merges
+          $notes = @()
+          $notes += "## Neo ${{ steps.ver.outputs.version }}"
+          $notes += ''
+          $notes += '### Commits'
+          $notes += ''
+          if ($prev) { $notes += "Changes since ``$prev``:" ; $notes += '' }
+          $notes += $commits
+          $notes += ''
+          $notes += '### Artifacts'
+          $notes += ''
+          foreach ($variant in @('int8', 'fp32')) {
+            $notes += "- ``neo-${{ steps.ver.outputs.version }}-$variant-installer-x64.exe`` — 安装包"
+            $notes += "- ``neo-${{ steps.ver.outputs.version }}-$variant-portable-x64.zip`` — 便携包"
+          }
+          $notes += 'INT8 / FP32 仅区分数学识别模型；两版均保留 DirectML，语音识别统一 INT8。安装到同一 Neo 目录，选择一种即可。'
+          $notes += '另附 Git Bash 和原生依赖对应源码包。'
+          $notes += ''
+          $notes += '两者内容一致：'
+          $notes += ''
+          $notes += '- ``neo.exe`` - main application'
+          $notes += '- ``resources/models/wake/`` - wake-word models (melspectrogram / embedding / hi_neo)'
+          $notes += '- ``resources/models/stt/`` - SenseVoice int8 ASR + Silero VAD'
+          $notes += '- ``resources/lang/`` - Chinese and English language resources (zh-CN / en-US)'
+          $notes += '- ``runtime/onnx/`` - ONNX Runtime DLLs'
+          $notes += '- ``runtime/gitbash/`` - bundled MinGit (bash tool runtime)'
+
+          $notes += '- ``LICENSE`` (Neo Apache-2.0) and ``NOTICE`` remain next to ``neo.exe``; MSVC CRT DLLs are not bundled'
+          $notes += '- Prerequisite: official Microsoft Visual C++ v14 x64 Redistributable >= 14.51.36247.0 and at least as new as the build tools; obtain the latest supported version from https://aka.ms/vc14/vc_redist.x64.exe'
+          $notes += '- Install that prerequisite independently if needed; neither package downloads or installs it automatically. This conservative version requirement is not inferred from PE imports; clean-machine compatibility remains unverified.'
+          $notes += '- ``docs/licenses/`` - public third-party license texts, notices and indexes; private audit reports are excluded and payload checks are not legal clearance'
+          $notes -join "`n" | Out-File -Encoding utf8 dist\notes.md
+          Get-Content dist\notes.md
+
+      - name: Create release
+        if: inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.ver.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+          RELEASE_PRERELEASE: ${{ steps.ver.outputs.prerelease }}
+        run: |
+          python -B tools/stage_source_companions.py publish --lock tools/source-companions.lock.json --package dist/neo --output dist --repository "$env:RELEASE_REPOSITORY" --tag "$env:RELEASE_TAG" --version "$env:RELEASE_VERSION" --notes dist/notes.md --prerelease "$env:RELEASE_PRERELEASE" --variants int8 fp32
+          if ($LASTEXITCODE -ne 0) { throw 'Source/binary asset verification failed; do not publish or automatically retry the draft' }

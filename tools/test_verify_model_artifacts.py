@@ -51,6 +51,50 @@ class ArtifactTests(unittest.TestCase):
                 if '--help' in arguments:
                     self.assertIn('--download', result.stdout)
 
+    def test_verify_reads_pins_from_build_body_not_release_wrapper(self):
+        cache = self.root / '.cache/stt'
+        cache.mkdir(parents=True)
+        model, tokens, vad = b'model fixture', b'tokens fixture', b'vad fixture'
+        archive = self.archive([
+            (v.PREFIX + '/model.int8.onnx', model, tarfile.REGTYPE),
+            (v.PREFIX + '/tokens.txt', tokens, tarfile.REGTYPE),
+        ])
+        archive.rename(cache / 'sv.tar.bz2')
+        (cache / 'silero_vad.onnx').write_bytes(vad)
+        artifacts = tuple((filename, remote, (cache / filename).stat().st_size, v.digest(cache / filename))
+                          for filename, remote, _, _ in v.ARTIFACTS)
+        for name, data in [('sense-voice/model.int8.onnx', model), ('sense-voice/tokens.txt', tokens),
+                           ('vad/silero_vad.onnx', vad)]:
+            path = self.root / 'crates/neo-stt/assets' / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        workflows = self.root / '.github/workflows'
+        workflows.mkdir(parents=True)
+        wrapper = workflows / 'release.yml'
+        wrapper.write_text('jobs:\n  release:\n    uses: ./.github/workflows/build.yml\n', encoding='utf-8')
+        build = workflows / 'build.yml'
+        pins = '\n'.join(f"          ${name} = '{artifact[3]}'"
+                         for name, artifact in zip(('svExpected', 'vadExpected'), artifacts))
+        body = 'jobs:\n  check:\n    steps:\n      - name: Download STT models\n        run: |\n' + pins + '\n'
+        build.write_text(body, encoding='utf-8')
+        with patch.object(v, 'ARTIFACTS', artifacts):
+            report = v.verify(self.root, cache)
+            self.assertTrue(report['workflow_pins_verified'])
+            self.assertTrue(all(row['matches'] for row in report['local_comparisons']))
+            # A stale pin in the wrapper must never rescue a changed/missing body pin.
+            wrapper.write_text(body, encoding='utf-8')
+            for artifact in artifacts:
+                with self.subTest(artifact=artifact[0]):
+                    build.write_text(body.replace(artifact[3], '0' * 64), encoding='utf-8')
+                    with self.assertRaisesRegex(ValueError, 'workflow pin differs'):
+                        v.verify(self.root, cache)
+            build.write_text('jobs: {}\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'workflow pin differs'):
+                v.verify(self.root, cache)
+            build.unlink()
+            with self.assertRaises(FileNotFoundError):
+                v.verify(self.root, cache)
+
     def test_hashes_without_extraction(self):
         path = self.archive([('model', b'weight', tarfile.REGTYPE)])
         rows = v.archive_members(path)

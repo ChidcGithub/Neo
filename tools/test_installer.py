@@ -1035,9 +1035,9 @@ class InstallerTests(unittest.TestCase):
 
     def test_release_uses_explicit_x64_output_and_formal_assets(self):
         root = Path(__file__).resolve().parent.parent
-        workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        workflow = (root / ".github/workflows/build.yml").read_text(encoding="utf-8")
         self.assertIn("cargo build --locked --release -p neo-app --target x86_64-pc-windows-msvc", workflow)
-        self.assertIn(r"Copy-Item target\x86_64-pc-windows-msvc\release\neo.exe", workflow)
+        self.assertIn(r"Copy-Item target\ci-rust\x86_64-pc-windows-msvc\release\neo.exe", workflow)
         self.assertNotIn(r"Copy-Item target\release\neo.exe", workflow)
         self.assertIn(r'Copy-Item "crates\neo-wake\assets\$model" "$pkg\resources\models\wake\"', workflow)
         self.assertIn(r'Copy-Item crates\neo-wake\assets\*.dll "$pkg\runtime\onnx\"', workflow)

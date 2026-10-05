@@ -34,6 +34,11 @@ GitHub 的 release 资产在国内经常下不动（本机实测直接 `TimeoutE
 缓存的 .neo-version / .neo-archive-sha256 仅记录 tag 与已下载归档摘要；
 用户可写这些 marker，它们不是缓存内容认证、对应源码完整性或许可批准。
 
+可选 --archive-cache .cache/runtime-archives 必须同时指定 --version 和 --sha256。
+仅存原始 <sha256>.zip（只读），不存解压运行时或 GCM 凭据。每次使用均重新
+校验并安装（包括 --force），不信任 marker；命中无需 API，tag 来自固定版本。
+缺失才查询该版本的资产并下载；损坏缓存直接拒绝，不自动覆盖。
+
 只要 stdlib，不引第三方依赖。
 """
 
@@ -209,13 +214,97 @@ def download(tag: str, asset: str, only: str | None, tmp: str) -> str:
     raise SystemExit("所有镜像都失败了：\n  " + "\n  ".join(errors))
 
 
+def archive_cache_entry(directory: str, digest: str) -> tuple[str, bool]:
+    directory = os.path.abspath(directory)
+    # 缓存与可替换的运行时隔离，避免发布/清理运行时连带删除归档。
+    dest = os.path.normcase(os.path.abspath(DEST))
+    normalized = os.path.normcase(directory)
+    if (os.path.splitdrive(normalized)[0] == os.path.splitdrive(dest)[0]
+            and os.path.commonpath((normalized, dest)) in (normalized, dest)):
+        raise ValueError("归档缓存目录不能与运行时目录重叠")
+    path = os.path.join(directory, digest + ".zip")
+    check_local_path(path)
+    if os.path.lexists(directory) and not os.path.isdir(directory):
+        raise ValueError("归档缓存路径不是目录")
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return path, False
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_DOWNLOAD_BYTES:
+        raise ValueError("归档缓存不是普通文件或超过大小预算")
+    return path, True
+
+
+def verify_archive(path: str, expected: str, snapshot=None) -> str:
+    """有界校验；命中时只解压校验过的私有副本，不重新打开共享缓存。"""
+    check_local_path(path)
+    if not stat.S_ISREG(os.lstat(path).st_mode):
+        raise ValueError("归档不是普通文件")
+    started = time.monotonic()
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_DOWNLOAD_BYTES
+                or getattr(info, "st_file_attributes", 0) & 0x400):
+            raise ValueError("归档不是普通文件或超过大小预算")
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = source.read(262144)
+            total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES or time.monotonic() - started > DOWNLOAD_DEADLINE:
+                raise ValueError("归档校验超过大小或时间预算")
+            if not chunk:
+                break
+            digest.update(chunk)
+            if snapshot is not None:
+                snapshot.write(chunk)
+    actual = digest.hexdigest()
+    if actual != expected:
+        raise ValueError(f"ZIP SHA-256 不匹配：预期 {expected}，实际 {actual}")
+    return actual
+
+
+def store_archive(source: str, target: str, digest: str) -> None:
+    directory = os.path.dirname(target)
+    check_local_path(target)
+    os.makedirs(directory, exist_ok=True)
+    check_local_path(target)
+    fd, temporary = tempfile.mkstemp(prefix=".archive-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            verify_archive(source, digest, output)
+            output.flush()
+            os.fsync(output.fileno())
+        check_local_path(target)
+        os.chmod(temporary, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        try:
+            # Windows rename 不覆盖目标；POSIX link 原子创建且不替换已有文件。
+            if os.name == "nt":
+                os.rename(temporary, target)
+            else:
+                os.link(temporary, target)
+        except FileExistsError:
+            # 并发写入也只能复用校验成功的条目，绝不覆盖未知文件。
+            verify_archive(target, digest)
+    finally:
+        if os.path.lexists(temporary):
+            if os.name == "nt":
+                os.chmod(temporary, stat.S_IWRITE | stat.S_IREAD)
+            os.unlink(temporary)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="拉取随包的 Git Bash 运行时")
     ap.add_argument("--version", default=None, help="Git for Windows 版本，默认最新")
     ap.add_argument("--mirror", default=None, choices=sorted(MIRRORS), help="只用指定源")
     ap.add_argument("--force", action="store_true", help="已存在也重下")
     ap.add_argument("--sha256", help="预期 ZIP SHA-256（64 位十六进制，须同时指定 --version）")
+    ap.add_argument("--archive-cache", help="原始 ZIP 缓存目录（须同时指定 --version 和 --sha256）")
     args = ap.parse_args()
+    if args.archive_cache is not None and (not args.archive_cache.strip() or not args.version or not args.sha256):
+        ap.error("--archive-cache 必须是非空目录并同时指定 --version 和 --sha256")
     if args.sha256 is not None:
         if not re.fullmatch(r"[0-9a-fA-F]{64}", args.sha256):
             ap.error("--sha256 必须是 64 位十六进制摘要")
@@ -223,9 +312,12 @@ def main() -> int:
             ap.error("--sha256 必须同时指定 --version")
         args.sha256 = args.sha256.lower()
 
+    cache_path, archive_hit = None, False
     try:
         for rel in ("", "bin/bash.exe", "usr/bin/bash.exe", ".neo-version", ".neo-archive-sha256"):
             check_local_path(os.path.join(DEST, rel))
+        if args.archive_cache is not None:
+            cache_path, archive_hit = archive_cache_entry(args.archive_cache, args.sha256)
     except (OSError, ValueError) as e:
         print(f"运行时路径无效：{e}", file=sys.stderr)
         return 1
@@ -243,13 +335,17 @@ def main() -> int:
     except (OSError, UnicodeError):
         pass
     requested = "v" + args.version.removeprefix("v") if args.version else None
-    if (bash and not args.force and (requested is None or requested == cached_tag)
+    if (cache_path is None and bash and not args.force and (requested is None or requested == cached_tag)
             and (args.sha256 is None or args.sha256 == cached_sha256)):
         print(f"已存在：{bash}")
         return 0
 
-    tag, asset, official = pick_asset(args.version)
-    print(f"版本 {tag}，资产 {asset}\n官方地址：{official}")
+    if archive_hit:
+        tag = requested
+        print(f"版本 {tag}，归档缓存：{cache_path}")
+    else:
+        tag, asset, official = pick_asset(args.version)
+        print(f"版本 {tag}，资产 {asset}\n官方地址：{official}")
     parent = os.path.dirname(DEST)
     os.makedirs(parent, exist_ok=True)
     lock = os.path.join(parent, ".gitbash-install.lock")
@@ -260,15 +356,23 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix=".gitbash-stage-", dir=parent) as td:
             zip_path = os.path.join(td, "runtime.zip")
-            used = download(tag, asset, args.mirror, zip_path)
-            print(f"下载完成（源：{used}）")
-            digest = hashlib.sha256()
-            with open(zip_path, "rb") as f:
-                for chunk in iter(lambda: f.read(262144), b""):
-                    digest.update(chunk)
-            archive_sha256 = digest.hexdigest()
-            if args.sha256 is not None and archive_sha256 != args.sha256:
-                raise ValueError(f"ZIP SHA-256 不匹配：预期 {args.sha256}，实际 {archive_sha256}")
+            if archive_hit:
+                with open(zip_path, "xb") as snapshot:
+                    archive_sha256 = verify_archive(cache_path, args.sha256, snapshot)
+            else:
+                used = download(tag, asset, args.mirror, zip_path)
+                print(f"下载完成（源：{used}）")
+                if cache_path is not None:
+                    archive_sha256 = verify_archive(zip_path, args.sha256)
+                    store_archive(zip_path, cache_path, args.sha256)
+                else:
+                    digest = hashlib.sha256()
+                    with open(zip_path, "rb") as f:
+                        for chunk in iter(lambda: f.read(262144), b""):
+                            digest.update(chunk)
+                    archive_sha256 = digest.hexdigest()
+                    if args.sha256 is not None and archive_sha256 != args.sha256:
+                        raise ValueError(f"ZIP SHA-256 不匹配：预期 {args.sha256}，实际 {archive_sha256}")
             stage = os.path.join(td, "payload")
             os.mkdir(stage)
             with zipfile.ZipFile(zip_path) as z:

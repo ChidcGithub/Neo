@@ -170,7 +170,7 @@ def download(cache, artifact, ledger_path):
 def verify(root, cache):
     for filename, _, size, expected in ARTIFACTS:
         verify_file(cache / filename, size, expected)
-    workflow = (root / '.github/workflows/release.yml').read_text(encoding='utf-8')
+    workflow = (root / '.github/workflows/build.yml').read_text(encoding='utf-8')
     for variable, artifact in zip(('svExpected', 'vadExpected'), ARTIFACTS):
         match = re.search(r'\$' + variable + r"\s*=\s*'([0-9a-f]{64})'", workflow)
         if not match or match.group(1) != artifact[3]:

@@ -1,5 +1,5 @@
 """Inert payload tests; optional tiny NSIS compilation, never installation/network."""
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, chdir, redirect_stderr, redirect_stdout
 import copy
 import hashlib
 import io
@@ -46,6 +46,7 @@ def record(data, key='size'):
 
 class VariantTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.dict(os.environ, {'CARGO_TARGET_DIR': ''}))
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -219,6 +220,80 @@ class VariantTests(unittest.TestCase):
         self.mocks['check_release.validate_payload'].side_effect = ValueError('missing required runtime resource')
         with self.assertRaisesRegex(ValueError, 'required runtime resource'):
             self.verify()
+
+    def test_main_build_unset_and_empty_use_default(self):
+        for value in (None, ''):
+            with self.subTest(value=value), patch.dict(os.environ):
+                if value is None:
+                    os.environ.pop('CARGO_TARGET_DIR', None)
+                else:
+                    os.environ['CARGO_TARGET_DIR'] = value
+                with chdir(self.package):
+                    self.assertEqual(v.main_build(self.root), self.root / v.MAIN_BUILD)
+                    self.verify()
+
+    def test_main_build_relative_and_external_absolute_ignore_cwd(self):
+        outside = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.inventory()
+        self.make_zip()
+        for target in ('target/ci-rust', str(outside / 'cargo-target')):
+            with self.subTest(target=target), patch.dict(os.environ, {'CARGO_TARGET_DIR': target}):
+                build = self.root / target / 'x86_64-pc-windows-msvc/release/neo.exe'
+                build.parent.mkdir(parents=True)
+                build.write_bytes(pe_fixture())
+                (self.root / v.MAIN_BUILD).write_bytes(pe_fixture(b'stale'))
+                with chdir(self.package):
+                    self.assertEqual(v.main_build(self.root), build)
+                    self.assertEqual(self.verify()['status'], 'integrity-verified')
+                    self.verify('archive')
+                    # A matching old-path build must not hide a mismatched override.
+                    (self.root / v.MAIN_BUILD).write_bytes(pe_fixture())
+                    build.write_bytes(pe_fixture(b'other'))
+                    for mode in ('package', 'archive'):
+                        with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'current release build'):
+                            self.verify(mode)
+
+    def test_main_build_missing_override_never_falls_back(self):
+        outside = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.inventory()
+        self.make_zip()
+        for target in ('target/ci-rust', str(outside / 'missing')):
+            with self.subTest(target=target), patch.dict(os.environ, {'CARGO_TARGET_DIR': target}):
+                self.assertTrue((self.root / v.MAIN_BUILD).is_file())
+                with self.assertRaises(FileNotFoundError):
+                    v.main_build(self.root)
+                for mode in ('package', 'archive'):
+                    with self.subTest(mode=mode), self.assertRaises(FileNotFoundError):
+                        self.verify(mode)
+
+    def test_main_build_directory_is_not_regular(self):
+        build = self.root / 'target/ci-rust/x86_64-pc-windows-msvc/release/neo.exe'
+        build.mkdir(parents=True)
+        with patch.dict(os.environ, {'CARGO_TARGET_DIR': 'target/ci-rust'}):
+            with self.assertRaisesRegex(ValueError, 'Expected regular unlinked file'):
+                v.main_build(self.root)
+            with self.assertRaisesRegex(ValueError, 'Expected regular unlinked file'):
+                self.verify()
+
+    def test_main_build_symlink_escape_is_rejected(self):
+        outside = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        external_build = outside / 'x86_64-pc-windows-msvc/release/neo.exe'
+        external_build.parent.mkdir(parents=True)
+        external_build.write_bytes(pe_fixture())
+        target_link = self.root / 'target/linked'
+        build_link = self.root / 'target/ci-rust/x86_64-pc-windows-msvc/release/neo.exe'
+        build_link.parent.mkdir(parents=True)
+        try:
+            target_link.symlink_to(outside, target_is_directory=True)
+            build_link.symlink_to(external_build)
+        except OSError as error:
+            self.skipTest('Symbolic links unavailable: ' + str(error))
+        for target in ('target/linked', str(target_link), 'target/ci-rust'):
+            with self.subTest(target=target), patch.dict(os.environ, {'CARGO_TARGET_DIR': target}):
+                with self.assertRaisesRegex(ValueError, 'Symlink/reparse input or output is forbidden'):
+                    v.main_build(self.root)
+                with self.assertRaisesRegex(ValueError, 'Symlink/reparse input or output is forbidden'):
+                    self.verify()
 
     def test_drawing_swap_missing_corrupt_and_source_inventory(self):
         paths = ['apps/drawing/neo-drawing.exe', 'apps/blackboard/DirectML.dll',

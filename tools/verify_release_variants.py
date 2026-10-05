@@ -13,8 +13,10 @@ Use fp32 and its corresponding paths for FP32. Package/ZIP checks write nothing.
 Installer checks invoke only a trusted 7z extractor (--extractor, default PATH),
 using a cleaned temporary directory under --work-root. No downloads, installation,
 feature removal, or release/legal approval. Requires the current main build at
- target/x86_64-pc-windows-msvc/release/neo.exe. Byte equality to that build is
-not a source/build attestation or final static-library identity verification.
+<CARGO_TARGET_DIR>/x86_64-pc-windows-msvc/release/neo.exe. An unset/empty target
+directory defaults to target; relative paths are based on the repository root.
+Byte equality to that build is not a source/build attestation or final
+static-library identity verification.
 Use trusted, quiescent directories; concurrent hostile mutation is unsupported.
 """
 from __future__ import annotations
@@ -23,6 +25,7 @@ import argparse
 import hashlib
 import json
 import mmap
+import os
 from pathlib import Path
 import re
 import shutil
@@ -88,6 +91,11 @@ def regular(path):
     require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
             'Expected regular unlinked file: ' + str(path))
     return path
+
+
+def main_build(root):
+    target = Path(os.environ.get('CARGO_TARGET_DIR') or 'target')
+    return regular(root / target / Path(MAIN_BUILD).relative_to('target'))
 
 
 def read_json(path):
@@ -216,7 +224,7 @@ def verify_package(package, variant, version, *, root=ROOT, require_manifest=Fal
     records = {name: file_record(path) for name, path in paths.items()}
     check_release.validate_payload(package)
     verify_pe(package / 'neo.exe', executable=True)
-    require(records['neo.exe'] == file_record(root / MAIN_BUILD),
+    require(records['neo.exe'] == file_record(main_build(root)),
             'neo.exe differs from current release build')
     sensevoice.verify(root, package)
     source_lock = sources.read_lock(root / 'tools/source-companions.lock.json')
