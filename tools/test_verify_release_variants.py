@@ -270,10 +270,34 @@ class VariantTests(unittest.TestCase):
         build = self.root / 'target/ci-rust/x86_64-pc-windows-msvc/release/neo.exe'
         build.mkdir(parents=True)
         with patch.dict(os.environ, {'CARGO_TARGET_DIR': 'target/ci-rust'}):
-            with self.assertRaisesRegex(ValueError, 'Expected regular unlinked file'):
+            with self.assertRaisesRegex(ValueError, 'Expected regular file:'):
                 v.main_build(self.root)
-            with self.assertRaisesRegex(ValueError, 'Expected regular unlinked file'):
+            with self.assertRaisesRegex(ValueError, 'Expected regular file:'):
                 self.verify()
+
+    def test_cargo_hardlinked_build_input_matches_independent_package(self):
+        self.inventory()
+        self.make_zip()
+        for target in ('target', 'target/ci-rust'):
+            with self.subTest(target=target), patch.dict(os.environ, {'CARGO_TARGET_DIR': target}):
+                build = self.root / target / 'x86_64-pc-windows-msvc/release/neo.exe'
+                build.parent.mkdir(parents=True, exist_ok=True)
+                build.write_bytes(pe_fixture())
+                dependency = build.parent / 'deps/neo-hashed.exe'
+                dependency.parent.mkdir()
+                try:
+                    os.link(build, dependency)
+                except OSError as error:
+                    self.skipTest('Hardlinks unavailable: ' + str(error))
+                self.assertGreater(build.stat().st_nlink, 1)
+                self.assertEqual((self.package / 'neo.exe').stat().st_nlink, 1)
+                self.assertEqual(v.main_build(self.root), build)
+                self.verify()
+                self.verify('archive')
+                dependency.write_bytes(pe_fixture(b'changed through Cargo alias'))
+                with self.assertRaisesRegex(ValueError, 'current release build'):
+                    self.verify()
+                dependency.unlink()
 
     def test_main_build_symlink_escape_is_rejected(self):
         outside = Path(self.enterContext(tempfile.TemporaryDirectory()))

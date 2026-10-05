@@ -85,17 +85,20 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def regular(path):
+def regular(path, *, allow_hardlinks=False):
     path = math_models.checked(path)
     info = path.stat()
-    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
+    require(stat.S_ISREG(info.st_mode) and (allow_hardlinks or info.st_nlink == 1),
+            'Expected regular file: ' + str(path) if allow_hardlinks else
             'Expected regular unlinked file: ' + str(path))
     return path
 
 
 def main_build(root):
     target = Path(os.environ.get('CARGO_TARGET_DIR') or 'target')
-    return regular(root / target / Path(MAIN_BUILD).relative_to('target'))
+    # Cargo hardlinks the top-level executable to its deps artifact. This is a
+    # read-only build input; packaged files must still be independent copies.
+    return regular(root / target / Path(MAIN_BUILD).relative_to('target'), allow_hardlinks=True)
 
 
 def read_json(path):
@@ -113,8 +116,8 @@ def stream_record(stream, limit):
     return {'size': size, 'sha256': digest.hexdigest()}
 
 
-def file_record(path):
-    path = regular(path)
+def file_record(path, *, allow_hardlinks=False):
+    path = regular(path, allow_hardlinks=allow_hardlinks)
     before = path.stat()
     with path.open('rb') as stream:
         record = stream_record(stream, before.st_size)
@@ -224,7 +227,7 @@ def verify_package(package, variant, version, *, root=ROOT, require_manifest=Fal
     records = {name: file_record(path) for name, path in paths.items()}
     check_release.validate_payload(package)
     verify_pe(package / 'neo.exe', executable=True)
-    require(records['neo.exe'] == file_record(main_build(root)),
+    require(records['neo.exe'] == file_record(main_build(root), allow_hardlinks=True),
             'neo.exe differs from current release build')
     sensevoice.verify(root, package)
     source_lock = sources.read_lock(root / 'tools/source-companions.lock.json')
