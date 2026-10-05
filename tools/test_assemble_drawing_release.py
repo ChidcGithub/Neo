@@ -306,15 +306,22 @@ class AssemblyTests(unittest.TestCase):
 
     def test_symlink_payload_rejected(self):
         dll = self.runtime / "DirectML.dll"
-        other = self.root / "other.dll"
-        other.write_bytes(dll.read_bytes())
+        content = dll.read_bytes()
         dll.unlink()
-        try:
-            dll.symlink_to(other)
-        except OSError:
-            self.skipTest("Symlink privilege unavailable")
-        with self.assertRaisesRegex(ValueError, "Symlink"):
-            a.audit_runtime(self.runtime)
+        for parent, message in ((self.runtime, "Symlink"),
+                                (self.root, "Path escapes repository")):
+            with self.subTest(target_parent=parent):
+                other = parent / "other.dll"
+                other.write_bytes(content)
+                try:
+                    dll.symlink_to(other)
+                except OSError:
+                    self.skipTest("Symlink privilege unavailable")
+                try:
+                    with self.assertRaisesRegex(ValueError, message):
+                        a.audit_runtime(self.runtime)
+                finally:
+                    dll.unlink()
 
     def test_review_has_no_commit_self_reference_and_ignored_output_is_clean(self):
         before, _ = a.verify_review(self.source, self.lock)
