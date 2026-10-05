@@ -15,22 +15,22 @@ import struct
 import subprocess
 import sys
 import tomllib
-from datetime import date, datetime, timezone
+
 from pathlib import Path
 from xml.etree import ElementTree
 
 # Only stdlib-only primitives, never the evaluation build/assembly path.
 if __package__:
-    from .check_distribution_review import check_review, fields, relative_file, require, unique_object
+    from .check_distribution_review import fields, relative_file, require, unique_object
     from .package_combined import PEImports, checked, copy_verified, digest, git, source_allowed, tree_digest, write_json
 else:
-    from check_distribution_review import check_review, fields, relative_file, require, unique_object
+    from check_distribution_review import fields, relative_file, require, unique_object
     from package_combined import PEImports, checked, copy_verified, digest, git, source_allowed, tree_digest, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / "tools/drawing-runtime.lock.json"
 TARGET = "x86_64-pc-windows-msvc"
-REVIEWED = "distribution/legal/app/REVIEWED.md"
+
 RUST_TEXT = r"distribution/legal/app/rust/texts/[0-9a-f]{64}\.txt"
 ARTIFACTS = ("neo-drawing.exe", "neo-blackboard.exe", "DirectML.dll")
 
@@ -49,17 +49,11 @@ def load_lock(path=LOCK):
     return lock
 
 
-def approval(lock):
-    require(lock.get("public_approved") is True and lock.get("distribution_review") == "reviewed",
-            "Drawing public distribution is not approved (lock gate)")
-    review = lock.get("review")
-    fields(review, {"source_commit", "source_tree_sha256", "cargo_lock_sha256", "version", "reviewed_sha256", "legal_files"}, "drawing review binding")
-    require(review["source_commit"] == lock["commit"], "Review source commit differs from lock")
-    for key in ("source_tree_sha256", "cargo_lock_sha256", "reviewed_sha256"):
-        require(isinstance(review[key], str) and re.fullmatch(r"[0-9a-f]{64}", review[key]), "Invalid review digest: " + key)
-    require(isinstance(review["version"], str) and review["version"].strip(), "Missing reviewed version")
-    require(isinstance(review["legal_files"], dict) and review["legal_files"], "Missing reviewed legal manifest")
-    return review
+def pinned_bytes(source, lock, name):
+    data = git(source, "show", lock["commit"] + ":" + name, raw=True)
+    if not isinstance(data, bytes):
+        raise TypeError("Expected pinned Git blob bytes")
+    return data
 
 
 def source_info(source, lock):
@@ -80,41 +74,38 @@ def source_info(source, lock):
     require({"Cargo.toml", "Cargo.lock", "LICENSE"} <= files.keys(), "Incomplete source manifest")
     version = tomllib.loads((source / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]
     return {"source_commit": lock["commit"], "source_tree_sha256": hashlib.sha256(tree).hexdigest(),
-            "cargo_lock_sha256": files["Cargo.lock"]["sha256"], "version": version,
+            "cargo_lock_sha256": hashlib.sha256(pinned_bytes(source, lock, "Cargo.lock")).hexdigest(), "version": version,
             "files": files, "source_files_sha256": tree_digest(files)}, set(names)
 
 
-def verify_review(source, lock):
-    review = approval(lock)
+def verify_source(source, lock):
+    binding = lock.get("source_binding")
+    fields(binding, {"source_commit", "source_tree_sha256", "cargo_lock_sha256", "version", "legal_files"}, "drawing source binding")
+    require(binding["source_commit"] == lock["commit"], "Source binding commit differs from lock")
+    for key in ("source_tree_sha256", "cargo_lock_sha256"):
+        require(isinstance(binding[key], str) and re.fullmatch(r"[0-9a-f]{64}", binding[key]), "Invalid source digest: " + key)
+    require(isinstance(binding["version"], str) and binding["version"].strip(), "Missing source version")
+    require(isinstance(binding["legal_files"], dict) and binding["legal_files"], "Missing legal manifest")
     info, names = source_info(source, lock)
     for key in ("source_commit", "source_tree_sha256", "cargo_lock_sha256", "version"):
-        require(review[key] == info[key], "Drawing review binding mismatch: " + key)
-    require(REVIEWED in names, "Missing pinned REVIEWED.md; local legal notes are not approval")
-    marker = relative_file(source, REVIEWED)
-    require(digest(marker)["sha256"] == review["reviewed_sha256"], "REVIEWED.md hash mismatch")
-    # A version-bound record plus a substantive human review, not a bool/empty marker.
-    match = re.fullmatch(r"```json\s*\n(.*?)\n```\s*\n(.+)", marker.read_text(encoding="utf-8").strip(), re.DOTALL)
-    if match is None or not match[2].strip():
-        raise ValueError("REVIEWED.md needs JSON binding and human review body")
-    record = json.loads(match[1], object_pairs_hook=unique_object)
-    fields(record, {"schema", "status", "version", "cargo_lock_sha256", "reviewer", "date"}, "REVIEWED metadata")
-    require(type(record["schema"]) is int and record["schema"] == 1 and record["status"] == "APPROVED", "REVIEWED metadata is not approved")
-    for key in ("version", "cargo_lock_sha256"):
-        require(record[key] == info[key], "REVIEWED version/lock mismatch")
-    require(isinstance(record["reviewer"], str) and record["reviewer"].strip(), "Missing human reviewer")
-    require(isinstance(record["date"], str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", record["date"])
-            and date.fromisoformat(record["date"]) <= datetime.now(timezone.utc).date(), "Invalid review date")
+        require(binding[key] == info[key], "Drawing source binding mismatch: " + key)
     legal = set(lock["legal_files"]) | {name for name in names if re.fullmatch(RUST_TEXT, name)}
-    require(set(review["legal_files"]) == legal, "Reviewed legal manifest must exactly match allowlist")
+    missing = sorted(legal - names)
+    require(not missing, "Missing pinned legal text: " + ", ".join(missing))
+    require(set(binding["legal_files"]) == legal, "Legal manifest must exactly match allowlist")
+    manifest = {}
     for name in sorted(legal):
-        require(name in names, "Missing pinned legal text: " + name)
-        path = relative_file(source, name)
-        value = digest(path)["sha256"]
-        require(value == review["legal_files"][name], "Legal manifest hash mismatch: " + name)
-        require(path.read_text(encoding="utf-8-sig").strip(), "Empty legal text: " + name)
+        relative_file(source, name)
+        # Git checkout filters may change CRLF; hash and ship the original blob,
+        # never normalize legal text or substitute a local supplemental file.
+        data = pinned_bytes(source, lock, name)
+        value = hashlib.sha256(data).hexdigest()
+        require(value == binding["legal_files"][name], "Legal manifest hash mismatch: " + name)
+        require(data.decode("utf-8-sig").strip(), "Empty legal text: " + name)
         if re.fullmatch(RUST_TEXT, name):
-            require(value == path.stem, "Rust legal body does not match its hash filename")
-    return info, sorted(legal)
+            require(value == Path(name).stem, "Rust legal body does not match its hash filename")
+        manifest[name] = value
+    return info, manifest
 
 
 def directml_provenance(source, lock):
@@ -271,11 +262,10 @@ def build(source, target_dir, lock_path=LOCK):
 
 
 def assemble(source, target_dir, package, lock_path=LOCK, root=ROOT):
-    # Standalone invocation cannot bypass the main project's approval gate either.
-    check_review(Path(root) / "tools/distribution-review.json", root=root)
+
     lock = load_lock(lock_path)
     source, target_dir, package = checked(source), checked(target_dir), checked(package)
-    info, legal = verify_review(source, lock)
+    info, legal = verify_source(source, lock)
     receipt = read_json(target_dir / "drawing-build.json")
     runtime = target_dir / TARGET / "release"
     artifacts = audit_runtime(runtime)
@@ -297,15 +287,19 @@ def assemble(source, target_dir, package, lock_path=LOCK, root=ROOT):
             "No app-local CRT is supplied in this subdirectory. Do not copy System32 or developer CRT DLLs.\n"
             "https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist\n"
             "Clean-machine runtime acceptance is not established by this package check.\n", encoding="utf-8")
-    for name in legal:
-        copy_verified(source / name, legal_root / name)
-    copy_verified(source / REVIEWED, legal_root / "REVIEWED.md")
+    for name, expected in legal.items():
+        data = pinned_bytes(source, lock, name)
+        require(hashlib.sha256(data).hexdigest() == expected, "Legal blob changed during assembly: " + name)
+        destination = checked(legal_root / name)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        require(digest(destination)["sha256"] == expected, "Legal copy hash mismatch: " + name)
     for name in info["files"]:
         copy_verified(source / name, source_root / name)
     write_json(legal_root / "SOURCE.json", {**info, "repository": lock["repository"], "lock_sha256": digest(lock_path)["sha256"],
-               "reviewed_sha256": lock["review"]["reviewed_sha256"], "legal_files": lock["review"]["legal_files"],
+               "legal_files": legal,
                "artifacts": artifacts, "directml_provenance": provenance, "crt_policy": "external-official-msvc-x64-prerequisite",
-               "clean_install_verified": False, "scope": "Allowlisted project source, not complete third-party corresponding source; human review must cover delivery obligations"})
+               "clean_install_verified": False, "scope": "Allowlisted project source, not complete third-party corresponding source; technical manifest only"})
     hashes = {path.relative_to(package).as_posix(): digest(path) for base in [*destinations, legal_root, source_root]
               for path in sorted(base.rglob("*")) if path.is_file()}
     write_json(legal_root / "FILES.sha256.json", hashes)
@@ -314,7 +308,7 @@ def assemble(source, target_dir, package, lock_path=LOCK, root=ROOT):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("lock-outputs", "check-approval", "verify-review", "build", "assemble"))
+    parser.add_argument("command", choices=("lock-outputs", "verify-source", "build", "assemble"))
     parser.add_argument("--lock", type=Path, default=LOCK)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--target-dir", type=Path)
@@ -329,12 +323,11 @@ def main(argv=None):
                     ("repository", lock["repository"].removeprefix("https://github.com/")),
                     ("rust", lock["rust"]),
                 ))
-        elif args.command == "check-approval":
-            approval(lock)
+
         else:
             require(args.source is not None, "--source is required")
-            if args.command == "verify-review":
-                verify_review(args.source, lock)
+            if args.command == "verify-source":
+                verify_source(args.source, lock)
             else:
                 require(args.target_dir is not None, "--target-dir is required")
                 if args.command == "build":

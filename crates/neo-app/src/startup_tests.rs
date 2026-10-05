@@ -63,26 +63,77 @@
     }
     #[test]
     fn log_writer_subprocess() {
-        let Some(dir) = std::env::var_os("NEO_STARTUP_LOG_TEST_DIR") else { return };
+        let Some(dir) = std::env::var_os("NEO_STARTUP_LOG_TEST_DIR") else {
+            return;
+        };
         let dir = PathBuf::from(dir);
-        for _ in 0..800 {
-            append_log(&dir, &log_line("database", "database_open_failed", true)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for index in 0..800 {
+            loop {
+                match append_log(&dir, &log_line("database", "database_open_failed", true)) {
+                    Ok(()) => break,
+                    // Production logging is bounded/best-effort; this stress test must
+                    // complete every write without assuming fair OS lock scheduling.
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("log write {index}/800 failed: {error:?}"),
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "log writer exceeded total time budget"
+            );
         }
     }
     #[test]
     fn concurrent_process_log_rotation() {
-        let dir = std::env::temp_dir().join(format!("neo-startup-process-log-{}-{}", std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "neo-startup-process-log-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir_all(&dir).unwrap();
-        let mut children: Vec<_> = (0..3).map(|_| {
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "startup::tests::log_writer_subprocess", "--test-threads=1"])
-                .env("NEO_STARTUP_LOG_TEST_DIR", &dir)
-                .stdout(std::process::Stdio::null()).spawn().unwrap()
-        }).collect();
-        for child in &mut children { assert!(child.wait().unwrap().success()); }
+        let children: Vec<_> = (0..3)
+            .map(|_| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "startup::tests::log_writer_subprocess",
+                        "--test-threads=1",
+                    ])
+                    .env("NEO_STARTUP_LOG_TEST_DIR", &dir)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        // Reap every writer before asserting, even when one writer failed.
+        let outputs: Vec<_> = children
+            .into_iter()
+            .map(|child| child.wait_with_output().unwrap())
+            .collect();
+        for (index, output) in outputs.iter().enumerate() {
+            assert!(
+                output.status.success(),
+                "log writer {index} exited {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         for entry in fs::read_dir(&dir).unwrap().map(Result::unwrap) {
-            if entry.path().extension().is_some_and(|extension| extension == "log") {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "log")
+            {
                 assert!(entry.metadata().unwrap().len() <= LOG_LIMIT);
                 for line in fs::read_to_string(entry.path()).unwrap().lines() {
                     assert!(line.starts_with("timestamp="));
@@ -90,6 +141,35 @@
                 }
             }
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn held_log_lock_returns_busy_without_writing() {
+        let dir = std::env::temp_dir().join(format!(
+            "neo-startup-held-lock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("startup.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let result = append_log(&dir, "must not be written\n");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(!dir.join("startup.log").exists());
+        drop(lock);
+        append_log(&dir, "after release\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("startup.log")).unwrap(),
+            "after release\n"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

@@ -1,0 +1,69 @@
+SenseVoice-Small model: attribution, conversion and applicable terms
+Notice date: 2026-10-05
+
+Model authors/project: FunAudioLLM / Alibaba Group.
+Original project: https://github.com/FunAudioLLM/SenseVoice
+Current repository: https://github.com/QwenAudio/SenseVoice
+Original model: https://huggingface.co/FunAudioLLM/SenseVoiceSmall
+
+Neo uses the SenseVoice-Small ONNX INT8 conversion distributed by
+csukuangfj / sherpa-onnx, not a Neo-trained or Neo-relicensed model:
+https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tree/2365baeacb507f821a0c8120fcee3d484dba7a07
+The conversion applies dynamic MatMul QUInt8 quantization. tokens.txt lists
+tokenizer pieces and IDs. Neo does not further train these weights.
+Conversion script attribution: Copyright 2024 Xiaomi Corp. (Fangjun Kuang);
+the script credits Yuekai Zhang's export_onnx.py as a reference.
+Retain the model name and these author/source attributions when redistributing.
+
+MODEL TERMS ARE NOT THE CODE LICENSE
+
+The model card refers to the nonstandard FunASR MODEL_LICENSE, not the MIT
+license of the inference code and not Neo's Apache-2.0 license.
+The accompanying original texts are:
+  FunASR-MODEL_LICENSE-v1.0 -- historical terms preceding the 2024-07 release
+  FunASR-MODEL_LICENSE      -- later v1.1 text, unchanged at the checked revision
+They are retained for accurate provenance; inclusion does not assert that the
+recipient may freely choose a version or that later amendments are retroactive.
+See also sensevoice-20240731-card.md, sherpa-sense-LICENSE,
+sherpa-sense-README.md and ATTRIBUTIONS.txt.
+
+Section 2 permits use, copying, modification and sharing subject to the whole
+agreement. Section 2.2 requires source/author attribution and model names.
+Both versions' section 3 contains "for reference and learning purposes only"
+and liability/risk language. Read the complete applicable terms, including
+termination provisions; this notice does not replace or amend them.
+
+SCOPE OF COMMERCIAL-USE STATEMENTS
+
+The official README contains a positive commercial-use explanation:
+https://github.com/QwenAudio/SenseVoice/blob/586bbdb2b052f4fe19322581825228b6810a9fb3/README.md#license
+A maintainer also gave a positive response for local transcription integrated
+into desktop software, rather than standalone model resale:
+https://github.com/QwenAudio/SenseVoice/issues/286#issuecomment-4494732043
+
+However, the explanation cited by the README is now explicitly marked as an
+earlier response, not final license-owner confirmation:
+https://github.com/QwenAudio/SenseVoice/issues/334#issuecomment-5083546605
+The related clarification for pinned ONNX artifacts remains unresolved:
+https://github.com/modelscope/FunASR/issues/3715#issuecomment-5771978258
+The proposed README correction https://github.com/QwenAudio/SenseVoice/pull/357
+was not merged as of this notice date. The existing README wording predates
+these qualifications; it is not a subsequent resolution of them.
+
+Accordingly, Neo does not claim that production/commercial-use interpretation
+has received final clarification, nor label the model as Creative Commons NC
+or assert that its section 2 sharing permission has been revoked. Free download
+alone does not resolve the section 3 purpose wording. A distributor/user must
+consider the applicable model terms and intended use; accepting a risk is not
+new permission from the rights holder. No upstream endorsement or additional
+rights are granted by this notice. A license-owner clarification may supersede
+this dated status, but should not be assumed in advance.
+
+NEO DISTRIBUTION DECISION
+
+On 2026-10-05, Neo's project owner decided to retain this SenseVoice conversion
+for integrated local speech recognition and proceed on the basis of the positive
+official explanations above, with awareness of the disclosed ambiguity. This is
+Neo's distribution decision, not new permission or final clarification from the
+model rights holder, and not a guarantee covering every recipient's intended use.
+The original terms, model name, attributions and this disclosure remain supplied.

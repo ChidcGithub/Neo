@@ -73,21 +73,24 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
         for name in ('MANIFEST.json', 'MODIFICATIONS.md', 'gitbash-distribution-policy.json'):
             self.assertIn(name, assembly)
 
-    def test_distribution_gate_is_first_release_action_after_checkout(self):
+    def test_release_uses_technical_checks_without_approval_policy_calls(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         check, release = workflow.split("\n  release:\n", 1)
         steps = re.split(r"(?m)^      - name: ", release)[1:]
         self.assertTrue(steps[0].startswith("Checkout\n"))
-        gate = steps[1]
-        self.assertTrue(gate.startswith("Verify distribution approval (fail closed)\n"))
-        self.assertIn("        run: python tools/check_distribution_review.py --policy tools/distribution-review.json\n", gate)
-        self.assertNotRegex(gate, r"(?m)^\s+(?:if|continue-on-error):")
+        source = next(step for step in steps if step.startswith("Verify pinned drawing source and legal bodies\n"))
+        self.assertIn("        run: python tools/assemble_drawing_release.py verify-source --source target/package/drawing-src\n", source)
+        self.assertNotRegex(source, r"(?m)^\s+(?:if|continue-on-error):")
+        for forbidden in ("check_distribution_review.py", "distribution-review.json", "check-approval", "verify-review",
+                          "Verify distribution approval", "Verify drawing lock approval"):
+            self.assertNotIn(forbidden, workflow)
+        self.assertNotRegex(release, r"--(?:policy|skip)[\w-]*\b")
         self.assertNotIn("continue-on-error:", release)
         self.assertNotIn("always()", release)
-        self.assertNotIn("check_distribution_review.py --policy", check)
+
         for name in ("Build", "Download STT models", "Fetch MinGit runtime", "Assemble package",
                      "Zip portable package", "Build installer (NSIS)", "Create release"):
-            self.assertGreater(release.index("- name: " + name + "\n"), release.index("- name: Verify distribution approval"))
+            self.assertGreater(release.index("- name: " + name + "\n"), release.index("- name: Verify pinned drawing source and legal bodies\n"))
         for module in ("tools.test_distribution_review", "tools.test_audit_native_link", "tools.test_check_release"):
             self.assertIn(module, check)
         self.assertIn("PYTHONPATH: tools", check)
@@ -120,7 +123,7 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
                 self.assertNotIn(forbidden, job)
         self.assertIn("python -B -m unittest tools.test_prepare_sherpa_ci -v", check)
         self.assertLess(check.index("tools.test_prepare_sherpa_ci"), check.index("tools/prepare_sherpa_ci.py --"))
-        self.assertLess(release.index("check_distribution_review.py --policy"), release.index("Cache Sherpa download"))
+        self.assertLess(release.index("assemble_drawing_release.py verify-source"), release.index("tools/prepare_sherpa_ci.py --"))
 
     def test_drawing_root_package_tests_do_not_use_pythonpath_workaround(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -146,22 +149,20 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
             self.assertNotIn(forbidden, drawing)
         self.assertNotRegex(drawing, r"(?m)^\s+if:")
 
-    def test_release_drawing_gates_precede_build_and_assembly_precedes_archive(self):
+    def test_release_drawing_source_check_precedes_build_and_assembly_precedes_archive(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         release = workflow.split("\n  release:\n", 1)[1]
         self.assertIn("needs: [check, drawing-check]", release)
         self.assertIn("runs-on: windows-2022", release)
         steps = re.split(r"(?m)^      - name: ", release)[1:]
-        self.assertTrue(steps[2].startswith("Verify drawing lock approval (fail closed)\n"))
-        order = ["check_distribution_review.py --policy", "assemble_drawing_release.py check-approval",
-                 "assemble_drawing_release.py lock-outputs", "Checkout pinned drawing for release",
-                 "assemble_drawing_release.py verify-review", "Determine version", "Build\n",
+        order = ["assemble_drawing_release.py lock-outputs", "Checkout pinned drawing for release",
+                 "assemble_drawing_release.py verify-source", "Determine version", "Build\n",
                  "assemble_drawing_release.py build", "Assemble package\n",
                  "Audit packaged PE imports (external CRT prerequisite)", "assemble_drawing_release.py assemble", "Zip portable package"]
         self.assertEqual([release.index(value) for value in order], sorted(release.index(value) for value in order))
         self.assertIn("ref: ${{ steps.drawing-pin.outputs.commit }}", release)
         self.assertIn("path: target/package/drawing-src", release)
-        for name in ("Verify drawing lock approval", "Verify drawing reviewed source", "Assemble approved drawing release"):
+        for name in ("Verify pinned drawing source and legal bodies", "Assemble pinned drawing release"):
             step = next(step for step in steps if step.startswith(name))
             self.assertNotRegex(step, r"(?m)^\s+(?:if|continue-on-error):")
         for forbidden in ("package_combined.py", "download-artifact", "--mode evaluation", "public_approved =", "--force", "--skip"):
@@ -235,7 +236,7 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
     def test_source_stage_precedes_binaries_and_publish_uses_verified_draft_helper(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         release = workflow.split("\n  release:\n", 1)[1]
-        order = ["Assemble approved drawing release", "Stage pinned source companions (fail closed)",
+        order = ["Assemble pinned drawing release", "Stage pinned source companions (fail closed)",
                  "Zip portable package", "Build installer (NSIS)", "Create release"]
         self.assertEqual([release.index(name) for name in order], sorted(release.index(name) for name in order))
         stage = pwsh_step("Stage pinned source companions (fail closed)")

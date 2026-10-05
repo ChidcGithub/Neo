@@ -25,23 +25,24 @@ import stat
 import subprocess
 import tempfile
 import time
+import tomllib
 import urllib.parse
 import urllib.request
 import zipfile
 
 if __package__:
-    from . import assemble_drawing_release as drawing
     from . import check_distribution_review as distribution_review
     from . import native_source_bundle as native
     from . import native_source_binding as native_binding
     from . import prepare_runtime_distribution as runtime
+    from . import verify_ort_sources as ort_sources
     from .runtime_sources import check_path, file_record, load_json, safe_relative
 else:
-    import assemble_drawing_release as drawing
     import check_distribution_review as distribution_review
     import native_source_bundle as native
     import native_source_binding as native_binding
     import prepare_runtime_distribution as runtime
+    import verify_ort_sources as ort_sources
     from runtime_sources import check_path, file_record, load_json, safe_relative
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +73,7 @@ def https_url(value):
 def read_lock(path, *, online=True):
     lock = load_json(path)
     require(lock.get("schema") == 1, "Unknown source lock schema")
+    ort_sources.check_lock_entry(lock)
     sources = lock["sources"]
     require(len(sources) == 2 and {s["kind"] for s in sources} == KINDS, "Expected native and gitbash sources exactly once")
     for source in sources:
@@ -338,6 +340,7 @@ def stage(lock_path, package, distribution, native_lib, output, work_root, repos
         check_path(path)
     require(output.is_dir() and package.is_dir() and notice_path.parent.is_dir(), "Missing package/output directories")
     require(not any(p.exists() for p in [notice_path, *destinations]), "Refusing to overwrite source delivery output")
+    ort_sources.verify(lock, root=ROOT, package=package, required=False)
     work_root.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + budget_seconds
     with tempfile.TemporaryDirectory(prefix="source-delivery-", dir=work_root) as temporary:
@@ -353,6 +356,9 @@ def stage(lock_path, package, distribution, native_lib, output, work_root, repos
                 download(source, bundle, deadline)
             verify_bundle(bundle, source, package, distribution, native_lib, directory, max_expanded_mib * CHUNK)
             bundles.append(bundle)
+        if "ort_eigen_notice" in lock:
+            native_bundle = next(bundle for bundle, source in zip(bundles, lock["sources"]) if source["kind"] == "native")
+            ort_sources.verify(lock, root=ROOT, package=package, bundle=native_bundle)
         created = []
         try:
             for bundle, destination, source in zip(bundles, destinations, lock["sources"]):
@@ -387,28 +393,51 @@ def verify_remote(assets, expected):
         require(asset.get("digest") == "sha256:" + record["sha256"], "Remote SHA-256 missing/mismatch: " + asset["name"])
 
 
-def check_publication_review(repository, tag, version):
-    """Enforce workflow gates for direct callers too, without any network calls."""
-    record = distribution_review.check_review(ROOT / distribution_review.POLICY)
-    drawing.approval(drawing.load_lock())
+def check_publication_identity(repository, tag, version):
+    """Bind publication to a clean, tagged checkout, not human approval records."""
     identity(repository, tag, version)
-    require(version == record["review"]["root_version"], "Release version differs from reviewed root version")
-    # check_review binds HEAD's source tree to the reviewed commit, allowing only
-    # the approval-record commit itself to differ. The release tag must name HEAD.
+
+    def committed_toml(name):
+        path = distribution_review.relative_file(ROOT, name)
+        data = path.read_bytes()
+        # Check these inputs even when index flags hide changes from git diff.
+        require(data.replace(b"\r\n", b"\n") == distribution_review.git(
+            ROOT, "show", f"HEAD:{name}").replace(b"\r\n", b"\n"),
+                f"{name} differs from committed HEAD")
+        return tomllib.loads(data.decode("utf-8"))
+
+    workspace = committed_toml("Cargo.toml")["workspace"]
+    require(version == workspace["package"]["version"], "Release version differs from root Cargo version")
+    packages = committed_toml("Cargo.lock")["package"]
+    for member in workspace["members"]:
+        package = committed_toml(f"{member}/Cargo.toml")["package"]
+        package_version = package["version"]
+        if package_version == {"workspace": True}:
+            package_version = version
+        locked = [p for p in packages if p["name"] == package["name"] and "source" not in p]
+        require(len(locked) == 1 and locked[0]["version"] == package_version,
+                f"Cargo.lock version mismatch for workspace package {package['name']}")
+    distribution_review.git(ROOT, "diff", "--exit-code", "HEAD", "--")
+    # Also reject staged changes whose working-tree copy has been restored to HEAD.
+    distribution_review.git(ROOT, "diff", "--cached", "--exit-code", "HEAD", "--")
+    require(not distribution_review.git(ROOT, "ls-files", "--others", "--exclude-standard", "-z"),
+            "Untracked non-ignored files in publication checkout")
     tag_commit = distribution_review.git(ROOT, "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}").strip()
     head = distribution_review.git(ROOT, "rev-parse", "--verify", "HEAD").strip()
     require(re.fullmatch(rb"[0-9a-f]{40}", head) and tag_commit == head,
-            "Existing local release tag must point at the reviewed HEAD commit")
+            "Existing local release tag must point at HEAD commit")
 
 
 def publish(lock_path, package, output, repository, tag, version, notes, prerelease, *, variants=None):
     """Explicit gated network command. Failure leaves the draft private."""
-    check_publication_review(repository, tag, version)
+    check_publication_identity(repository, tag, version)
     if variants is not None:
         require(len(variants) == len(VARIANTS) and set(variants) == set(VARIANTS),
                 "Variants must include int8 and fp32 exactly once, with no unknown variants")
     lock = read_lock(lock_path)
     expected_notice = source_access(lock, repository, tag, version)
+    ort_sources.verify(lock, root=ROOT, package=package,
+                       bundle=output / asset_name(version, "native"), required=False)
     require(load_json(package / "docs/licenses/SOURCE-ACCESS.json") == expected_notice, "Source access notice differs from lock/release identity")
     if variants is not None:
         # SOURCE-ACCESS.json is the staged delivery manifest; compare bytes too,

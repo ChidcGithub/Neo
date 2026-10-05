@@ -95,11 +95,40 @@ class WorkflowSyntaxTests(unittest.TestCase):
                 self.assertIn("tools/prepare_sherpa_ci.py", key)
                 self.assertNotIn("restore-keys", caches[0]["with"])
                 if job_name == "release":
-                    self.assertEqual(steps[1]["name"], "Verify distribution approval (fail closed)")
-                    self.assertEqual(steps[2]["name"], "Verify drawing lock approval (fail closed)")
-                    self.assertGreater(index, 2)
+                    source = next(i for i, step in enumerate(steps)
+                                  if step.get("name") == "Verify pinned drawing source and legal bodies")
+                    self.assertLess(source, index)
         drawing = workflow["jobs"]["drawing-check"]["steps"]
         self.assertFalse(any("prepare_sherpa_ci" in step.get("run", "") for step in drawing))
+
+    def test_release_requires_pinned_drawing_source_before_build_without_policy_calls(self):
+        workflow = parse_workflow((WORKFLOWS / "release.yml").read_text(encoding="utf-8"))
+        steps = workflow["jobs"]["release"]["steps"]
+        names = [step.get("name") for step in steps]
+        source = names.index("Verify pinned drawing source and legal bodies")
+        self.assertEqual(steps[source]["run"], "python tools/assemble_drawing_release.py verify-source --source target/package/drawing-src")
+        checkout = names.index("Checkout pinned drawing for release")
+        self.assertLess(names.index("Read drawing release pin"), checkout)
+        self.assertLess(checkout, source)
+        self.assertEqual(steps[checkout]["with"]["repository"], "${{ steps.drawing-pin.outputs.repository }}")
+        self.assertEqual(steps[checkout]["with"]["ref"], "${{ steps.drawing-pin.outputs.commit }}")
+        self.assertEqual(steps[checkout]["with"]["path"], "target/package/drawing-src")
+        for name in ("Build", "Build drawing release and check both windowless versions"):
+            self.assertLess(source, names.index(name))
+        assembly = names.index("Assemble pinned drawing release")
+        self.assertLess(names.index("Build drawing release and check both windowless versions"), assembly)
+        self.assertLess(assembly, names.index("Stage pinned source companions (fail closed)"))
+        for index in (source, assembly):
+            self.assertNotIn("if", steps[index])
+            self.assertNotIn("continue-on-error", steps[index])
+        for job in workflow["jobs"].values():
+            for step in job["steps"]:
+                script = step.get("run", "")
+                for forbidden in ("check_distribution_review.py", "distribution-review.json", "check-approval", "verify-review"):
+                    self.assertNotIn(forbidden, script)
+                self.assertNotRegex(script, r"--policy[\w-]*\b")
+        for step in steps:
+            self.assertNotRegex(step.get("run", ""), r"--skip[\w-]*\b")
 
     def test_source_delivery_is_required_before_archives_and_uses_only_publish_step_token(self):
         workflow = parse_workflow((WORKFLOWS / "release.yml").read_text(encoding="utf-8"))
@@ -147,7 +176,7 @@ class WorkflowSyntaxTests(unittest.TestCase):
         self.assertIn("-$variant-installer-x64.exe", installer)
         self.assertIn("--variants int8 fp32", by_name["Create release"]["run"])
         self.assertIn("--list 'v[0-9]*'", by_name["Generate changelog"]["run"])
-        self.assertIn("assemble_drawing_release.py assemble", by_name["Assemble approved drawing release"]["run"])
+        self.assertIn("assemble_drawing_release.py assemble", by_name["Assemble pinned drawing release"]["run"])
         self.assertTrue(any("tools.test_prepare_math_models" in s.get("run", "") for s in workflow["jobs"]["check"]["steps"]))
 
     def test_parser_rejects_regressed_root_package_step_indentation(self):

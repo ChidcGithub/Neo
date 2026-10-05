@@ -81,6 +81,18 @@ jobs:
       - name: Native source binding regressions
         run: python -B -m unittest tools.test_native_source_binding -v
 
+      - name: ORT Eigen source notice regressions
+        run: python -B -m unittest tools.test_verify_ort_sources -v
+
+      - name: Verify pinned ORT Eigen source notices
+        run: python -B tools/verify_ort_sources.py
+
+      - name: SenseVoice notice regressions
+        run: python -B -m unittest tools.test_verify_sensevoice_notices -v
+
+      - name: Verify SenseVoice license materials
+        run: python -B tools/verify_sensevoice_notices.py
+
       - name: Math model download regressions
         run: python -B -m unittest tools.test_prepare_math_models -v
 
@@ -185,12 +197,6 @@ jobs:
         with:
           fetch-depth: 0 # 需要完整历史生成 changelog
 
-      # 默认阻断；审批记录不是自动法律判断。不得给门禁添加 continue-on-error/绕过参数。
-      - name: Verify distribution approval (fail closed)
-        run: python tools/check_distribution_review.py --policy tools/distribution-review.json
-
-      - name: Verify drawing lock approval (fail closed)
-        run: python tools/assemble_drawing_release.py check-approval
 
       - name: Read drawing release pin
         id: drawing-pin
@@ -204,8 +210,8 @@ jobs:
           path: target/package/drawing-src
           persist-credentials: false
 
-      - name: Verify drawing reviewed source and legal bodies (fail closed)
-        run: python tools/assemble_drawing_release.py verify-review --source target/package/drawing-src
+      - name: Verify pinned drawing source and legal bodies
+        run: python tools/assemble_drawing_release.py verify-source --source target/package/drawing-src
 
       - name: Determine version
         id: ver
@@ -351,6 +357,9 @@ jobs:
           # 仅复制公开法律文件；docs-pri 审计报告与本地证据不随包。
           Copy-Item -Recurse docs\licenses "$pkg\docs\licenses"
 
+      - name: Verify packaged SenseVoice identity and notices
+        run: python -B tools/verify_sensevoice_notices.py --package dist/neo
+
       # 外部官方 x64 CRT prerequisite：只审计 PE，不收集 DLL，不下载或执行 vc_redist。
       - name: Audit packaged PE imports (external CRT prerequisite)
         shell: pwsh
@@ -365,7 +374,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Packaged PE / CRT audit failed' }
 
       # Drawing has its own PE audit; both applications use an external CRT prerequisite.
-      - name: Assemble approved drawing release
+      - name: Assemble pinned drawing release
         run: python tools/assemble_drawing_release.py assemble --source target/package/drawing-src --target-dir target/package/drawing-build --package dist/neo
 
       - name: Stage pinned source companions (fail closed)

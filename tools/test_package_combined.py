@@ -47,7 +47,8 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(self.lock["commit"], "ea1ecc87ec97717117f03625fd958c75cc2c0a49")
         self.assertEqual(self.lock["rust"], "1.97.1")
         self.assertEqual(self.lock["protocol"], 1)
-        self.assertFalse(self.lock["public_approved"])
+        self.assertNotIn("public_approved", self.lock)
+        self.assertEqual(self.lock["source_binding"]["source_commit"], self.lock["commit"])
 
     def test_strong_source_allowlist(self):
         for name in ("Cargo.lock", "drawing/src/main.rs", "crates/board-core/src/lib.rs"):

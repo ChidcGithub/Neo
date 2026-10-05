@@ -4,7 +4,7 @@
   "blockers": [
     {
       "issue": "sherpa-native",
-      "outstanding": "A source-built no-TTS Sherpa candidate and isolated Neo relink now exclude detected eSpeak/Piper retention with ASR/VAD and build-graph evidence. Complete native ORT/Eigen provenance, corresponding-source/notice obligations and release-artifact binding; the technical fix and no-marker scan are not blanket distribution clearance."
+      "outstanding": "No-TTS removal is technically verified. ORT/Eigen source routes are now documented from official artifact checksums, actual library baselines and fixed recipes; static 1.28.2 uses two supplied patches, wake 1.30.0 and drawing 1.22.0 use the supplied base source by their identified recipes. Producer-checkout limits are disclosed in docs/licenses/runtime/ORT-EIGEN-SOURCE.txt, not treated as a signature/reproducibility requirement. Remaining release work: execute fresh CI native validation and verify final package binding, notices and source delivery; this record is not whole-release approval."
     },
     {
       "issue": "gitbash-source",
@@ -12,7 +12,7 @@
     },
     {
       "issue": "model-rights",
-      "outstanding": "The owner confirmed self-training and selected MIT for the hash-identified hi_neo weights; the author-license gap is resolved. CI Silero v4 MIT and historical SenseVoice FunASR terms are identified. Review intended-use compliance and known third-party input rights separately, retain embedding/conversion notices, and use the verified CI VAD rather than an unidentified local artifact."
+      "outstanding": "hi_neo author MIT authorization and CI Silero v4 MIT identity are resolved. SenseVoice section 2 permits sharing subject to the full agreement; section 3 purpose wording remains ambiguous against the positive README/desktop-use replies. As checked 2026-10-05, issue #334 retains the explicit non-final qualification, PR #357 is unmerged and FunASR #3715 remains unresolved for pinned ONNX artifacts. On 2026-10-05 the project owner explicitly chose to retain SenseVoice in Neo and proceed based on the existing positive official explanations after disclosure of this ambiguity. The project intended-use decision is recorded and is no longer awaiting confirmation; it neither resolves the upstream ambiguity nor grants new rights or approves the whole release. Remaining model delivery work: verify SENSEVOICE-NOTICE.txt, both historical agreement texts and conversion attributions in the final package, and use the identified CI VAD. Concrete third-party training-input questions remain separate from the author's resolved MIT grant."
     },
     {
       "issue": "msvc-authorization",

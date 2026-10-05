@@ -19,6 +19,8 @@ MatMul QUInt8 quantization; tokens.txt enumerates tokenizer pieces and IDs.
 Conversion script notice: Copyright 2024 Xiaomi Corp. (Fangjun Kuang).
 The script credits Yuekai Zhang's export_onnx.py as a reference.
 These describe upstream conversion; Neo has not retrained these weights.
+See SENSEVOICE-NOTICE.txt for the model terms and the unresolved section 3
+interpretation; code MIT and Neo Apache-2.0 do not relicense these weights.
 
 LiveKit wakeword
 Source: https://github.com/livekit/livekit-wakeword

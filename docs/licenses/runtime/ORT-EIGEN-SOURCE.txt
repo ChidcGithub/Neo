@@ -1,0 +1,99 @@
+ONNX Runtime / Eigen source access and modification notice
+2026-10-05
+
+This notice applies to Neo combined packages, including drawing and blackboard.
+It supersedes outdated availability/correspondence statements in the historical
+native-sources notes and source archive. Original license texts remain unchanged.
+It is not an upstream endorsement, a producer attestation, or whole-release approval.
+
+EIGEN SOURCE ACCESS (MPL-2.0)
+
+Eigen covered source may be obtained, modified and redistributed under the
+Mozilla Public License 2.0. Complete original source and file-level notices are
+available without charge at:
+https://github.com/ChidcGithub/Neo/releases/download/dependency-sources-v1/neo-native-sources-updated.zip
+Archive size: 7570574 bytes
+SHA-256: 757fed6d081ea23a2862d5ebb90c7fe57ded08f842724a199bcc454df07a2a8a
+
+Inside that ZIP:
+  sources/eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33.zip
+  SHA-256: 6a60d76351f97132669daeeb721d6bf14b008101883ad2d687a3201c5c461eb0
+  Complete 1891-file base source, retaining copyright and license notices.
+
+The complete MPL text is also supplied at
+native-sources/eigen-1d8b82b-COPYING.MPL2 beside this notice. Other file-level
+Eigen terms are retained in the source archive and accompanying COPYING files.
+MPL-covered portions retain their license within the larger work; this does not
+relicense Neo or require every component of the larger work to use MPL.
+For offline distribution, provide this companion on the same delivery media.
+Versioned application releases also supply the identical companion under the
+native source asset name recorded in ../SOURCE-ACCESS.json.
+
+DISTINCT INPUTS AND PATCH ROUTES
+
+1. Neo no-TTS Sherpa uses Eigen 5.0.1 directly, separate from ORT's Eigen.
+   Its complete unmodified source is sources/eigen-5.0.1.tar.gz in the companion.
+   SHA-256: e9c326dc8c05cd1e044c71f30f1b2e34a6161a3b6ecf445d56b53ff1669e3dec
+   Current-build recipe validation checks the actual source tree and libraries.
+
+2. Main static ORT 1.28.2:
+   ORT baseline: 33ca9628233dc8f002435e868d4c2e9f82766ca1
+   Producer archive SHA-256:
+   77c6cc2a419828f450a570851d7d6d2385523c411dbe858f841a4c7338a78881
+   Uses Eigen 1d8b82b0740839c0de7f1242a3585e3390ff5f33 with these patches,
+   in this order, included in the companion's notices/ directory:
+     ort-1.28.2-eigen-s390x-build.patch
+     ort-1.28.2-eigen-s390x-build-werror.patch
+   Apply to the unpacked base with patch --binary --ignore-whitespace -p1.
+   These modify ZVector headers and Eigen/src/Core/RandomImpl.h. The x64 target
+   does not make the supplied source changes inapplicable. Isolated source
+   reconstruction was verified; the base ZIP itself remains unpatched.
+   Official build run 33741118114, builder commit
+   6314c7b252578dc0b8ddd3919b593c4359812818, successful upload timestamps,
+   release checksum and archive-to-LIB equality support this correspondence.
+   https://github.com/csukuangfj/onnxruntime-build/actions/runs/33741118114
+   https://github.com/microsoft/onnxruntime/blob/33ca9628233dc8f002435e868d4c2e9f82766ca1/cmake/external/eigen.cmake
+   This is a documented engineering inference, not recovered per-file production
+   history or equality of the outer Actions ZIP and inner release archive.
+
+3. Wake ORT 1.30.0 Windows DLLs:
+   Official wheel SHA-256:
+   0edd0145a6e3fce8a1276491dc784d615e3c58bcb952c9b4e5c876d5c6a12ad7
+   ORT baseline: f2c39fe2f838cf35ce7da92824f5a5e3ee6e88a7
+   DLLs and existing MIT/third-party notices match the official wheel bytes.
+   Its Windows Python packaging uses the vcpkg Eigen overlay at the same base
+   revision, with no header patch invocation. Do NOT apply the static 1.28.2
+   patches to this route. Installed CMake/pkg-config metadata fixups are distinct
+   from covered header changes. The exact Azure production run was not recovered.
+   https://github.com/microsoft/onnxruntime/blob/f2c39fe2f838cf35ce7da92824f5a5e3ee6e88a7/cmake/vcpkg-ports/eigen3/portfile.cmake
+
+4. Drawing/blackboard Pyke static ORT 1.22.0:
+   Producer TGZ SHA-256:
+   540d19b3379fda6fb8f7280d8c15efde20ed225a67a357a6dae38c4300fe190d
+   LIB SHA-256:
+   ea936a55f367d8eeaafd50e595a18b254281ed16fe566c614e6e4b10055ce024
+   ORT baseline: f217402897f40ebba457e2421bc0a4702771968e
+   Official checksum manifest:
+   https://github.com/pykeio/ort/blob/d1ebde95d386513fea836593815e8f86f7b96a85/ort-sys/dist.txt
+   Together with the actual LIB baseline and contemporaneous builder
+   77ec493e3495901a361469951ab992181e52fd05, this supports supplying the same
+   complete Eigen base revision without the static 1.28.2 patches. The inspected
+   four builder patches do not change Eigen. A later download-mirror patch also
+   retained that revision. GitLab/GitHub archive containers differ, but the
+   complete source files and Git tree were verified equal.
+   The actual production checkout/cache was not recovered; no statement that
+   the producer attested to an unmodified tree is made. No contrary Eigen
+   modification was identified. Source identification is a reasonable engineering
+   inference, not a signed or bit-reproducible-build claim.
+   https://github.com/microsoft/onnxruntime/blob/f217402897f40ebba457e2421bc0a4702771968e/cmake/external/eigen.cmake
+
+ONNX Runtime retains its MIT license; Eigen retains its applicable file-level
+licenses. Preserve all shipped MIT/third-party notices, including the drawing
+runtime's separate notices. The companion is Eigen source supply plus native
+notices, not a complete source distribution of every native component.
+
+Evidence limitations above are disclosed, not converted into a requirement for
+producer signatures or byte-for-byte build reproduction. If a different input,
+patch or specific contrary provenance is discovered, reassess this mapping and
+supply the corresponding covered source. Final package validation must retain
+this notice, the JSON mapping, source access records and original license texts.

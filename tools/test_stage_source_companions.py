@@ -26,19 +26,11 @@ def write_json(path, value):
 
 
 @contextmanager
-def mock_publication_review(version):
-    # Only synthetic asset-flow tests substitute gate results; no policy is written.
-    with patch.object(delivery.distribution_review, "check_review", return_value={"review": {"root_version": version}}) as parent, \
-            patch.object(delivery.drawing, "load_lock", return_value={"synthetic": True}) as lock, \
-            patch.object(delivery.drawing, "approval") as child, \
-            patch.object(delivery.distribution_review, "git", return_value=b"a" * 40 + b"\n") as git:
+def mock_publication_identity(version):
+    # Asset-flow tests remain offline; real checkout identity is tested separately.
+    with patch.object(delivery, "check_publication_identity") as check:
         yield
-        parent.assert_called_once_with(delivery.ROOT / delivery.distribution_review.POLICY)
-        lock.assert_called_once_with()
-        child.assert_called_once_with({"synthetic": True})
-        if git.called:
-            if git.call_count != 2:
-                raise AssertionError("Expected both local tag and HEAD checks")
+        check.assert_called_once_with("owner/repo", "v" + version, version)
 
 
 class SourceDeliveryTests(unittest.TestCase):
@@ -277,7 +269,7 @@ class SourceDeliveryTests(unittest.TestCase):
                         path.unlink()
                     (self.package / "docs/licenses/SOURCE-ACCESS.json").unlink()
                 args, assets = self.prepare_publish(version)
-                with mock_publication_review(version), patch.object(delivery, "run_gh", side_effect=self.gh_results(assets, version)) as gh:
+                with mock_publication_identity(version), patch.object(delivery, "run_gh", side_effect=self.gh_results(assets, version)) as gh:
                     delivery.publish(*args)
                 calls = [call.args[0] for call in gh.call_args_list]
                 self.assertEqual(len(calls), 4)
@@ -300,13 +292,13 @@ class SourceDeliveryTests(unittest.TestCase):
         source = self.output / assets[0]["name"]
         original = source.read_bytes()
         source.write_bytes(b"tamper")
-        with mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh, self.assertRaisesRegex(ValueError, "missing/changed"):
+        with mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh, self.assertRaisesRegex(ValueError, "missing/changed"):
             delivery.publish(*args)
         gh.assert_not_called()
         source.write_bytes(original)
         notice = self.package / "docs/licenses/SOURCE-ACCESS.json"
         write_json(notice, {"status": "published"})
-        with mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh, self.assertRaisesRegex(ValueError, "notice differs"):
+        with mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh, self.assertRaisesRegex(ValueError, "notice differs"):
             delivery.publish(*args)
         gh.assert_not_called()
 
@@ -318,7 +310,7 @@ class SourceDeliveryTests(unittest.TestCase):
             variant[0].update(changes)
             variants.append(variant)
         for variant in variants:
-            with self.subTest(variant=variant), mock_publication_review(args[5]), patch.object(delivery, "run_gh", side_effect=self.gh_results(variant)) as gh:
+            with self.subTest(variant=variant), mock_publication_identity(args[5]), patch.object(delivery, "run_gh", side_effect=self.gh_results(variant)) as gh:
                 with self.assertRaises(ValueError):
                     delivery.publish(*args)
                 self.assertEqual(gh.call_count, 3)
@@ -328,10 +320,10 @@ class SourceDeliveryTests(unittest.TestCase):
         args, assets = self.prepare_publish()
         results = self.gh_results(assets)
         results[1] = json.dumps({"databaseId": 17, "tagName": "v1.2.3", "isDraft": False, "isPrerelease": False})
-        with mock_publication_review(args[5]), patch.object(delivery, "run_gh", side_effect=results) as gh, self.assertRaisesRegex(ValueError, "private draft"):
+        with mock_publication_identity(args[5]), patch.object(delivery, "run_gh", side_effect=results) as gh, self.assertRaisesRegex(ValueError, "private draft"):
             delivery.publish(*args)
         self.assertEqual(gh.call_count, 2)
-        with mock_publication_review(args[5]), patch.object(delivery, "run_gh", side_effect=subprocess.CalledProcessError(1, ["gh"])) as gh:
+        with mock_publication_identity(args[5]), patch.object(delivery, "run_gh", side_effect=subprocess.CalledProcessError(1, ["gh"])) as gh:
             with self.assertRaises(subprocess.CalledProcessError):
                 delivery.publish(*args)
         self.assertEqual(gh.call_count, 1)
@@ -342,6 +334,138 @@ class SourceDeliveryTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], ["gh", "release", "view", "v1.2.3"])
         self.assertTrue(run.call_args.kwargs["check"])
         self.assertEqual(run.call_args.kwargs["timeout"], 600)
+
+
+class OrtSourceDeliveryTests(unittest.TestCase):
+    setUp = SourceDeliveryTests.setUp
+    save_lock = SourceDeliveryTests.save_lock
+    fake_download = SourceDeliveryTests.fake_download
+    stage = SourceDeliveryTests.stage
+    prepare_publish = SourceDeliveryTests.prepare_publish
+    gh_results = SourceDeliveryTests.gh_results
+
+    def enable_ort_notice(self):
+        from tools.test_verify_ort_sources import fixture, digest, put_json
+        ort = delivery.ort_sources
+        self.public = self.root / "public-root"
+        lock, self.ort_record, bundle, payload = fixture(self.public, self.package)
+        self.lock["ort_eigen_notice"] = lock["ort_eigen_notice"]
+        source = next(s for s in self.lock["sources"] if s["kind"] == "native")
+        source.update(lock["sources"][0])
+        source["expected_runtime_files_sha256"] = delivery.runtime.digest_json(delivery.tree_files(self.package / "runtime/onnx"))
+        self.bundles["native"] = bundle
+        self.save_lock()
+        patch.dict(ort.native.SOURCES, {ort.EIGEN: {**ort.native.SOURCES[ort.EIGEN],
+                   "sha256": digest(payload["sources/" + ort.EIGEN])}}).start()
+        patch.object(ort, "tracked").start()
+        verify = ort.verify
+
+        def fixture_root(lock, **kwargs):
+            kwargs["root"] = self.public
+            return verify(lock, **kwargs)
+
+        self.ort_verify = patch.object(ort, "verify", side_effect=fixture_root).start()
+        self.put_json = put_json
+
+    def assert_no_outputs(self):
+        self.assertEqual(list(self.output.iterdir()), [])
+        self.assertFalse((self.package / "docs/licenses/SOURCE-ACCESS.json").exists())
+
+    def test_opt_in_verifies_package_then_zip_before_staging(self):
+        self.enable_ort_notice()
+        result, _, _ = self.stage()
+        self.assertEqual(len(result["sources"]), 2)
+        self.assertEqual(self.ort_verify.call_count, 2)
+        self.assertNotIn("bundle", self.ort_verify.call_args_list[0].kwargs)
+        self.assertIn("bundle", self.ort_verify.call_args_list[1].kwargs)
+
+    def test_partial_lock_and_missing_or_stale_notice_block_before_download(self):
+        self.enable_ort_notice()
+        original = copy.deepcopy(self.lock)
+        for key in original["ort_eigen_notice"]:
+            self.lock = copy.deepcopy(original)
+            del self.lock["ort_eigen_notice"][key]
+            self.save_lock()
+            with self.subTest(key=key), patch.object(delivery, "download") as download, self.assertRaises(ValueError):
+                delivery.stage(*self.stage_args)
+            download.assert_not_called()
+            self.assert_no_outputs()
+        self.lock = original
+        self.save_lock()
+        path = self.package / delivery.ort_sources.NOTICE
+        path.unlink()
+        for stale in (False, True):
+            if stale:
+                path.write_text("stale", encoding="utf-8")
+            with self.subTest(stale=stale), patch.object(delivery, "download") as download, self.assertRaises(ValueError):
+                delivery.stage(*self.stage_args)
+            download.assert_not_called()
+            self.assert_no_outputs()
+
+    def test_package_missing_full_mpl_blocks_before_download_or_output(self):
+        self.enable_ort_notice()
+        (self.package / delivery.ort_sources.PUBLIC_NATIVE / "eigen-1d8b82b-COPYING.MPL2").unlink()
+        with patch.object(delivery, "download") as download, self.assertRaisesRegex(ValueError, "COPYING.MPL2"):
+            delivery.stage(*self.stage_args)
+        download.assert_not_called()
+        self.assert_no_outputs()
+
+    def test_wrong_native_member_fails_before_copy_even_with_relocked_zip(self):
+        self.enable_ort_notice()
+        bundle = self.bundles["native"]
+        with zipfile.ZipFile(bundle) as archive:
+            payload = {name: archive.read(name) for name in archive.namelist()}
+        payload["sources/" + delivery.ort_sources.EIGEN] = b"wrong Eigen archive"
+        with zipfile.ZipFile(bundle, "w") as archive:
+            for name, content in payload.items():
+                archive.writestr(name, content)
+        pin = delivery.file_record(bundle)
+        next(s for s in self.lock["sources"] if s["kind"] == "native").update(pin)
+        self.ort_record["source_delivery"].update(pin)
+        self.put_json(self.public, delivery.ort_sources.RECORD, self.ort_record)
+        shutil.copyfile(self.public / delivery.ort_sources.RECORD, self.package / delivery.ort_sources.RECORD)
+        self.lock["ort_eigen_notice"]["record_sha256"] = delivery.file_record(self.public / delivery.ort_sources.RECORD)["sha256"]
+        self.save_lock()
+        with self.assertRaisesRegex(ValueError, "Source member hash mismatch"):
+            self.stage()
+        self.assert_no_outputs()
+
+    def test_publish_rechecks_base_against_public_root_before_gh(self):
+        self.enable_ort_notice()
+        args, assets = self.prepare_publish()
+        with mock_publication_identity(args[5]), patch.object(delivery, "run_gh", side_effect=self.gh_results(assets)) as gh:
+            delivery.publish(*args)
+        self.assertEqual(gh.call_count, 4)
+        (self.package / delivery.ort_sources.NOTICE).write_text("changed", encoding="utf-8")
+        with mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh, self.assertRaisesRegex(ValueError, "differs from tracked"):
+            delivery.publish(*args)
+        gh.assert_not_called()
+
+    def test_variants_cannot_omit_or_change_notice_or_override_public_root(self):
+        self.enable_ort_notice()
+        args, assets = self.prepare_publish(variants=delivery.VARIANTS)
+        packages = [self.package.with_name(self.package.name + "-" + v) for v in delivery.VARIANTS]
+        for variant, package in zip(delivery.VARIANTS, packages):
+            delivery.inventory(package, variant, args[5])
+        with mock_publication_identity(args[5]), patch.object(delivery, "run_gh", side_effect=self.gh_results(assets)):
+            delivery.publish(*args, variants=delivery.VARIANTS)
+        notice = delivery.ort_sources.NOTICE
+        original = (self.package / notice).read_bytes()
+        for missing in (True, False):
+            path = packages[0] / notice
+            if missing:
+                path.unlink()
+            else:
+                path.write_bytes(b"changed")
+            with mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh, self.assertRaisesRegex(ValueError, "notices differ"):
+                delivery.publish(*args, variants=delivery.VARIANTS)
+            gh.assert_not_called()
+            path.write_bytes(original)
+        for package in (self.package, *packages):
+            (package / notice).write_bytes(b"same stale notice everywhere")
+        with mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh, self.assertRaisesRegex(ValueError, "differs from tracked"):
+            delivery.publish(*args, variants=delivery.VARIANTS)
+        gh.assert_not_called()
 
 
 class VariantPublicationTests(unittest.TestCase):
@@ -381,7 +505,7 @@ class VariantPublicationTests(unittest.TestCase):
     def test_cli_publishes_both_variants_and_shared_sources_in_one_verified_draft(self):
         with self.offline():
             args, assets = self.prepare_variants()
-            with mock_publication_review(args[5]), \
+            with mock_publication_identity(args[5]), \
                     patch.object(sys, "argv", self.cli_args(args) + ["--variants", "int8", "fp32"]), \
                     patch.object(delivery, "run_gh", side_effect=self.gh_results(assets, args[5])) as gh:
                 delivery.main()
@@ -414,7 +538,7 @@ class VariantPublicationTests(unittest.TestCase):
             original = path.read_bytes()
             for content in (None, b""):
                 with self.subTest(name=path.name, content=content), self.offline(), \
-                        mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh:
+                        mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh:
                     if content is None:
                         path.unlink()
                     else:
@@ -429,7 +553,7 @@ class VariantPublicationTests(unittest.TestCase):
         for variants in ([], ["int8"], ["fp32"], ["int8", "int8"], ["fp32", "fp32"],
                          ["int8", "fp16"], ["INT8", "fp32"], ["../int8", "fp32"],
                          ["int8", "fp32", "int8"]):
-            with self.subTest(variants=variants), self.offline(), mock_publication_review(args[5]), \
+            with self.subTest(variants=variants), self.offline(), mock_publication_identity(args[5]), \
                     patch.object(delivery, "read_lock") as lock, patch.object(delivery, "run_gh") as gh, \
                     self.assertRaisesRegex(ValueError, "exactly once"):
                 delivery.publish(*args, variants=variants)
@@ -462,7 +586,7 @@ class VariantPublicationTests(unittest.TestCase):
                 original = path.read_bytes()
                 for content in (None, b"{}", original + b"\n"):
                     with self.subTest(variant=variant, name=name, content=content), self.offline(), \
-                            mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh:
+                            mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh:
                         if content is None:
                             path.unlink()
                         else:
@@ -473,14 +597,14 @@ class VariantPublicationTests(unittest.TestCase):
                         path.write_bytes(original)
             extra = directory / "docs/licenses/extra.txt"
             extra.write_bytes(b"not in base")
-            with self.offline(), mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh, \
+            with self.offline(), mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh, \
                     self.assertRaisesRegex(ValueError, "notices differ"):
                 delivery.publish(*args, variants=["int8", "fp32"])
             gh.assert_not_called()
             extra.unlink()
             absent = directory.with_name(directory.name + "-absent")
             directory.rename(absent)
-            with self.offline(), mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh, \
+            with self.offline(), mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh, \
                     self.assertRaises(OSError):
                 delivery.publish(*args, variants=["int8", "fp32"])
             gh.assert_not_called()
@@ -493,7 +617,7 @@ class VariantPublicationTests(unittest.TestCase):
             notice = delivery.load_json(path)
             notice["sources"][0]["sha256"] = "0" * 64
             write_json(path, notice)
-        with self.offline(), mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh, \
+        with self.offline(), mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh, \
                 self.assertRaisesRegex(ValueError, "notice differs from lock"):
             delivery.publish(*args, variants=["int8", "fp32"])
         gh.assert_not_called()
@@ -508,7 +632,7 @@ class VariantPublicationTests(unittest.TestCase):
                 changed[i].update(change)
                 bad_assets.append(changed)
         for remote in bad_assets:
-            with self.subTest(remote=remote), self.offline(), mock_publication_review(args[5]), \
+            with self.subTest(remote=remote), self.offline(), mock_publication_identity(args[5]), \
                     patch.object(delivery, "run_gh", side_effect=self.gh_results(remote, args[5])) as gh, \
                     self.assertRaises(ValueError):
                 delivery.publish(*args, variants=["fp32", "int8"])
@@ -524,7 +648,7 @@ class VariantPublicationTests(unittest.TestCase):
                 original = path.read_bytes()
                 for content in (None, b"x" * len(original)):
                     with self.subTest(variant=variant, name=name, content=content), self.offline(), \
-                            mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh:
+                            mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh:
                         if content is None:
                             path.unlink()
                         else:
@@ -535,7 +659,7 @@ class VariantPublicationTests(unittest.TestCase):
                         path.write_bytes(original)
             extra = package / "resources/models/math/extra.onnx"
             extra.write_bytes(b"unexpected model")
-            with self.offline(), mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh, \
+            with self.offline(), mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh, \
                     self.assertRaisesRegex(ValueError, "package manifest differs"):
                 delivery.publish(*args, variants=["int8", "fp32"])
             gh.assert_not_called()
@@ -552,7 +676,7 @@ class VariantPublicationTests(unittest.TestCase):
                              dict(original, variant="fp32" if variant == "int8" else "int8"),
                              dict(original, schema=2), dict(original, files={}), unsafe):
                 with self.subTest(variant=variant, manifest=manifest), self.offline(), \
-                        mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh:
+                        mock_publication_identity(args[5]), patch.object(delivery, "run_gh") as gh:
                     if manifest is None:
                         path.unlink()
                     else:
@@ -561,16 +685,6 @@ class VariantPublicationTests(unittest.TestCase):
                         delivery.publish(*args, variants=["int8", "fp32"])
                     gh.assert_not_called()
                     write_json(path, original)
-
-    def test_variants_do_not_bypass_real_publication_gate(self):
-        missing = delivery.ROOT / "target/source-delivery-gate-test-unused"
-        with self.offline(), patch.object(delivery, "run_gh") as gh, \
-                patch.object(delivery, "read_lock") as lock, \
-                self.assertRaisesRegex(ValueError, "Outstanding distribution blockers|not APPROVED"):
-            delivery.publish(delivery.LOCK, missing, missing, "owner/repo", "v1.2.3-pre11", "1.2.3-pre11",
-                             missing, True, variants=["int8", "fp32"])
-        gh.assert_not_called()
-        lock.assert_not_called()
 
 
 class InventoryTests(unittest.TestCase):
@@ -895,96 +1009,208 @@ class LocalSourceTests(unittest.TestCase):
         publish.assert_not_called()
 
 
-class PublicationGateTests(unittest.TestCase):
-    def publish(self):
-        # Gates must reject before touching any of these deliberately absent assets.
-        missing = delivery.ROOT / "target/source-delivery-gate-test-unused"
-        delivery.publish(delivery.LOCK, missing, missing, "owner/repo", "v1.2.3", "1.2.3", missing, False)
+class PublicationIdentityTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="publication-identity-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.enterContext(patch.object(delivery, "ROOT", self.root))
+        self.git("init")
+        self.git("config", "user.name", "Identity test")
+        self.git("config", "user.email", "identity@example.test")
+        self.git("config", "commit.gpgsign", "false")
+        self.git("config", "tag.gpgsign", "false")
+        self.git("config", "core.autocrlf", "false")
+        (self.root / "crates/app/src").mkdir(parents=True)
+        (self.root / "Cargo.toml").write_text(
+            '[workspace]\nmembers = ["crates/app"]\n[workspace.package]\nversion = "1.2.3"\n', encoding="utf-8")
+        (self.root / "crates/app/Cargo.toml").write_text(
+            '[package]\nname = "neo-app"\nversion.workspace = true\n', encoding="utf-8")
+        (self.root / "Cargo.lock").write_text(
+            'version = 4\n[[package]]\nname = "neo-app"\nversion = "1.2.3"\n', encoding="utf-8")
+        (self.root / "crates/app/src/main.rs").write_text("fn main() {}\n", encoding="utf-8")
+        (self.root / ".gitignore").write_text("/target/\n/dist/\n", encoding="utf-8")
+        self.commit_and_tag()
 
-    def test_real_default_policy_blocks_direct_publish_without_any_gh(self):
-        with patch.object(delivery.distribution_review, "check_review", wraps=delivery.distribution_review.check_review) as parent, \
-                patch.object(delivery.drawing, "approval") as child, \
-                patch.object(delivery, "read_lock") as source_lock, \
-                patch.object(delivery, "run_gh") as gh, \
-                self.assertRaisesRegex(ValueError, "Outstanding distribution blockers|not APPROVED"):
-            self.publish()
-        parent.assert_called_once_with(delivery.ROOT / delivery.distribution_review.POLICY)
+    def git(self, *args):
+        return subprocess.run(["git", "--no-pager", "--no-optional-locks", *args], cwd=self.root,
+                              env={**os.environ, "GIT_EDITOR": "true"}, check=True,
+                              capture_output=True, timeout=15).stdout
+
+    def commit_and_tag(self):
+        self.git("add", ".")
+        self.git("commit", "--no-verify", "-m", "Synthetic identity fixture")
+        self.git("tag", "-f", "v1.2.3")
+
+    def publish(self, *, repository="owner/repo", tag="v1.2.3", version="1.2.3", variants=None):
+        # Identity must reject before touching deliberately absent assets.
+        missing = self.root / "target/unused"
+        delivery.publish(delivery.LOCK, missing, missing, repository, tag, version, missing, False,
+                         variants=variants)
+
+    def assert_blocked(self, error=ValueError, message=None, **kwargs):
+        with patch.object(delivery, "read_lock") as lock, patch.object(delivery, "run_gh") as gh, \
+                patch.object(delivery, "download") as download:
+            context = self.assertRaises(error) if message is None else self.assertRaisesRegex(error, message)
+            with context:
+                self.publish(**kwargs)
+        lock.assert_not_called()
+        gh.assert_not_called()
+        download.assert_not_called()
+
+    def test_clean_checkout_without_policy_or_reviewed_record_reaches_source_checks(self):
+        self.assertFalse((self.root / delivery.distribution_review.POLICY).exists())
+        from tools import assemble_drawing_release as drawing
+        with patch.object(delivery.distribution_review, "check_review", side_effect=AssertionError("Human gate called")) as parent, \
+                patch.object(drawing, "approval", create=True, side_effect=AssertionError("Human gate called")) as child, \
+                patch.object(drawing, "load_lock", side_effect=AssertionError("Approval lock read")) as drawing_lock, \
+                patch.object(delivery, "read_lock", side_effect=ValueError("source checks reached")) as lock, \
+                patch.object(delivery, "run_gh") as gh:
+            for variants in (None, delivery.VARIANTS):
+                with self.subTest(variants=variants), self.assertRaisesRegex(ValueError, "source checks reached"):
+                    self.publish(variants=variants)
+            self.assertEqual(lock.call_count, 2)
+        parent.assert_not_called()
         child.assert_not_called()
-        source_lock.assert_not_called()
+        drawing_lock.assert_not_called()
         gh.assert_not_called()
 
-    def test_real_drawing_lock_blocks_when_only_parent_gate_is_mocked(self):
-        with patch.object(delivery.distribution_review, "check_review", return_value={"review": {"root_version": "1.2.3"}}), \
-                patch.object(delivery.drawing, "approval", wraps=delivery.drawing.approval) as child, \
-                patch.object(delivery.distribution_review, "git") as git, \
-                patch.object(delivery, "run_gh") as gh, \
-                self.assertRaisesRegex(ValueError, "Drawing public distribution is not approved"):
-            self.publish()
-        child.assert_called_once()
-        git.assert_not_called()
-        gh.assert_not_called()
+    def test_existing_blocked_records_are_unchanged_and_not_required_to_be_approved(self):
+        (self.root / "tools").mkdir()
+        for name in ("distribution-review.json", "drawing-runtime.lock.json"):
+            shutil.copyfile(delivery.LOCK.with_name(name), self.root / "tools" / name)
+        self.commit_and_tag()
+        before = {p.name: p.read_bytes() for p in (self.root / "tools").iterdir()}
+        delivery.check_publication_identity("owner/repo", "v1.2.3", "1.2.3")
+        self.assertEqual(before, {p.name: p.read_bytes() for p in (self.root / "tools").iterdir()})
+        self.assertEqual(self.git("status", "--porcelain"), b"")
 
-    def test_mismatched_or_missing_local_tag_and_git_errors_block_before_gh(self):
-        for result in ([b"a" * 40, b"b" * 40], [b"", b""],
-                       subprocess.CalledProcessError(128, ["git", "rev-parse"]),
-                       subprocess.TimeoutExpired(["git", "rev-parse"], 15)):
-            with self.subTest(result=result), \
-                    patch.object(delivery.distribution_review, "check_review", return_value={"review": {"root_version": "1.2.3"}}), \
-                    patch.object(delivery.drawing, "load_lock", return_value={"synthetic": True}), \
-                    patch.object(delivery.drawing, "approval"), \
-                    patch.object(delivery.distribution_review, "git", side_effect=result) as git, \
-                    patch.object(delivery, "read_lock") as source_lock, \
-                    patch.object(delivery, "run_gh") as gh:
-                with self.assertRaises((ValueError, subprocess.SubprocessError)):
-                    self.publish()
-                self.assertEqual(git.call_args_list[0].args,
-                                 (delivery.ROOT, "rev-parse", "--verify", "refs/tags/v1.2.3^{commit}"))
-                if git.call_count == 2:
-                    self.assertEqual(git.call_args_list[1].args, (delivery.ROOT, "rev-parse", "--verify", "HEAD"))
-                source_lock.assert_not_called()
-                gh.assert_not_called()
+    def test_annotated_tag_and_ignored_build_outputs_are_allowed(self):
+        self.git("tag", "-f", "-a", "v1.2.3", "-m", "Synthetic annotated tag")
+        for name in ("target", "dist"):
+            (self.root / name).mkdir()
+            (self.root / name / "artifact.zip").write_bytes(b"ignored output")
+        delivery.check_publication_identity("owner/repo", "v1.2.3", "1.2.3")
 
-    def test_release_version_must_match_review_before_git_or_gh(self):
-        with patch.object(delivery.distribution_review, "check_review", return_value={"review": {"root_version": "9.9.9"}}), \
-                patch.object(delivery.drawing, "load_lock", return_value={"synthetic": True}), \
-                patch.object(delivery.drawing, "approval"), \
-                patch.object(delivery.distribution_review, "git") as git, \
-                patch.object(delivery, "run_gh") as gh, \
-                self.assertRaisesRegex(ValueError, "reviewed root version"):
-            self.publish()
-        git.assert_not_called()
-        gh.assert_not_called()
+    def test_repository_and_tag_version_format_rejected_before_git(self):
+        for args in ({"repository": "https://github.com/owner/repo"}, {"repository": "../repo"},
+                     {"tag": "v9.9.9"}, {"version": "not-a-version"}):
+            with self.subTest(args=args), patch.object(delivery.distribution_review, "git") as git:
+                self.assert_blocked(**args)
+            git.assert_not_called()
 
-    def test_both_gates_and_matching_tag_still_do_not_bypass_null_source_url(self):
+    def test_release_version_must_match_real_root_manifest(self):
+        self.assert_blocked(message="root Cargo version", tag="v9.9.9", version="9.9.9")
+
+    def test_committed_lock_version_mismatch_blocks_publication(self):
+        path = self.root / "Cargo.lock"
+        path.write_text(path.read_text(encoding="utf-8").replace("1.2.3", "9.9.9"), encoding="utf-8")
+        self.commit_and_tag()
+        self.assert_blocked(message="Cargo.lock version mismatch")
+
+    def test_missing_duplicate_and_registry_only_lock_entries_rejected(self):
+        path = self.root / "Cargo.lock"
+        original = path.read_text(encoding="utf-8")
+        for content in ('version = 4\npackage = []\n', original + original.split("version = 4\n")[1],
+                        original + 'source = "registry+https://example.test/index"\n'):
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                self.commit_and_tag()
+                self.assert_blocked(message="Cargo.lock version mismatch")
+
+    def test_missing_untracked_or_malformed_cargo_inputs_rejected(self):
+        for name in ("Cargo.toml", "Cargo.lock", "crates/app/Cargo.toml"):
+            path = self.root / name
+            original = path.read_bytes()
+            with self.subTest(name=name, state="missing"):
+                path.unlink()
+                self.assert_blocked(error=OSError)
+            path.write_bytes(original)
+            self.git("rm", "--cached", "--", name)
+            self.git("commit", "--no-verify", "-m", "Remove Cargo input")
+            with self.subTest(name=name, state="untracked"):
+                self.assert_blocked(error=subprocess.CalledProcessError)
+            path.write_text("not valid TOML", encoding="utf-8")
+            self.commit_and_tag()
+            with self.subTest(name=name, state="malformed"):
+                self.assert_blocked()
+            path.write_bytes(original)
+            self.commit_and_tag()
+
+    def test_hidden_manifest_and_lock_edits_rejected(self):
+        for name in ("Cargo.toml", "Cargo.lock", "crates/app/Cargo.toml"):
+            path = self.root / name
+            original = path.read_bytes()
+            for flag in ("assume-unchanged", "skip-worktree"):
+                with self.subTest(name=name, flag=flag):
+                    self.git("update-index", "--" + flag, "--", name)
+                    path.write_bytes(original + b"\n# hidden edit\n")
+                    self.assert_blocked(message="differs from committed HEAD")
+                    path.write_bytes(original)
+                    self.git("update-index", "--no-" + flag, "--", name)
+
+    def test_dirty_tracked_checkout_rejected_for_single_and_variant_publication(self):
+        name = "crates/app/src/main.rs"
+        path = self.root / name
+        original = path.read_bytes()
+        for state in ("unstaged", "staged", "staged-worktree-restored", "deleted"):
+            for variants in (None, delivery.VARIANTS):
+                with self.subTest(state=state, variants=variants):
+                    if state == "deleted":
+                        path.unlink()
+                    else:
+                        path.write_bytes(b"fn main() { panic!(); }\n")
+                    if state.startswith("staged"):
+                        self.git("add", "--", name)
+                    if state == "staged-worktree-restored":
+                        path.write_bytes(original)
+                    self.assert_blocked(error=subprocess.CalledProcessError, variants=variants)
+                    path.write_bytes(original)
+                    self.git("add", "--", name)
+
+    def test_untracked_meaningful_files_rejected(self):
+        for name in ("crates/app/src/extra.rs", "Cargo.toml.backup", "new-notice.txt"):
+            with self.subTest(name=name):
+                path = self.root / name
+                path.write_bytes(b"untracked input")
+                self.assert_blocked(message="Untracked non-ignored")
+                path.unlink()
+
+    def test_missing_branch_only_wrong_and_non_commit_tags_rejected(self):
+        self.git("tag", "-d", "v1.2.3")
+        self.git("branch", "v1.2.3")
+        self.assert_blocked(error=subprocess.CalledProcessError)
+        self.git("tag", "v1.2.3")
+        (self.root / "crates/app/src/main.rs").write_bytes(b"fn main() { println!(\"new\"); }\n")
+        self.git("add", ".")
+        self.git("commit", "--no-verify", "-m", "Advance HEAD without release tag")
+        for variants in (None, delivery.VARIANTS):
+            self.assert_blocked(message="tag must point at HEAD", variants=variants)
+        self.git("tag", "-f", "v1.2.3", "HEAD:Cargo.toml")
+        self.assert_blocked(error=subprocess.CalledProcessError)
+
+    def test_tag_is_rechecked_after_retargeting(self):
+        previous = self.git("rev-parse", "HEAD").decode().strip()
+        (self.root / "crates/app/src/main.rs").write_bytes(b"fn main() { println!(\"new\"); }\n")
+        self.commit_and_tag()
+        delivery.check_publication_identity("owner/repo", "v1.2.3", "1.2.3")
+        self.git("tag", "-f", "v1.2.3", previous)
+        self.assert_blocked(message="tag must point at HEAD")
+
+    def test_git_errors_and_timeouts_fail_before_source_inputs_or_gh(self):
+        for error in (subprocess.CalledProcessError(128, ["git"]), subprocess.TimeoutExpired(["git"], 15)):
+            with self.subTest(error=error), patch.object(delivery.distribution_review, "git", side_effect=error):
+                self.assert_blocked(error=subprocess.SubprocessError)
+
+    def test_valid_identity_does_not_bypass_null_source_url(self):
         lock = delivery.load_json(delivery.LOCK)
         lock["sources"][0]["download_url"] = None
-        with mock_publication_review("1.2.3"), patch.object(delivery, "run_gh") as gh, \
+        with patch.object(delivery, "run_gh") as gh, patch.object(delivery, "download") as download, \
                 patch.object(delivery, "load_json", return_value=lock), \
                 self.assertRaisesRegex(ValueError, "download_url is null"):
             self.publish()
         gh.assert_not_called()
-
-    def test_gate_order_precedes_source_inputs_and_all_network(self):
-        events = []
-
-        def git(root, *args):
-            events.append(args[-1])
-            return b"a" * 40 + b"\n"
-
-        def source_lock(path):
-            events.append("source-lock")
-            raise ValueError("stop before source inputs")
-
-        with patch.object(delivery.distribution_review, "check_review", side_effect=lambda path: (events.append("parent") or {"review": {"root_version": "1.2.3"}})), \
-                patch.object(delivery.drawing, "load_lock", side_effect=lambda: (events.append("drawing-lock") or {"synthetic": True})), \
-                patch.object(delivery.drawing, "approval", side_effect=lambda lock: events.append("drawing-approval")), \
-                patch.object(delivery.distribution_review, "git", side_effect=git), \
-                patch.object(delivery, "read_lock", side_effect=source_lock), \
-                patch.object(delivery, "run_gh") as gh, \
-                self.assertRaisesRegex(ValueError, "stop before source inputs"):
-            self.publish()
-        self.assertEqual(events, ["parent", "drawing-lock", "drawing-approval", "refs/tags/v1.2.3^{commit}", "HEAD", "source-lock"])
-        gh.assert_not_called()
+        download.assert_not_called()
 
 
 class GitbashAdapterTests(unittest.TestCase):

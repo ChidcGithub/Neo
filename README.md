@@ -144,8 +144,8 @@ written to `graphics-help.txt` in the startup log directory on failure.
 
 ## Download & Install
 
-The workspace version is **`0.1.0-pre11`**. Binary publication remains gated;
-workflow support does not mean downloadable application packages are available.
+The workspace version is **`0.1.0-pre11`**. The release workflow builds and
+publishes binaries after technical checks; see Releases for available packages.
 The earlier [pre10 source prerelease](https://github.com/ChidcGithub/Neo/releases/tag/v0.1.0-pre10)
 is unchanged. The source tree includes some tracked binary assets.
 
@@ -292,8 +292,8 @@ including hidden/disconnected instances. Hosted region capture uses its separate
 confirmed-hide path; no external board lease is treated as safe across EOF.
 
 The combined-release workflow builds the pinned drawing project and packages its
-applications and runtime files after release checks pass. Public binary release
-is not yet enabled. Math-recognition models are installed under the blackboard application's
+applications and runtime files after source, build and package checks pass.
+Math-recognition models are installed under the blackboard application's
 `models/texteller-int8/` or `models/texteller/`; ordinary drawing does not require them. Native GUI/real-host acceptance
 remains separate from synthetic protocol tests.
 
@@ -483,9 +483,9 @@ The single source of truth is `[workspace.package].version` in the root
 Pushing a matching `v*` tag triggers the release pipeline after its check job.
 Manual dispatch requires that the version tag already exists and points to the
 selected commit; the workflow never implicitly creates a tag from the default branch.
-Binary publication is currently blocked by the main and drawing distribution
-checks. Download hashes alone do not enable publication. The workflow must also
-stage matching source companions and verify the final package; GUI and clean
+Manual approval flags and REVIEWED.md markers are not required. Publication still
+requires a clean tagged checkout, pinned source and license hashes, matching
+source companions and final package/remote asset verification; GUI and clean
 Windows installation acceptance are separate checks. Internal acceptance records
 remain in untracked `docs-pri/`.
 
@@ -534,5 +534,5 @@ Third-party code, fonts, models and runtimes retain their own terms; see the
 [license texts and notices](docs/licenses/). Detailed audit reports
 are kept locally in `docs-pri/licenses/`, not in Git or release packages.
 The current native build excludes eSpeak/Piper TTS, and the packaged Git runtime
-excludes GCM. Binary distribution still requires matching source delivery and
-completion of the remaining component reviews.
+excludes GCM. Packages retain applicable third-party terms and matching source
+access notices; Neo's license does not relicense model weights.

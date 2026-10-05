@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "scope": "Pinned source delivery inputs; not distribution approval. Native recipe validates current build inputs, libraries, graph, symbols and Eigen source correspondence; archive history is not a CI output hash. ORT producer correspondence remains a separate review.",
+  "scope": "Pinned source delivery and documented ORT/Eigen source mapping; not whole-release approval. Current native builds are recipe-validated; producer-checkout limitations are disclosed in ORT-EIGEN-SOURCE.txt.",
   "sources": [
     {
       "kind": "gitbash",
@@ -21,5 +21,11 @@
       },
       "download_url": "https://github.com/ChidcGithub/Neo/releases/download/dependency-sources-v1/neo-native-sources-updated.zip"
     }
-  ]
+  ],
+  "ort_eigen_notice": {
+    "path": "docs/licenses/runtime/ORT-EIGEN-SOURCE.txt",
+    "sha256": "2576c84bbe6497375fbc9930a29e25d2ff8be31d75741178137346edef526894",
+    "record_path": "docs/licenses/runtime/ort-eigen-correspondence.json",
+    "record_sha256": "849605e6f83cf547c90acbb91bed0d6733d2ca022c29b21c69721003487edf87"
+  }
 }

@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "final_binary_identity_verified": false,
+  "components": [
+    {
+      "id": "wake-onnxruntime",
+      "artifact_sha256": "44741724166ad61c8c82885e394793807f2cf5707c83b9e33c2d78d75c6e7650",
+      "eigen_archive": "eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33.zip",
+      "eigen_sha256": "6a60d76351f97132669daeeb721d6bf14b008101883ad2d687a3201c5c461eb0",
+      "patches": []
+    },
+    {
+      "id": "wake-onnxruntime-providers-shared",
+      "artifact_sha256": "fabb99add45aa1a0386c80bc63e92479c5f56e9e95ab98c85fb7ad21c4092ce0",
+      "eigen_archive": "eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33.zip",
+      "eigen_sha256": "6a60d76351f97132669daeeb721d6bf14b008101883ad2d687a3201c5c461eb0",
+      "patches": []
+    },
+    {
+      "id": "sherpa-static-onnxruntime",
+      "artifact_sha256": "77c6cc2a419828f450a570851d7d6d2385523c411dbe858f841a4c7338a78881",
+      "eigen_archive": "eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33.zip",
+      "eigen_sha256": "6a60d76351f97132669daeeb721d6bf14b008101883ad2d687a3201c5c461eb0",
+      "patches": [
+        {
+          "path": "docs/licenses/runtime/native-sources/ort-1.28.2-eigen-s390x-build.patch",
+          "sha256": "6d41f4504f665bc591336c668a1aa16ffc5e0f02fe9c2f9c46c6f5660b54c849",
+          "member": "notices/ort-1.28.2-eigen-s390x-build.patch"
+        },
+        {
+          "path": "docs/licenses/runtime/native-sources/ort-1.28.2-eigen-s390x-build-werror.patch",
+          "sha256": "a1a7b0ca8382cb00542587b6bc725f59abd59ad5bb491825f7876ad6e344ef0b",
+          "member": "notices/ort-1.28.2-eigen-s390x-build-werror.patch"
+        }
+      ]
+    },
+    {
+      "id": "drawing-static-onnxruntime",
+      "artifact_sha256": "540d19b3379fda6fb8f7280d8c15efde20ed225a67a357a6dae38c4300fe190d",
+      "eigen_archive": "eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33.zip",
+      "eigen_sha256": "6a60d76351f97132669daeeb721d6bf14b008101883ad2d687a3201c5c461eb0",
+      "patches": [],
+      "drawing_commit": "ea1ecc87ec97717117f03625fd958c75cc2c0a49"
+    }
+  ],
+  "source_delivery": {
+    "kind": "native",
+    "url": "https://github.com/ChidcGithub/Neo/releases/download/dependency-sources-v1/neo-native-sources-updated.zip",
+    "size": 7570574,
+    "sha256": "757fed6d081ea23a2862d5ebb90c7fe57ded08f842724a199bcc454df07a2a8a",
+    "eigen_member": "sources/eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33.zip"
+  }
+}

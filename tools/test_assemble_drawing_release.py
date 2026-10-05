@@ -1,6 +1,6 @@
 """Offline synthetic release regressions; no Cargo/network/GUI or real approvals."""
 import copy
-from datetime import date
+
 import hashlib
 import json
 import os
@@ -15,10 +15,10 @@ from unittest.mock import patch
 
 if __package__:
     from . import assemble_drawing_release as a
-    from . import check_distribution_review as main_gate
+
 else:
     import assemble_drawing_release as a
-    import check_distribution_review as main_gate
+
 
 
 def pe_fixture(delay=False, machine=0x8664):
@@ -52,32 +52,35 @@ class LockTests(unittest.TestCase):
         env = dict(os.environ)
         env.pop("PYTHONPATH", None)
         for args in (["-m", "tools.assemble_drawing_release"], ["tools/assemble_drawing_release.py"]):
-            result = subprocess.run([sys.executable, "-B", *args, "check-approval"], cwd=a.ROOT,
+            result = subprocess.run([sys.executable, "-B", *args, "verify-source"], cwd=a.ROOT,
                                     env=env, capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 1)
-            self.assertIn("not approved", result.stderr)
+            self.assertIn("--source is required", result.stderr)
             self.assertNotIn("ImportError", result.stderr)
-        for args in (["-m", "unittest", "tools.test_assemble_drawing_release.LockTests.test_boolean_is_not_review"],
-                     ["tools/test_assemble_drawing_release.py", "LockTests.test_boolean_is_not_review"],
-                     ["tools/test_release_workflow.py", "ReleaseWorkflowStaticTests.test_distribution_gate_is_first_release_action_after_checkout"]):
+        for args in (["-m", "unittest", "tools.test_assemble_drawing_release.LockTests.test_real_lock_stays_pinned_without_approval_fields"],
+                     ["tools/test_assemble_drawing_release.py", "LockTests.test_real_lock_stays_pinned_without_approval_fields"]):
             result = subprocess.run([sys.executable, "-B", *args], cwd=a.ROOT, env=env,
                                     capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_real_lock_stays_pinned_and_unapproved(self):
+    def test_real_lock_stays_pinned_without_approval_fields(self):
         lock = a.load_lock()
         self.assertEqual(lock["commit"], "ea1ecc87ec97717117f03625fd958c75cc2c0a49")
         self.assertEqual(lock["rust"], "1.97.1")
-        self.assertIs(lock["public_approved"], False)
-        with self.assertRaisesRegex(ValueError, "not approved"):
-            a.approval(lock)
-        self.assertEqual(a.main(["check-approval"]), 1)
-
-    def test_boolean_is_not_review(self):
-        lock = dict(a.load_lock(), public_approved=True, distribution_review="reviewed")
-        for review in (None, True, {}, {"status": "APPROVED"}):
-            with self.subTest(review=review), self.assertRaises(ValueError):
-                a.approval(dict(lock, review=review))
+        for key in ("public_approved", "distribution_review", "review"):
+            self.assertNotIn(key, lock)
+        self.assertEqual(set(lock["source_binding"]), {
+            "source_commit", "source_tree_sha256", "cargo_lock_sha256", "version", "legal_files"})
+        self.assertEqual(lock["source_binding"]["source_commit"], lock["commit"])
+        legal = lock["source_binding"]["legal_files"]
+        self.assertEqual(len(legal), 312)
+        self.assertLessEqual(set(lock["legal_files"]), legal.keys())
+        for suffix in ("APACHE", "BSD", "MINPACK", "MPL2", "README"):
+            name = "distribution/legal/app/native/ort-eigen/eigen-COPYING." + suffix
+            self.assertNotIn(name, lock["legal_files"])
+            self.assertNotIn(name, legal)
+        self.assertTrue(any("docs/licenses/runtime/native-sources/eigen-1d8b82b-COPYING.*" in text
+                            for text in lock["limitations"]))
 
     def test_lock_outputs_validate_before_writing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,7 +101,7 @@ class LockTests(unittest.TestCase):
     def test_duplicate_json_keys_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "lock.json"
-            path.write_text('{"public_approved": false, "public_approved": true}')
+            path.write_text('{"schema": 1, "schema": 1}')
             with self.assertRaisesRegex(ValueError, "Duplicate"):
                 a.load_lock(path)
 
@@ -117,7 +120,7 @@ class AssemblyTests(unittest.TestCase):
         self.package.mkdir()
         self.lock_path = self.root / "lock.json"
         self.lock = a.load_lock()
-        self.lock.update(public_approved=True, distribution_review="reviewed")
+
         self.put("Cargo.toml", b'[workspace.package]\nversion = "0.0.1"\n')
         self.put("Cargo.lock", b"# synthetic dependency lock\n")
         self.put("drawing/src/main.rs", b"fn main() {}\n")
@@ -135,10 +138,7 @@ class AssemblyTests(unittest.TestCase):
             self.put(name, self.legal)
         self.rust_text = "distribution/legal/app/rust/texts/" + sha(self.legal) + ".txt"
         self.put(self.rust_text, self.legal)
-        metadata = {"schema": 1, "status": "APPROVED", "version": "0.0.1",
-                    "cargo_lock_sha256": sha((self.source / "Cargo.lock").read_bytes()),
-                    "reviewer": "SYNTHETIC TEST ONLY", "date": date.today().isoformat()}
-        self.put(a.REVIEWED, ("```json\n" + json.dumps(metadata) + "\n```\nSynthetic review fixture only.\n").encode())
+
         for name in ("PRIVATE.md", "models/private.onnx", "distribution/legal/app/native/private-evidence.json",
                      "distribution/legal/model/REVIEWED.md", "target/secret.exe"):
             self.put(name, b"must never ship")
@@ -169,9 +169,9 @@ class AssemblyTests(unittest.TestCase):
     def bind(self):
         info, names = a.source_info(self.source, self.lock)
         legal = set(self.lock["legal_files"]) | {n for n in names if n == self.rust_text}
-        self.lock["review"] = {key: info[key] for key in ("source_commit", "source_tree_sha256", "cargo_lock_sha256", "version")}
-        self.lock["review"].update(reviewed_sha256=a.digest(self.source / a.REVIEWED)["sha256"],
-                                    legal_files={name: a.digest(self.source / name)["sha256"] for name in legal if (self.source / name).exists()})
+        self.lock["source_binding"] = {key: info[key] for key in ("source_commit", "source_tree_sha256", "cargo_lock_sha256", "version")}
+        self.lock["source_binding"]["legal_files"] = {
+            name: sha(a.pinned_bytes(self.source, self.lock, name)) for name in sorted(legal & names)}
         a.write_json(self.lock_path, self.lock)
         a.write_json(self.target / "drawing-build.json", {
             "schema": 1, "source": info, "lock_sha256": a.digest(self.lock_path)["sha256"],
@@ -183,11 +183,7 @@ class AssemblyTests(unittest.TestCase):
         })
 
     def assemble(self):
-        # Mock ONLY the independent main-project gate, never the drawing gate.
-        with patch.object(a, "check_review") as gate:
-            result = a.assemble(self.source, self.target, self.package, self.lock_path, self.root)
-        gate.assert_called_once_with(self.root / "tools/distribution-review.json", root=self.root)
-        return result
+        return a.assemble(self.source, self.target, self.package, self.lock_path, self.root)
 
     def test_synthetic_assembly_exact_layout_hashes_and_legal_bodies(self):
         hashes = self.assemble()
@@ -202,6 +198,9 @@ class AssemblyTests(unittest.TestCase):
         self.assertEqual(manifest["source_commit"], self.lock["commit"])
         self.assertEqual(manifest["lock_sha256"], a.digest(self.lock_path)["sha256"])
         self.assertFalse(manifest["clean_install_verified"])
+        self.assertEqual(manifest["legal_files"], self.lock["source_binding"]["legal_files"])
+        for key in ("review", "reviewed_sha256", "public_approved", "distribution_review"):
+            self.assertNotIn(key, manifest)
         self.assertEqual(a.read_json(legal_root / "FILES.sha256.json"), hashes)
         for name, value in hashes.items():
             self.assertEqual(a.digest(self.package / name), value)
@@ -212,58 +211,72 @@ class AssemblyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be new"):
             self.assemble()
 
-    def test_main_gate_cannot_be_bypassed(self):
-        with patch.object(a, "check_review", side_effect=ValueError("Main gate blocked")):
-            with self.assertRaisesRegex(ValueError, "Main gate"):
-                a.assemble(self.source, self.target, self.package, self.lock_path, self.root)
-        self.assertEqual(list(self.package.iterdir()), [])
+    def test_assembly_without_main_policy_or_reviewed_marker(self):
+        self.assertFalse((self.root / "tools/distribution-review.json").exists())
+        self.assertFalse((self.source / "distribution/legal/app/REVIEWED.md").exists())
+        self.assemble()
+        self.assertFalse(any(p.name == "REVIEWED.md" for p in self.package.rglob("*")))
 
-    def test_false_approval_blocks_before_output(self):
-        self.lock["public_approved"] = False
-        a.write_json(self.lock_path, self.lock)
-        with self.assertRaisesRegex(ValueError, "not approved"):
-            self.assemble()
-        self.assertEqual(list(self.package.iterdir()), [])
+    def test_legacy_approval_flags_do_not_gate_assembly(self):
+        self.lock.update(public_approved=False, distribution_review="unreviewed")
+        self.bind()
+        self.assemble()
 
     def test_missing_pinned_legal_cannot_be_supplied_by_local_file(self):
         name = self.lock["legal_files"][-1]
         (self.source / name).unlink()
         self.commit()
         self.bind()
-        with self.assertRaisesRegex(ValueError, "legal manifest"):
-            a.verify_review(self.source, self.lock)
+        with self.assertRaisesRegex(ValueError, "Missing pinned legal text") as error:
+            a.verify_source(self.source, self.lock)
+        self.assertIn(name, str(error.exception))
         self.put(name, self.legal)
         with self.assertRaisesRegex(ValueError, "must be clean"):
-            a.verify_review(self.source, self.lock)
+            a.verify_source(self.source, self.lock)
+        self.git("config", "core.excludesFile", str(self.root / "ignored-legal"))
+        (self.root / "ignored-legal").write_text(name + "\n")
+        self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=all"), "")
+        with self.assertRaisesRegex(ValueError, "Missing pinned legal text"):
+            self.assemble()
+        self.assertEqual(list(self.package.iterdir()), [])
 
-    def test_missing_marker_blocks_even_with_true_lock(self):
-        (self.source / a.REVIEWED).unlink()
-        self.commit()
-        info, _ = a.source_info(self.source, self.lock)
-        for key in ("source_commit", "source_tree_sha256"):
-            self.lock["review"][key] = info[key]
-        with self.assertRaisesRegex(ValueError, "Missing pinned REVIEWED"):
-            a.verify_review(self.source, self.lock)
+    def test_source_binding_schema_is_required(self):
+        for binding in (None, True, {}, {"status": "APPROVED"}):
+            with self.subTest(binding=binding), self.assertRaisesRegex(ValueError, "source binding"):
+                a.verify_source(self.source, dict(self.lock, source_binding=binding))
 
-    def test_empty_bool_and_wrong_version_review_markers_block(self):
-        original = (self.source / a.REVIEWED).read_bytes()
-        for body in (b"true\n", b"APPROVED\n", original.replace(b'"0.0.1"', b'"99.0.0"')):
-            self.put(a.REVIEWED, body)
+    def test_source_binding_and_legal_digest_tampering(self):
+        for key in ("source_commit", "source_tree_sha256", "cargo_lock_sha256", "version"):
+            lock = copy.deepcopy(self.lock)
+            lock["source_binding"][key] = "0" * (40 if key == "source_commit" else 64)
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                a.verify_source(self.source, lock)
+        lock = copy.deepcopy(self.lock)
+        lock["source_binding"]["legal_files"]["LICENSE"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "Legal manifest hash"):
+            a.verify_source(self.source, lock)
+        for extra in (False, True):
+            lock = copy.deepcopy(self.lock)
+            if extra:
+                lock["source_binding"]["legal_files"]["PRIVATE.md"] = "0" * 64
+            else:
+                del lock["source_binding"]["legal_files"]["LICENSE"]
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "exactly match allowlist"):
+                a.verify_source(self.source, lock)
+
+    def test_wrong_pinned_commit_is_rejected(self):
+        lock = dict(self.lock, commit="0" * 40)
+        with self.assertRaisesRegex(ValueError, "checkout differs from lock"):
+            a.source_info(self.source, lock)
+
+    def test_empty_or_misnamed_rust_legal_blob_is_rejected(self):
+        for body, message in ((b" \r\n", "Empty legal text"), (b"changed legal text\r\n", "hash filename")):
+            self.put(self.rust_text, body)
             self.commit()
             self.bind()
-            with self.assertRaises(ValueError):
-                a.verify_review(self.source, self.lock)
-
-    def test_review_binding_and_legal_digest_tampering(self):
-        for key in ("source_commit", "source_tree_sha256", "cargo_lock_sha256", "reviewed_sha256", "version"):
-            lock = copy.deepcopy(self.lock)
-            lock["review"][key] = "0" * (40 if key == "source_commit" else 64)
-            with self.subTest(key=key), self.assertRaises(ValueError):
-                a.verify_review(self.source, lock)
-        lock = copy.deepcopy(self.lock)
-        lock["review"]["legal_files"]["LICENSE"] = "0" * 64
-        with self.assertRaisesRegex(ValueError, "Legal manifest hash"):
-            a.verify_review(self.source, lock)
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, message):
+                self.assemble()
+            self.assertEqual(list(self.package.iterdir()), [])
 
     def test_dirty_source_or_changed_binary_blocks(self):
         self.put("drawing/src/main.rs", b"changed")
@@ -275,10 +288,27 @@ class AssemblyTests(unittest.TestCase):
             self.assemble()
         self.assertEqual(list(self.package.iterdir()), [])
 
+    def test_tracked_legal_edit_and_stale_source_receipt_are_rejected(self):
+        name = self.lock["legal_files"][-1]
+        self.put(name, b"changed legal body")
+        with self.assertRaisesRegex(ValueError, "must be clean"):
+            self.assemble()
+        self.put(name, self.legal)
+        self.put("drawing/src/main.rs", b"fn main() { /* changed source */ }\n")
+        self.commit()
+        info, _ = a.source_info(self.source, self.lock)
+        for key in ("source_commit", "source_tree_sha256", "cargo_lock_sha256", "version"):
+            self.lock["source_binding"][key] = info[key]
+        a.write_json(self.lock_path, self.lock)
+        with self.assertRaisesRegex(ValueError, "receipt source/lock mismatch"):
+            self.assemble()
+        self.assertEqual(list(self.package.iterdir()), [])
+
     def test_evaluation_or_wrong_toolchain_receipt_is_rejected(self):
         path = self.target / "drawing-build.json"
         original = a.read_json(path)
-        for key, value in (("schema", True), ("command", ["cargo", "build", "--offline"]),
+        for key, value in (("schema", True), ("source", {}), ("lock_sha256", "0" * 64),
+                           ("command", ["cargo", "build", "--offline"]),
                            ("toolchain", {"rustc": "rustc 1.96.0 (wrong)", "cargo": "cargo 1.97.1 (synthetic)"}),
                            ("version_output", {"neo-drawing.exe": "Synthetic app 0.0.1"})):
             a.write_json(path, {**original, key: value})
@@ -323,12 +353,12 @@ class AssemblyTests(unittest.TestCase):
                 finally:
                     dll.unlink()
 
-    def test_review_has_no_commit_self_reference_and_ignored_output_is_clean(self):
-        before, _ = a.verify_review(self.source, self.lock)
+    def test_source_binding_has_no_commit_self_reference_and_ignored_output_is_clean(self):
+        before, _ = a.verify_source(self.source, self.lock)
         self.put("target/package/generated.txt", b"ignored")
         self.put("dist/generated.txt", b"ignored")
         self.put(".cache/generated.txt", b"ignored")
-        self.assertEqual(a.verify_review(self.source, self.lock)[0], before)
+        self.assertEqual(a.verify_source(self.source, self.lock)[0], before)
         self.put("untracked-source.rs", b"not ignored")
         with self.assertRaisesRegex(ValueError, "clean"):
             a.source_info(self.source, self.lock)
@@ -453,53 +483,40 @@ class AssemblyTests(unittest.TestCase):
             with patch.object(a.os, "readlink", return_value=str(dll)), self.assertRaisesRegex(ValueError, "Symlink"):
                 a.trusted_directml_target(dll, self.runtime, provenance)
 
-    def test_real_main_gate_recheck_allows_ignored_output_but_not_tracked_edits(self):
-        # Disposable parent repository; no real approval record is created or changed.
-        root = self.root / "main"
-        root.mkdir()
+    def test_main_policy_is_not_read_by_drawing_assembly(self):
+        policy = self.root / "tools/distribution-review.json"
+        policy.parent.mkdir()
+        policy.write_bytes(b"not a review record")
+        self.assemble()
+        self.assertEqual(policy.read_bytes(), b"not a review record")
 
-        def git(*args):
-            return subprocess.check_output(["git", "--no-pager", "-C", str(root), *args],
-                                           env=dict(os.environ, GIT_EDITOR="true"), stderr=subprocess.STDOUT).decode().strip()
+    def test_legal_blobs_preserve_crlf_and_ignore_checkout_conversion(self):
+        # Preserve a CRLF blob explicitly, while Git expands other LF blobs.
+        self.put(".gitattributes", b"* text=auto\nLICENSE -text\n")
+        lf_body = b"SYNTHETIC legal text with pinned LF\n"
+        old_rust = self.rust_text
+        (self.source / old_rust).unlink()
+        self.rust_text = "distribution/legal/app/rust/texts/" + sha(lf_body) + ".txt"
+        self.put(self.rust_text, lf_body)
+        self.commit()
+        self.git("config", "core.autocrlf", "true")
+        for name in ("Cargo.lock", self.rust_text):
+            (self.source / name).unlink()
+            self.git("checkout", "--", name)
+        self.assertIn(b"\r\n", (self.source / self.rust_text).read_bytes())
+        self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=all"), "")
+        self.bind()
+        self.assertNotEqual(a.digest(self.source / "Cargo.lock")["sha256"], self.lock["source_binding"]["cargo_lock_sha256"])
+        self.assemble()
+        legal_root = self.package / "docs/licenses/NeoRuntime-drawing"
+        self.assertEqual((legal_root / self.rust_text).read_bytes(), lf_body)
+        self.assertEqual((legal_root / "LICENSE").read_bytes(), self.legal)
+        manifest = a.read_json(legal_root / "SOURCE.json")
+        for name, value in manifest["legal_files"].items():
+            self.assertEqual(a.digest(legal_root / name)["sha256"], value)
 
-        (root / "tools").mkdir()
-        (root / ".gitignore").write_text("/target/\n/dist/\n/.cache/\n")
-        (root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.0.1"\n')
-        (root / "Cargo.lock").write_text("synthetic lock")
-        (root / "evidence.txt").write_text("SYNTHETIC test evidence, not authorization")
-        policy = root / "tools/distribution-review.json"
-        a.write_json(policy, {})
-        git("init", "-q")
-        git("config", "core.autocrlf", "false")
-        git("config", "user.name", "Synthetic Tests")
-        git("config", "user.email", "synthetic@example.invalid")
-        git("add", ".")
-        git("-c", "commit.gpgsign=false", "commit", "-qm", "Synthetic sources")
-        commit = git("rev-parse", "HEAD")
-        record = {"schema": 1, "status": "APPROVED", "blockers": [],
-                  "review": {"reviewer": "SYNTHETIC TEST ONLY", "date": date.today().isoformat(), "commit": commit,
-                             "source_tree_sha256": main_gate.source_tree(root, commit), "root_version": "0.0.1",
-                             "cargo_lock_sha256": a.digest(root / "Cargo.lock")["sha256"]},
-                  "resolutions": {issue: {"summary": "Synthetic fixture", "evidence": [{"path": "evidence.txt", "sha256": a.digest(root / "evidence.txt")["sha256"]}]}
-                                  for issue in main_gate.REQUIRED_ISSUES}}
-        a.write_json(policy, record)
-        git("add", ".")
-        git("-c", "commit.gpgsign=false", "commit", "-qm", "Synthetic approval")
-        a.check_review(policy, root=root)
-        for name in ("target/package/drawing-src/ignored.txt", "dist/neo/neo.exe", ".cache/stt/model"):
-            path = root / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"synthetic build output")
-        self.assertEqual(a.check_review(policy, root=root), record)
-        a.assemble(self.source, self.target, self.package, self.lock_path, root)
-        (root / "evidence.txt").write_text("changed tracked input")
-        with self.assertRaises(ValueError):
-            a.assemble(self.source, self.target, self.package, self.lock_path, root)
-        (root / "evidence.txt").write_text("SYNTHETIC test evidence, not authorization")
-        with (root / "Cargo.toml").open("a") as stream:
-            stream.write("# tracked build input changed\n")
-        with self.assertRaises(subprocess.CalledProcessError):
-            a.assemble(self.source, self.target, self.package, self.lock_path, root)
+    def test_verify_source_cli_succeeds_without_reviewed(self):
+        self.assertEqual(a.main(["verify-source", "--source", str(self.source), "--lock", str(self.lock_path)]), 0)
 
     def test_build_rejects_wrong_directml_before_running_any_executable(self):
         target = self.root / "rejected-build"
