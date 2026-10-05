@@ -106,6 +106,39 @@ fn filter_is_only_a_type_filter_and_images_are_never_authorized() {
 }
 
 #[test]
+fn handwritten_is_not_editable_and_cannot_authorize_model_operations() {
+    let handwritten = json!({"id":"handwritten-private","kind":{"type":"handwritten",
+        "position":point(),"text":"private text","layout":leaf("private layout"),
+        "strokes":[{"points":[{"x":0,"y":0,"time":0,"pressure":1}],"style":style()}]}});
+    assert!(!editable_object(&handwritten));
+    invalid(handwritten.clone());
+    let existing = vec![
+        text("text"),
+        shape("line"),
+        plot(json!(["x"])),
+        math(leaf("5")),
+        stroke(1),
+        json!({"id":"axes","kind":{"type":"coordinate_system","origin":point(),"scale":10}}),
+    ];
+    let mut mixed = existing.clone();
+    mixed.push(handwritten.clone());
+    let authorized: Vec<_> = mixed.into_iter().filter(editable_object).collect();
+    assert_eq!(authorized, existing);
+    for op in ["add", "update"] {
+        assert!(response(vec![operation(op, handwritten.clone())], &authorized).is_err());
+    }
+    assert!(response(
+        vec![json!({"op":"delete","id":"handwritten-private"})],
+        &authorized
+    )
+    .is_err());
+    for object in &authorized {
+        response(vec![operation("update", object.clone())], &authorized).unwrap();
+        response(vec![json!({"op":"delete","id":object["id"]})], &authorized).unwrap();
+    }
+}
+
+#[test]
 fn strict_json_rejects_prose_fences_trailing_values_and_wrong_envelopes() {
     for s in [
         "",

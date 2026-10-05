@@ -144,8 +144,9 @@ written to `graphics-help.txt` in the startup log directory on failure.
 
 ## Download & Install
 
-The workspace version is **`0.1.0-pre11`**. The release workflow builds and
-publishes binaries after technical checks; see Releases for available packages.
+The workspace is preparing **`0.1.0`**; this is not an announcement of a published
+stable release. The workflow builds and publishes binaries after technical checks;
+see Releases for available packages.
 The earlier [pre10 source prerelease](https://github.com/ChidcGithub/Neo/releases/tag/v0.1.0-pre10)
 is unchanged. The source tree includes some tracked binary assets.
 
@@ -163,6 +164,11 @@ Only the blackboard math-recognition model differs between **INT8** and **FP32**
 Choose one variant; both use the same installation and user-data locations.
 INT8 uses the pre-quantized [model asset](https://github.com/ChidcGithub/Neo/releases/tag/models-texteller-int8-v1);
 FP32 comes from a pinned upstream revision. CI checks sizes and SHA-256 values.
+Both variants contain the full feature set; INT8 reduces the math model's size
+and memory requirements, while quantization can change recognition results.
+Final packages are checked for required applications, runtime files, models,
+notices and sources. Portable ZIPs and extracted installer payloads are compared
+to the corresponding file manifest without running the installers.
 Both formats and variants must succeed before a single Release is published.
 
 > [!TIP]

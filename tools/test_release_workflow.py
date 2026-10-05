@@ -109,7 +109,7 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
         for job in (check, release):
             steps = re.split(r"(?m)^      - name: ", job)[1:]
             prepare = next(step for step in steps if step.startswith("Prepare mandatory no-TTS Sherpa native\n"))
-            self.assertIn("--budget-seconds 600 --validation-seconds 180 --max-download-mib 256", prepare)
+            self.assertIn("--budget-seconds 1500 --validation-seconds 180 --max-download-mib 256", prepare)
             self.assertNotRegex(prepare, r"(?m)^\s+(?:if|continue-on-error):")
             first_cargo = re.search(r"\bcargo\s+(?:check|test|build)\b", job)
             self.assertIsNotNone(first_cargo)

@@ -96,9 +96,21 @@ jobs:
       - name: Math model download regressions
         run: python -B -m unittest tools.test_prepare_math_models -v
 
+      - name: Complete release variant regressions
+        run: python -B -m unittest tools.test_verify_release_variants -v
+
       - name: Prepare mandatory no-TTS Sherpa native
         timeout-minutes: 30
-        run: python -B tools/prepare_sherpa_ci.py --budget-seconds 600 --validation-seconds 180 --max-download-mib 256
+        run: python -B tools/prepare_sherpa_ci.py --budget-seconds 1500 --validation-seconds 180 --max-download-mib 256
+
+      - name: Show native failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-ChildItem target/sherpa-asr/native -File -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Output $_.Name
+            Get-Content -LiteralPath $_.FullName -Tail 80
+          }
 
       - name: Check all workspace targets
         run: cargo check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
@@ -261,7 +273,16 @@ jobs:
 
       - name: Prepare mandatory no-TTS Sherpa native
         timeout-minutes: 30
-        run: python -B tools/prepare_sherpa_ci.py --budget-seconds 600 --validation-seconds 180 --max-download-mib 256
+        run: python -B tools/prepare_sherpa_ci.py --budget-seconds 1500 --validation-seconds 180 --max-download-mib 256
+
+      - name: Show native failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-ChildItem target/sherpa-asr/native -File -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Output $_.Name
+            Get-Content -LiteralPath $_.FullName -Tail 80
+          }
 
       - name: Build
         run: cargo build --locked --release -p neo-app --target x86_64-pc-windows-msvc
@@ -399,6 +420,8 @@ jobs:
             Copy-Item -Recurse dist/neo $pkg
             python -B tools/prepare_math_models.py --variant $variant --package $pkg --cache .cache/math-models
             if ($LASTEXITCODE -ne 0) { throw "Math model preparation failed: $variant" }
+            python -B tools/verify_release_variants.py package --package $pkg --variant $variant --version "${{ steps.ver.outputs.version }}"
+            if ($LASTEXITCODE -ne 0) { throw "Complete package validation failed: $variant" }
             python -B tools/stage_source_companions.py inventory --package $pkg --variant $variant --version "${{ steps.ver.outputs.version }}"
             if ($LASTEXITCODE -ne 0) { throw "Final package inventory failed: $variant" }
           }
@@ -413,6 +436,8 @@ jobs:
             if (Test-Path $zip) { throw "Archive already exists: $zip" }
             7z a -tzip -mx=5 $zip "./dist/neo-$variant" | Select-Object -Last 2
             if ($LASTEXITCODE -ne 0) { throw "7z exit $LASTEXITCODE" }
+            python -B tools/verify_release_variants.py archive --package "dist/neo-$variant" --variant $variant --version "${{ steps.ver.outputs.version }}" --archive $zip
+            if ($LASTEXITCODE -ne 0) { throw "Portable archive verification failed: $variant" }
           }
 
       - name: Generate installer art
@@ -445,6 +470,8 @@ jobs:
             if (Test-Path $out) { throw "Installer already exists: $out" }
             & $mk /NOCD /INPUTCHARSET UTF8 "/DVERSION=$v" "/DVI_VERSION=$vi" "/DPACKAGE_DIR=dist\neo-$variant" "/DOUTPUT_FILE=$out" tools\installer.nsi | Select-Object -Last 4
             if ($LASTEXITCODE -ne 0) { throw "makensis exit $LASTEXITCODE" }
+            python -B tools/verify_release_variants.py installer --package "dist/neo-$variant" --variant $variant --version $v --archive $out --extractor 7z --work-root target/verify-release-variants
+            if ($LASTEXITCODE -ne 0) { throw "Installer payload verification failed: $variant" }
           }
 
       - name: Generate changelog

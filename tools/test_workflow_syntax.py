@@ -75,7 +75,7 @@ class WorkflowSyntaxTests(unittest.TestCase):
                 self.assertEqual(len(preparations), 1)
                 index = preparations[0]
                 prepare = steps[index]
-                self.assertEqual(prepare["run"], "python -B tools/prepare_sherpa_ci.py --budget-seconds 600 --validation-seconds 180 --max-download-mib 256")
+                self.assertEqual(prepare["run"], "python -B tools/prepare_sherpa_ci.py --budget-seconds 1500 --validation-seconds 180 --max-download-mib 256")
                 self.assertEqual(prepare["timeout-minutes"], "30")
                 self.assertNotIn("if", prepare)
                 self.assertNotIn("continue-on-error", prepare)
@@ -175,6 +175,9 @@ class WorkflowSyntaxTests(unittest.TestCase):
         self.assertIn("/DOUTPUT_FILE=$out", installer)
         self.assertIn("-$variant-installer-x64.exe", installer)
         self.assertIn("--variants int8 fp32", by_name["Create release"]["run"])
+        self.assertLess(prepare.index("verify_release_variants.py package"), prepare.index("stage_source_companions.py inventory"))
+        self.assertIn("verify_release_variants.py archive", by_name["Zip portable package"]["run"])
+        self.assertIn("verify_release_variants.py installer", installer)
         self.assertIn("--list 'v[0-9]*'", by_name["Generate changelog"]["run"])
         self.assertIn("assemble_drawing_release.py assemble", by_name["Assemble pinned drawing release"]["run"])
         self.assertTrue(any("tools.test_prepare_math_models" in s.get("run", "") for s in workflow["jobs"]["check"]["steps"]))

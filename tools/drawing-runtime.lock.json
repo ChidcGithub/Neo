@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "repository": "https://github.com/ChidcGithub/NeoRuntime-drawing",
-  "commit": "ea1ecc87ec97717117f03625fd958c75cc2c0a49",
+  "commit": "8c32db0d2e5aa55dca774cf1c06547710ce8d2c2",
   "rust": "1.97.1",
   "target": "x86_64-pc-windows-msvc",
   "protocol": 1,
@@ -29,9 +29,9 @@
   "crt_information_url": "https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist",
   "limitations": ["Technical manifest only; no approval assertion", "Eigen notices delivered in main docs/licenses/runtime/native-sources/eigen-1d8b82b-COPYING.*; final package checked by verify_ort_sources", "No model payload", "No GUI/capture/microphone", "Developer-machine checks are not clean-install acceptance"],
   "source_binding": {
-    "source_commit": "ea1ecc87ec97717117f03625fd958c75cc2c0a49",
-    "source_tree_sha256": "4201eb12a7ad5724f6c75db82ed934fff7813a8361105d4476b99a4494425243",
-    "cargo_lock_sha256": "b148dff3befb112d32993fa08fadc4514df6ce0a45467ef1a3f1c0b4a5d06d1f",
+    "source_commit": "8c32db0d2e5aa55dca774cf1c06547710ce8d2c2",
+    "source_tree_sha256": "6910c89f3f7c597ffeb87704039de21c86877dafcc28eb0b057074ef4f4ed773",
+    "cargo_lock_sha256": "108deb894394b36400ba77bdf3d5254d2ddbefb8134c778112856bac1a1523e9",
     "version": "0.0.1",
     "legal_files": {
       "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",

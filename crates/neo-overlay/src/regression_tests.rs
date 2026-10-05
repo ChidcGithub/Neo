@@ -634,6 +634,37 @@ fn desktop_barrier_timeout_and_last_guard_restore() {
 }
 
 #[test]
+fn card_empty_frame_returns_before_input_allocation_and_display_reads() {
+    // 不创建 HWND/GPU；保护空卡片快路径的顺序，避免把 viewport map 分配移回热路径。
+    let source = include_str!("lib.rs");
+    let frame = source
+        .split("    fn egui_frame(")
+        .nth(1)
+        .unwrap()
+        .split("    fn placeholder_desktop(")
+        .next()
+        .unwrap();
+    let lock = frame
+        .find("let mut cards = self.cards.lock().ok()?;")
+        .unwrap();
+    let empty = frame.find("if cards.is_empty()").unwrap();
+    let early_return = frame.find("return None;").unwrap();
+    assert!(lock < empty && empty < early_return);
+    for work in [
+        "self.wnd.ppp.load",
+        "self.wnd.bounds.lock()",
+        "let input = egui::RawInput",
+        "self.egui_start.elapsed()",
+        "self.egui_ctx.begin_pass(input)",
+    ] {
+        assert!(early_return < frame.find(work).unwrap(), "{work}");
+    }
+    // 一直持有同一份卡片快照，避免先 has_cards 再重锁的竞态与额外锁开销。
+    assert_eq!(frame.matches("self.cards.lock()").count(), 1);
+    assert!(frame.contains("for (id, card) in cards.iter_mut()"));
+}
+
+#[test]
 fn toast_passive_card_never_opens_capture_or_posts_show_hide() {
     let (handle, commands, release, finished) = fake_handle();
     handle.set_card(

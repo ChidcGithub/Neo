@@ -320,6 +320,8 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Envelope, String> {
 }
 
 pub(super) fn ready(data: &Value, kind: BoardKind) -> Result<HashSet<String>, String> {
+    // Document/package versions and object_types are additive capabilities, not
+    // the JSONL envelope version or permission to expose new kinds to the model.
     if data["app"].as_str() != Some(kind.code())
         || data["headless"] != false
         || data["has_window"] != true

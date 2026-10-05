@@ -354,6 +354,13 @@ class VerifyTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "build.DEPS"):
             self.verify()
 
+    def test_stale_drawing_record_commit_rejected_with_updated_record_hash(self):
+        drawing = next(c for c in self.record["components"] if c["id"] == "drawing-static-onnxruntime")
+        drawing["drawing_commit"] = "0" * 40
+        self.save_record()
+        with self.assertRaisesRegex(ValueError, "Drawing ORT commit/archive hash mismatch"):
+            self.verify(package=False, bundle=False)
+
     def test_drawing_pin_and_package_provenance_change(self):
         path = self.root / ort.DRAWING_LOCK
         original = path.read_bytes()
@@ -429,6 +436,17 @@ class VerifyTests(unittest.TestCase):
 
 
 class TrackedAndCliTests(unittest.TestCase):
+    def test_real_drawing_pin_record_and_source_lock_stay_in_sync(self):
+        drawing = ort.read_json(ort.ROOT / ort.DRAWING_LOCK)
+        record = ort.read_json(ort.ROOT / ort.RECORD)
+        lock = ort.read_json(ort.ROOT / ort.LOCK)
+        self.assertEqual(ort.DRAWING_COMMIT, "8c32db0d2e5aa55dca774cf1c06547710ce8d2c2")
+        self.assertEqual(drawing["commit"], ort.DRAWING_COMMIT)
+        self.assertEqual(drawing["source_binding"]["source_commit"], ort.DRAWING_COMMIT)
+        self.assertEqual(ort.file_record(ort.ROOT / ort.RECORD)["sha256"],
+                         lock["ort_eigen_notice"]["record_sha256"])
+        ort.check_record(record, lock, ort.ROOT)
+
     def test_exact_git_index_paths_required(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

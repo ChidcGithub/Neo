@@ -1006,7 +1006,9 @@ fn invalid_oversize_descriptors_fail_without_reads_or_skipping_objects() {
         ("offset", json!(-1)),
         ("next_offset", json!(0)),
         ("next_offset", json!(2)),
-        ("next_offset", json!(null)),
+        ("next_offset", json!("1")),
+        ("next_offset", json!(-1)),
+        ("next_offset", json!(true)),
         ("total_bytes", json!(0)),
         ("total_bytes", json!("60000")),
         ("total_bytes", json!(MAX_SNAPSHOT_BYTES)),
@@ -1154,6 +1156,259 @@ fn consecutive_fallbacks_preserve_known_total_and_enforce_object_count() {
     );
     assert_edit_failed(&mut m, &f);
     assert!(!f.sent().iter().any(|r| r.1 == "objects.read"));
+}
+
+fn handwritten(id: &str, large: bool) -> Value {
+    json!({"id":id,"kind":{"type":"handwritten","position":{"x":80,"y":80},
+        "text":"private handwriting text",
+        "layout":{"type":"text","value":"private handwriting layout"},
+        "strokes":[{"points":vec![json!({"x":0,"y":0,"time":0,"pressure":1}); if large { 2000 } else { 1 }],
+            "style":{"color":{"r":245,"g":245,"b":235,"a":255},"width":1,"dashed":false}}]}})
+}
+
+#[test]
+fn last_large_object_null_completes_only_after_chunks_with_known_or_unknown_total() {
+    for known_total in [false, true] {
+        for kind in ["text", "handwritten"] {
+            let (mut m, f, s) = begin_edit();
+            let mut expected = Vec::new();
+            let offset = usize::from(known_total);
+            if known_total {
+                expected.push(edit_text("first"));
+                respond_objects(&f, Ok(object_page(&s, 0, 2, expected.clone())));
+                m.poll(true);
+            }
+            let object = if kind == "handwritten" {
+                handwritten("last", true)
+            } else {
+                let mut object = edit_text("last");
+                object["kind"]["text"] = json!("x".repeat(60 * 1024));
+                object
+            };
+            let size = serde_json::to_vec(&object).unwrap().len();
+            assert!(size > OBJECT_PAGE_BYTES);
+            let mut e = oversized_object(&s, offset, "last", size);
+            e.data.as_mut().unwrap()["next_offset"] = Value::Null;
+            respond_objects(&f, Err(e));
+            m.poll(true);
+            let Phase::Reading(d) = &m.boards[0].host.task.as_ref().unwrap().phase else {
+                panic!()
+            };
+            let snapshot = d.snapshot.as_ref().unwrap();
+            assert_eq!(snapshot.total, Some(offset + 1));
+            assert_eq!(snapshot.offset, offset);
+            assert!(!snapshot.complete());
+            assert!(m.boards[0].host.agent_requests.as_ref().unwrap().is_empty());
+            download_object(&mut m, &f, &s, &object);
+            if kind == "text" {
+                expected.push(object);
+            }
+            let requests = m.boards[0].host.agent_requests.as_ref().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].edit_objects, Some(expected));
+            assert!(requests[0].images.is_empty());
+            assert_eq!(
+                f.sent().iter().filter(|r| r.1 == "objects.list").count(),
+                offset + 1
+            );
+            assert!(!f.sent().iter().any(|r| r.1 == "resources.read"));
+        }
+    }
+}
+
+#[test]
+fn oversize_next_offset_requires_presence_and_consistent_current_total() {
+    for (offset, total, next) in [
+        (0, None, None),
+        (1, Some(3), Some(Value::Null)),
+        (1, Some(1), Some(Value::Null)),
+        (1, Some(1), Some(json!(2))),
+        (2, Some(1), Some(json!(3))),
+        (1, Some(2), Some(json!(1))),
+        (1, Some(2), Some(json!(3))),
+    ] {
+        let (mut m, f, s) = begin_edit();
+        let Phase::Reading(d) = &mut m.boards[0].host.task.as_mut().unwrap().phase else {
+            panic!()
+        };
+        let snapshot = d.snapshot.as_mut().unwrap();
+        snapshot.offset = offset;
+        snapshot.total = total;
+        let mut e = oversized_object(&s, offset, "last", 60000);
+        let data = e.data.as_mut().unwrap().as_object_mut().unwrap();
+        if let Some(next) = next {
+            data.insert("next_offset".into(), next);
+        } else {
+            data.remove("next_offset");
+        }
+        respond_objects(&f, Err(e));
+        assert_edit_failed(&mut m, &f);
+        assert!(!f.sent().iter().any(|r| r.1 == "objects.read"));
+    }
+}
+
+#[test]
+fn handwritten_is_opaque_in_mixed_context_and_host_never_returns_its_delete() {
+    for delete_handwriting in [false, true] {
+        let (mut m, f, s) = begin_edit();
+        let objects = vec![
+            edit_text("editable"),
+            handwritten("private-id", false),
+            json!({"id":"image","kind":{"type":"image","asset_ref":"asset:private"}}),
+        ];
+        respond_objects(&f, Ok(object_page(&s, 0, 3, objects)));
+        m.poll(true);
+        let request = &m.boards[0].host.agent_requests.as_ref().unwrap()[0];
+        assert_eq!(request.edit_objects, Some(vec![edit_text("editable")]));
+        assert!(request.images.is_empty());
+        assert!(!request.prompt.contains("private"));
+        let context = serde_json::to_string(&request.edit_objects).unwrap();
+        assert!(!context.contains("private"));
+        let id = if delete_handwriting {
+            "private-id"
+        } else {
+            "editable"
+        };
+        // Exercise the same validator as the real Agent before completing the fake
+        // worker. The fake transport proves only host output, not child GUI/save IO.
+        let validated = crate::drawing_objects::validate_edit_response(
+            &json!({"answer":"done","operations":[{"op":"delete","id":id}]}).to_string(),
+            request.edit_objects.as_ref().unwrap(),
+            &request.object_prefix,
+        )
+        .map_err(|e| error("agent_failed", &e));
+        assert_eq!(validated.is_err(), delete_handwriting);
+        let Phase::FakeAgent { finished, result } =
+            &mut m.boards[0].host.task.as_mut().unwrap().phase
+        else {
+            panic!()
+        };
+        *result = validated;
+        finished.store(true, Ordering::Release);
+        m.poll(true);
+        let replies = f.replies();
+        let reply = &replies
+            .iter()
+            .find(|(id, _)| id == "runtime:edit")
+            .unwrap()
+            .1;
+        if delete_handwriting {
+            assert!(reply.is_err());
+        } else {
+            assert_eq!(
+                reply.as_ref().unwrap()["operations"],
+                json!([{"op":"delete","id":"editable"}])
+            );
+        }
+        assert!(!f.sent().iter().any(|r| matches!(
+            r.1.as_str(),
+            "objects.apply" | "document.save" | "resources.read"
+        )));
+        for (_, reply) in replies {
+            if let Ok(value) = reply {
+                assert!(!value.to_string().contains("private-id"));
+            }
+        }
+    }
+}
+
+#[test]
+fn unknown_and_malformed_kinds_fail_closed_in_lists_and_chunks() {
+    for kind in [
+        Value::Null,
+        json!({}),
+        json!({"type":null}),
+        json!({"type":42}),
+        json!({"type":"future_kind"}),
+        json!({"type":"Handwritten"}),
+        json!({"type":"text"}),
+    ] {
+        for chunked in [false, true] {
+            let (mut m, f, s) = begin_edit();
+            let object = json!({"id":"bad","kind":kind});
+            if chunked {
+                let mut e =
+                    oversized_object(&s, 0, "bad", serde_json::to_vec(&object).unwrap().len());
+                e.data.as_mut().unwrap()["next_offset"] = Value::Null;
+                respond_objects(&f, Err(e));
+                m.poll(true);
+                download_object(&mut m, &f, &s, &object);
+            } else {
+                respond_objects(&f, Ok(object_page(&s, 0, 1, vec![object])));
+            }
+            assert_edit_failed(&mut m, &f);
+        }
+    }
+}
+
+#[test]
+fn handwritten_chunk_budget_includes_prior_objects_separators_and_brackets() {
+    for extra in [0, 1] {
+        let (mut m, f, s) = begin_edit();
+        let first = handwritten("first", false);
+        let mut last = handwritten("last", true);
+        let overhead = serde_json::to_vec(&vec![first.clone(), last.clone()])
+            .unwrap()
+            .len();
+        // Opaque payload: even metadata the host does not interpret must be charged.
+        let padding = MAX_SNAPSHOT_BYTES - overhead + extra;
+        let text = last["kind"]["text"].as_str().unwrap().to_owned();
+        last["kind"]["text"] = json!(format!("{text}{}", "x".repeat(padding)));
+        respond_objects(&f, Ok(object_page(&s, 0, 2, vec![first])));
+        m.poll(true);
+        let mut e = oversized_object(&s, 1, "last", serde_json::to_vec(&last).unwrap().len());
+        e.data.as_mut().unwrap()["next_offset"] = Value::Null;
+        respond_objects(&f, Err(e));
+        m.poll(true);
+        if extra == 1 {
+            assert_edit_failed(&mut m, &f);
+            assert_eq!(
+                f.replies().last().unwrap().1.as_ref().unwrap_err().code,
+                "resource_limit"
+            );
+            assert!(!f.sent().iter().any(|r| r.1 == "objects.read"));
+        } else {
+            download_object(&mut m, &f, &s, &last);
+            assert_eq!(
+                m.boards[0].host.agent_requests.as_ref().unwrap()[0].edit_objects,
+                Some(vec![])
+            );
+            assert_eq!(f.sent().iter().filter(|r| r.1 == "objects.list").count(), 2);
+        }
+    }
+}
+
+#[test]
+fn handwritten_whole_scan_counts_small_and_chunked_objects() {
+    let (mut m, f, s) = begin_edit();
+    for offset in (0..224).step_by(32) {
+        let objects = (offset..offset + 32)
+            .map(|n| handwritten(&format!("h-{n}"), false))
+            .collect();
+        respond_objects(&f, Ok(object_page(&s, offset, 256, objects)));
+        m.poll(true);
+    }
+    let objects = (224..255)
+        .map(|n| handwritten(&format!("h-{n}"), false))
+        .collect();
+    respond_objects(&f, Ok(object_page(&s, 224, 256, objects)));
+    m.poll(true);
+    let last = handwritten("last", false);
+    let mut e = oversized_object(&s, 255, "last", serde_json::to_vec(&last).unwrap().len());
+    e.data.as_mut().unwrap()["next_offset"] = Value::Null;
+    respond_objects(&f, Err(e));
+    m.poll(true);
+    download_object(&mut m, &f, &s, &last);
+    assert_eq!(
+        m.boards[0].host.agent_requests.as_ref().unwrap()[0].edit_objects,
+        Some(vec![])
+    );
+    let (mut m, f, s) = begin_edit();
+    respond_objects(
+        &f,
+        Ok(object_page(&s, 0, 257, vec![handwritten("first", false)])),
+    );
+    assert_edit_failed(&mut m, &f);
 }
 
 fn edit_text(id: &str) -> Value {
@@ -1407,7 +1662,7 @@ fn snapshot_budgets_include_filtered_images_and_never_truncate() {
         f.replies().last().unwrap().1.as_ref().unwrap_err().code,
         "resource_limit"
     );
-    for kind in ["image", "text"] {
+    for kind in ["image", "handwritten", "text"] {
         let (mut m, f, s) = begin_edit();
         for offset in 0..4 {
             let mut object = edit_text(&format!("object-{offset}"));

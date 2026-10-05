@@ -1653,6 +1653,12 @@ impl Gfx {
         egui::TexturesDelta,
         egui_wgpu::ScreenDescriptor,
     )> {
+        // RawInput::default 会分配根 viewport map；纯光环帧无需构造它。
+        let mut cards = self.cards.lock().ok()?;
+        if cards.is_empty() {
+            return None;
+        }
+
         let ppp = f32::from_bits(self.wnd.ppp.load(Ordering::Relaxed));
         let (vx, vy) = self.wnd.bounds.lock().unwrap().origin;
         let (ox, oy) = (vx as f32 / ppp, vy as f32 / ppp);
@@ -1670,11 +1676,6 @@ impl Gfx {
             focused: false,
             ..Default::default()
         };
-
-        let mut cards = self.cards.lock().ok()?;
-        if cards.is_empty() {
-            return None;
-        }
 
         // 主屏点 → 层内点：减窗口原点（虚拟屏原点可为负）。
         // 注意：draw 闭包内不得调用 set_card（锁重入会死锁）。

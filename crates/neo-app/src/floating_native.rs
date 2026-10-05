@@ -561,7 +561,7 @@ struct CacheWork {
 #[derive(PartialEq, Eq)]
 struct LabelKey {
     language: crate::i18n::Language,
-    bounds: Vec<(i32, i32, i32, i32)>,
+    bounds: [(i32, i32, i32, i32); 2],
 }
 
 impl RenderCache {
@@ -609,15 +609,14 @@ impl RenderCache {
                 }
             }
             // Use exact integer GDI bounds, not quantized animation progress.
+            // An open menu always has two labels; cache hits need no heap key.
+            let mut label_circles = animated_circles(amount).skip(2);
             let key = LabelKey {
                 language: crate::i18n::language(),
-                bounds: animated_circles(amount)
-                    .skip(2)
-                    .map(|circle| {
-                        let r = label_bounds(circle, scale);
-                        (r.left, r.top, r.right, r.bottom)
-                    })
-                    .collect(),
+                bounds: std::array::from_fn(|_| {
+                    let r = label_bounds(label_circles.next().unwrap(), scale);
+                    (r.left, r.top, r.right, r.bottom)
+                }),
             };
             if self.label_key.as_ref() != Some(&key) {
                 let dib = self.dib.as_mut().unwrap();

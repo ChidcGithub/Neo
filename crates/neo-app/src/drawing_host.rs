@@ -190,19 +190,26 @@ impl Snapshot {
             .filter(|n| *n > 0)
             .ok_or_else(invalid)?;
         let next = self.offset.checked_add(1).ok_or_else(invalid)?;
+        let last = match v.get("next_offset") {
+            Some(Value::Null) => true,
+            Some(value) if value.as_u64() == Some(next as u64) => false,
+            _ => return Err(invalid()),
+        };
         if !Self::context(v, original)
             || v["offset"].as_u64() != Some(self.offset as u64)
-            || v["next_offset"].as_u64() != Some(next as u64)
             || self.reading.is_some()
             || self.offset >= MAX_SNAPSHOT_OBJECTS
-            || self.total.is_some_and(|n| next > n)
+            || self.total.is_some_and(|n| next > n || (last && next != n))
             || self.objects.iter().any(|o| o["id"].as_str() == Some(id))
         {
             return Err(invalid());
         }
         self.budget(total)?;
-        // The list error has no page total. Keep an unknown total unknown until
-        // the next list reply, rather than treating this one object as the page.
+        // Explicit null identifies the last object, but completion still waits
+        // for its chunks. Numeric offsets retain the legacy continuation behavior.
+        if last {
+            self.total = Some(next);
+        }
         self.reading = Some(ObjectRead {
             id: id.to_owned(),
             total,
@@ -254,7 +261,10 @@ impl Snapshot {
             self.bytes += size + usize::from(self.offset > 0);
             if editable_object(&object) {
                 self.objects.push(object);
-            } else if object["kind"]["type"].as_str() != Some("image") {
+            } else if !matches!(
+                object["kind"]["type"].as_str(),
+                Some("image" | "handwritten")
+            ) {
                 return Err(invalid());
             }
             self.offset = next_object;
@@ -302,8 +312,8 @@ impl Snapshot {
         {
             return Err(invalid());
         }
-        // Charge every object, including images, before filtering. Count the JSON
-        // array brackets and separators across pages, not only editable content.
+        // Charge every object, including images and handwriting, before filtering.
+        // Count array brackets and separators across pages, not only editable content.
         for (index, object) in objects.iter().enumerate() {
             let size = serde_json::to_vec(object).map_err(|_| invalid())?.len();
             self.bytes = self
@@ -317,7 +327,10 @@ impl Snapshot {
             }
             if editable_object(object) {
                 self.objects.push(object.clone());
-            } else if object["kind"]["type"].as_str() != Some("image") {
+            } else if !matches!(
+                object["kind"]["type"].as_str(),
+                Some("image" | "handwritten")
+            ) {
                 return Err(invalid());
             }
         }
@@ -1015,10 +1028,10 @@ pub(super) fn panel(host: &mut Host, ctx: &egui::Context) {
                 ui.add_enabled_ui(c.write_allowed, |ui| { ui.checkbox(&mut c.write_back, tr("允许回答写回原页面")); });
                                 if !c.write_allowed || !c.write_back { c.structured_edit = false; }
                                 ui.add_enabled_ui(c.write_allowed && c.write_back, |ui| {
-                                    ui.checkbox(&mut c.structured_edit, tr("允许读取当前页并新增、修改或删除图形对象"));
+                                    ui.checkbox(&mut c.structured_edit, tr("允许读取当前页并新增、修改或删除支持的图形对象"));
                                 });
                                 if c.structured_edit {
-                                    ui.label(tr("当前页图形对象将发送到远端模型服务，可能包含文字。不会读取其他页面或额外图片。"));
+                                    ui.label(tr("当前页支持的图形及文字将发送给模型。手写对象不发送、不修改；图片仅按另行授权发送。不会读取其他页面。"));
                                 }
                 if !c.assets.is_empty() { ui.checkbox(&mut c.vision_confirmed, tr("我确认此模型支持图片输入，并同意发送这些图片")); }
                 ui.horizontal(|ui| {

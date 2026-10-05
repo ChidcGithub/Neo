@@ -210,6 +210,43 @@ fn handshake_uses_actual_methods_and_restricted_permissions() {
 }
 
 #[test]
+fn ready_jsonl_v1_accepts_child_v3_document_and_object_capabilities() {
+    let mut r = ready();
+    r["data"]["document_file_versions"] = json!([1, 2, 3]);
+    r["data"]["resource_persistence"] = json!("board-session-package-v1");
+    r["data"]["resource_persistence_versions"] = json!([
+        "board-session-package-v1",
+        "board-session-package-v2",
+        "board-session-package-v3"
+    ]);
+    r["data"]["object_types"] = json!([
+        "stroke",
+        "shape",
+        "text",
+        "math",
+        "handwritten",
+        "image",
+        "coordinate_system",
+        "function_plot"
+    ]);
+    r["data"]["object_chunk_encoding"] = json!("utf8_json_u8_array");
+    r["data"]["object_chunk_bytes"] = json!(8192);
+    let mut h = Harness::new();
+    h.feed(r.clone()).unwrap();
+    let configure: Value = serde_json::from_slice(&h.writes.try_recv().unwrap().bytes).unwrap();
+    assert_eq!(configure["version"], 1);
+    assert_eq!(configure["method"], "configure");
+    assert!(h.events.try_recv().is_err());
+    h.feed(json!({"version":1,"type":"response","id":"neo:42:0","ok":true,"result":state()}))
+        .unwrap();
+    assert!(matches!(h.events.try_recv().unwrap(), Event::Ready(_)));
+    assert!(h.writes.try_recv().is_err());
+    // File/package v3 does not authorize a JSONL v3 envelope.
+    r["version"] = json!(3);
+    assert!(Harness::new().feed(r).is_err());
+}
+
+#[test]
 fn configure_errors_and_timeouts_never_emit_ready() {
     let mut h = Harness::new();
     h.request(1, "show");

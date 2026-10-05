@@ -96,6 +96,44 @@ fn precomputed_geometry_and_reused_coverage_match_original_pixels() {
 }
 
 #[test]
+fn inline_label_key_matches_collected_bounds_and_reuses_mask() {
+    use crate::i18n::{with_language, Language};
+    unsafe {
+        let mut cache = RenderCache::default();
+        for scale in [0.5, 1.0, 1.25, 2.0, 4.0] {
+            let size = (EXTENT * scale) as i32;
+            for language in [Language::ZhCn, Language::EnUs] {
+                with_language(language, || {
+                    for amount in [0.01, 0.5, 1.0, 1.0 - f32::EPSILON] {
+                        cache.prepare(size, scale, amount).unwrap();
+                        let expected: Vec<_> = animated_circles(amount)
+                            .skip(2)
+                            .map(|circle| {
+                                let r = label_bounds(circle, scale);
+                                (r.left, r.top, r.right, r.bottom)
+                            })
+                            .collect();
+                        let key = cache.label_key.as_ref().unwrap();
+                        assert_eq!(key.language, language);
+                        assert_eq!(key.bounds.as_slice(), expected.as_slice());
+                        let work = cache.work;
+                        let mask = cache.mask.as_ptr();
+                        cache.prepare(size, scale, amount).unwrap();
+                        assert_eq!(cache.work, work);
+                        assert_eq!(cache.mask.as_ptr(), mask);
+                        // Closing and reopening must retain the same valid mask.
+                        cache.prepare(size, scale, 0.0).unwrap();
+                        cache.prepare(size, scale, amount).unwrap();
+                        assert_eq!(cache.work, work);
+                        assert_eq!(cache.mask.as_ptr(), mask);
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[test]
 fn repeated_frames_reuse_dib_artwork_fonts_and_mask() {
     crate::i18n::with_language(crate::i18n::Language::ZhCn, || unsafe {
         let mut cache = RenderCache::default();
