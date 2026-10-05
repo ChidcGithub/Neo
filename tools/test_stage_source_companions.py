@@ -100,18 +100,25 @@ class SourceDeliveryTests(unittest.TestCase):
             result = delivery.stage(*self.stage_args)
         return result, gitbash, native
 
-    def prepare_publish(self, version="1.2.3"):
+    def prepare_publish(self, version="1.2.3", variants=None):
         notice, _, _ = self.stage()
         if version != "1.2.3":
             notice = delivery.source_access(self.lock, "owner/repo", "v" + version, version)
             write_json(self.package / "docs/licenses/SOURCE-ACCESS.json", notice)
             for source in notice["sources"]:
                 shutil.copyfile(self.bundles[source["kind"]], self.output / source["name"])
-        for suffix in ("portable-x64.zip", "installer-x64.exe"):
-            (self.output / f"neo-{version}-{suffix}").write_bytes(b"synthetic binary")
+        prefixes = [f"neo-{version}"]
+        if variants is not None:
+            for variant in variants:
+                shutil.copytree(self.package, self.package.with_name(f"{self.package.name}-{variant}"))
+            prefixes = [f"neo-{version}-{variant}" for variant in variants]
+        binary_names = [f"{prefix}-{suffix}" for prefix in prefixes
+                        for suffix in ("portable-x64.zip", "installer-x64.exe")]
+        for name in binary_names:
+            (self.output / name).write_bytes(b"synthetic binary")
         notes = self.root / "notes.txt"
         notes.write_text("test notes", encoding="utf-8")
-        names = [s["name"] for s in notice["sources"]] + [f"neo-{version}-{s}" for s in ("portable-x64.zip", "installer-x64.exe")]
+        names = [s["name"] for s in notice["sources"]] + binary_names
         assets = []
         for name in names:
             record = delivery.file_record(self.output / name)
@@ -288,6 +295,319 @@ class SourceDeliveryTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], ["gh", "release", "view", "v1.2.3"])
         self.assertTrue(run.call_args.kwargs["check"])
         self.assertEqual(run.call_args.kwargs["timeout"], 600)
+
+
+class VariantPublicationTests(unittest.TestCase):
+    setUp = SourceDeliveryTests.setUp
+    save_lock = SourceDeliveryTests.save_lock
+    fake_download = SourceDeliveryTests.fake_download
+    stage = SourceDeliveryTests.stage
+    prepare_publish = SourceDeliveryTests.prepare_publish
+    gh_results = SourceDeliveryTests.gh_results
+
+    def prepare_variants(self):
+        # Exercise the real stage-once, copy-to-siblings layout with synthetic inputs.
+        self.package.rename(self.output / "neo")
+        self.package = self.output / "neo"
+        self.stage_args = (self.lock_path, self.package, *self.stage_args[2:])
+        (self.package / "docs/licenses/SOURCE-NOTICE.txt").write_text("synthetic source notice", encoding="utf-8")
+        args, assets = self.prepare_publish("1.2.3-pre11", variants=("int8", "fp32"))
+        for variant in ("int8", "fp32"):
+            package = self.package.with_name("neo-" + variant)
+            models = package / "resources/models/math"
+            models.mkdir(parents=True)
+            (models / "model.onnx").write_bytes(b"synthetic math model " + variant.encode())
+            delivery.inventory(package, variant, args[5])
+        return args, assets
+
+    def cli_args(self, args):
+        return ["source-delivery", "publish", "--lock", str(args[0]), "--package", str(args[1]),
+                "--output", str(args[2]), "--repository", args[3], "--tag", args[4], "--version", args[5],
+                "--notes", str(args[6]), "--prerelease", "true"]
+
+    @contextmanager
+    def offline(self):
+        with patch.object(delivery.urllib.request, "build_opener", side_effect=AssertionError("Unexpected network")), \
+                patch.object(delivery.subprocess, "run", side_effect=AssertionError("Unexpected subprocess")):
+            yield
+
+    def test_cli_publishes_both_variants_and_shared_sources_in_one_verified_draft(self):
+        with self.offline():
+            args, assets = self.prepare_variants()
+            with mock_publication_review(args[5]), \
+                    patch.object(sys, "argv", self.cli_args(args) + ["--variants", "int8", "fp32"]), \
+                    patch.object(delivery, "run_gh", side_effect=self.gh_results(assets, args[5])) as gh:
+                delivery.main()
+        names = {f"neo-{args[5]}-{variant}-{suffix}" for variant in ("int8", "fp32")
+                 for suffix in ("portable-x64.zip", "installer-x64.exe")}
+        names.update(f"neo-{args[5]}-{kind}-sources.zip" for kind in ("gitbash", "native"))
+        self.assertEqual({asset["name"] for asset in assets}, names)
+        calls = [call.args[0] for call in gh.call_args_list]
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(calls[0][:3], ["release", "create", args[4]])
+        self.assertEqual(calls[0][3:9], [str(self.output / asset["name"]) for asset in assets])
+        self.assertEqual(calls[0][9], "--repo")
+        for flag in ("--draft", "--verify-tag", "--prerelease"):
+            self.assertIn(flag, calls[0])
+        self.assertEqual(calls[1][:2], ["release", "view"])
+        self.assertIn("--paginate", calls[2])
+        self.assertIn("--slurp", calls[2])
+        self.assertIn("repos/owner/repo/releases/17/assets?per_page=100", calls[2])
+        self.assertEqual(calls[3][:2], ["release", "edit"])
+        self.assertIn("--draft=false", calls[3])
+        self.assertIn("--prerelease=true", calls[3])
+
+    def test_every_binary_and_shared_source_is_mandatory_before_any_gh(self):
+        args, assets = self.prepare_variants()
+        # Legacy binaries must never fill a missing variant slot.
+        for suffix in ("portable-x64.zip", "installer-x64.exe"):
+            (self.output / f"neo-{args[5]}-{suffix}").write_bytes(b"legacy")
+        for asset in assets:
+            path = self.output / asset["name"]
+            original = path.read_bytes()
+            for content in (None, b""):
+                with self.subTest(name=path.name, content=content), self.offline(), \
+                        mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh:
+                    if content is None:
+                        path.unlink()
+                    else:
+                        path.write_bytes(content)
+                    with self.assertRaises(ValueError):
+                        delivery.publish(*args, variants=["int8", "fp32"])
+                    gh.assert_not_called()
+                    path.write_bytes(original)
+
+    def test_unknown_duplicate_empty_and_partial_variants_rejected_before_source_inputs(self):
+        args, _ = self.prepare_variants()
+        for variants in ([], ["int8"], ["fp32"], ["int8", "int8"], ["fp32", "fp32"],
+                         ["int8", "fp16"], ["INT8", "fp32"], ["../int8", "fp32"],
+                         ["int8", "fp32", "int8"]):
+            with self.subTest(variants=variants), self.offline(), mock_publication_review(args[5]), \
+                    patch.object(delivery, "read_lock") as lock, patch.object(delivery, "run_gh") as gh, \
+                    self.assertRaisesRegex(ValueError, "exactly once"):
+                delivery.publish(*args, variants=variants)
+            lock.assert_not_called()
+            gh.assert_not_called()
+
+    def test_cli_rejects_bad_variant_and_stage_variants(self):
+        args, _ = self.prepare_variants()
+        for flags in (["--variants", "int8", "fp16"], ["--variants"]):
+            with self.subTest(flags=flags), self.offline(), \
+                    patch.object(sys, "argv", self.cli_args(args) + flags), \
+                    patch.object(sys, "stderr", io.StringIO()), patch.object(delivery, "publish") as publish, \
+                    self.assertRaises(SystemExit):
+                delivery.main()
+            publish.assert_not_called()
+        argv = self.cli_args(args) + ["--variants", "int8", "fp32"]
+        argv[1] = "stage"
+        with self.offline(), patch.object(sys, "argv", argv), patch.object(sys, "stderr", io.StringIO()) as stderr, \
+                patch.object(delivery, "stage") as stage, self.assertRaises(SystemExit):
+            delivery.main()
+        self.assertIn("publish-only", stderr.getvalue())
+        stage.assert_not_called()
+
+    def test_each_variant_requires_identical_delivery_manifest_and_notices(self):
+        args, _ = self.prepare_variants()
+        for variant in ("int8", "fp32"):
+            directory = self.package.with_name("neo-" + variant)
+            for name in ("SOURCE-ACCESS.json", "SOURCE-NOTICE.txt"):
+                path = directory / "docs/licenses" / name
+                original = path.read_bytes()
+                for content in (None, b"{}", original + b"\n"):
+                    with self.subTest(variant=variant, name=name, content=content), self.offline(), \
+                            mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh:
+                        if content is None:
+                            path.unlink()
+                        else:
+                            path.write_bytes(content)
+                        with self.assertRaises((ValueError, OSError)):
+                            delivery.publish(*args, variants=["int8", "fp32"])
+                        gh.assert_not_called()
+                        path.write_bytes(original)
+            extra = directory / "docs/licenses/extra.txt"
+            extra.write_bytes(b"not in base")
+            with self.offline(), mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh, \
+                    self.assertRaisesRegex(ValueError, "notices differ"):
+                delivery.publish(*args, variants=["int8", "fp32"])
+            gh.assert_not_called()
+            extra.unlink()
+            absent = directory.with_name(directory.name + "-absent")
+            directory.rename(absent)
+            with self.offline(), mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh, \
+                    self.assertRaises(OSError):
+                delivery.publish(*args, variants=["int8", "fp32"])
+            gh.assert_not_called()
+            absent.rename(directory)
+
+    def test_matching_variant_notices_cannot_override_lock_or_base(self):
+        args, _ = self.prepare_variants()
+        for package in (self.package, self.package.with_name("neo-int8"), self.package.with_name("neo-fp32")):
+            path = package / "docs/licenses/SOURCE-ACCESS.json"
+            notice = delivery.load_json(path)
+            notice["sources"][0]["sha256"] = "0" * 64
+            write_json(path, notice)
+        with self.offline(), mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh, \
+                self.assertRaisesRegex(ValueError, "notice differs from lock"):
+            delivery.publish(*args, variants=["int8", "fp32"])
+        gh.assert_not_called()
+
+    def test_remote_partial_duplicate_extra_or_changed_assets_leave_variant_draft_unpublished(self):
+        args, assets = self.prepare_variants()
+        bad_assets = [assets[:i] + assets[i + 1:] for i in range(len(assets))]
+        bad_assets += [assets + [assets[0]], assets + [dict(assets[0], name="extra.zip")]]
+        for i in range(len(assets)):
+            for change in ({"digest": None}, {"digest": "sha256:" + "0" * 64}, {"size": 0}, {"state": "new"}):
+                changed = copy.deepcopy(assets)
+                changed[i].update(change)
+                bad_assets.append(changed)
+        for remote in bad_assets:
+            with self.subTest(remote=remote), self.offline(), mock_publication_review(args[5]), \
+                    patch.object(delivery, "run_gh", side_effect=self.gh_results(remote, args[5])) as gh, \
+                    self.assertRaises(ValueError):
+                delivery.publish(*args, variants=["fp32", "int8"])
+            self.assertEqual(gh.call_count, 3)
+            self.assertFalse(any(call.args[0][:2] == ["release", "edit"] for call in gh.call_args_list))
+
+    def test_changed_missing_and_extra_package_files_block_before_gh(self):
+        args, _ = self.prepare_variants()
+        for variant in ("int8", "fp32"):
+            package = self.package.with_name("neo-" + variant)
+            for name in ("resources/models/math/model.onnx", "runtime/onnx/runtime.dll"):
+                path = package / name
+                original = path.read_bytes()
+                for content in (None, b"x" * len(original)):
+                    with self.subTest(variant=variant, name=name, content=content), self.offline(), \
+                            mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh:
+                        if content is None:
+                            path.unlink()
+                        else:
+                            path.write_bytes(content)
+                        with self.assertRaisesRegex(ValueError, "package manifest differs"):
+                            delivery.publish(*args, variants=["int8", "fp32"])
+                        gh.assert_not_called()
+                        path.write_bytes(original)
+            extra = package / "resources/models/math/extra.onnx"
+            extra.write_bytes(b"unexpected model")
+            with self.offline(), mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh, \
+                    self.assertRaisesRegex(ValueError, "package manifest differs"):
+                delivery.publish(*args, variants=["int8", "fp32"])
+            gh.assert_not_called()
+            extra.unlink()
+
+    def test_missing_wrong_identity_and_unsafe_inventory_block_before_gh(self):
+        args, _ = self.prepare_variants()
+        for variant in ("int8", "fp32"):
+            path = self.package.with_name("neo-" + variant) / delivery.PACKAGE_MANIFEST
+            original = delivery.load_json(path)
+            unsafe = copy.deepcopy(original)
+            unsafe["files"]["../outside"] = next(iter(unsafe["files"].values()))
+            for manifest in (None, dict(original, version="9.9.9"),
+                             dict(original, variant="fp32" if variant == "int8" else "int8"),
+                             dict(original, schema=2), dict(original, files={}), unsafe):
+                with self.subTest(variant=variant, manifest=manifest), self.offline(), \
+                        mock_publication_review(args[5]), patch.object(delivery, "run_gh") as gh:
+                    if manifest is None:
+                        path.unlink()
+                    else:
+                        write_json(path, manifest)
+                    with self.assertRaises((ValueError, OSError)):
+                        delivery.publish(*args, variants=["int8", "fp32"])
+                    gh.assert_not_called()
+                    write_json(path, original)
+
+    def test_variants_do_not_bypass_real_publication_gate(self):
+        missing = delivery.ROOT / "target/source-delivery-gate-test-unused"
+        with self.offline(), patch.object(delivery, "run_gh") as gh, \
+                patch.object(delivery, "read_lock") as lock, \
+                self.assertRaisesRegex(ValueError, "Outstanding distribution blockers|not APPROVED"):
+            delivery.publish(delivery.LOCK, missing, missing, "owner/repo", "v1.2.3-pre11", "1.2.3-pre11",
+                             missing, True, variants=["int8", "fp32"])
+        gh.assert_not_called()
+        lock.assert_not_called()
+
+
+class InventoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="test-inventory-", dir=delivery.ROOT / "target/source-delivery-evaluation")
+        self.addCleanup(self.temp.cleanup)
+        self.package = Path(self.temp.name) / "neo-int8"
+        self.package.mkdir()
+        (self.package / "neo.exe").write_bytes(b"synthetic executable")
+        models = self.package / "resources/models/math"
+        models.mkdir(parents=True)
+        (models / "model.onnx").write_bytes(b"synthetic model")
+        (models / delivery.PACKAGE_MANIFEST).write_bytes(b"nested namesake is not excluded")
+        self.destination = self.package / delivery.PACKAGE_MANIFEST
+
+    offline = VariantPublicationTests.offline
+
+    def test_cli_inventory_records_full_tree_without_repository_tag_or_output(self):
+        paths = ("neo.exe", "resources/models/math/model.onnx", "resources/models/math/PACKAGE-MANIFEST.json")
+        expected_files = {name: {"size": len((self.package / name).read_bytes()),
+                                 "sha256": hashlib.sha256((self.package / name).read_bytes()).hexdigest()}
+                          for name in paths}
+        for variant in ("int8", "fp32"):
+            with self.subTest(variant=variant), self.offline(), \
+                    patch.object(sys, "argv", ["source-delivery", "inventory", "--package", str(self.package),
+                                               "--variant", variant, "--version", "1.2.3-pre11"]), \
+                    patch.object(sys, "stdout", io.StringIO()):
+                delivery.main()
+            manifest = delivery.load_json(self.destination)
+            self.assertEqual(manifest, {"schema": 1, "version": "1.2.3-pre11", "variant": variant, "files": expected_files})
+            self.assertEqual(manifest, delivery.package_manifest(self.package, variant, "1.2.3-pre11"))
+            self.destination.unlink()
+
+    def test_inventory_refuses_existing_output_and_invalid_identity(self):
+        self.destination.write_bytes(b"preserve existing inventory")
+        with self.assertRaisesRegex(ValueError, "overwrite"):
+            delivery.inventory(self.package, "int8", "1.2.3-pre11")
+        self.assertEqual(self.destination.read_bytes(), b"preserve existing inventory")
+        self.destination.unlink()
+        for variant, version in (("fp16", "1.2.3"), ("int8", "../1.2.3"), (None, "1.2.3")):
+            with self.subTest(variant=variant, version=version), self.assertRaises(ValueError):
+                delivery.inventory(self.package, variant, version)
+            self.assertFalse(self.destination.exists())
+
+    def test_inventory_rejects_links_before_output(self):
+        original_lstat = Path.lstat
+        for name in ("neo.exe", "resources/models", delivery.PACKAGE_MANIFEST):
+            blocked = (self.package / name).absolute()
+
+            def lstat(path, *args, **kwargs):
+                if path.absolute() == blocked:
+                    return Mock(st_mode=0o100644, st_file_attributes=0x400)
+                return original_lstat(path, *args, **kwargs)
+
+            with self.subTest(name=name), patch.object(Path, "lstat", lstat), \
+                    self.assertRaisesRegex(ValueError, "reparse/symlink"):
+                delivery.inventory(self.package, "int8", "1.2.3")
+            self.assertFalse(self.destination.exists())
+        linked = self.package / "linked.exe"
+        os.link(self.package / "neo.exe", linked)
+        with self.assertRaisesRegex(ValueError, "without links"):
+            delivery.inventory(self.package, "int8", "1.2.3")
+        self.assertFalse(self.destination.exists())
+
+    def test_cli_command_specific_required_arguments(self):
+        common = ["--package", str(self.package), "--version", "1.2.3"]
+        cases = [("inventory", common, "requires --variant")]
+        for command in ("stage", "publish"):
+            flags = common + ["--output", str(self.package.parent), "--repository", "owner/repo", "--tag", "v1.2.3"]
+            for flag in ("--output", "--repository", "--tag"):
+                index = flags.index(flag)
+                cases.append((command, flags[:index] + flags[index + 2:], "requires --output, --repository and --tag"))
+        for command, flags, message in cases:
+            with self.subTest(command=command, flags=flags), self.offline(), \
+                    patch.object(sys, "argv", ["source-delivery", command, *flags]), \
+                    patch.object(sys, "stderr", io.StringIO()) as stderr, \
+                    patch.object(delivery, "inventory") as inventory, \
+                    patch.object(delivery, "stage") as stage, patch.object(delivery, "publish") as publish, \
+                    self.assertRaises(SystemExit):
+                delivery.main()
+            self.assertIn(message, stderr.getvalue())
+            inventory.assert_not_called()
+            stage.assert_not_called()
+            publish.assert_not_called()
 
 
 class LocalSourceTests(unittest.TestCase):

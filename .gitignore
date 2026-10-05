@@ -8,8 +8,8 @@
 Thumbs.db
 desktop.ini
 
-# 自写说明、审计与过程文档只保留本地；法律正文和第三方原始材料除外
-/README.md
+# 根目录 README 保留；其他自写说明、审计与过程文档只保留本地
+# 法律正文和第三方原始材料除外
 /tools/*.md
 /crates/**/*.md
 /vendor/sherpa-onnx-sys/NEO-ASR.md
@@ -36,7 +36,7 @@ desktop.ini
 /build/
 /runtime/
 
-# STT 模型资产（约 240 MB，从 hf-mirror 重新下载，不进版本库）
+# STT 模型资产（构建时从官方 release 下载并校验，不进版本库）
 /crates/neo-stt/assets/
 
 # 唤醒词训练：数据 / 环境 / 产物（合计约 24 GB，可重新下载与训练，不进版本库）

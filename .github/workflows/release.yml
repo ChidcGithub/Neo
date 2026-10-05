@@ -1,5 +1,6 @@
 # 自动构建 Windows 发行包并发布 GitHub Release。
-# 产物：neo-<ver>-installer-x64.exe（NSIS 安装包）+ neo-<ver>-portable-x64.zip（便携包）。
+# 产物：neo-<ver>-{int8,fp32}-{installer-x64.exe,portable-x64.zip} + 对应源码。
+# 精度仅区分数学模型；两版均保留 DirectML，语音模型统一 INT8。
 # 触发：推送 v* 标签，或手动 workflow_dispatch（必须已有对应版本 tag 且指向所选提交）。
 # 版本号含 "-"（如 -rc...）时发布为 pre-release。
 #
@@ -76,6 +77,9 @@ jobs:
 
       - name: Source delivery offline regressions
         run: python -B -m unittest tools.test_stage_source_companions -v
+
+      - name: Math model download regressions
+        run: python -B -m unittest tools.test_prepare_math_models -v
 
       - name: Prepare mandatory no-TTS Sherpa native
         timeout-minutes: 30
@@ -171,7 +175,7 @@ jobs:
     permissions:
       contents: write
     runs-on: windows-2022
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -372,15 +376,32 @@ jobs:
           python -B tools/stage_source_companions.py stage --lock tools/source-companions.lock.json --package dist/neo --output dist --distribution target/package/runtime-distribution --native-lib target/sherpa-asr/native/install/lib --work-root target/source-delivery --repository "$env:RELEASE_REPOSITORY" --tag "$env:RELEASE_TAG" --version "$env:RELEASE_VERSION" --budget-seconds 600 --max-download-mib 1024 --max-expanded-mib 2048
           if ($LASTEXITCODE -ne 0) { throw 'Matching source delivery required before binary archives; release remains BLOCKED' }
 
+      - name: Prepare math model variants
+        timeout-minutes: 60
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($variant in @('int8', 'fp32')) {
+            $pkg = "dist/neo-$variant"
+            if (Test-Path $pkg) { throw "Variant package must be clean: $pkg" }
+            Copy-Item -Recurse dist/neo $pkg
+            python -B tools/prepare_math_models.py --variant $variant --package $pkg --cache .cache/math-models
+            if ($LASTEXITCODE -ne 0) { throw "Math model preparation failed: $variant" }
+            python -B tools/stage_source_companions.py inventory --package $pkg --variant $variant --version "${{ steps.ver.outputs.version }}"
+            if ($LASTEXITCODE -ne 0) { throw "Final package inventory failed: $variant" }
+          }
+
       - name: Zip portable package
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
-          $zip = "dist\neo-${{ steps.ver.outputs.version }}-portable-x64.zip"
-          7z a -tzip -mx=5 $zip ".\dist\neo" | Select-Object -Last 2
-          if ($LASTEXITCODE -ne 0) { throw "7z exit $LASTEXITCODE" }
-          "zip=$zip" >> $env:GITHUB_OUTPUT
-        id: zip
+          $ErrorActionPreference = 'Stop'
+          foreach ($variant in @('int8', 'fp32')) {
+            $zip = "dist/neo-${{ steps.ver.outputs.version }}-$variant-portable-x64.zip"
+            if (Test-Path $zip) { throw "Archive already exists: $zip" }
+            7z a -tzip -mx=5 $zip "./dist/neo-$variant" | Select-Object -Last 2
+            if ($LASTEXITCODE -ne 0) { throw "7z exit $LASTEXITCODE" }
+          }
 
       - name: Generate installer art
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
@@ -407,8 +428,12 @@ jobs:
           # makensis 默认把编译工作目录切到脚本所在目录（tools\）：/NOCD 保持
           # 在仓库根，脚本里的相对路径才找得到 dist\ 与 target\；
           # /INPUTCHARSET UTF8：脚本是 UTF-8（中文注释），默认 ACP 会报编码错。
-          & $mk /NOCD /INPUTCHARSET UTF8 "/DVERSION=$v" "/DVI_VERSION=$vi" tools\installer.nsi | Select-Object -Last 4
-          if ($LASTEXITCODE -ne 0) { throw "makensis exit $LASTEXITCODE" }
+          foreach ($variant in @('int8', 'fp32')) {
+            $out = "dist\neo-$v-$variant-installer-x64.exe"
+            if (Test-Path $out) { throw "Installer already exists: $out" }
+            & $mk /NOCD /INPUTCHARSET UTF8 "/DVERSION=$v" "/DVI_VERSION=$vi" "/DPACKAGE_DIR=dist\neo-$variant" "/DOUTPUT_FILE=$out" tools\installer.nsi | Select-Object -Last 4
+            if ($LASTEXITCODE -ne 0) { throw "makensis exit $LASTEXITCODE" }
+          }
 
       - name: Generate changelog
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
@@ -416,9 +441,9 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ steps.ver.outputs.tag }}"
-          $prev = git tag --sort=-v:refname | Where-Object { $_ -ne $tag } | Select-Object -First 1
+          $prev = git --no-pager tag --merged HEAD --sort=-v:refname --list 'v[0-9]*' | Where-Object { $_ -ne $tag } | Select-Object -First 1
           $range = if ($prev) { "$prev..HEAD" } else { 'HEAD' }
-          $commits = git log $range --pretty=format:'- %h %s (@%an)' --no-merges
+          $commits = git --no-pager log $range --pretty=format:'- %h %s (@%an)' --no-merges
           $notes = @()
           $notes += "## Neo ${{ steps.ver.outputs.version }}"
           $notes += ''
@@ -429,8 +454,12 @@ jobs:
           $notes += ''
           $notes += '### Artifacts'
           $notes += ''
-          $notes += "- ``neo-${{ steps.ver.outputs.version }}-installer-x64.exe`` — 安装包（per-user 免管理员，装到 ``%LOCALAPPDATA%\Programs\Neo``，含卸载与开始菜单/桌面快捷方式）"
-          $notes += "- ``neo-${{ steps.ver.outputs.version }}-portable-x64.zip`` — 便携包（先满足下述外部运行库前置条件，再解压运行）"
+          foreach ($variant in @('int8', 'fp32')) {
+            $notes += "- ``neo-${{ steps.ver.outputs.version }}-$variant-installer-x64.exe`` — 安装包"
+            $notes += "- ``neo-${{ steps.ver.outputs.version }}-$variant-portable-x64.zip`` — 便携包"
+          }
+          $notes += 'INT8 / FP32 仅区分数学识别模型；两版均保留 DirectML，语音识别统一 INT8。安装到同一 Neo 目录，选择一种即可。'
+          $notes += '另附 Git Bash 和原生依赖对应源码包。'
           $notes += ''
           $notes += '两者内容一致：'
           $notes += ''
@@ -458,5 +487,5 @@ jobs:
           RELEASE_VERSION: ${{ steps.ver.outputs.version }}
           RELEASE_PRERELEASE: ${{ steps.ver.outputs.prerelease }}
         run: |
-          python -B tools/stage_source_companions.py publish --lock tools/source-companions.lock.json --package dist/neo --output dist --repository "$env:RELEASE_REPOSITORY" --tag "$env:RELEASE_TAG" --version "$env:RELEASE_VERSION" --notes dist/notes.md --prerelease "$env:RELEASE_PRERELEASE"
+          python -B tools/stage_source_companions.py publish --lock tools/source-companions.lock.json --package dist/neo --output dist --repository "$env:RELEASE_REPOSITORY" --tag "$env:RELEASE_TAG" --version "$env:RELEASE_VERSION" --notes dist/notes.md --prerelease "$env:RELEASE_PRERELEASE" --variants int8 fp32
           if ($LASTEXITCODE -ne 0) { throw 'Source/binary asset verification failed; do not publish or automatically retry the draft' }

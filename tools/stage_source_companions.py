@@ -4,6 +4,14 @@ Stage accepts either network inputs or paired --local-gitbash/--local-native pat
 (no filename convention). Local inputs must stay inside the repository; package,
 output and work must stay under target/source-delivery-evaluation. Local staging
 allows null source URLs but never changes publication gates or source validators.
+
+Publish optionally accepts --variants int8 fp32. Stage the base package once,
+then copy it to sibling packages (dist/neo-int8 and dist/neo-fp32 for dist/neo)
+before packaging. Both variants must retain identical docs/licenses contents;
+all four variant binaries and the two shared source ZIPs are required.
+After final model preparation, run inventory --package dist/neo-int8 --variant
+int8 --version VERSION (and likewise for fp32) before creating binary archives.
+Inventory writes PACKAGE-MANIFEST.json; variant publication verifies the full tree.
 """
 from __future__ import annotations
 
@@ -37,6 +45,8 @@ else:
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = Path(__file__).with_name("source-companions.lock.json")
 KINDS = {"gitbash", "native"}
+VARIANTS = ("int8", "fp32")
+PACKAGE_MANIFEST = "PACKAGE-MANIFEST.json"
 CHUNK = 1024 * 1024
 
 
@@ -78,9 +88,13 @@ def read_lock(path, *, online=True):
     return lock
 
 
+def check_version(version):
+    require(isinstance(version, str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?", version), "Invalid version")
+
+
 def identity(repository, tag, version):
     require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repository), "Invalid repository")
-    require(re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?", version), "Invalid version")
+    check_version(version)
     require(tag == "v" + version, "Tag/version mismatch")
 
 
@@ -154,6 +168,52 @@ def tree_files(directory):
     runtime.records(files)
     require(files, "Empty runtime file set")
     return files
+
+
+def package_manifest(package, variant, version):
+    require(variant in VARIANTS, "Unknown package variant")
+    check_version(version)
+    check_path(package)
+    require(package.is_dir(), f"Missing package directory: {package}")
+    files = []
+
+    def visit(directory):
+        # Check before descending; never follow junctions or silently omit an
+        # unreadable subtree. Only the root inventory is excluded, not namesakes.
+        for path in sorted(directory.iterdir()):
+            check_path(path)
+            name = safe_relative(path.relative_to(package).as_posix())
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                require(name != PACKAGE_MANIFEST, "Package manifest must be a regular file")
+                visit(path)
+            else:
+                require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
+                        f"Package entry must be a regular file without links: {name}")
+                if name != PACKAGE_MANIFEST:
+                    files.append({"path": name, **file_record(path)})
+
+    visit(package)
+    require(files, "Empty package file set")
+    return {"schema": 1, "version": version, "variant": variant, "files": runtime.records(files)}
+
+
+def inventory(package, variant, version):
+    destination = package / PACKAGE_MANIFEST
+    check_path(destination)
+    require(not destination.exists(), "Refusing to overwrite package inventory")
+    manifest = package_manifest(package, variant, version)
+    created = False
+    try:
+        with destination.open("x", encoding="utf-8", newline="\n") as stream:
+            created = True
+            json.dump(manifest, stream, indent=2)
+            stream.write("\n")
+    except BaseException:
+        if created:
+            destination.unlink()
+        raise
+    return manifest
 
 
 def verify_native_binding(source, package, native_lib):
@@ -332,12 +392,28 @@ def check_publication_review(repository, tag, version):
             "Existing local release tag must point at the reviewed HEAD commit")
 
 
-def publish(lock_path, package, output, repository, tag, version, notes, prerelease):
+def publish(lock_path, package, output, repository, tag, version, notes, prerelease, *, variants=None):
     """Explicit gated network command. Failure leaves the draft private."""
     check_publication_review(repository, tag, version)
+    if variants is not None:
+        require(len(variants) == len(VARIANTS) and set(variants) == set(VARIANTS),
+                "Variants must include int8 and fp32 exactly once, with no unknown variants")
     lock = read_lock(lock_path)
     expected_notice = source_access(lock, repository, tag, version)
     require(load_json(package / "docs/licenses/SOURCE-ACCESS.json") == expected_notice, "Source access notice differs from lock/release identity")
+    if variants is not None:
+        # SOURCE-ACCESS.json is the staged delivery manifest; compare bytes too,
+        # together with the other source/legal notices copied from the base.
+        base_notices = tree_files(package / "docs/licenses")
+        for variant in VARIANTS:
+            variant_package = package.with_name(f"{package.name}-{variant}")
+            require(load_json(variant_package / "docs/licenses/SOURCE-ACCESS.json") == expected_notice,
+                    f"Variant {variant} source access notice differs from base/lock/release identity")
+            require(tree_files(variant_package / "docs/licenses") == base_notices,
+                    f"Variant {variant} source/legal notices differ from base package")
+            manifest = load_json(variant_package / PACKAGE_MANIFEST)
+            require(manifest == package_manifest(variant_package, variant, version),
+                    f"Variant {variant} package manifest differs from current tree/version/variant")
     require(prerelease == ("-" in version.split("+", 1)[0]), "Prerelease/version mismatch")
     paths, expected = [], {}
     for source in expected_notice["sources"]:
@@ -346,12 +422,14 @@ def publish(lock_path, package, output, repository, tag, version, notes, prerele
         require(record == {k: source[k] for k in ("size", "sha256")}, "Source asset missing/changed before upload")
         paths.append(path)
         expected[path.name] = record
-    for suffix in ("portable-x64.zip", "installer-x64.exe"):
-        path = output / f"neo-{version}-{suffix}"
-        record = file_record(path)
-        require(record["size"] > 0, "Empty binary asset")
-        paths.append(path)
-        expected[path.name] = record
+    prefixes = [f"neo-{version}-{variant}" for variant in VARIANTS] if variants is not None else [f"neo-{version}"]
+    for prefix in prefixes:
+        for suffix in ("portable-x64.zip", "installer-x64.exe"):
+            path = output / f"{prefix}-{suffix}"
+            record = file_record(path)
+            require(record["size"] > 0, "Empty binary asset")
+            paths.append(path)
+            expected[path.name] = record
     check_path(notes)
     require(notes.is_file(), "Missing release notes")
     # All assets in the same create invocation; never expose an incomplete release.
@@ -377,12 +455,12 @@ def publish(lock_path, package, output, repository, tag, version, notes, prerele
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("stage", "publish"))
+    parser.add_argument("command", choices=("stage", "publish", "inventory"))
     parser.add_argument("--lock", type=Path, default=LOCK)
     parser.add_argument("--package", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--repository", required=True)
-    parser.add_argument("--tag", required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--repository")
+    parser.add_argument("--tag")
     parser.add_argument("--version", required=True)
     parser.add_argument("--distribution", type=Path)
     parser.add_argument("--native-lib", type=Path)
@@ -393,6 +471,9 @@ def main():
     parser.add_argument("--max-download-mib", type=int, default=1024)
     parser.add_argument("--max-expanded-mib", type=int, default=2048)
     parser.add_argument("--notes", type=Path)
+    parser.add_argument("--variant", choices=VARIANTS, help="Inventory only; package math variant")
+    parser.add_argument("--variants", nargs="+", choices=VARIANTS,
+                        help="Publish only; requires both int8 and fp32 and their sibling packages (default: single package)")
     parser.add_argument("--prerelease", choices=("true", "false"), default="false")
     args = parser.parse_args()
     try:
@@ -400,6 +481,15 @@ def main():
                 "Local stage requires both --local-gitbash and --local-native")
         local = args.local_gitbash is not None
         require(not local or args.command == "stage", "Local sources are stage-only; publication gates are unchanged")
+        require(args.variants is None or args.command == "publish", "Variants are publish-only; stage the base package once")
+        require(args.variant is None or args.command == "inventory", "--variant is inventory-only")
+        if args.command == "inventory":
+            require(args.variant is not None, "Inventory requires --variant")
+            inventory(args.package, args.variant, args.version)
+            print("Package inventory written; not legal approval")
+            return
+        require(args.output is not None and args.repository is not None and args.tag is not None,
+                "Stage/publish requires --output, --repository and --tag")
         if args.command == "stage":
             if args.work_root is None:
                 args.work_root = ROOT / ("target/source-delivery-evaluation/work" if local else "target/source-delivery")
@@ -411,7 +501,8 @@ def main():
             print("Source delivery staged; planned until publication, not legal approval")
         else:
             require(args.notes is not None, "Publish requires --notes")
-            publish(args.lock, args.package, args.output, args.repository, args.tag, args.version, args.notes, args.prerelease == "true")
+            publish(args.lock, args.package, args.output, args.repository, args.tag, args.version, args.notes, args.prerelease == "true",
+                    variants=args.variants)
     except (ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile, subprocess.SubprocessError) as error:
         parser.exit(1, f"source delivery BLOCKED: {error}\n")
 

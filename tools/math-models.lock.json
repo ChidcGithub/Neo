@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "revision": "7b96df06b9d81cdb129c3bef68b7250bc3e2b0ea",
+  "int8": {
+    "archive": {
+      "url": "https://github.com/ChidcGithub/Neo/releases/download/models-texteller-int8-v1/texteller-int8-v1.zip",
+      "size": 292826942,
+      "sha256": "07fdb9e9d4f7a684c5a243a25d117f16b0719d199101985ae77d2b789d9610ab"
+    },
+    "files": {
+      "LICENSE-APACHE-2.0.txt": {"size": 11358, "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},
+      "UPSTREAM-MODEL-CARD.md": {"size": 1457, "sha256": "ac635a57419f02053817d7aa6922db9afffa563af8f7bcf1bd92775d99207ba4"},
+      "config.json": {"size": 4504, "sha256": "ae1df4b712a25df6cbf0441d0e5602cee139f3f371c1b3555274db7aed2c0135"},
+      "decoder_model.onnx": {"size": 278733527, "sha256": "28a6b9d60644d6b2e3280593dc985456c2db71bbd4e86f69585d385801a651a8"},
+      "encoder_model.onnx": {"size": 89332035, "sha256": "6d1daf6052c879e0fba9b0a282c2720ddd03b7642063f38392db03d78123d0cb"},
+      "generation_config.json": {"size": 154, "sha256": "dce3cbe591ed7fc9d9ea9c588697e9e3a05248446343cf1682df309c013d5ab7"},
+      "optimization.json": {"size": 1347, "sha256": "61565063571e6c75f7e44879fd358dff9a5a4f28e0f51f58e97f8405c82a13a8"},
+      "tokenizer.json": {"size": 1044328, "sha256": "3fd70ac72edab8213b7dd13271b3c69b6c2252ab3e04f8045939dad0847309be"},
+      "ATTRIBUTION.txt": {"size": 398, "sha256": "7f1933482166c832b6dbf599499915ca31133f73595b2df3748e72330466df02"},
+      "decoder_model.onnx.MODIFICATIONS.txt": {"size": 719, "sha256": "2c36224d2e8738d94671f329851b970ec6dbb2f0b777f7c128ee30da8aa787ab"},
+      "encoder_model.onnx.MODIFICATIONS.txt": {"size": 719, "sha256": "494b409caa315e9705a252dbd8d92cf89acdcc69403381f47a82de73702e5355"},
+      "FILES.sha256.json": {"size": 1651, "sha256": "e2ea8eebac129e20b1bf11d2ec74bd59dc1877580e8c08d07e4af2c38ab3874a"}
+    }
+  },
+  "fp32": {
+    "files": {
+      "encoder_model.onnx": {
+        "url": "https://huggingface.co/OleehyO/TexTeller/resolve/7b96df06b9d81cdb129c3bef68b7250bc3e2b0ea/encoder_model.onnx?download=true",
+        "size": 343553824,
+        "sha256": "071afc0a0c92b2ee3847612127eb9e82b1c39413725e692f4405e5ea9e265bf0"
+      },
+      "decoder_model.onnx": {
+        "url": "https://huggingface.co/OleehyO/TexTeller/resolve/7b96df06b9d81cdb129c3bef68b7250bc3e2b0ea/decoder_model.onnx?download=true",
+        "size": 908716081,
+        "sha256": "288cb8e37cdda66f725f2739efd2e7846636666a815e27533891c68389ec3659"
+      },
+      "config.json": {
+        "url": "https://huggingface.co/OleehyO/TexTeller/resolve/7b96df06b9d81cdb129c3bef68b7250bc3e2b0ea/config.json?download=true",
+        "size": 4504,
+        "sha256": "ae1df4b712a25df6cbf0441d0e5602cee139f3f371c1b3555274db7aed2c0135"
+      },
+      "generation_config.json": {
+        "url": "https://huggingface.co/OleehyO/TexTeller/resolve/7b96df06b9d81cdb129c3bef68b7250bc3e2b0ea/generation_config.json?download=true",
+        "size": 154,
+        "sha256": "dce3cbe591ed7fc9d9ea9c588697e9e3a05248446343cf1682df309c013d5ab7"
+      },
+      "tokenizer.json": {
+        "url": "https://huggingface.co/OleehyO/TexTeller/resolve/7b96df06b9d81cdb129c3bef68b7250bc3e2b0ea/tokenizer.json?download=true",
+        "size": 1044328,
+        "sha256": "3fd70ac72edab8213b7dd13271b3c69b6c2252ab3e04f8045939dad0847309be"
+      },
+      "LICENSE-APACHE-2.0.txt": {
+        "source": "docs/licenses/supplemental/cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30.txt",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+        "size": 11358,
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      },
+      "UPSTREAM-MODEL-CARD.md": {
+        "url": "https://huggingface.co/OleehyO/TexTeller/resolve/7b96df06b9d81cdb129c3bef68b7250bc3e2b0ea/README.md?download=true",
+        "size": 1457,
+        "sha256": "ac635a57419f02053817d7aa6922db9afffa563af8f7bcf1bd92775d99207ba4"
+      }
+    }
+  }
+}

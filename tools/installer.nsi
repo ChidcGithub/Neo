@@ -17,6 +17,13 @@
   !define VI_VERSION "${VERSION}.0"
 !endif
 
+!ifndef PACKAGE_DIR
+  !define PACKAGE_DIR "dist\neo"
+!endif
+!ifndef OUTPUT_FILE
+  !define OUTPUT_FILE "dist\neo-${VERSION}-installer-x64.exe"
+!endif
+
 !define ART "target\package\installer-art"
 !if /FileExists "${ART}\neo.ico"
   !define HAVE_ART
@@ -30,7 +37,7 @@ ManifestDPIAware true
 Name "Neo"
 Caption "Neo 安装"
 BrandingText "Neo · 教室大屏 AI 助手"
-OutFile "dist\neo-${VERSION}-installer-x64.exe"
+OutFile "${OUTPUT_FILE}"
 InstallDir "$LOCALAPPDATA\Programs\Neo"
 RequestExecutionLevel user
 
@@ -555,7 +562,7 @@ create_stage:
   IfErrors install_failed
   SetOverwrite on
   ClearErrors
-  File /r "dist\neo\*.*"
+  File /r "${PACKAGE_DIR}\*.*"
 !ifdef HAVE_ART
   File /oname=neo.ico "${ART}\neo.ico"
 !endif

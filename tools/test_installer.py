@@ -517,7 +517,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("Call AcquireLock", install_init)
         self.assertNotIn("CheckPlatform", uninstall_init)
         self.assertIn("Call un.AcquireLock", uninstall_init)
-        self.assertLess(SOURCE.index("Call CheckPlatform"), SOURCE.index('File /r "dist'))
+        self.assertLess(SOURCE.index("Call CheckPlatform"), SOURCE.index('File /r "${PACKAGE_DIR}'))
 
     def test_crt_registry_version_boundaries_and_invalid_values(self):
         cases = [("v14.44.35211.0", False), ("v14.51.36231.0", False),
@@ -670,7 +670,8 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn(root + r"\README.md", m.files)
 
     def test_crt_whitelist_is_installed_and_uninstalled_without_unknown_files(self):
-        self.assertIn('File /r "dist\\neo\\*.*"', SOURCE)
+        self.assertIn('File /r "${PACKAGE_DIR}\\*.*"', SOURCE)
+        self.assertIn('!define PACKAGE_DIR "dist\\neo"', SOURCE)
         body = SOURCE.split('Section "Uninstall"', 1)[1]
         deleted_dlls = re.findall(r'Delete "\$INSTDIR\\([^"\\]+\.dll)"', body)
         self.assertEqual(set(deleted_dlls), set(CRT_NAMES))
@@ -1083,6 +1084,18 @@ class InstallerTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, (result.stdout + result.stderr).decode("utf-8", errors="replace"))
             self.assertTrue((Path(td) / "dist/neo-1.2.3-installer-x64.exe").is_file())
+            for variant in ("int8", "fp32"):
+                variant_payload = payload.with_name("neo-" + variant)
+                shutil.copytree(payload, variant_payload)
+                output = Path(td) / f"dist/neo-1.2.3-{variant}-installer-x64.exe"
+                result = subprocess.run(
+                    [compiler, "/NOCD", "/INPUTCHARSET", "UTF8", "/DVERSION=1.2.3",
+                     "/DVI_VERSION=1.2.3.0", f"/DPACKAGE_DIR={variant_payload}",
+                     f"/DOUTPUT_FILE={output}", str(script)],
+                    cwd=td, capture_output=True, timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, (result.stdout + result.stderr).decode("utf-8", errors="replace"))
+                self.assertTrue(output.is_file())
 
 
 if __name__ == "__main__":

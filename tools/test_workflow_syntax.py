@@ -123,6 +123,33 @@ class WorkflowSyntaxTests(unittest.TestCase):
         self.assertEqual(tests["run"], "python -B -m unittest tools.test_stage_source_companions -v")
         self.assertNotIn("if", tests)
 
+    def test_two_math_variants_share_base_and_publish_together(self):
+        workflow = parse_workflow((WORKFLOWS / "release.yml").read_text(encoding="utf-8"))
+        steps = workflow["jobs"]["release"]["steps"]
+        by_name = {s.get("name"): s for s in steps}
+        names = list(by_name)
+        self.assertLess(names.index("Stage pinned source companions (fail closed)"), names.index("Prepare math model variants"))
+        self.assertLess(names.index("Prepare math model variants"), names.index("Zip portable package"))
+        prepare = by_name["Prepare math model variants"]["run"]
+        self.assertIn("@('int8', 'fp32')", prepare)
+        self.assertIn("Copy-Item -Recurse dist/neo $pkg", prepare)
+        self.assertIn("tools/prepare_math_models.py --variant $variant --package $pkg", prepare)
+        self.assertNotIn("quantize", prepare)
+        for name in ("Prepare math model variants", "Zip portable package", "Build installer (NSIS)"):
+            script = by_name[name]["run"]
+            self.assertIn("@('int8', 'fp32')", script)
+            self.assertIn("$LASTEXITCODE", script)
+            self.assertNotIn("continue-on-error", by_name[name])
+        self.assertIn("-$variant-portable-x64.zip", by_name["Zip portable package"]["run"])
+        installer = by_name["Build installer (NSIS)"]["run"]
+        self.assertIn(r"/DPACKAGE_DIR=dist\neo-$variant", installer)
+        self.assertIn("/DOUTPUT_FILE=$out", installer)
+        self.assertIn("-$variant-installer-x64.exe", installer)
+        self.assertIn("--variants int8 fp32", by_name["Create release"]["run"])
+        self.assertIn("--list 'v[0-9]*'", by_name["Generate changelog"]["run"])
+        self.assertIn("assemble_drawing_release.py assemble", by_name["Assemble approved drawing release"]["run"])
+        self.assertTrue(any("tools.test_prepare_math_models" in s.get("run", "") for s in workflow["jobs"]["check"]["steps"]))
+
     def test_parser_rejects_regressed_root_package_step_indentation(self):
         text = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
         old = "      - name: Drawing release root-package regressions\n"
