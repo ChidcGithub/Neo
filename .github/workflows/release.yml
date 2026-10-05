@@ -78,6 +78,9 @@ jobs:
       - name: Source delivery offline regressions
         run: python -B -m unittest tools.test_stage_source_companions -v
 
+      - name: Native source binding regressions
+        run: python -B -m unittest tools.test_native_source_binding -v
+
       - name: Math model download regressions
         run: python -B -m unittest tools.test_prepare_math_models -v
 

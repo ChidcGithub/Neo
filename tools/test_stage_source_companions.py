@@ -61,7 +61,11 @@ class SourceDeliveryTests(unittest.TestCase):
         write_json(self.lib / "neo-sherpa-asr.json", {
             "status": "native-validated", "options": {"SHERPA_ONNX_ENABLE_TTS": "OFF"},
             "libraries": {"synthetic.lib": delivery.file_record(self.lib / "synthetic.lib")}})
-        self.lock = delivery.read_lock(delivery.LOCK, online=False)
+        # Keep these offline tests independent of the reviewed delivery lock/URLs.
+        self.lock = {"schema": 1, "sources": [
+            {"kind": kind, "sha256": "a" * 64, "size": 1,
+             "expected_runtime_files_sha256": "b" * 64, "download_url": None}
+            for kind in ("gitbash", "native")]}
         binding = {"manifest_sha256": delivery.file_record(self.lib / "neo-sherpa-asr.json")["sha256"],
                    "receipt_sha256": delivery.file_record(self.lib / "neo-asr-receipt.json")["sha256"]}
         self.addCleanup(patch.stopall)
@@ -139,9 +143,19 @@ class SourceDeliveryTests(unittest.TestCase):
         self.assertFalse(self.work.exists())
         self.assertEqual(list(self.output.iterdir()), [])
 
-    def test_checked_in_lock_remains_blocked_in_actual_cli(self):
+    def test_checked_in_lock_has_downloadable_pins_and_current_recipe(self):
+        lock = delivery.read_lock(delivery.LOCK)
+        for source in lock["sources"]:
+            self.assertTrue(source["download_url"].startswith(
+                "https://github.com/ChidcGithub/Neo/releases/download/dependency-sources-v1/"))
+        source = next(s for s in lock["sources"] if s["kind"] == "native")
+        self.assertEqual(source["native_binding"], delivery.native_binding.expected_binding())
+
+    def test_null_url_lock_remains_blocked_in_actual_cli(self):
+        self.lock["sources"][0]["download_url"] = None
+        self.save_lock()
         result = subprocess.run([sys.executable, "-B", str(delivery.ROOT / "tools/stage_source_companions.py"),
-                                 "stage", "--package", str(self.package), "--output", str(self.output),
+                                 "stage", "--lock", str(self.lock_path), "--package", str(self.package), "--output", str(self.output),
                                  "--distribution", str(self.distribution), "--native-lib", str(self.lib),
                                  "--repository", "owner/repo", "--tag", "v1.2.3", "--version", "1.2.3"],
                                 capture_output=True, text=True, timeout=15)
@@ -170,6 +184,39 @@ class SourceDeliveryTests(unittest.TestCase):
                 with patch.object(delivery, "download", side_effect=self.fake_download), self.assertRaisesRegex(ValueError, "Source ZIP size/SHA-256 mismatch"):
                     delivery.stage(*self.stage_args)
                 self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_recipe_schema_accepted_but_changed_recipe_rejected_before_download(self):
+        source = self.lock["sources"][1]
+        source["native_binding"] = delivery.native_binding.expected_binding()
+        self.save_lock()
+        self.assertEqual(delivery.read_lock(self.lock_path), self.lock)
+        source["native_binding"]["recipe_sha256"] = "0" * 64
+        self.save_lock()
+        with patch.object(delivery, "download") as download, self.assertRaisesRegex(ValueError, "explicit review"):
+            delivery.stage(*self.stage_args)
+        download.assert_not_called()
+
+    def test_recipe_dispatch_keeps_zip_validator_runtime_pin_and_atomic_failure(self):
+        source = self.lock["sources"][1]
+        source["native_binding"] = delivery.native_binding.expected_binding()
+        self.save_lock()
+        with patch.object(delivery.native_binding, "verify", side_effect=ValueError("fresh native rejected")) as verify:
+            with self.assertRaisesRegex(ValueError, "fresh native rejected"):
+                self.stage()
+            verify.assert_called_once()
+            self.assertEqual(verify.call_args.args[0], source["native_binding"])
+            self.assertEqual(verify.call_args.args[2], self.lib)
+        self.assertFalse((self.package / "docs/licenses/SOURCE-ACCESS.json").exists())
+        self.assertEqual(list(self.output.iterdir()), [])
+        with patch.object(delivery.native_binding, "verify") as verify:
+            _, _, historical = self.stage()
+            historical.assert_called_once()
+            verify.assert_called_once()
+        (self.package / "runtime/onnx/runtime.dll").write_bytes(b"tampered runtime")
+        with patch.object(delivery.native_binding, "verify") as verify, self.assertRaisesRegex(ValueError, "runtime file set"):
+            delivery.verify_native_binding(source, self.package, self.lib,
+                                           bundle=self.bundles["native"], work=self.work)
+        verify.assert_not_called()
 
     def test_native_old_binding_does_not_validate_different_ci_build(self):
         (self.lib / "neo-asr-receipt.json").write_bytes(b"different CI receipt")
@@ -909,7 +956,10 @@ class PublicationGateTests(unittest.TestCase):
         gh.assert_not_called()
 
     def test_both_gates_and_matching_tag_still_do_not_bypass_null_source_url(self):
+        lock = delivery.load_json(delivery.LOCK)
+        lock["sources"][0]["download_url"] = None
         with mock_publication_review("1.2.3"), patch.object(delivery, "run_gh") as gh, \
+                patch.object(delivery, "load_json", return_value=lock), \
                 self.assertRaisesRegex(ValueError, "download_url is null"):
             self.publish()
         gh.assert_not_called()

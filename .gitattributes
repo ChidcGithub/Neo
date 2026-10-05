@@ -1,2 +1,10 @@
 # Legal evidence and notices retain exact upstream bytes and recorded hashes.
 /docs/licenses/** -text -whitespace
+
+# Native recipe/receipt hashes must be stable across Windows and CI checkouts.
+/tools/build_sherpa_asr.py text eol=lf
+/tools/prepare_sherpa_ci.py text eol=lf
+/vendor/sherpa-onnx-sys/neo_asr.rs text eol=lf
+/tools/native_source_bundle.py text eol=lf
+/tools/native_source_binding.py text eol=lf
+/tools/runtime_sources.py text eol=lf

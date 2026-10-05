@@ -33,12 +33,14 @@ if __package__:
     from . import assemble_drawing_release as drawing
     from . import check_distribution_review as distribution_review
     from . import native_source_bundle as native
+    from . import native_source_binding as native_binding
     from . import prepare_runtime_distribution as runtime
     from .runtime_sources import check_path, file_record, load_json, safe_relative
 else:
     import assemble_drawing_release as drawing
     import check_distribution_review as distribution_review
     import native_source_bundle as native
+    import native_source_binding as native_binding
     import prepare_runtime_distribution as runtime
     from runtime_sources import check_path, file_record, load_json, safe_relative
 
@@ -81,10 +83,13 @@ def read_lock(path, *, online=True):
         else:
             https_url(source["download_url"])
     binding = next(s for s in sources if s["kind"] == "native")["native_binding"]
-    sha(binding["manifest_sha256"])
-    sha(binding["receipt_sha256"])
-    require(binding == {"manifest_sha256": native.MANIFEST_SHA, "receipt_sha256": native.RECEIPT_SHA},
-            "Native validator covers only the recorded local build; a new binding needs explicit review and validator support")
+    if binding.get("kind") == "recipe":
+        native_binding.check_binding(binding)
+    else:
+        sha(binding["manifest_sha256"])
+        sha(binding["receipt_sha256"])
+        require(binding == {"manifest_sha256": native.MANIFEST_SHA, "receipt_sha256": native.RECEIPT_SHA},
+                "Native validator covers only the recorded local build; a new binding needs explicit review and validator support")
     return lock
 
 
@@ -216,10 +221,14 @@ def inventory(package, variant, version):
     return manifest
 
 
-def verify_native_binding(source, package, native_lib):
+def verify_native_binding(source, package, native_lib, *, bundle=None, work=None):
     files = tree_files(package / "runtime/onnx")
     require(runtime.digest_json(files) == source["expected_runtime_files_sha256"], "Native runtime file set mismatch")
     binding = source["native_binding"]
+    if binding.get("kind") == "recipe":
+        require(bundle is not None and work is not None, "Recipe validation requires source ZIP and validation workspace")
+        native_binding.verify(binding, bundle, native_lib, work)
+        return
     for name, key in (("neo-sherpa-asr.json", "manifest_sha256"), ("neo-asr-receipt.json", "receipt_sha256")):
         require(file_record(native_lib / name)["sha256"] == binding[key],
                 "BLOCKED: native build differs from source lock's recorded local build; not valid for arbitrary CI native builds")
@@ -288,7 +297,7 @@ def verify_bundle(bundle, source, package, distribution, native_lib, work, max_e
     require(file_record(bundle) == {k: source[k] for k in ("size", "sha256")}, "Source ZIP size/SHA-256 mismatch")
     if source["kind"] == "native":
         native.verify(bundle)
-        verify_native_binding(source, package, native_lib)
+        verify_native_binding(source, package, native_lib, bundle=bundle, work=work)
     else:
         verify_gitbash(bundle, source, distribution, package / "runtime/gitbash", work, max_expanded)
 

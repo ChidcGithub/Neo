@@ -1,13 +1,13 @@
 {
   "schema": 1,
-  "scope": "Exact external source delivery inputs only; not approval. Null URLs block CI. Native binding is the recorded local build, not arbitrary CI output; ORT producer correspondence remains unconfirmed.",
+  "scope": "Pinned source delivery inputs; not distribution approval. Native recipe validates current build inputs, libraries, graph, symbols and Eigen source correspondence; archive history is not a CI output hash. ORT producer correspondence remains a separate review.",
   "sources": [
     {
       "kind": "gitbash",
       "sha256": "999c56ee597ba1071d62e474522487b1b7727d530550966b16de1b99c331282a",
       "size": 791265102,
       "expected_runtime_files_sha256": "ea7f28118cd09f9be62f40f6637a5444c10b2a950f162b615e491275916e9bdc",
-      "download_url": null
+      "download_url": "https://github.com/ChidcGithub/Neo/releases/download/dependency-sources-v1/gitbash-source-companion-no-gcm.zip"
     },
     {
       "kind": "native",
@@ -15,10 +15,11 @@
       "size": 7570574,
       "expected_runtime_files_sha256": "ea937d215c41b1c9ca0a1c84c5d0451ba25215b5e19e8074a6d1c3594d9a0f95",
       "native_binding": {
-        "manifest_sha256": "042914d1d3c427986d34343e40926e782694ba5cf8f06049783b103127239d5e",
-        "receipt_sha256": "5fef57cc8591730386b76fa7d1b7c78439258066026e030459f714dc2f9c81bb"
+        "kind": "recipe",
+        "schema": 1,
+        "recipe_sha256": "59d2d2598441cfbe4af1efcae8c86137b214d2ce52e49cadb2eb7ae020eb25d4"
       },
-      "download_url": null
+      "download_url": "https://github.com/ChidcGithub/Neo/releases/download/dependency-sources-v1/neo-native-sources-updated.zip"
     }
   ]
 }
