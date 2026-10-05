@@ -181,7 +181,7 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
         self.assertNotIn("imported app-local MSVC CRT DLLs", notes)
         self.assertNotIn("解压即用", notes)
 
-    def test_stt_download_and_extraction_stay_in_cache(self):
+    def test_stt_download_only_handles_raw_cache(self):
         step = workflow_step("Download STT models")
         script = pwsh_step("Download STT models")
         self.assertEqual(int(step["timeout-minutes"]), 20)
@@ -189,7 +189,9 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
         self.assertIn("curl.exe --fail --location --connect-timeout 20 --max-time 600 "
                       "--retry 2 --retry-max-time 900 --progress-bar --output $part $Uri", script)
         self.assertNotIn("Invoke-WebRequest", script)
-        self.assertIn(r"tar -xjf .cache\stt\sv.tar.bz2 -C .cache\stt\extracted", script)
+        for forbidden in ("tar -", "extracted", "models\\", "Copy-Item", "Get-ChildItem",
+                          "member-sha256", "ConvertTo-Json", "Write-Output"):
+            self.assertNotIn(forbidden, script)
         self.assertIn("if ($LASTEXITCODE -ne 0)", script)
         self.assertNotIn("assets-stt", script)
         self.assertNotIn("Invoke-Expression", script)
@@ -213,8 +215,7 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
             call = f"{path} ${variable}Expected '{failure}'"
             self.assertIn(call, script)
             self.assertIn(f"${variable}Hash = Get-SttDownload", script)
-            self.assertLess(script.index(call), script.index("tar -xjf"))
-            self.assertLess(script.index(call), script.index("Copy-Item"))
+
         for path in ("$Path", "$part"):
             hash_line = f"$hash = (Get-FileHash -Algorithm SHA256 -LiteralPath {path}).Hash.ToLowerInvariant()"
             self.assertIn(hash_line, script)
@@ -222,9 +223,15 @@ class ReleaseWorkflowStaticTests(unittest.TestCase):
         self.assertEqual(script.count("if ($hash -cne $Expected)"), 2)
         self.assertLess(script.index("if ($hash -cne $Expected)", script.index("curl.exe")),
                         script.index("Move-Item"))
-        self.assertIn(r"Set-Content -Encoding utf8 .cache\stt\member-sha256.json", script)
-        self.assertIn("Get-ChildItem -LiteralPath $extracted -Recurse -File", script)
-        self.assertIn("Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName", script)
+        for source, path, failure in (("cache", "$Path", "cached SHA-256 mismatch"),
+                                     ("download", "$part", "SHA-256 mismatch")):
+            start = script.index(f'Write-Host "$Label {source} hash start"')
+            hashed = script.index(f"$hash = (Get-FileHash -Algorithm SHA256 -LiteralPath {path})")
+            checked = script.index(f'throw "$Label {failure}"')
+            verified = script.index(f'Write-Host "$Label {source} verified: $hash"')
+            self.assertLess(start, hashed)
+            self.assertLess(hashed, checked)
+            self.assertLess(checked, verified)
         self.assertNotIn("docs-pri", script)
 
     def test_installer_art_default_workflow_and_nsis_agree(self):
@@ -301,7 +308,7 @@ class SttDownloadTests(unittest.TestCase):
             "vad": "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"}
 
     def run_script(self, *, cached=(), bad_cache=None, bad_download=None, network=None,
-                   extract_failure=False, uppercase_pin=None, dirty=None, stale_part=False):
+                   uppercase_pin=None, dirty=None, stale_part=False):
         temporary = tempfile.TemporaryDirectory(prefix="neo-stt-pins-")
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -321,7 +328,7 @@ class SttDownloadTests(unittest.TestCase):
             digest = hashlib.sha256(self.fixtures[name]).hexdigest()
             script = script.replace(pin, digest.upper() if name == uppercase_pin else digest)
         (root / "config.json").write_text(json.dumps({
-            "bad_download": bad_download, "network": network, "extract_failure": extract_failure,
+            "bad_download": bad_download, "network": network,
         }), encoding="utf-8")
         mocks = r'''
             $config = Get-Content config.json -Raw | ConvertFrom-Json
@@ -361,22 +368,20 @@ class SttDownloadTests(unittest.TestCase):
               # Even a complete-looking body must be rejected after a network error.
               $global:LASTEXITCODE = if ($config.network -eq $name) { 28 } else { 0 }
             }
-            function tar {
-              Add-Content events.txt 'tar'
-              if ($config.extract_failure) { $global:LASTEXITCODE = 2; return }
-              $root = '.cache/stt/extracted/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17'
-              New-Item -ItemType Directory $root | Out-Null
-              [IO.File]::WriteAllText((Join-Path $PWD "$root/model.int8.onnx"), 'mock model')
-              [IO.File]::WriteAllText((Join-Path $PWD "$root/tokens.txt"), 'mock tokens')
-              [IO.File]::WriteAllText((Join-Path $PWD "$root/README"), 'mock notice')
-              $global:LASTEXITCODE = 0
-            }
+            function tar { throw 'Download must not extract' }
+            function Copy-Item { throw 'Download must not copy models' }
+            function Get-ChildItem { throw 'Download must not enumerate members' }
         '''
         local = root / "assets-stt/local.onnx"
         local.parent.mkdir()
         local.write_bytes(b"local input unchanged")
         path = root / "download.ps1"
-        path.write_text(textwrap.dedent(mocks) + script, encoding="utf-8")
+        # Host progress must not become extra function return values.
+        check_hashes = r'''
+            if ($svHash -isnot [string] -or $svHash -cne $svExpected) { throw 'Invalid sv hash return' }
+            if ($vadHash -isnot [string] -or $vadHash -cne $vadExpected) { throw 'Invalid vad hash return' }
+        '''
+        path.write_text(textwrap.dedent(mocks) + script + textwrap.dedent(check_hashes), encoding="utf-8")
         result = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(path)],
                                 cwd=root, capture_output=True, text=True, errors="replace", timeout=30)
         self.assertEqual(local.read_bytes(), b"local input unchanged")
@@ -386,19 +391,9 @@ class SttDownloadTests(unittest.TestCase):
     def assert_success(self, cache, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(list(cache.glob("*.part")), [])
-        manifest = json.loads((cache / "member-sha256.json").read_text(encoding="utf-8-sig"))
-        self.assertEqual(manifest["sense_voice_archive_sha256"], hashlib.sha256(self.fixtures["sv"]).hexdigest())
-        self.assertEqual(manifest["silero_sha256"], hashlib.sha256(self.fixtures["vad"]).hexdigest())
-        self.assertEqual(len(manifest["members"]), 4)
-        for member in manifest["members"]:
-            base = cache / "extracted" if member["archive"] else cache
-            data = (base / member["path"]).read_bytes()
-            self.assertEqual(member["size"], len(data))
-            self.assertEqual(member["sha256"], hashlib.sha256(data).hexdigest())
-        self.assertEqual({p.relative_to(cache / "models").as_posix(): p.read_bytes()
-                          for p in (cache / "models").rglob("*") if p.is_file()},
-                         {"sense-voice/model.int8.onnx": b"mock model", "sense-voice/tokens.txt": b"mock tokens",
-                          "vad/silero_vad.onnx": self.fixtures["vad"]})
+        self.assertEqual({p.name for p in cache.iterdir()}, set(self.filenames.values()))
+        for name, content in self.fixtures.items():
+            self.assertEqual((cache / self.filenames[name]).read_bytes(), content)
 
     def assert_download_failure(self, cache, result, events, message):
         self.assertNotEqual(result.returncode, 0)
@@ -409,7 +404,7 @@ class SttDownloadTests(unittest.TestCase):
         self.assertFalse((cache / "member-sha256.json").exists())
         self.assertEqual(list(cache.glob("*.part")), [])
 
-    def test_actual_script_checks_downloads_before_extract_and_copy(self):
+    def test_actual_script_checks_downloads_before_raw_promotion(self):
         for bad in ("sv", "vad", None):
             with self.subTest(bad=bad):
                 cache, result, events = self.run_script(bad_download=bad)
@@ -421,8 +416,8 @@ class SttDownloadTests(unittest.TestCase):
                                      ["curl:sv"] if bad == "sv" else ["curl:sv", "curl:vad"])
                     continue
                 self.assert_success(cache, result)
-                self.assertEqual(events[:7], ["curl:sv", "hash:sv.tar.bz2.part", "move:sv.tar.bz2",
-                                             "curl:vad", "hash:silero_vad.onnx.part", "move:silero_vad.onnx", "tar"])
+                self.assertEqual(events, ["curl:sv", "hash:sv.tar.bz2.part", "move:sv.tar.bz2",
+                                          "curl:vad", "hash:silero_vad.onnx.part", "move:silero_vad.onnx"])
 
     def test_cache_hits_are_rehashed_without_curl(self):
         for cached in (("sv", "vad"), ("sv",), ("vad",)):
@@ -432,7 +427,7 @@ class SttDownloadTests(unittest.TestCase):
                 self.assertEqual([e for e in events if e.startswith("curl:")],
                                  ["curl:" + name for name in self.fixtures if name not in cached])
                 for name in cached:
-                    self.assertLess(events.index("hash:" + self.filenames[name]), events.index("tar"))
+                    self.assertEqual(events.count("hash:" + self.filenames[name]), 1)
                     self.assertNotIn("move:" + self.filenames[name], events)
 
     def test_bad_cache_fails_without_redownload_or_extraction(self):
@@ -455,16 +450,31 @@ class SttDownloadTests(unittest.TestCase):
                 self.assertEqual([e for e in events if e.startswith("curl:")],
                                  ["curl:sv"] if failed == "sv" else ["curl:sv", "curl:vad"])
 
-    def test_extract_failure_stops_before_manifest_and_copy(self):
-        cache, result, events = self.run_script(extract_failure=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("STT model extraction failed", result.stdout + result.stderr)
-        self.assertEqual(events[-1], "tar")
-        self.assertFalse((cache / "member-sha256.json").exists())
-        self.assertEqual([p for p in (cache / "models").rglob("*") if p.is_file()], [])
-        self.assertEqual(list(cache.glob("*.part")), [])
-        for name, content in self.fixtures.items():
-            self.assertEqual((cache / self.filenames[name]).read_bytes(), content)
+    def test_separate_prepare_cli_preserves_raw_cache_and_propagates_exit(self):
+        # Archive validation/rollback uses real Python fixtures in test_prepare_stt_models.
+        # Here execute the workflow command with only its CLI boundary mocked.
+        for exit_code in (0, 23):
+            with self.subTest(exit_code=exit_code):
+                cache, downloaded, _ = self.run_script()
+                self.assert_success(cache, downloaded)
+                script = textwrap.dedent('''
+                    function python {
+                      $args | ConvertTo-Json | Set-Content cli-args.json
+                      $global:LASTEXITCODE = EXIT_CODE
+                    }
+                ''').replace("EXIT_CODE", str(exit_code))
+                script += workflow_step("Prepare STT models")["run"]
+                # GitHub's default Windows pwsh shell forwards the native exit status.
+                script += '\nif (Test-Path variable:LASTEXITCODE) { exit $LASTEXITCODE }\n'
+                root = cache.parent.parent
+                path = root / "prepare.ps1"
+                path.write_text(script, encoding="utf-8")
+                result = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(path)],
+                                        cwd=root, capture_output=True, text=True, errors="replace", timeout=30)
+                self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+                self.assertEqual(json.loads((root / "cli-args.json").read_text(encoding="utf-8-sig")),
+                                 ["-B", "tools/prepare_stt_models.py", "--cache", ".cache/stt"])
+                self.assert_success(cache, downloaded)
 
     def test_sha_comparison_is_case_sensitive_for_cache_and_download(self):
         for cached in ((), ("sv", "vad")):
@@ -474,15 +484,34 @@ class SttDownloadTests(unittest.TestCase):
                     self.assert_download_failure(cache, result, events, "SHA-256 mismatch")
                     self.assertNotIn("move:" + self.filenames[name], events)
 
-    def test_dirty_extraction_and_model_directories_are_rejected(self):
+    def test_download_leaves_existing_preparation_outputs_alone(self):
         for dirty in ("extracted", "models"):
             with self.subTest(dirty=dirty):
                 cache, result, events = self.run_script(cached=("sv", "vad"), dirty=dirty)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("STT extraction and model directories must be clean", result.stdout + result.stderr)
-                self.assertEqual(events, [])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(events, ["hash:sv.tar.bz2", "hash:silero_vad.onnx"])
                 self.assertEqual((cache / dirty / "sentinel").read_bytes(), b"do not reuse")
                 self.assertFalse((cache / "member-sha256.json").exists())
+
+    def test_hash_progress_is_visible_and_only_success_is_verified(self):
+        for cached in ((), ("sv", "vad")):
+            for bad in (None, "sv", "vad"):
+                with self.subTest(cached=cached, bad=bad):
+                    cache, result, _ = self.run_script(cached=cached, bad_cache=bad, bad_download=bad)
+                    source = "cache" if cached else "download"
+                    self.assertEqual(result.returncode == 0, bad is None, result.stdout + result.stderr)
+                    for name, label in (("sv", "SenseVoice archive"), ("vad", "Silero")):
+                        start = f"{label} {source} hash start"
+                        verified = f"{label} {source} verified: {hashlib.sha256(self.fixtures[name]).hexdigest()}"
+                        if bad == "sv" and name == "vad":
+                            self.assertNotIn(start, result.stdout)
+                        else:
+                            self.assertIn(start, result.stdout)
+                        if name == bad or (bad == "sv" and name == "vad"):
+                            self.assertNotIn(f"{label} {source} verified:", result.stdout)
+                        else:
+                            self.assertIn(verified, result.stdout)
+                            self.assertLess(result.stdout.index(start), result.stdout.index(verified))
 
     def test_stale_partial_is_discarded_not_resumed(self):
         cache, result, events = self.run_script(stale_part=True)

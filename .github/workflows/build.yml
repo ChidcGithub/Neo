@@ -129,6 +129,9 @@ jobs:
       - name: Verify SenseVoice license materials
         run: python -B tools/verify_sensevoice_notices.py
 
+      - name: STT preparation offline regressions
+        run: python -B -m unittest tools.test_prepare_stt_models -v
+
       - name: Math model download regressions
         run: python -B -m unittest tools.test_prepare_math_models -v
 
@@ -259,14 +262,13 @@ jobs:
           # 官方 release 资产摘要只固定字节，不表示模型许可或来源审查已通过。
           $svExpected = '7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e'
           $vadExpected = '9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6'
-          if ((Test-Path .cache\stt\extracted) -or (Test-Path .cache\stt\models)) {
-            throw 'STT extraction and model directories must be clean'
-          }
           New-Item -ItemType Directory -Force .cache\stt | Out-Null
           function Get-SttDownload($Uri, $Path, $Expected, $Label) {
             if (Test-Path -LiteralPath $Path) {
+              Write-Host "$Label cache hash start"
               $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
               if ($hash -cne $Expected) { throw "$Label cached SHA-256 mismatch" }
+              Write-Host "$Label cache verified: $hash"
               return $hash
             }
             $part = "$Path.part"
@@ -274,11 +276,13 @@ jobs:
               # Only verified raw files enter the cache; never resume an untrusted partial.
               Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
               # retry-max-time only limits starting retries, not an in-flight transfer.
-              # The 20-minute step timeout bounds both downloads and extraction together.
+              # The 20-minute step timeout bounds both raw downloads together.
               curl.exe --fail --location --connect-timeout 20 --max-time 600 --retry 2 --retry-max-time 900 --progress-bar --output $part $Uri
               if ($LASTEXITCODE -ne 0) { throw "$Label download failed (curl exit $LASTEXITCODE)" }
+              Write-Host "$Label download hash start"
               $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $part).Hash.ToLowerInvariant()
               if ($hash -cne $Expected) { throw "$Label SHA-256 mismatch" }
+              Write-Host "$Label download verified: $hash"
               Move-Item -LiteralPath $part -Destination $Path
               return $hash
             } finally {
@@ -287,25 +291,6 @@ jobs:
           }
           $svHash = Get-SttDownload "$base/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2" .cache\stt\sv.tar.bz2 $svExpected 'SenseVoice archive'
           $vadHash = Get-SttDownload "$base/silero_vad.onnx" .cache\stt\silero_vad.onnx $vadExpected 'Silero'
-          New-Item -ItemType Directory .cache\stt\extracted, .cache\stt\models\sense-voice, .cache\stt\models\vad | Out-Null
-          tar -xjf .cache\stt\sv.tar.bz2 -C .cache\stt\extracted
-          if ($LASTEXITCODE -ne 0) { throw 'STT model extraction failed' }
-          # 构建证据留在 cache 根，不复制进 models 或发行包；不读取本地开发模型。
-          $extracted = (Resolve-Path .cache\stt\extracted).Path
-          $members = @(Get-ChildItem -LiteralPath $extracted -Recurse -File | Sort-Object FullName | ForEach-Object {
-            [ordered]@{
-              archive = 'sv.tar.bz2'
-              path = [IO.Path]::GetRelativePath($extracted, $_.FullName).Replace('\', '/')
-              size = $_.Length
-              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
-            }
-          })
-          $members += [ordered]@{ archive = $null; path = 'silero_vad.onnx'; size = (Get-Item .cache\stt\silero_vad.onnx).Length; sha256 = $vadHash }
-          [ordered]@{ sense_voice_archive_sha256 = $svHash; silero_sha256 = $vadHash; members = $members } |
-            ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 .cache\stt\member-sha256.json
-          Copy-Item '.cache\stt\extracted\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\model.int8.onnx',
-                    '.cache\stt\extracted\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\tokens.txt' .cache\stt\models\sense-voice\
-          Copy-Item .cache\stt\silero_vad.onnx .cache\stt\models\vad\silero_vad.onnx
 
       - name: Save STT raw downloads
         if: inputs.publish && steps.stt-downloads.outputs.cache-hit != 'true'
@@ -315,6 +300,11 @@ jobs:
             .cache/stt/sv.tar.bz2
             .cache/stt/silero_vad.onnx
           key: ${{ steps.stt-downloads.outputs.cache-primary-key }}
+
+      - name: Prepare STT models
+        if: inputs.publish
+        timeout-minutes: 5
+        run: python -B tools/prepare_stt_models.py --cache .cache/stt
 
       - name: Restore MinGit raw archive
         if: inputs.publish

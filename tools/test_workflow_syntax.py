@@ -277,7 +277,8 @@ class WorkflowSyntaxTests(unittest.TestCase):
             'Native preparation offline regressions', 'Source delivery offline regressions',
             'Native source binding regressions', 'ORT Eigen source notice regressions',
             'Verify pinned ORT Eigen source notices', 'SenseVoice notice regressions',
-            'Verify SenseVoice license materials', 'Math model download regressions', 'Complete release variant regressions',
+            'Verify SenseVoice license materials', 'STT preparation offline regressions',
+            'Math model download regressions', 'Complete release variant regressions',
             'Prepare mandatory no-TTS Sherpa native', 'Invalidate cached Sherpa Rust bindings', 'Check all workspace targets',
             'Safe library tests', 'Tool policy tests', 'UIA validation and search contracts (no live desktop probe)',
             'Overlay contracts and native hit testing', 'App overlay fallback tests (no GUI or audio)',
@@ -340,12 +341,36 @@ class WorkflowSyntaxTests(unittest.TestCase):
         for restore_name, prepare_name, save_name, consumer_name in (
             ('Restore Sherpa download archives and CMake wheel', 'Prepare mandatory no-TTS Sherpa native',
              'Save Sherpa download archives and CMake wheel', 'Check all workspace targets'),
-            ('Restore STT raw downloads', 'Download STT models', 'Save STT raw downloads', 'Assemble package'),
+            ('Restore STT raw downloads', 'Download STT models', 'Save STT raw downloads', 'Prepare STT models'),
             ('Restore math model raw downloads', 'Prepare math model variants', 'Save math model raw downloads', 'Zip portable package'),
             ('Restore MinGit raw archive', 'Fetch MinGit runtime', 'Save MinGit raw archive', 'Prepare GCM-free MinGit distribution'),
         ):
             indices = [steps.index(by_name[name]) for name in (restore_name, prepare_name, save_name, consumer_name)]
             self.assertEqual(indices, sorted(indices))
+
+    def test_stt_preparation_is_separate_required_and_after_raw_cache_save(self):
+        workflow = parse_workflow((WORKFLOWS / 'build.yml').read_text(encoding='utf-8'))
+        steps = workflow['jobs']['check']['steps']
+        by_name = {step['name']: step for step in steps}
+        prepare = by_name['Prepare STT models']
+        self.assertEqual(prepare['run'], 'python -B tools/prepare_stt_models.py --cache .cache/stt')
+        self.assertEqual(prepare['timeout-minutes'], '5')
+        self.assertEqual(prepare['if'], RELEASE_IF)
+        self.assertNotIn('continue-on-error', prepare)
+        self.assertEqual(prepare.get('shell', 'pwsh'), 'pwsh')
+        names = [step['name'] for step in steps]
+        download = names.index('Download STT models')
+        self.assertEqual(names[download:download + 3],
+                         ['Download STT models', 'Save STT raw downloads', 'Prepare STT models'])
+        self.assertLess(names.index('Prepare STT models'), names.index('Assemble package'))
+        save = by_name['Save STT raw downloads']
+        self.assertEqual(save['if'], "inputs.publish && steps.stt-downloads.outputs.cache-hit != 'true'")
+        self.assertNotIn('continue-on-error', save)
+        regression = by_name['STT preparation offline regressions']
+        self.assertEqual(regression['run'], 'python -B -m unittest tools.test_prepare_stt_models -v')
+        self.assertNotIn('if', regression)
+        self.assertNotIn('continue-on-error', regression)
+        self.assertLess(steps.index(regression), download)
 
     def test_parser_rejects_duplicate_keys_instead_of_hiding_checks(self):
         for text in ('jobs:\n  check: {}\n  check: {}\n',
