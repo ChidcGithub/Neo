@@ -290,9 +290,28 @@ class VariantTests(unittest.TestCase):
             self.skipTest('Symbolic links unavailable: ' + str(error))
         for target in ('target/linked', str(target_link), 'target/ci-rust'):
             with self.subTest(target=target), patch.dict(os.environ, {'CARGO_TARGET_DIR': target}):
-                with self.assertRaisesRegex(ValueError, 'Symlink/reparse input or output is forbidden'):
+                with self.assertRaisesRegex(ValueError, 'Link/reparse point or special file forbidden:'):
                     v.main_build(self.root)
-                with self.assertRaisesRegex(ValueError, 'Symlink/reparse input or output is forbidden'):
+                with self.assertRaisesRegex(ValueError, 'Link/reparse point or special file forbidden:'):
+                    self.verify()
+
+    def test_main_build_reparse_rejected_without_symlink_privilege(self):
+        from types import SimpleNamespace
+
+        target = self.root / 'target/ci-rust'
+        original_lstat = Path.lstat
+
+        def lstat(path, *args, **kwargs):
+            if path == target:
+                return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=0x400)
+            return original_lstat(path, *args, **kwargs)
+
+        for value in ('target/ci-rust', str(target)):
+            with self.subTest(target=value), patch.dict(os.environ, {'CARGO_TARGET_DIR': value}), \
+                    patch.object(Path, 'lstat', lstat):
+                with self.assertRaisesRegex(ValueError, 'Link/reparse point or special file forbidden:'):
+                    v.main_build(self.root)
+                with self.assertRaisesRegex(ValueError, 'Link/reparse point or special file forbidden:'):
                     self.verify()
 
     def test_drawing_swap_missing_corrupt_and_source_inventory(self):

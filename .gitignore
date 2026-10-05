@@ -2,6 +2,7 @@
 /target
 
 # 编辑器 / 系统
+.zed/
 .vscode/
 .idea/
 *.swp
