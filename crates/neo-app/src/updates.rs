@@ -62,12 +62,20 @@ impl UpdateChecker {
     }
 
     #[cfg(test)]
-    pub(crate) fn request_controlled(&mut self, ctx: &egui::Context, result: Status) -> Box<dyn FnOnce() + Send> {
+    pub(crate) fn request_controlled(
+        &mut self,
+        ctx: &egui::Context,
+        result: Status,
+    ) -> Box<dyn FnOnce() + Send> {
         let mut pending = None;
-        self.start(ctx, move || result, |job| {
-            pending = Some(job);
-            Ok(())
-        });
+        self.start(
+            ctx,
+            move || result,
+            |job| {
+                pending = Some(job);
+                Ok(())
+            },
+        );
         pending.expect("controlled worker must acquire single flight")
     }
 
@@ -114,12 +122,19 @@ impl UpdateChecker {
         self.receiver = Some((self.generation, receiver));
         self.pending = false;
         self.status = Status::Checking;
-        let running = Arc::clone(&self.running);
-        let repaint = ctx.clone();
+        // The guard must exist before spawn so dropping an unstarted job also
+        // releases single-flight ownership and wakes the UI.
+        let completion = Completion {
+            running: Arc::clone(&self.running),
+            repaint: ctx.clone(),
+            sender: Some(sender),
+        };
         let job = Box::new(move || {
-            let _completion = Completion { running, repaint };
+            let completion = completion;
             let result = worker();
-            let _ = sender.send(result);
+            if let Some(sender) = completion.sender.as_ref() {
+                let _ = sender.send(result);
+            }
         });
         if spawn(job).is_err() {
             self.running.store(false, Ordering::Release);
@@ -134,10 +149,13 @@ impl UpdateChecker {
 struct Completion {
     running: Arc<AtomicBool>,
     repaint: egui::Context,
+    sender: Option<mpsc::Sender<Status>>,
 }
 
 impl Drop for Completion {
     fn drop(&mut self) {
+        // A failed worker must be observable as Disconnected before the repaint.
+        drop(self.sender.take());
         self.running.store(false, Ordering::Release);
         self.repaint.request_repaint();
     }

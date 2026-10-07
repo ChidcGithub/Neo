@@ -182,6 +182,9 @@ jobs:
       - name: Tool policy tests
         run: 'cargo test --locked -p neo-tools --lib policy::tests::'
 
+      - name: Mod contracts and read-only discovery tests
+        run: 'cargo test --locked -p neo-tools --lib mods:: -- --test-threads=1'
+
       - name: UIA validation and search contracts (no live desktop probe)
         run: 'cargo test --locked -p neo-tools --lib --target x86_64-pc-windows-msvc -- screen_uia:: screen_elements:: screen_element_search:: click::tests:: --test-threads=1'
 

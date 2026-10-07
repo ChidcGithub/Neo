@@ -483,6 +483,72 @@ fn spawn_failure_is_visible_once_and_can_be_retried() {
 }
 
 #[test]
+fn abandoned_worker_releases_single_flight_and_allows_retry() {
+    let ctx = egui::Context::default();
+    let mut checker = UpdateChecker::default();
+    let job = checker.request_controlled(&ctx, Status::UpToDate);
+    assert!(checker.is_running());
+    drop(job);
+    assert!(!checker.is_running());
+    assert_eq!(
+        checker.poll(),
+        Some(Status::Failed(tr(RESPONSE_ERROR).into()))
+    );
+    assert_eq!(checker.poll(), None);
+    checker.request_controlled(&ctx, Status::UpToDate)();
+    assert_eq!(checker.poll(), Some(Status::UpToDate));
+}
+
+#[test]
+fn unwinding_worker_reports_failure_and_allows_retry() {
+    let ctx = egui::Context::default();
+    let mut checker = UpdateChecker::default();
+    let mut job = None;
+    checker.start(
+        &ctx,
+        || panic!("synthetic worker failure"),
+        |worker| {
+            job = Some(worker);
+            Ok(())
+        },
+    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.unwrap())).is_err());
+    assert!(!checker.is_running());
+    assert_eq!(
+        checker.poll(),
+        Some(Status::Failed(tr(RESPONSE_ERROR).into()))
+    );
+    assert_eq!(checker.poll(), None);
+    checker.request_controlled(&ctx, Status::UpToDate)();
+    assert_eq!(checker.poll(), Some(Status::UpToDate));
+}
+
+#[test]
+fn completion_disconnects_and_releases_before_notifying_ui() {
+    let ctx = egui::Context::default();
+    let running = Arc::new(AtomicBool::new(true));
+    let (sender, receiver) = mpsc::channel::<Status>();
+    let observed = Arc::new(AtomicBool::new(false));
+    let observed_callback = Arc::clone(&observed);
+    let running_callback = Arc::clone(&running);
+    let receiver = std::sync::Mutex::new(receiver);
+    ctx.set_request_repaint_callback(move |_| {
+        assert!(!running_callback.load(Ordering::Acquire));
+        assert!(matches!(
+            receiver.lock().unwrap().try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        observed_callback.store(true, Ordering::Release);
+    });
+    drop(Completion {
+        running,
+        repaint: ctx,
+        sender: Some(sender),
+    });
+    assert!(observed.load(Ordering::Acquire));
+}
+
+#[test]
 fn drop_does_not_wait_for_pending_worker() {
     let ctx = egui::Context::default();
     let mut checker = UpdateChecker::default();

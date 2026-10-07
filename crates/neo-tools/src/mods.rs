@@ -1,4 +1,8 @@
-//! Inert out-of-process MOD SDK draft. No discovery, execution, sandbox or approval grants.
+//! Out-of-process MOD contracts with explicit read-only discovery and an inert
+//! session state machine. No process execution, sandbox or approval grants.
+
+pub mod discovery;
+pub mod session;
 use serde::{
     de::{self, Visitor},
     Deserialize, Deserializer, Serialize,

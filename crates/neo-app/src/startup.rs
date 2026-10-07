@@ -622,6 +622,8 @@ mod native {
         scale: f32,
         backdrop: std::cell::Cell<Backdrop>,
         glass: std::cell::RefCell<Option<Vec<u32>>>,
+        // Glyphs, brand raster and frozen plate are composed only once per theme.
+        plate: std::cell::RefCell<Option<Vec<u32>>>,
         layered: std::cell::Cell<bool>,
         failed: std::cell::Cell<bool>,
     }
@@ -629,9 +631,12 @@ mod native {
     struct Layout {
         width: i32,
         height: i32,
+        body: RECT,
+        icon: RECT,
         brand: RECT,
         caption: RECT,
         progress: RECT,
+        radius: f32,
     }
     /// Size against the usable screen, not resolution multiplied by DPI again.
     /// DPI only sets comfortable bounds; the final fit wins on small displays.
@@ -646,10 +651,10 @@ mod native {
         let fitted = desired
             .min(1440.)
             .min(width as f32 * 0.85)
-            .min(height as f32 * 0.4 * (360. / 96.));
+            .min(height as f32 * 0.4 * (400. / 144.));
         // Skip an unusably tiny splash rather than clipping text or allocating a
         // surface from invalid monitor geometry. Main-window startup continues.
-        (fitted >= 120.).then_some(fitted / 360.)
+        (fitted >= 200.).then_some(fitted / 400.)
     }
 
     fn layout(scale: f32) -> Layout {
@@ -660,20 +665,15 @@ mod native {
             right: px(r),
             bottom: px(b),
         };
-        let height = px(96.);
-        let width = px(360.);
         Layout {
-            width,
-            height,
-            brand: rect(24., 10., 336., 52.),
-            caption: rect(24., 56., 336., 80.),
-            // 从底边反推上边，分数 DPI 下也保持贴边且厚度一致。
-            progress: RECT {
-                left: 0,
-                top: height - px(3.),
-                right: width,
-                bottom: height,
-            },
+            width: px(400.),
+            height: px(144.),
+            body: rect(8., 6., 392., 134.),
+            icon: rect(32., 26., 108., 102.),
+            brand: rect(132., 22., 368., 72.),
+            caption: rect(134., 77., 368., 99.),
+            progress: rect(32., 116., 368., 119.),
+            radius: 22. * scale,
         }
     }
 
@@ -698,6 +698,7 @@ mod native {
     }
 
     unsafe fn configure_backdrop(card: &Card) {
+        card.plate.borrow_mut().take();
         #[repr(C)]
         struct HighContrast {
             size: u32,
@@ -732,14 +733,16 @@ mod native {
         brand: [u8; 3],
         caption: [u8; 3],
         track: [u8; 3],
+        high_contrast: bool,
     }
     impl Palette {
         fn light() -> Self {
             Self {
-                body: [232, 234, 237],
-                brand: [77, 107, 254],
-                caption: [70, 80, 103],
-                track: [174, 188, 229],
+                body: [242, 244, 248],
+                brand: [69, 103, 225],
+                caption: [48, 55, 70],
+                track: [194, 202, 222],
+                high_contrast: false,
             }
         }
         unsafe fn for_backdrop(mode: Backdrop) -> Self {
@@ -753,12 +756,13 @@ mod native {
             };
             let body = color(COLOR_WINDOW);
             let ink = color(COLOR_WINDOWTEXT);
-            let track = std::array::from_fn(|i| ((body[i] as u16 + ink[i] as u16) / 2) as u8);
+            let track = ink;
             Self {
                 body,
                 brand: ink,
                 caption: ink,
                 track,
+                high_contrast: true,
             }
         }
     }
@@ -794,38 +798,7 @@ mod native {
         }
     }
 
-    fn card_pixel(
-        geometry: &Layout,
-        x: i32,
-        y: i32,
-        glyph: u8,
-        segment: &RECT,
-        duplicate: bool,
-        palette: &Palette,
-    ) -> u32 {
-        if x < 0 || x >= geometry.width || y < 0 || y >= geometry.height {
-            return 0;
-        }
-        let contains = |r: &RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
-        if contains(&geometry.progress) {
-            let color = if !duplicate && contains(segment) {
-                palette.brand
-            } else {
-                palette.track
-            };
-            return premultiplied(color, 1.);
-        }
-        let ink = if contains(&geometry.caption) {
-            palette.caption
-        } else {
-            palette.brand
-        };
-        let channel = |i: usize| {
-            ((ink[i] as u32 * glyph as u32 + palette.body[i] as u32 * (255 - glyph as u32) + 127)
-                / 255) as u8
-        };
-        premultiplied([channel(0), channel(1), channel(2)], 1.)
-    }
+    include!("startup_visual.rs");
 
     fn text_halo(mask: &[u8], width: usize, index: usize, radius: usize) -> u8 {
         let height = mask.len() / width;
@@ -852,7 +825,10 @@ mod native {
     }
 
     unsafe fn fallback_region(geometry: &Layout) -> HRGN {
-        CreateRectRgn(0, 0, geometry.width, geometry.height)
+        let r = geometry.body;
+        let diameter = (geometry.radius * 2.).round() as i32;
+        // GDI's right/bottom bounds are exclusive; match the layered body, not its shadow.
+        CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, diameter, diameter)
     }
 
     fn opaque_pixel(pixel: u32, background: [u8; 3]) -> u32 {
@@ -876,9 +852,9 @@ mod native {
             0,
             0,
             DEFAULT_CHARSET as u32,
-            0,
-            0,
-            ANTIALIASED_QUALITY as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            CLEARTYPE_QUALITY as u32,
             0,
             wide("Segoe UI").as_ptr(),
         );
@@ -899,11 +875,26 @@ mod native {
             value.as_ptr(),
             (value.len() - 1) as i32,
             &mut rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         ) != 0;
         SelectObject(dc, old);
         DeleteObject(font);
         drawn
+    }
+
+    unsafe fn draw_glyphs(dc: HDC, geometry: &Layout, scale: f32, caption: &str) -> bool {
+        let px = |n: f32| (n * scale).round().max(1.) as i32;
+        let drawn = text(dc, "Neo", geometry.brand, px(42.), 600, rgb(255, 255, 255))
+            && text(
+                dc,
+                caption,
+                geometry.caption,
+                px(14.),
+                400,
+                rgb(255, 255, 255),
+            );
+        // Finish GDI writes before reading the DIB on the CPU, even on failure.
+        GdiFlush() != 0 && drawn
     }
 
     unsafe fn paint(hwnd: HWND, card: &Card) {
@@ -911,6 +902,11 @@ mod native {
         let target = BeginPaint(hwnd, &mut ps);
         let geometry = layout(card.scale);
         let (width, height) = (geometry.width, geometry.height);
+        if width <= 0 || height <= 0 || width as usize * height as usize > MAX_CARD_PIXELS {
+            EndPaint(hwnd, &ps);
+            card.failed.set(true);
+            return;
+        }
         let dc = CreateCompatibleDC(target);
         let mut info: BITMAPINFO = std::mem::zeroed();
         info.bmiHeader = BITMAPINFOHEADER {
@@ -944,67 +940,39 @@ mod native {
             return;
         }
         let pixels = std::slice::from_raw_parts_mut(bits.cast::<u32>(), (width * height) as usize);
-        pixels.fill(0);
-        let px = |n: f32| (n * card.scale).round() as i32;
-        // GDI 只生成白字黑底的灰度覆盖率，不依赖其未定义的 alpha 字节，也不用色键抠字。
-        let drawn = text(dc, "Neo", geometry.brand, px(32.), 650, rgb(255, 255, 255))
-            && text(
-                dc,
-                if card.duplicate {
-                    tr("Neo 已经在运行")
-                } else {
-                    tr("正在启动")
-                },
-                geometry.caption,
-                px(14.),
-                600,
-                rgb(255, 255, 255),
-            );
-        // CPU 读取 DIB 前等待 GDI 批处理完成，再合成文字与玻璃色层。
-        if GdiFlush() == 0 || !drawn {
-            card.failed.set(true);
-        }
         let palette = Palette::for_backdrop(card.backdrop.get());
-        let phase = animation_phase(card.started.elapsed().as_secs_f32(), card.duplicate);
-        let segment = progress_segment(&geometry, phase);
-        let glass = card.glass.borrow();
-        let mask: Vec<u8> = pixels.iter().map(|pixel| (*pixel & 255) as u8).collect();
-        let radius = px(1.).clamp(1, 4);
-        for (index, pixel) in pixels.iter_mut().enumerate() {
-            let mut palette = palette;
-            if card.backdrop.get() == Backdrop::Glass {
-                if let Some(background) = glass.as_ref().and_then(|pixels| pixels.get(index)) {
-                    palette.body = [
-                        (background >> 16) as u8,
-                        (background >> 8) as u8,
-                        *background as u8,
-                    ];
-                }
+        let mut plate = card.plate.borrow_mut();
+        if plate.is_none() {
+            pixels.fill(0);
+            let caption = if card.duplicate {
+                tr("Neo 已经在运行")
+            } else {
+                tr("正在启动")
+            };
+            // Only memory GDI draws glyphs; grayscale coverage ignores GDI's alpha byte.
+            if !draw_glyphs(dc, &geometry, card.scale, caption) {
+                card.failed.set(true);
             }
-            let (x, y) = (index as i32 % width, index as i32 / width);
-            if card.backdrop.get() != Backdrop::HighContrast && y < geometry.progress.top {
-                let near_text = [geometry.brand, geometry.caption].iter().any(|r| {
-                    x >= r.left - radius
-                        && x < r.right + radius
-                        && y >= r.top - radius
-                        && y < r.bottom + radius
-                });
-                let halo = if near_text {
-                    text_halo(&mask, width as usize, index, radius as usize)
-                } else {
-                    0
-                };
-                palette = readable_text_palette(palette, halo);
+            let mask: Vec<u8> = pixels.iter().map(|p| (*p & 255) as u8).collect();
+            let size = (geometry.icon.right - geometry.icon.left) as usize;
+            let (icon, _, _) = crate::brand::whale_rgba(size);
+            let glass = card.glass.borrow();
+            *plate = render_plate(&geometry, &mask, &icon, glass.as_deref(), palette);
+            if plate.is_none() {
+                card.failed.set(true);
             }
-            *pixel = card_pixel(
+        }
+        if let Some(plate) = plate.as_ref() {
+            pixels.copy_from_slice(plate);
+            render_progress(
+                pixels,
                 &geometry,
-                x,
-                y,
-                mask[index],
-                &segment,
+                animation_phase(card.started.elapsed().as_secs_f32(), card.duplicate),
                 card.duplicate,
-                &palette,
+                palette,
             );
+        } else {
+            pixels.fill(premultiplied(palette.body, 1.));
         }
         if card.layered.get() {
             let blend = BLENDFUNCTION {
@@ -1030,7 +998,7 @@ mod native {
                 ULW_ALPHA,
             ) == 0
             {
-                // 普通 GDI 降级路径使用同尺寸直角矩形，保留底边的完整进度条。
+                // Rounded opaque fallback excludes the translucent shadow.
                 let region = fallback_region(&geometry);
                 if region.is_null() || SetWindowRgn(hwnd, region, 0) == 0 {
                     if !region.is_null() {
@@ -1162,6 +1130,7 @@ mod native {
                 layered: std::cell::Cell::new(true),
                 failed: std::cell::Cell::new(false),
                 glass: std::cell::RefCell::new(None),
+                plate: std::cell::RefCell::new(None),
             };
             let area = info.rcWork;
             let x = area.left + (area.right - area.left - width) / 2;
@@ -1217,9 +1186,11 @@ mod native {
             // capture, no capture of the card itself, no dependency on DWM effects.
             InvalidateRect(hwnd, null(), 0);
             paint(hwnd, &card);
-            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            InvalidateRect(hwnd, null(), 0);
-            UpdateWindow(hwnd);
+            if !card.failed.get() {
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                InvalidateRect(hwnd, null(), 0);
+                UpdateWindow(hwnd);
+            }
             'surface: loop {
                 let done = if duplicate {
                     card.started.elapsed() >= Duration::from_millis(1300)

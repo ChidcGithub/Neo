@@ -11,9 +11,9 @@ fn render_is_bounded_and_rejects_invalid_shapes() {
 
 #[test]
 fn blur_removes_fine_detail_and_retains_a_light_gray_plate() {
-    let source: Vec<_> = (0..30).flat_map(|y| (0..90).map(move |x| {
-        if (x + y) % 2 == 0 { 0 } else { 0xffffff }
-    })).collect();
+    let source: Vec<_> = (0..30)
+        .flat_map(|y| (0..90).map(move |x| if (x + y) % 2 == 0 { 0 } else { 0xffffff }))
+        .collect();
     let output = render(&source, 90, 30, 360, 120).unwrap();
     assert_eq!(output.len(), 360 * 120);
     for pixel in &output {
@@ -21,7 +21,7 @@ fn blur_removes_fine_detail_and_retains_a_light_gray_plate() {
         for shift in [0, 8, 16] {
             let value = (pixel >> shift) & 255;
             // Edge extension affects checker corners more with the lighter tint.
-            assert!((154..=219).contains(&value), "tinted channel={value}");
+            assert!((170..=231).contains(&value), "tinted channel={value}");
         }
     }
     // Original black/white checker contrast is gone, but subtle grain survives.
@@ -36,12 +36,17 @@ fn blur_removes_fine_detail_and_retains_a_light_gray_plate() {
 fn backdrop_color_survives_blur_without_exposing_sharp_content() {
     let dark = render(&[0; 16], 4, 4, 12, 4).unwrap();
     let light = render(&[0xffffff; 16], 4, 4, 12, 4).unwrap();
-    // Tint is brighter, but still contributes exactly half of each channel.
-    assert_eq!(dark[0], 0xff7b7c7e);
+    // Preserve 40% backdrop contribution; the fixed tint carries readability.
+    assert_eq!(dark[0], 0xff95989c);
     for (a, b) in dark.iter().zip(light) {
         for shift in [0, 8, 16] {
-            let difference = ((b >> shift) & 255) - ((a >> shift) & 255);
-            assert!((127..=128).contains(&difference), "backdrop weight must remain 50%");
+            let low = (a >> shift) & 255;
+            let high = (b >> shift) & 255;
+            assert_eq!(
+                high,
+                (low + 102).min(255),
+                "40% backdrop contribution with highlight clipping"
+            );
         }
     }
 }
