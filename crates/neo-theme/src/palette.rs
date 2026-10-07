@@ -98,6 +98,26 @@ pub mod neutral {
 
     /// `--dsw-static-deepseek-50`
     pub const DS_50: Color32 = rgb(237, 243, 254);
+
+    // ---- 高对比（HC）专用实色 ----
+    /// HC 背景层（`surface_1`）：纯黑。
+    pub const BLACK: Color32 = rgb(0, 0, 0);
+    /// HC 卡片 / 面板层（`surface_2`）。
+    pub const HC_24: Color32 = rgb(24, 24, 27);
+    /// HC 悬停底（实色，替代半透明叠加）。
+    pub const HC_32: Color32 = rgb(32, 32, 36);
+    /// HC 最上层（弹窗 / 菜单 / toast，`surface_3`）。
+    pub const HC_40: Color32 = rgb(40, 40, 45);
+    /// HC 按下 / 选中底。
+    pub const HC_48: Color32 = rgb(48, 48, 54);
+    /// HC 弱描边（`muted`）。
+    pub const HC_184: Color32 = rgb(184, 184, 190);
+    /// HC 三级 / 说明文字：三层表面上对比度 ≥ 7。
+    pub const HC_188: Color32 = rgb(188, 188, 194);
+    /// HC 二级文字。
+    pub const HC_210: Color32 = rgb(210, 210, 216);
+    /// HC 弱强调底（`accent_soft`）。
+    pub const HC_ACCENT_SOFT: Color32 = rgb(10, 45, 110);
 }
 
 /// 组件级 token —— 上游 `--dsw-alias-button-*` / `bg-mask-*` / `bg-overlay` / `toast-bg`
@@ -297,6 +317,21 @@ pub struct Palette {
     pub border_l2: Color32,
     pub border_l3: Color32,
 
+    // ---- 语义层级（实色，非透明度叠加）----
+    // 参照「container + on_* 配对」的层级色模式：表面阶梯 + 弱强调底/文字对 +
+    // 弱描边。三套取值（light / dark / HC）全部是不透明实色 —— 层级关系靠
+    // 明度差表达，不靠 alpha 叠出来，叠两层也不会串色。
+    /// `surface_1`：应用背景层，与 [`Palette::bg_base`] 同值（层级阶梯里的语义别名）。
+    pub surface_1: Color32,
+    /// `surface_2`：卡片 / 面板层（neo-ui 的 `Panel` 默认底）。
+    pub surface_2: Color32,
+    /// `surface_3`：最上层 —— 弹窗 / 菜单 / toast。
+    pub surface_3: Color32,
+    /// `accent_soft` 上的配对文字（container + on_* 的 on 侧）。
+    pub accent_on_soft: Color32,
+    /// 弱描边（分隔表面与其内容物的低强调边界）。
+    pub muted: Color32,
+
     // ---- 交互态 ----
     /// `--dsw-alias-interactive-bg-hover`
     pub hover: Color32,
@@ -342,6 +377,13 @@ impl Palette {
         border_l2: white_a(31),
         border_l3: white_a(41),
 
+        // 暗色层级：越高越亮（与 bg_layer 阶梯同向）。
+        surface_1: neutral::N_950,
+        surface_2: neutral::N_875,
+        surface_3: neutral::N_800,
+        accent_on_soft: deepseek::D300,
+        muted: neutral::N_400,
+
         hover: white_a(20),
         hover_solid: neutral::N_800,
         active: white_a(36),
@@ -379,11 +421,65 @@ impl Palette {
         border_l2: black_a(38),
         border_l3: black_a(52),
 
+        // 亮色层级：越高越带灰（surface_container 式阶梯）。
+        surface_1: neutral::N_00,
+        surface_2: neutral::N_75,
+        surface_3: neutral::N_150,
+        accent_on_soft: deepseek::D500,
+        muted: neutral::N_700,
+
         hover: rgba(38, 49, 72, 15),
         hover_solid: neutral::N_75,
         active: rgba(38, 49, 72, 26),
         nav_hover: neutral::N_75,
         nav_active: neutral::N_100,
+    };
+
+    /// 高对比主题（HC）：纯黑底 + 全实色，文字配对对比度 ≥ 7（WCAG AAA）。
+    ///
+    /// 尚未接入 [`crate::ThemeMode`]（枚举变动会波及 neo-app），先以独立色板
+    /// 提供三套实色中的第三套；明暗判别走 `bg_base` 亮度，因此 HC 自动使用
+    /// 暗色组件 token。
+    pub const HIGH_CONTRAST: Self = Self {
+        bg_base: neutral::BLACK,
+        bg_layer_1: neutral::HC_24,
+        bg_layer_2: neutral::HC_40,
+        bg_layer_3: neutral::HC_48,
+        sidebar_fill: neutral::BLACK,
+        input_surface: neutral::HC_24,
+        selector: neutral::HC_48,
+        bubble: neutral::HC_24,
+
+        label_primary: neutral::N_00,
+        label_secondary: neutral::HC_210,
+        label_tertiary: neutral::HC_188,
+        label_caption: neutral::HC_188,
+        label_on_accent: neutral::BLACK,
+
+        accent: deepseek::D300,
+        accent_soft: neutral::HC_ACCENT_SOFT,
+        link: deepseek::D300,
+
+        success: neutral::GREEN_400,
+        warn: neutral::AMBER_400,
+        error: neutral::RED_400,
+
+        border_l1: neutral::HC_32,
+        border_l2: neutral::HC_48,
+        border_l3: neutral::HC_184,
+
+        // HC 层级：表面之间只差明度，描边与文字拉开到 7:1 以上。
+        surface_1: neutral::BLACK,
+        surface_2: neutral::HC_24,
+        surface_3: neutral::HC_40,
+        accent_on_soft: deepseek::D200,
+        muted: neutral::HC_184,
+
+        hover: neutral::HC_32,
+        hover_solid: neutral::HC_40,
+        active: neutral::HC_48,
+        nav_hover: neutral::HC_32,
+        nav_active: neutral::HC_40,
     };
 
     /// 适用于教室大屏的默认主题：亮环境优先选亮色。
@@ -393,6 +489,13 @@ impl Palette {
         } else {
             Self::LIGHT
         }
+    }
+}
+
+impl Default for Palette {
+    /// 默认亮色：教室大屏的首等公民（见 [`Palette::LIGHT`]）。
+    fn default() -> Self {
+        Self::LIGHT
     }
 }
 
