@@ -89,6 +89,7 @@ pub mod neutral {
     // ---- 状态色阶梯 ----
     pub const RED_400: Color32 = rgb(242, 90, 90);
     pub const RED_600: Color32 = rgb(236, 19, 19);
+pub const RED_700: Color32 = rgb(200, 30, 30);
     pub const GREEN_400: Color32 = rgb(78, 209, 126);
     pub const GREEN_500: Color32 = rgb(34, 197, 94);
     pub const AMBER_400: Color32 = rgb(247, 173, 49);
@@ -198,8 +199,8 @@ impl Components {
         overlay: neutral::N_150,
         toast: neutral::N_800,
 
-        error: neutral::RED_600,
-        error_soft: rgba(236, 19, 19, 13), // .05
+        error: neutral::RED_700,
+        error_soft: rgba(200, 30, 30, 13), // .05
         success: neutral::GREEN_500,
         success_soft: rgba(34, 197, 94, 26),
         warn: neutral::AMBER_500,

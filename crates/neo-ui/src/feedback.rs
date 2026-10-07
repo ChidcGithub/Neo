@@ -56,9 +56,13 @@ impl<'a> InlineNotice<'a> {
             NoticeTone::Error => d.c().error,
         };
         ui.push_id(self.id, |ui| {
-            egui::Frame::new()
+            let frame = egui::Frame::new()
                 .inner_margin(egui::Margin::same(d.m().s(8.0).round() as i8))
                 .fill(translucent(color, 0.08))
+                .stroke(egui::Stroke::new(1.0, translucent(color, 0.25)))
+                .corner_radius(egui::CornerRadius::same(
+                    (d.m().s(6.0).round() as u8).max(2),
+                ))
                 .show(ui, |ui| {
                     ui.add(
                         egui::Label::new(
@@ -68,8 +72,21 @@ impl<'a> InlineNotice<'a> {
                         )
                         .wrap(),
                     )
-                })
-                .inner
+                });
+            // 低幅度 hover 反馈：悬停时轻微提亮底色。
+            if frame.response.hovered() {
+                let lift = crate::base::ease(ui, self.id.with("notice-hover"), 1.0);
+                if lift > 0.001 {
+                    ui.painter().rect_filled(
+                        frame.response.rect,
+                        egui::CornerRadius::same((d.m().s(6.0).round() as u8).max(2)),
+                        translucent(color, 0.04 * lift),
+                    );
+                }
+            } else {
+                crate::base::ease(ui, self.id.with("notice-hover"), 0.0);
+            }
+            frame.inner
         })
         .inner
     }
@@ -179,14 +196,20 @@ fn toast_size(ui: &Ui, d: &Design, text: &str) -> Vec2 {
 /// 在 rect 内画一条 toast（elevation + squircle 底 + 图标 + 文字）。
 fn paint_toast_chrome(ui: &Ui, d: &Design, kind: ToastKind, rect: Rect) {
     let m = d.m();
+    // 读取队列写入的淡入透明度（无队列时默认 1.0 = 不透明）。
+    let alpha: f32 = ui
+        .ctx()
+        .data(|d| d.get_temp(egui::Id::new("neo-toast-fade-alpha")))
+        .unwrap_or(1.0);
+    let fade = |c: Color32| -> Color32 { c.gamma_multiply(alpha) };
     // toast 浮在所有内容之上：最上层表面 surface_3。
     ui.painter()
         .add(crate::base::elevation_soft(d).as_shape(rect, m.s(20.0)));
     ui.painter().squircle(
         rect,
         m.s(20.0),
-        d.p().surface_3,
-        egui::Stroke::new(1.0, translucent(d.p().border_l2, 0.4)),
+        fade(d.p().surface_3),
+        egui::Stroke::new(1.0, fade(translucent(d.p().border_l2, 0.4))),
     );
 
     let icon_d = m.s(16.0);
@@ -194,16 +217,26 @@ fn paint_toast_chrome(ui: &Ui, d: &Design, kind: ToastKind, rect: Rect) {
         egui::pos2(rect.left() + m.s(14.0) + icon_d * 0.5, rect.center().y),
         Vec2::splat(icon_d),
     );
-    toast_icon(kind).paint(ui.painter(), icon_rect, toast_accent(d, kind));
+    toast_icon(kind).paint(ui.painter(), icon_rect, fade(toast_accent(d, kind)));
 }
 
 fn paint_toast(ui: &Ui, d: &Design, kind: ToastKind, text: &str, rect: Rect) {
     paint_toast_chrome(ui, d, kind, rect);
     let m = d.m();
+    let alpha: f32 = ui
+        .ctx()
+        .data(|d| d.get_temp(egui::Id::new("neo-toast-fade-alpha")))
+        .unwrap_or(1.0);
     let font = d.font(d.t().label);
     let inner = inset(rect, m.s(38.0), 0.0, m.s(14.0), 0.0);
     let shown = crate::base::elide(ui.painter(), text, &font, inner.width());
-    text_left(ui.painter(), inner, &shown, font, d.p().label_primary);
+    text_left(
+        ui.painter(),
+        inner,
+        &shown,
+        font,
+        d.p().label_primary.gamma_multiply(alpha),
+    );
 }
 
 /// 单条 toast（布局流）。toast 是纯提示：只感知悬停，不拦截点击。

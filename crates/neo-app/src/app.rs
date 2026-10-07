@@ -1218,7 +1218,9 @@ impl NeoApp {
             self.drawing.cancel_host_tasks();
             self.drawing_desktop.windows.main_avoided = false;
             #[cfg(all(windows, not(test)))]
-            { self.drawing_desktop.windows.placement = None; }
+            {
+                self.drawing_desktop.windows.placement = None;
+            }
         }
         self.desktop_windows.main_avoided = false;
         #[cfg(all(windows, not(test)))]
@@ -2382,11 +2384,15 @@ impl NeoApp {
 
         // 主窗可整轮暂避，但确认卡只在实际桌面租约/暂避验证期间挂起。
         let suspended = self.drawing_desktop.started.is_some()
-            || active && !self.desktop_cancels.is_empty() || !self.desktop_pending.is_empty();
+            || active && !self.desktop_cancels.is_empty()
+            || !self.desktop_pending.is_empty();
         ctx.data_mut(|data| data.insert_temp(egui::Id::new("neo-desktop-suspended"), suspended));
 
-        if !active && self.desktop_pending.is_empty() && !hold_main
-            && self.drawing_desktop.started.is_none() {
+        if !active
+            && self.desktop_pending.is_empty()
+            && !hold_main
+            && self.drawing_desktop.started.is_none()
+        {
             self.desktop_windows.restore();
             self.desktop_cancels.clear();
             self.desktop_restore_pending = false;
@@ -2408,13 +2414,25 @@ impl NeoApp {
     /// Restore only once the manager no longer owns a capture worker/cleanup task.
     fn tick_drawing_barrier(&mut self, ctx: &egui::Context) {
         use std::sync::atomic::Ordering;
-        if ctx.current_pass_index() != 0 { return; }
+        if ctx.current_pass_index() != 0 {
+            return;
+        }
         if self.drawing.capture_waiting() && self.drawing_desktop.started.is_none() {
-            let tools_active = self.state.desktop_execution.as_ref()
+            let tools_active = self
+                .state
+                .desktop_execution
+                .as_ref()
                 .is_some_and(|g| g.active.load(Ordering::Acquire) != 0);
-            if tools_active || !self.desktop_pending.is_empty() || self.desktop_windows.main_avoided
-                || self.quitting || self.exit_blocked || self.drawing_exit_pending || self.desktop_exit_pending {
-                self.drawing.capture_permitted(Err("Neo 桌面任务正在运行，无法截图".into()), ctx);
+            if tools_active
+                || !self.desktop_pending.is_empty()
+                || self.desktop_windows.main_avoided
+                || self.quitting
+                || self.exit_blocked
+                || self.drawing_exit_pending
+                || self.desktop_exit_pending
+            {
+                self.drawing
+                    .capture_permitted(Err("Neo 桌面任务正在运行，无法截图".into()), ctx);
                 return;
             }
             self.drawing_desktop.started = Some(std::time::Instant::now());
@@ -2425,18 +2443,26 @@ impl NeoApp {
                 let repaint = ctx.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.drawing_desktop.overlay_pending = Some(rx);
-                if std::thread::Builder::new().name("drawing-hide-overlay".into()).spawn(move || {
-                    let result = gate.acquire(&cancel, std::time::Duration::from_secs(5));
-                    let _ = tx.send(result);
-                    repaint.request_repaint();
-                }).is_err() {
+                if std::thread::Builder::new()
+                    .name("drawing-hide-overlay".into())
+                    .spawn(move || {
+                        let result = gate.acquire(&cancel, std::time::Duration::from_secs(5));
+                        let _ = tx.send(result);
+                        repaint.request_repaint();
+                    })
+                    .is_err()
+                {
                     self.drawing.cancel_host_tasks();
                 }
             }
         }
-        if self.drawing_desktop.started.is_none() { return; }
+        if self.drawing_desktop.started.is_none() {
+            return;
+        }
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("neo-desktop-suspended"), true));
-        if let Some(floating) = &self.floating { floating.set_visible(false); }
+        if let Some(floating) = &self.floating {
+            floating.set_visible(false);
+        }
         if let Some(rx) = &self.drawing_desktop.overlay_pending {
             match rx.try_recv() {
                 Ok(result) => {
@@ -2467,11 +2493,18 @@ impl NeoApp {
                 self.drawing.capture_permitted(Err(e), ctx);
             }
         } else if self.drawing.capture_waiting() {
-            if self.drawing_desktop.started.is_some_and(|s| s.elapsed() >= std::time::Duration::from_secs(8)) {
-                self.drawing.capture_permitted(Err("Neo 窗口隐藏确认超时".into()), ctx);
+            if self
+                .drawing_desktop
+                .started
+                .is_some_and(|s| s.elapsed() >= std::time::Duration::from_secs(8))
+            {
+                self.drawing
+                    .capture_permitted(Err("Neo 窗口隐藏确认超时".into()), ctx);
             } else if self.drawing_desktop.overlay_pending.is_none()
-                && self.floating.as_ref().is_none_or(|f| f.is_hidden()) {
-                self.drawing.capture_permitted(self.drawing_desktop.windows.verify(), ctx);
+                && self.floating.as_ref().is_none_or(|f| f.is_hidden())
+            {
+                self.drawing
+                    .capture_permitted(self.drawing_desktop.windows.verify(), ctx);
             }
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -2479,16 +2512,21 @@ impl NeoApp {
 
     fn tick(&mut self, ctx: egui::Context) {
         // Revoke before polling worker results so a restored Neo window cannot publish.
-        if self.drawing_desktop.hidden_pass && self.drawing.capture_active()
+        if self.drawing_desktop.hidden_pass
+            && self.drawing.capture_active()
             && (self.drawing_desktop.windows.verify().is_err()
-                || self.floating.as_ref().is_some_and(|f| !f.is_hidden()) && !self.drawing.capture_waiting()) {
+                || self.floating.as_ref().is_some_and(|f| !f.is_hidden())
+                    && !self.drawing.capture_waiting())
+        {
             self.drawing.cancel_host_tasks();
         }
         self.drawing.set_services(self.state.llm_config(), &ctx);
         self.drawing.poll(self.state.classroom_safe);
         self.tick_drawing_barrier(&ctx);
         let consent = self.drawing.consent_pending();
-        if consent && !self.drawing_consent_seen { self.show_window(&ctx); }
+        if consent && !self.drawing_consent_seen {
+            self.show_window(&ctx);
+        }
         self.drawing_consent_seen = consent;
         for message in self.drawing.take_notices() {
             self.floating_notice(tr(message));
@@ -3300,7 +3338,10 @@ impl App for NeoApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         #[cfg(all(windows, not(test)))]
-        { self.desktop_windows.bind(_frame); self.drawing_desktop.windows.bind(_frame); }
+        {
+            self.desktop_windows.bind(_frame);
+            self.drawing_desktop.windows.bind(_frame);
+        }
         self.render(ui);
     }
 
@@ -3308,7 +3349,10 @@ impl App for NeoApp {
     /// 所有业务轮询只在这里执行，不能在 render 中再次推进桌面屏障。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(all(windows, not(test)))]
-        { self.desktop_windows.bind(_frame); self.drawing_desktop.windows.bind(_frame); }
+        {
+            self.desktop_windows.bind(_frame);
+            self.drawing_desktop.windows.bind(_frame);
+        }
         self.tick(ctx.clone());
     }
 }
@@ -3316,3 +3360,7 @@ impl App for NeoApp {
 #[cfg(test)]
 #[path = "app_snapshot.rs"]
 mod snapshot;
+
+#[cfg(test)]
+#[path = "app_audit_tests.rs"]
+mod audit;

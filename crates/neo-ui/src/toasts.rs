@@ -17,6 +17,9 @@ use std::time::Duration;
 
 use egui::{Align2, Area, Direction, Id, Order, Pos2, Ui};
 
+/// toast 淡入时长（秒）：短促的 alpha 渐变，不弹跳不缩放。
+const TOAST_FADE_IN_SECS: f32 = 0.15;
+
 /// toast 类别（决定图标与强调色）。
 #[derive(Default, Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub enum ToastKind {
@@ -85,9 +88,7 @@ impl Default for ToastOptions {
 
 impl ToastOptions {
     pub fn duration(mut self, duration: impl Into<Option<Duration>>) -> Self {
-        self.ttl_sec = duration
-            .into()
-            .map_or(f64::INFINITY, |d| d.as_secs_f64());
+        self.ttl_sec = duration.into().map_or(f64::INFINITY, |d| d.as_secs_f64());
         self
     }
 
@@ -156,11 +157,28 @@ impl Toasts {
         let dt = ui.input(|i| i.unstable_dt) as f64;
 
         let mut queue: Vec<Toast> = ui.data_mut(|d| d.get_temp(self.id).unwrap_or_default());
+        let prev_len = queue.len();
         queue.extend(std::mem::take(&mut self.added));
+        let new_count = queue.len().saturating_sub(prev_len);
         queue.retain(|t| t.options.ttl_sec > 0.0);
 
         let mut offset = self.offset;
         for (i, toast) in queue.iter_mut().enumerate() {
+            // 新投递的 toast 带淡入：透明度从 0 → 1，时长 TOAST_FADE_IN_SECS。
+            // 已有 toast（索引前移的）不重新淡入，靠记录进入帧的 Id 来区分。
+            let is_new = new_count > 0 && i >= prev_len;
+            let fade_id = self.id.with("fade").with(i);
+            if is_new {
+                // 从 0 开始：先写 0 再写 1，animate_value_with_time 会做渐变。
+                ui.ctx().animate_value_with_time(fade_id, 0.0, 0.0);
+            }
+            let alpha: f32 = ui
+                .ctx()
+                .animate_value_with_time(fade_id, 1.0, TOAST_FADE_IN_SECS);
+
+            // 把淡入透明度写进 temp data，供 contents 回调里的绘制函数读取。
+            ui.data_mut(|d| d.insert_temp(Id::new("neo-toast-fade-alpha"), alpha));
+
             let response = Area::new(self.id.with(i))
                 .anchor(self.align, offset.to_vec2())
                 .order(self.order)

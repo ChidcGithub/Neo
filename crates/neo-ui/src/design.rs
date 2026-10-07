@@ -92,3 +92,7 @@ impl Design {
         self.theme.mode == neo_theme::ThemeMode::Dark
     }
 }
+
+#[cfg(test)]
+#[path = "design_tests.rs"]
+mod tests;

@@ -17,6 +17,8 @@ pub enum BadgeTone {
     Neutral,
     /// 业务蓝（强调 / 当前项）。
     Accent,
+    /// 信息。
+    Info,
     /// 成功。
     Success,
     /// 警告。
@@ -52,12 +54,33 @@ impl<'a> Badge<'a> {
     fn colors(&self, d: &Design) -> (egui::Color32, egui::Color32) {
         let p = d.p();
         let c = d.c();
+        // 实色底 + 配对前景：状态色直接作底，前景色按底的亮度选
+        // （暗底配亮字 / 亮底配暗字），保证 WCAG AA ≥ 4.5。
+        let on_bright = egui::Color32::from_rgba_premultiplied(0, 0, 0, 255);
+        let on_dark = egui::Color32::from_rgba_premultiplied(255, 255, 255, 255);
+        let pick_fg = |bg: egui::Color32| -> egui::Color32 {
+            let lin = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let lum = 0.2126 * lin(bg.r()) + 0.7152 * lin(bg.g()) + 0.0722 * lin(bg.b());
+            if lum > 0.18 {
+                on_bright
+            } else {
+                on_dark
+            }
+        };
         match self.tone {
             BadgeTone::Neutral => (p.bg_layer_3, p.label_tertiary),
             BadgeTone::Accent => (p.accent_soft, p.label_primary),
-            BadgeTone::Success => (c.success_soft, c.success),
-            BadgeTone::Warn => (c.warn_soft, c.warn_label),
-            BadgeTone::Danger => (c.error_soft, c.error),
+            BadgeTone::Info => (c.business, c.on_info),
+            BadgeTone::Success => (c.success, pick_fg(c.success)),
+            BadgeTone::Warn => (c.warn, pick_fg(c.warn)),
+            BadgeTone::Danger => (c.error, pick_fg(c.error)),
         }
     }
 
@@ -97,3 +120,7 @@ impl<'a> Badge<'a> {
         rect
     }
 }
+
+#[cfg(test)]
+#[path = "badge_tests.rs"]
+mod tests;

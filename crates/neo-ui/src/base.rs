@@ -232,21 +232,23 @@ pub fn divider(painter: &Painter, d: &Design, rect: Rect) {
 
 /// 卡片投影 —— 对应上游 `--dsw-elevation-soft`。
 ///
-/// 亮色主题下投影要更淡，否则白底上的灰边会显脏。
+/// 明暗两套**几何完全一致**（offset / blur / spread 不随主题变），只有颜色不同：
+/// 主题切换不该挪动任何已绘制的形状，阴影也不例外。亮色下投影更淡，
+/// 否则白底上的灰边会显脏。
 pub fn elevation_soft(d: &Design) -> egui::epaint::Shadow {
-    if d.is_dark() {
-        egui::epaint::Shadow {
-            offset: [0, 6],
-            blur: 22,
-            spread: 0,
-            color: neo_theme::palette::black_a(100),
-        }
+    let color = if d.is_dark() {
+        neo_theme::palette::black_a(100)
     } else {
-        egui::epaint::Shadow {
-            offset: [0, 6],
-            blur: 20,
-            spread: 0,
-            color: neo_theme::palette::rgba(15, 17, 21, 28),
-        }
+        neo_theme::palette::rgba(15, 17, 21, 28)
+    };
+    egui::epaint::Shadow {
+        offset: [0, 6],
+        blur: 20,
+        spread: 0,
+        color,
     }
 }
+
+#[cfg(test)]
+#[path = "base_tests.rs"]
+mod tests;

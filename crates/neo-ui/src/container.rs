@@ -41,11 +41,14 @@ impl Panel {
         let radius = self.radius.unwrap_or(m.radius_card());
         let painter = ui.painter();
         painter.add(crate::base::elevation_soft(d).as_shape(rect, radius));
+        // 描边走层级 token `muted`（实色弱描边，对 surface_2/3 的对比度
+        // 由 neo-theme 的层级契约保底），不再用 alpha 叠加的 border_l2 ——
+        // 后者叠在实色表面上对比度随底色漂移，HC 下几乎看不见。
         painter.squircle(
             rect,
             radius,
             self.fill.unwrap_or(p.surface_2),
-            egui::Stroke::new(1.0, p.border_l2),
+            egui::Stroke::new(1.0, p.muted),
         );
         inset_all(rect, pad)
     }

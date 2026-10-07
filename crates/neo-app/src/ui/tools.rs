@@ -163,7 +163,9 @@ pub fn confirm(
         })
         .sum::<f32>()
         + gap * 2.0;
-    let stacked = button_width > inner_w;
+    // Include the right-side gap: three right-aligned buttons need their
+    // rightmost edge at inner_w - gap, so stack when they would overflow.
+    let stacked = button_width + gap > inner_w;
     let footer_h = if stacked {
         3.0 * button_h + 2.0 * gap
     } else {
