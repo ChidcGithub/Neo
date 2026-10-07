@@ -1109,8 +1109,8 @@ fn pages_do_not_hardcode_colors() {
         "Color32::from_rgba(",
         "Color32::from_gray(",
     ];
-    // 存量棘轮：仅 app.rs 的两处 Color32::RED。
-    const RATCHET: &[(&str, &str, usize)] = &[("app.rs", "Color32::RED", 2)];
+    // 存量棘轮：app.rs 的两处 Color32::RED 已迁移至 palette.error。
+    const RATCHET: &[(&str, &str, usize)] = &[("app.rs", "Color32::RED", 0)];
 
     let mut failures = Vec::new();
     for (file, source) in PAGE_SOURCES {

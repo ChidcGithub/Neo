@@ -97,7 +97,7 @@ sequenceDiagram
 
     Mic->>Wake: 16 kHz stream
     Wake-->>Overlay: “Hi, Neo” detected
-    Overlay->>Overlay: marquee on · capture desktop @ 30 fps
+    Overlay->>Overlay: marquee on · capture desktop @ 20 fps
     Mic->>STT: dictation frames
     STT-->>LLM: transcript (VAD endpoint)
     LLM-->>User: streaming Markdown / KaTeX answer
@@ -384,7 +384,7 @@ flowchart LR
     Mic --> Wake -->|wake event| App
     Mic --> STT -->|transcript| App
     App -->|show / level| Overlay
-    Screen -->|30 fps capture| Overlay
+    Screen -->|20 fps capture| Overlay
     App --> LLM --> Tools
     Tools -->|confirmation / question cards| Overlay
     App <--> Store

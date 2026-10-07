@@ -1149,7 +1149,7 @@ impl NeoApp {
                     ui.label(tr("当前为纯内存模式；退出会丢失本次会话和设置变更。"));
                 }
                 if self.confirm_discard {
-                    ui.colored_label(egui::Color32::RED, tr("确认丢弃未保存的消息、设置、课堂素材和记忆索引？重启可能恢复旧的安全偏好。"));
+                    ui.colored_label(self.theme.palette.error, tr("确认丢弃未保存的消息、设置、课堂素材和记忆索引？重启可能恢复旧的安全偏好。"));
                     if ui.button(tr("确认丢弃并退出")).clicked() {
                         self.confirm_discard_exit(ctx);
                     }
@@ -2994,7 +2994,7 @@ impl NeoApp {
                 .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 8.0))
                 .show(&ctx, |ui| {
                     ui.colored_label(
-                        egui::Color32::RED,
+                        self.theme.palette.error,
                         tr("设置尚未保存；安全限制仅对本次运行生效，重启可能恢复旧值。"),
                     );
                     if ui.button(tr("重试保存设置")).clicked() {
