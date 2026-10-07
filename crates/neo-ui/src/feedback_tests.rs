@@ -15,12 +15,18 @@ fn inline_notice_has_thin_border() {
         });
         output.textures_delta.clear();
 
-        // egui::Frame 的 stroke 画出来是 Rect shape（带 stroke），不是 Path。
+        // 描边可以是 Rect（egui::Frame）或 Path（squircle）——不变量是「有细边框」，
+        // 形状种类是实现细节。
         let has_border = output.shapes.iter().any(|clipped| {
-            matches!(
-                &clipped.shape,
-                egui::Shape::Rect(r) if r.stroke.width > 0.0
-            )
+            let width = match &clipped.shape {
+                egui::Shape::Rect(r) if r.stroke.color != egui::Color32::TRANSPARENT => {
+                    r.stroke.width
+                }
+                // squircle 描边是 Path；Neo 的 squircle_stroked 只会以实色描边。
+                egui::Shape::Path(p) => p.stroke.width,
+                _ => 0.0,
+            };
+            width > 0.0
         });
         assert!(has_border, "{mode:?}: InlineNotice 应画出细边框");
     }

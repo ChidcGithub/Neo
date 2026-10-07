@@ -56,37 +56,43 @@ impl<'a> InlineNotice<'a> {
             NoticeTone::Error => d.c().error,
         };
         ui.push_id(self.id, |ui| {
-            let frame = egui::Frame::new()
-                .inner_margin(egui::Margin::same(d.m().s(8.0).round() as i8))
-                .fill(translucent(color, 0.08))
-                .stroke(egui::Stroke::new(1.0, translucent(color, 0.25)))
-                .corner_radius(egui::CornerRadius::same(
-                    (d.m().s(6.0).round() as u8).max(2),
-                ))
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(self.text)
-                                .font(d.font(d.t().caption))
-                                .color(color),
-                        )
-                        .wrap(),
-                    )
-                });
+            // 与库内其它表面同一条约定：圆角一律超椭圆（见 container.rs），
+            // 不用 egui::Frame 的正圆角。
+            let pad = d.m().s(8.0);
+            let radius = d.m().s(6.0);
+            let font = d.font(d.t().caption);
+            // 与 egui::Frame + Label::wrap 同一份几何：换行上限是可用宽，
+            // 实际宽度缩到排版结果（短文本不撑满整行）。
+            let wrap_w = (ui.available_width() - pad * 2.0).max(1.0);
+            let galley = ui
+                .painter()
+                .layout(self.text.to_owned(), font.clone(), color, wrap_w);
+            let text_size = galley.size();
+            let w = pad * 2.0 + text_size.x;
+            let h = pad * 2.0 + text_size.y;
+            let (rect, response) = ui.allocate_exact_size(Vec2::new(w, h), egui::Sense::hover());
+            ui.painter().squircle(
+                rect,
+                radius,
+                translucent(color, 0.08),
+                egui::Stroke::new(1.0, translucent(color, 0.25)),
+            );
+            crate::base::at(ui, rect.shrink(pad), |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(self.text).font(font).color(color)).wrap(),
+                );
+            });
             // 低幅度 hover 反馈：悬停时轻微提亮底色。
-            if frame.response.hovered() {
+            if response.hovered() {
                 let lift = crate::base::ease(ui, self.id.with("notice-hover"), 1.0);
                 if lift > 0.001 {
-                    ui.painter().rect_filled(
-                        frame.response.rect,
-                        egui::CornerRadius::same((d.m().s(6.0).round() as u8).max(2)),
-                        translucent(color, 0.04 * lift),
-                    );
+                    ui.painter()
+                        .squircle_filled(rect, radius, translucent(color, 0.04 * lift));
                 }
             } else {
                 crate::base::ease(ui, self.id.with("notice-hover"), 0.0);
             }
-            frame.inner
+            response
         })
         .inner
     }

@@ -938,3 +938,364 @@ fn settings_switch_rect_stable_across_on_off_states() {
         assert_eq!(on_rect, now, "on 态开关在 pressed={pressed} 时矩形漂移");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 4. 组件归口 / token 使用 / 形状的源码级审查（ratchet）
+//
+// 与 neo-overlay::regression_tests 同一手法：直接扫 `include_str!` 进来的
+// 页面源码。规则来自 ui/mod.rs 的「组件归口」与 container.rs 的「圆角一律
+// 超椭圆」。
+//
+// 这是一把**只能收紧的棘轮**：下表记录了审查日现存的历史遗留点，
+// 数量只许减不许增 —— 新增一处裸控件 / 硬编码色，测试就红。
+// ---------------------------------------------------------------------------
+
+/// 页面层源码（不含 *_tests.rs / *_regression.rs，测试允许直接用 egui 探针）。
+const PAGE_SOURCES: &[(&str, &str)] = &[
+    ("app.rs", include_str!("app.rs")),
+    ("ui/classwin.rs", include_str!("ui/classwin.rs")),
+    ("ui/composer.rs", include_str!("ui/composer.rs")),
+    ("ui/confirmwin.rs", include_str!("ui/confirmwin.rs")),
+    ("ui/conversation.rs", include_str!("ui/conversation.rs")),
+    ("ui/hero.rs", include_str!("ui/hero.rs")),
+    ("ui/logs.rs", include_str!("ui/logs.rs")),
+    ("ui/markdown.rs", include_str!("ui/markdown.rs")),
+    ("ui/math.rs", include_str!("ui/math.rs")),
+    ("ui/miniwin.rs", include_str!("ui/miniwin.rs")),
+    ("ui/settings.rs", include_str!("ui/settings.rs")),
+    ("ui/sidebar.rs", include_str!("ui/sidebar.rs")),
+    ("ui/toastwin.rs", include_str!("ui/toastwin.rs")),
+    ("ui/tools.rs", include_str!("ui/tools.rs")),
+    ("ui/waketest.rs", include_str!("ui/waketest.rs")),
+    ("drawing_host.rs", include_str!("drawing_host.rs")),
+];
+
+/// 数 `needle` 在源码里出现的次数（粗粒度，但对「这个调用点存在」足够稳）。
+fn count_occurrences(source: &str, needle: &str) -> usize {
+    source.matches(needle).count()
+}
+
+/// 棘轮表：页面里现存的裸 egui 交互控件（按钮 / 复选 / 单选 / 分段原生件）。
+///
+/// 审查日（2026-10-08）的存量：
+/// - `app.rs`：退出对话框与「上下文状态 / 设置未保存」两个 egui::Window 里的
+///   8 处 `ui.button`；
+/// - `ui/settings.rs`：设置页导航的 `ui.selectable_value` + 窄屏回退 /
+///   关于页 / choice_row 的 3 处 `egui::Button::new`；
+/// - `ui/logs.rs`：诊断页的 `ui.checkbox` / `ui.selectable_label` /
+///   `egui::Button::new` / `Button::selectable`；
+/// - `ui/waketest.rs`、`ui/classwin.rs`：各一处裸按钮；
+/// - `drawing_host.rs`：画板授权窗的 checkbox 与按钮。
+///
+/// 修掉任何一处就把对应数字减下去；归零后把整行从表里删掉。
+const BARE_EGUI_RATCHET: &[(&str, &str, usize)] = &[
+    ("app.rs", "ui.button(", 8),
+    ("ui/settings.rs", "ui.selectable_value(", 1),
+    ("ui/settings.rs", "egui::Button::new(", 3),
+    ("ui/logs.rs", "ui.checkbox(", 2),
+    ("ui/logs.rs", "ui.selectable_label(", 1),
+    ("ui/logs.rs", "egui::Button::new(", 2),
+    ("ui/logs.rs", "egui::Button::selectable(", 1),
+    ("ui/waketest.rs", "egui::Button::new(", 1),
+    ("ui/classwin.rs", "ui.button(", 1),
+    ("drawing_host.rs", "ui.checkbox(", 3),
+    ("drawing_host.rs", "egui::Button::new(", 1),
+    ("drawing_host.rs", "ui.button(", 2),
+];
+
+/// 页面层不得新增裸 egui 交互控件；存量只能减少。
+///
+/// 依据 ui/mod.rs：「所有可复用控件都收在 neo_ui；页面只做编排与业务」。
+/// 按钮 / 复选 / 单选 / 分段在组件库都有对应物（Button / Switch /
+/// Segmented / NavItem），裸用 egui 的会同时丢掉悬停过渡、触控命中区
+/// 与禁用态。
+#[test]
+fn pages_do_not_add_bare_egui_controls() {
+    const NEEDLES: &[&str] = &[
+        "ui.button(",
+        "ui.checkbox(",
+        "ui.radio(",
+        "ui.toggle_value(",
+        "ui.selectable_label(",
+        "ui.selectable_value(",
+        "ui.menu_button(",
+        "ui.image_button(",
+        "egui::Button::new(",
+        "egui::Button::selectable(",
+        "egui::Slider::new(",
+        "egui::DragValue::new(",
+    ];
+    let mut failures = Vec::new();
+    for (file, source) in PAGE_SOURCES {
+        for needle in NEEDLES {
+            let actual = count_occurrences(source, needle);
+            let allowed = BARE_EGUI_RATCHET
+                .iter()
+                .find(|(f, n, _)| f == file && n == needle)
+                .map(|(_, _, a)| *a)
+                .unwrap_or(0);
+            if actual > allowed {
+                failures.push(format!(
+                    "{file}: `{needle}` 出现 {actual} 次，超过存量上限 {allowed} —— \
+                     新控件请用 neo_ui 的组件"
+                ));
+            }
+        }
+    }
+    // 棘轮表里的文件必须在 PAGE_SOURCES 里（写错文件名会静默失效）。
+    for (file, _, _) in BARE_EGUI_RATCHET {
+        assert!(
+            PAGE_SOURCES.iter().any(|(name, _)| name == file),
+            "棘轮表里的 {file} 不在 PAGE_SOURCES 里"
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// 页面层的裸 egui 浮窗（egui::Window）存量。
+///
+/// 这些窗口默认落在 `Order::Middle` —— 与设置模态（直接画在根 Ui 上）同层，
+/// egui 的「点击置顶」会让它们盖过模态遮罩。存量只减不增；新浮层请走
+/// `neo_ui::Modal`（自带整屏 blocker，恒在内容之上）。
+const BARE_WINDOW_RATCHET: &[(&str, usize)] = &[
+    ("app.rs", 3),          // 退出保存 / 上下文状态 / 设置未保存
+    ("drawing_host.rs", 2), // 画板授权 / 画板处理中
+];
+
+/// 页面层不得新增 `egui::Window` 浮窗（层级见上）。
+#[test]
+fn pages_do_not_add_bare_egui_windows() {
+    for (file, source) in PAGE_SOURCES {
+        let allowed = BARE_WINDOW_RATCHET
+            .iter()
+            .find(|(f, _)| f == file)
+            .map(|(_, a)| *a)
+            .unwrap_or(0);
+        let actual = count_occurrences(source, "egui::Window::new(");
+        assert!(
+            actual <= allowed,
+            "{file}: `egui::Window::new` 出现 {actual} 次，超过存量上限 {allowed}"
+        );
+    }
+    for (file, _) in BARE_WINDOW_RATCHET {
+        assert!(
+            PAGE_SOURCES.iter().any(|(name, _)| name == file),
+            "棘轮表里的 {file} 不在 PAGE_SOURCES 里"
+        );
+    }
+}
+
+/// 文本与装饰色一律走语义 token（`Palette` / `Components`）。
+///
+/// 审查日存量：`app.rs` 的两个「未保存」窗口用 `egui::Color32::RED` ——
+/// 它在亮 / 暗 / HC 三套色板下是同一个红，没有对比度契约（页面错误色应走
+/// `p.error` / `c().error`）。其余 Color32 常量只许出现在测试与探针代码里
+/// （本测试不扫 *_tests.rs）。
+#[test]
+fn pages_do_not_hardcode_colors() {
+    const HARDCODED: &[&str] = &[
+        "Color32::RED",
+        "Color32::GREEN",
+        "Color32::BLUE",
+        "Color32::YELLOW",
+        "Color32::GOLD",
+        "Color32::LIGHT_RED",
+        "Color32::LIGHT_GREEN",
+        "Color32::LIGHT_BLUE",
+        "Color32::DARK_RED",
+        "Color32::DARK_GREEN",
+        "Color32::DARK_BLUE",
+        "Color32::from_rgb(",
+        "Color32::from_rgba(",
+        "Color32::from_gray(",
+    ];
+    // 存量棘轮：仅 app.rs 的两处 Color32::RED。
+    const RATCHET: &[(&str, &str, usize)] = &[("app.rs", "Color32::RED", 2)];
+
+    let mut failures = Vec::new();
+    for (file, source) in PAGE_SOURCES {
+        for needle in HARDCODED {
+            let actual = count_occurrences(source, needle);
+            let allowed = RATCHET
+                .iter()
+                .find(|(f, n, _)| f == file && n == needle)
+                .map(|(_, _, a)| *a)
+                .unwrap_or(0);
+            if actual > allowed {
+                failures.push(format!(
+                    "{file}: 硬编码颜色 `{needle}` 出现 {actual} 次（存量上限 {allowed}），\
+                     文本颜色请走语义 token"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// 间距一律走 `Metrics`（`m.s(...)` / `m.card_gap()` …），不写裸数字。
+///
+/// `Metrics::scale` 随屏幕尺寸与观看距离缩放；裸数字在 4K 远距下会
+/// 缩成看不清的几像素。本测试锁定最显眼的两类：
+/// `add_space(<数字>)` 与 `item_spacing = vec2(<数字>…)` / `Vec2::splat(<数字>)`。
+#[test]
+fn pages_do_not_use_literal_spacing() {
+    let mut failures = Vec::new();
+    for (file, source) in PAGE_SOURCES {
+        for line in source.lines() {
+            let line = line.trim();
+            if line.starts_with("//") {
+                continue;
+            }
+            for prefix in [
+                "add_space(",
+                "item_spacing = egui::vec2(",
+                "item_spacing = vec2(",
+                "item_spacing = Vec2::splat(",
+            ] {
+                if let Some(rest) = line.split(prefix).nth(1) {
+                    // 紧跟前缀的第一个 token 是裸数字才算违规；m.s(8.0) 之类放行。
+                    let token: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                        .collect();
+                    if token.parse::<f32>().is_ok() && !token.is_empty() {
+                        failures.push(format!("{file}: 裸数字间距 `{line}`"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// 页面里的直角矩形棘轮。
+///
+/// 圆角一律超椭圆（`SquirclePaint`，见 neo-ui/container.rs 头注）；
+/// `rect_filled(rect, 0.0, …)` 只允许出现在两类地方：
+/// 1. 整屏 / 整区**背景**铺满（四角被视口裁掉，圆角无意义）；
+/// 2. 数学公式的横线 / 分数线这类**非表面**装饰（math.rs）。
+///
+/// 审查日存量（全部属于上面两类）：
+/// - `app.rs`：背景 / 舞台切换遮罩 / 设置遮罩 3 处；
+/// - `ui/sidebar.rs`：侧栏整面铺底 1 处；
+/// - `ui/miniwin.rs`：打断确认铺底 1 处 + 截屏闪光 2 处（闪光是全屏效果）；
+/// - `ui/math.rs`：公式横线 3 处；
+/// - `ui/waketest.rs`：电平条 2 处（m.s(3.0) 正圆角 —— 超椭圆在 6pt 高、
+///   3pt 半径的进度条上与正圆不可分辨，记入存量待统改）；
+/// - `graphics.rs`：GPU 探针背景 1 处（不在 PAGE_SOURCES，仅记录）。
+const SQUARE_RECT_RATCHET: &[(&str, usize)] = &[
+    ("app.rs", 3),
+    ("ui/sidebar.rs", 1),
+    ("ui/miniwin.rs", 3),
+    ("ui/math.rs", 3),
+    ("ui/waketest.rs", 2),
+];
+
+/// 任何**可见表面**（卡片 / 气泡 / 提示条）不得用直角矩形。
+/// 表面请用 `painter().squircle*(…)`；背景铺满才能用 `rect_filled(…, 0.0, …)`。
+#[test]
+fn pages_do_not_add_square_corner_rects() {
+    for (file, allowed) in SQUARE_RECT_RATCHET {
+        let source = PAGE_SOURCES
+            .iter()
+            .find(|(name, _)| name == file)
+            .unwrap()
+            .1;
+        let actual =
+            count_occurrences(source, "rect_filled(") + count_occurrences(source, "rect_stroke(");
+        assert!(
+            actual <= *allowed,
+            "{file}: rect_filled/rect_stroke 共 {actual} 处，超过存量上限 {allowed} —— \
+             可见表面请用 squircle"
+        );
+    }
+    // 其它页面一处都不许有。
+    for (file, source) in PAGE_SOURCES {
+        if SQUARE_RECT_RATCHET.iter().any(|(f, _)| f == file) {
+            continue;
+        }
+        let actual =
+            count_occurrences(source, "rect_filled(") + count_occurrences(source, "rect_stroke(");
+        assert_eq!(
+            actual, 0,
+            "{file}: 出现 {actual} 处直角矩形（rect_filled/rect_stroke），表面请用 squircle"
+        );
+    }
+}
+
+/// neo-ui 组件库自身同样不得退回正圆角 —— 这是「组件归口」的另一半。
+///
+/// 审查日组件库的 `CornerRadius` 已全部清除（InlineNotice 改为 squircle）；
+/// `rect_filled` 仅剩三处合法用途：Switch 的胶囊轨道与滑块
+/// （半径=半高，超椭圆退化为胶囊，见 field.rs 注释）与 Modal 的整屏遮罩。
+#[test]
+fn neo_ui_surfaces_stay_squircle() {
+    let sources: &[(&str, &str)] = &[
+        (
+            "neo-ui/feedback.rs",
+            include_str!("../../neo-ui/src/feedback.rs"),
+        ),
+        ("neo-ui/badge.rs", include_str!("../../neo-ui/src/badge.rs")),
+        (
+            "neo-ui/button.rs",
+            include_str!("../../neo-ui/src/button.rs"),
+        ),
+        (
+            "neo-ui/container.rs",
+            include_str!("../../neo-ui/src/container.rs"),
+        ),
+        ("neo-ui/field.rs", include_str!("../../neo-ui/src/field.rs")),
+        ("neo-ui/modal.rs", include_str!("../../neo-ui/src/modal.rs")),
+        (
+            "neo-ui/toasts.rs",
+            include_str!("../../neo-ui/src/toasts.rs"),
+        ),
+    ];
+    for (file, source) in sources {
+        assert!(
+            !source.contains("CornerRadius"),
+            "{file}: 出现 CornerRadius —— 组件表面圆角一律走 SquirclePaint 超椭圆"
+        );
+    }
+    // rect_filled 只允许 field.rs（Switch 胶囊轨道：半径=半高时超椭圆
+    // 退化为胶囊，见 field.rs 注释）与 modal.rs（整屏遮罩）。
+    const RECT_FILLED_RATCHET: &[(&str, usize)] = &[("neo-ui/field.rs", 1), ("neo-ui/modal.rs", 1)];
+    for (file, allowed) in RECT_FILLED_RATCHET {
+        let source = sources.iter().find(|(name, _)| name == file).unwrap().1;
+        let actual =
+            count_occurrences(source, "rect_filled(") + count_occurrences(source, "rect_stroke(");
+        assert!(
+            actual <= *allowed,
+            "{file}: rect_filled/rect_stroke 共 {actual} 处，超过合法存量 {allowed}"
+        );
+    }
+}
+
+/// 层级契约：主窗内的浮层只有两种 ——
+///
+/// 1. **模态**（设置面板）：画在根 Ui、自带整屏 blocker 与遮罩，恒压住背景
+///    （app.rs render 里先画 background 再画设置，顺序即层级）；
+/// 2. **toast / 确认卡**：走独立透明视口（toastwin / confirmwin / miniwin），
+///    由 OS 保证在最前，不占 egui 层。
+///
+/// 因此页面源码里不应出现手动调层（`Order::` / `LayerId` / `set_layer`）：
+/// 一旦某个页面把自己抬到 `Order::Foreground`，它就能盖住模态遮罩，
+/// 「模态恒在上」的契约就破了。toast 队列组件（neo-ui/toasts.rs）用
+/// `Order::Tooltip` 是 vendor 实现的一部分，且它服务于独立视口，不受此限。
+#[test]
+fn pages_do_not_override_egui_layer_order() {
+    for (file, source) in PAGE_SOURCES {
+        for needle in [
+            "Order::Foreground",
+            "Order::Tooltip",
+            "LayerId::new",
+            "set_layer",
+        ] {
+            assert!(
+                !source.contains(needle),
+                "{file}: 出现 `{needle}` —— 层级由「模态在根 Ui + 提示走独立视口」约定，\
+                 页面不得手动调层"
+            );
+        }
+    }
+}
