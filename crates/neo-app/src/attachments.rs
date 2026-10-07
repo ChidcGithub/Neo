@@ -15,7 +15,7 @@ pub fn prepare_tool_images(outcome: &mut neo_tools::Outcome) {
             let (header, data) = url.split_once(',').ok_or("图片不是 data URL")?;
             if !matches!(header, "data:image/png;base64" | "data:image/jpeg;base64"
                 | "data:image/gif;base64" | "data:image/bmp;base64" | "data:image/webp;base64")
-                || data.len() > (MAX_SOURCE_IMAGE_BYTES + 2) / 3 * 4 {
+                || data.len() > MAX_SOURCE_IMAGE_BYTES.div_ceil(3) * 4 {
                 return Err("图片格式或编码体积超限".to_owned());
             }
             let bytes = base64::engine::general_purpose::STANDARD.decode(data)

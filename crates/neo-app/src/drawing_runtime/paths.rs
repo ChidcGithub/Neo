@@ -19,6 +19,8 @@ pub(super) fn resolve(kind: BoardKind) -> Result<PathBuf, String> {
     validate_path(&directory.join(kind.executable()), kind)
 }
 
+/// Production path validation; test builds construct trusted paths directly.
+#[allow(dead_code)]
 pub(super) fn validate_for_start(kind: BoardKind, path: &Path) -> Result<PathBuf, String> {
     let checked = validate_path(path, kind)?;
     if checked != resolve(kind)? {

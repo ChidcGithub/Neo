@@ -86,7 +86,7 @@ pub(super) unsafe fn capture(x: i32, y: i32, width: i32, height: i32) -> Option<
     let selected = !old.is_null() && old as isize != GDI_ERROR as isize;
     let mut captured = None;
     if selected {
-        SetStretchBltMode(dc, HALFTONE as i32);
+        SetStretchBltMode(dc, HALFTONE);
         SetBrushOrgEx(dc, 0, 0, null_mut());
         let copied = StretchBlt(
             dc,

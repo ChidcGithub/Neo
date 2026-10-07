@@ -236,6 +236,7 @@ impl ClassWin {
 }
 
 /// 画卡片；点了关闭返回 true。
+#[allow(clippy::too_many_arguments)] // paint coordinator; grouping would obscure the layout contract
 fn paint(
     ui: &mut egui::Ui,
     skin: &Skin<'_>,

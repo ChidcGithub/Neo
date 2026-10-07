@@ -10,6 +10,7 @@ use std::sync::{
 use std::thread::JoinHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // OpenDrawing/OpenBlackboard are produced by the native menu callback in production
 pub enum Action {
     Wake,
     OpenDrawing,

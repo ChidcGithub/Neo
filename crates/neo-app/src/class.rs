@@ -649,6 +649,7 @@ impl ClassMonitor {
             }
             // Settling 也收：STT 线程 flush 出来的最后几句在停后才到。
             ClassEvent::Line(text) => match &mut self.phase {
+                #[allow(clippy::collapsible_match)] // match arm body keeps the phase filter separate from the content check
                 ClassPhase::Active(session, _) | ClassPhase::Settling(session, _) => {
                     if !text.trim().is_empty() {
                         push_material(&mut session.transcript, &text, TRANSCRIPT_BYTES);

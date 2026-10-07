@@ -10,6 +10,7 @@ use semver::{Prerelease, Version};
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+#[allow(dead_code)] // used by the production network path; test builds stub it
 const ENDPOINT: &str = "https://api.github.com/repos/ChidcGithub/Neo/releases?per_page=100";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RELEASES: usize = 100;
@@ -17,6 +18,7 @@ const MAX_TAG_BYTES: usize = 128;
 const MAX_URL_BYTES: usize = 512;
 const NETWORK_ERROR: &str = "网络失败，请稍后重试";
 const RESPONSE_ERROR: &str = "更新服务响应异常";
+#[allow(dead_code)] // used by the production network path
 const RATE_LIMIT_ERROR: &str = "更新服务限流，请稍后重试";
 const SPAWN_ERROR: &str = "无法启动更新检查，请稍后重试";
 
@@ -52,6 +54,8 @@ impl UpdateChecker {
     }
 
     /// 已有工作时忽略请求，包括取消后尚未结束的网络请求。节流由调用方负责。
+    /// Production entry point; test builds use request_controlled.
+    #[allow(dead_code)]
     pub fn request(&mut self, ctx: &egui::Context) {
         self.start(ctx, check, |job| {
             std::thread::Builder::new()
@@ -161,6 +165,7 @@ impl Drop for Completion {
     }
 }
 
+#[allow(dead_code)] // used by the production network path
 fn check() -> Status {
     match fetch_release() {
         Ok(status) => status,
@@ -168,6 +173,7 @@ fn check() -> Status {
     }
 }
 
+#[allow(dead_code)] // used by the production network path
 fn fetch_release() -> Result<Status, &'static str> {
     let client = reqwest::blocking::Client::builder()
         .https_only(true)

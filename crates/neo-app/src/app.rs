@@ -38,8 +38,12 @@ fn test_db_path() -> std::path::PathBuf {
 }
 
 #[cfg(test)]
+/// Stream factory type for the test seam.
+type StreamStart = fn(neo_llm::Config, Vec<neo_llm::Msg>, Vec<serde_json::Value>) -> neo_llm::Stream;
+
+#[cfg(test)]
 thread_local! {
-    static STREAM_START: std::cell::Cell<fn(neo_llm::Config, Vec<neo_llm::Msg>, Vec<serde_json::Value>) -> neo_llm::Stream> =
+    static STREAM_START: std::cell::Cell<StreamStart> =
         const { std::cell::Cell::new(neo_llm::start_with_tools) };
 }
 
@@ -283,7 +287,7 @@ impl DesktopWindows {
         unsafe {
             use windows_sys::Win32::UI::WindowsAndMessaging::*;
             let hwnd = self.main as windows_sys::Win32::Foundation::HWND;
-            return self.main_avoided && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0;
+            self.main_avoided && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0
         }
         #[cfg(any(not(windows), test))]
         false
@@ -2898,6 +2902,8 @@ impl NeoApp {
         if !self.persistence_ok {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
+        #[allow(clippy::collapsible_if)] // nested if separates the persistence gate from the tool-state check for readability
+        #[allow(clippy::collapsible_if)] // nested if separates the persistence gate from the tool-state check
         if self.state.tool_open && self.persistence_ok {
             if self.state.awaiting_tool().is_none() {
                 if self.state.tools_running() {

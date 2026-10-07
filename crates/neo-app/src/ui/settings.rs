@@ -58,7 +58,7 @@ pub fn profile_cluster(ui: &Ui, skin: &Skin<'_>, rect: Rect, state: &AppState) -
         "观看距离 · {distance}",
         &[("distance", tr(state.distance.label()).to_owned())],
     );
-    let chip_w = neo_ui::Chip::width(&ui.painter(), &d, &label, false);
+    let chip_w = neo_ui::Chip::width(ui.painter(), &d, &label, false);
     let chip = Rect::from_min_size(
         egui::pos2(
             btn_center.x - btn_d * 0.5 - m.s(8.0) - chip_w,

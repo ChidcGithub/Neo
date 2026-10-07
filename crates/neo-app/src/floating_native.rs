@@ -325,7 +325,7 @@ unsafe fn capture(surface: &Surface, shared: &Shared, revision: u64) -> Option<V
     if screen.is_null() {
         return None;
     }
-    SetStretchBltMode(dib.dc, HALFTONE as i32);
+    SetStretchBltMode(dib.dc, HALFTONE);
     SetBrushOrgEx(dib.dc, 0, 0, null_mut());
     if !shared.may_capture(revision) {
         ReleaseDC(null_mut(), screen);
@@ -678,7 +678,7 @@ unsafe fn paint(
             color = blend(color, [236, 238, 240], (100.0 * rim) as u32);
             if circle.target == Target::Main {
                 let (ix, iy) = (x - icon_left, y - icon_left);
-                if ix >= 0 && iy >= 0 && ix < icon_size as i32 && iy < icon_size as i32 {
+                if ix >= 0 && iy >= 0 && ix < icon_size && iy < icon_size {
                     let p = icon.get_pixel(ix as u32, iy as u32);
                     color = blend(color, [65, 68, 72], p[3] as u32);
                 }

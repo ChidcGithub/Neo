@@ -564,6 +564,7 @@ impl Host {
         };
         self.replies.push_back((id, result));
     }
+#[allow(clippy::too_many_arguments)] // internal coordinator; grouping would obscure the call contract
     pub fn request(
         &mut self,
         id: String,

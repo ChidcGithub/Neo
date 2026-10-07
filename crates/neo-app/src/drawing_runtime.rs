@@ -40,6 +40,7 @@ const HOST_ID_BUDGET: usize = 4096;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
+#[allow(dead_code)] // test builds see it as unused; production RuntimeHandle::new uses it
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -85,6 +86,8 @@ impl Permissions {
         Self::new(safe, false, false)
     }
 
+    /// Reserved for the Mod API permission checks (roadmap 0.2).
+    #[allow(dead_code)]
     pub const fn classroom_safe(self) -> bool {
         self.classroom_safe
     }
@@ -189,6 +192,8 @@ pub struct RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    /// Production entry point; test builds construct sessions directly.
+    #[allow(dead_code)]
     pub fn start(
         kind: BoardKind,
         path: &Path,
@@ -243,6 +248,8 @@ impl RuntimeHandle {
     }
 
     /// Globally unique within this host process; channels and IDs never cross handles.
+    /// Reserved for the Mod API session generation checks (roadmap 0.2).
+    #[allow(dead_code)]
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -360,6 +367,8 @@ impl RuntimeHandle {
         None
     }
 
+    /// Reserved for the Mod API liveness checks (roadmap 0.2).
+    #[allow(dead_code)]
     pub fn is_alive(&self) -> bool {
         self.shared.alive.load(Ordering::Acquire)
     }
