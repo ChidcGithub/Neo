@@ -564,3 +564,7 @@ mod confirm_tests;
 #[cfg(test)]
 #[path = "list_confirm_cancel_tests.rs"]
 mod confirm_cancel_tests;
+
+#[cfg(test)]
+#[path = "list_stability_tests.rs"]
+mod stability_tests;

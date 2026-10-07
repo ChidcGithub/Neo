@@ -340,3 +340,7 @@ pub fn field_frame(ui: &Ui, d: &Design, rect: Rect, focused: bool) {
     ui.painter().squircle_stroked(rect, m.radius_chip(), border);
     let _ = inset_all(rect, 0.0);
 }
+
+#[cfg(test)]
+#[path = "field_stability_tests.rs"]
+mod stability_tests;

@@ -138,7 +138,8 @@ impl<'a> Modal<'a> {
         // 高度同宽度一样钳在视口内：调用方预算失误时不至于画出屏幕上下缘。
         let height = height.min(screen.height() * 0.9);
         let rect = Rect::from_center_size(screen.center(), Vec2::new(w, height));
-        let panel = Panel::new();
+        // 模态是最上层表面：surface_3，而不是 Panel 默认的 surface_2。
+        let panel = Panel::new().fill(d.p().surface_3);
         let body = panel.paint(ui, d, rect, ModalRhythm::new(d).pad);
 
         let r = ModalRhythm::new(d);
@@ -199,6 +200,10 @@ impl<'a> Modal<'a> {
 fn close_flag(title: &str) -> egui::Id {
     egui::Id::new(("neo-modal-close-flag", title))
 }
+
+#[cfg(test)]
+#[path = "modal_tests.rs"]
+mod tests;
 
 /// 简单确认框：标题 + 正文 + 取消/确认。
 ///
@@ -336,3 +341,7 @@ fn estimate_lines(text: &str, width: f32, font_size: f32) -> f32 {
         .sum::<f32>()
         .max(1.0)
 }
+
+#[cfg(test)]
+#[path = "modal_stability_tests.rs"]
+mod stability_tests;

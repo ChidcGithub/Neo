@@ -3,17 +3,23 @@
 //!
 //! 不走 crates.io 依赖的原因（本地改动）：
 //!
-//! - **状态比较加 0.5px 容差**（[`state_materially_changed`]）：上游对上一帧记忆的
+//! - **状态比较加 0.5pt 容差**（[`state_materially_changed`]）：上游对上一帧记忆的
 //!   item 尺寸做精确 f32 相等比较。分数倍缩放（如 0.85×）下 egui 的像素对齐会让
 //!   同一控件的实测高度随垂直居中相位在亚像素网格上抖动（实测 23.8125 ↔ 23.78125
 //!   交替），精确比较永远不相等 → 每帧 `request_discard` → 布局被双跑、egui 在
-//!   画面上刷 PERF WARNING。亚像素差异对布局不可见，按「未变化」处理即可收敛；
-//!   真实内容变化（改文本 / 增减项）远超 0.5px，不受影响。
+//!   画面上刷 PERF WARNING。所有实测/缓存尺寸字段（item 的 `inner_size` /
+//!   `inner_min_size`、容器级的 `max_item_size` / `shrunk_item_cross_size`）都按
+//!   「基本相同」处理即可收敛；身份与配置（id / content_id / grow / margin 等）
+//!   仍精确比较，真实内容变化（改文本 / 增减项）远超 0.5pt，不受影响。
 //! - 与 egui 小版本解耦：上游每版锁 egui 小版本，vendor 后随本仓库的 egui 一起升。
 //!
 //! 其余代码与上游逐字一致，便于日后对照同步。
 
 mod flex_widget;
+
+#[cfg(test)]
+#[path = "stability_tests.rs"]
+mod stability_tests;
 
 pub use flex_widget::FlexWidget;
 use egui::emath::{GuiRounding, TSTransform};
@@ -893,15 +899,29 @@ impl Default for FlexState {
     }
 }
 
-/// 本地改动（见文件头注释）：跨帧 item 状态比较带 0.5px 容差，
+/// 本地改动（见文件头注释）：跨帧状态比较带 0.5pt 容差，
 /// 吸收分数倍缩放下的亚像素测量抖动，防止无限 request_discard。
+///
+/// 容差只用于「实测/缓存」的尺寸字段（`inner_size` / `inner_min_size` /
+/// `max_item_size` / `shrunk_item_cross_size`）；身份与配置字段
+///（id / content_id / grow / basis / shrink / margin / 项目数）仍精确比较 ——
+/// 真实内容变化远超 0.5pt，不会被吞。
 fn state_materially_changed(prev: &FlexState, next: &FlexState) -> bool {
+    // 与 neo-ui 的 `MEASURE_EPSILON` 一致：1/32 的 GUI_ROUNDING 量化档
+    // （egui 0.36 亚像素对齐的最小步长）远小于它，真实变化远大于它。
     const EPS: f32 = 0.5;
     fn size_differs(a: Vec2, b: Vec2) -> bool {
         (a.x - b.x).abs() > EPS || (a.y - b.y).abs() > EPS
     }
-    if prev.max_item_size != next.max_item_size
-        || prev.shrunk_item_cross_size != next.shrunk_item_cross_size
+    fn opt_f32_differs(a: Option<f32>, b: Option<f32>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => (a - b).abs() > EPS,
+            // Some ↔ None 是结构性变化，不是抖动
+            (a, b) => a.is_some() != b.is_some(),
+        }
+    }
+    if size_differs(prev.max_item_size, next.max_item_size)
+        || opt_f32_differs(prev.shrunk_item_cross_size, next.shrunk_item_cross_size)
         || prev.items.len() != next.items.len()
     {
         return true;

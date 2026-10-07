@@ -171,8 +171,13 @@ impl<'a> Button<'a> {
         };
 
         let size = if self.touch_layout {
-            Vec2::new(m.hit_target(width).min(ui.max_rect().width()).max(0.0), m.hit_target(h))
-        } else { Vec2::new(width, h) };
+            Vec2::new(
+                m.hit_target(width).min(ui.max_rect().width()).max(0.0),
+                m.hit_target(h),
+            )
+        } else {
+            Vec2::new(width, h)
+        };
         let (slot, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         let rect = Rect::from_center_size(slot.center(), Vec2::new(width.min(size.x), h));
         // 默认 Id 带上位置：只按标签区分时，同一个界面里两个同名按钮
@@ -181,20 +186,29 @@ impl<'a> Button<'a> {
             ui.id()
                 .with(("btn", self.label, rect.left() as i32, rect.top() as i32))
         });
-        let interact_rect = if self.touch_layout { slot } else { Rect::from_center_size(
-            rect.center(),
-            Vec2::new(m.hit_target(width), m.hit_target(h)),
-        ) };
+        let interact_rect = if self.touch_layout {
+            slot
+        } else {
+            Rect::from_center_size(
+                rect.center(),
+                Vec2::new(m.hit_target(width), m.hit_target(h)),
+            )
+        };
         // 禁用 / 加载态：只感知悬停（不注册点击），这样 `clicked()` 天然为 false。
         let actionable = self.enabled && !self.loading;
         let interact_rect = interact_rect.intersect(ui.clip_rect());
-        let mut resp = if actionable { tap(ui, interact_rect, id) }
-            else { crate::base::hover_area(ui, interact_rect, id) };
+        let mut resp = if actionable {
+            tap(ui, interact_rect, id)
+        } else {
+            crate::base::hover_area(ui, interact_rect, id)
+        };
         if !actionable {
             resp.flags.remove(egui::response::Flags::ENABLED);
             resp.surrender_focus();
         }
-        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, resp.enabled(), self.label));
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, resp.enabled(), self.label)
+        });
         let st = State::of(&resp);
         let st = State {
             enabled: actionable,
@@ -254,7 +268,11 @@ impl<'a> Button<'a> {
 
         let radius = m.radius_chip().max(m.s(10.0));
         let clipped_painter = ui.painter().with_clip_rect(slot.intersect(ui.clip_rect()));
-        let painter = if self.touch_layout { &clipped_painter } else { ui.painter() };
+        let painter = if self.touch_layout {
+            &clipped_painter
+        } else {
+            ui.painter()
+        };
         // 按下时轻微收缩（98%），大屏上"按到了"的反馈。
         let press_scale = if st.pressed && self.enabled {
             0.985
@@ -307,14 +325,15 @@ impl<'a> Button<'a> {
         }
         let text_rect = if self.touch_layout && self.icon.is_none() && !self.loading {
             draw_rect
-        } else { Rect::from_center_size(
-            egui::pos2(cx + text_w * 0.5, draw_rect.center().y),
-            Vec2::new(text_w, draw_rect.height()),
-        ) };
+        } else {
+            Rect::from_center_size(
+                egui::pos2(cx + text_w * 0.5, draw_rect.center().y),
+                Vec2::new(text_w, draw_rect.height()),
+            )
+        };
         // 省略预算按按钮实际分到的宽度倒推（文本实测宽恒不大于它本身，
         // 拿实测宽当预算是永远不会省略的死逻辑）。
-        let text_budget =
-            (draw_rect.width() - m.s(16.0) * 2.0 - icon_w - spinner_w).max(m.s(20.0));
+        let text_budget = (draw_rect.width() - m.s(16.0) * 2.0 - icon_w - spinner_w).max(m.s(20.0));
         let shown = elide(painter, self.label, &font, text_budget);
         text_center(painter, text_rect, &shown, font, label_color);
 
@@ -418,7 +437,8 @@ impl IconButton {
         ui.scope(|ui| {
             ui.shrink_clip_rect(rect);
             self.show_at(ui, d, rect.center())
-        }).inner
+        })
+        .inner
     }
 
     fn visual_d(&self, d: &Design) -> f32 {
@@ -463,7 +483,9 @@ impl IconButton {
             resp.surrender_focus();
         }
         if let Some(label) = &self.label {
-            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, resp.enabled(), label));
+            resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, resp.enabled(), label)
+            });
         }
         let st = State::of(&resp);
 
@@ -520,7 +542,11 @@ impl IconButton {
         // 正圆：完全圆形元素退出超椭圆（上游 `corner-shape: round`）。
         painter.circle_filled(center, visual_d * 0.5, fill);
         if resp.has_focus() {
-            painter.circle_stroke(center, visual_d * 0.5, egui::Stroke::new(m.s(2.0), p.accent));
+            painter.circle_stroke(
+                center,
+                visual_d * 0.5,
+                egui::Stroke::new(m.s(2.0), p.accent),
+            );
         }
         self.icon.paint(
             painter,
@@ -632,8 +658,7 @@ impl<'a> Chip<'a> {
     /// 走布局流（量内容宽，分配 chip 高）——flex / horizontal 里直接用。
     pub fn show(self, ui: &mut Ui, d: &Design) -> Response {
         let w = Self::width(ui.painter(), d, self.label, self.chevron);
-        let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(w, d.m().chip_h()), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, d.m().chip_h()), egui::Sense::hover());
         self.show_at(ui, d, rect)
     }
 }
@@ -765,3 +790,7 @@ impl<'a> Segmented<'a> {
 #[cfg(test)]
 #[path = "button_id_tests.rs"]
 mod id_tests;
+
+#[cfg(test)]
+#[path = "button_stability_tests.rs"]
+mod stability_tests;

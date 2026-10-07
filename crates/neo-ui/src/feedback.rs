@@ -35,7 +35,11 @@ pub struct InlineNotice<'a> {
 
 impl<'a> InlineNotice<'a> {
     pub fn new(id: impl std::hash::Hash, text: &'a str) -> Self {
-        Self { id: crate::hash_id(id), text, tone: NoticeTone::Neutral }
+        Self {
+            id: crate::hash_id(id),
+            text,
+            tone: NoticeTone::Neutral,
+        }
     }
 
     pub fn tone(mut self, tone: NoticeTone) -> Self {
@@ -56,10 +60,18 @@ impl<'a> InlineNotice<'a> {
                 .inner_margin(egui::Margin::same(d.m().s(8.0).round() as i8))
                 .fill(translucent(color, 0.08))
                 .show(ui, |ui| {
-                    ui.add(egui::Label::new(egui::RichText::new(self.text)
-                        .font(d.font(d.t().caption)).color(color)).wrap())
-                }).inner
-        }).inner
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(self.text)
+                                .font(d.font(d.t().caption))
+                                .color(color),
+                        )
+                        .wrap(),
+                    )
+                })
+                .inner
+        })
+        .inner
     }
 }
 
@@ -167,13 +179,13 @@ fn toast_size(ui: &Ui, d: &Design, text: &str) -> Vec2 {
 /// 在 rect 内画一条 toast（elevation + squircle 底 + 图标 + 文字）。
 fn paint_toast_chrome(ui: &Ui, d: &Design, kind: ToastKind, rect: Rect) {
     let m = d.m();
-    let c = d.c();
+    // toast 浮在所有内容之上：最上层表面 surface_3。
     ui.painter()
         .add(crate::base::elevation_soft(d).as_shape(rect, m.s(20.0)));
     ui.painter().squircle(
         rect,
         m.s(20.0),
-        c.toast,
+        d.p().surface_3,
         egui::Stroke::new(1.0, translucent(d.p().border_l2, 0.4)),
     );
 
@@ -228,7 +240,10 @@ pub fn toast_wrapped(
     );
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     paint_toast_chrome(ui, d, kind, rect);
-    let pos = egui::pos2(rect.left() + m.s(38.0), rect.center().y - galley.size().y * 0.5);
+    let pos = egui::pos2(
+        rect.left() + m.s(38.0),
+        rect.center().y - galley.size().y * 0.5,
+    );
     ui.painter().galley(pos, galley, d.p().label_primary);
     response
 }

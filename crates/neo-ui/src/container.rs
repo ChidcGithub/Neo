@@ -2,23 +2,35 @@
 //!
 //! 圆角一律走 [`SquirclePaint`] 的超椭圆，与上游 `corner-shape: superellipse(1.5)` 对齐。
 
-use egui::{Rect, Ui};
+use egui::{Color32, Rect, Ui};
 use neo_theme::SquirclePaint;
 
 use crate::base::inset_all;
 use crate::Design;
 
 /// 浮层面板：抬升表面 + 投影 + 描边。
+///
+/// 默认底是层级阶梯的 `surface_2`（卡片 / 面板层）；弹窗 / 菜单这类
+/// 最上层表面用 [`Panel::fill`] 换成 `surface_3`。
 pub struct Panel {
     radius: Option<f32>,
+    fill: Option<Color32>,
 }
 
 impl Panel {
     pub fn new() -> Self {
-        Self { radius: None }
+        Self {
+            radius: None,
+            fill: None,
+        }
     }
     pub fn radius(mut self, r: f32) -> Self {
         self.radius = Some(r);
+        self
+    }
+    /// 覆盖默认底色（`surface_2`）。
+    pub fn fill(mut self, color: Color32) -> Self {
+        self.fill = Some(color);
         self
     }
 
@@ -32,7 +44,7 @@ impl Panel {
         painter.squircle(
             rect,
             radius,
-            p.bg_layer_1,
+            self.fill.unwrap_or(p.surface_2),
             egui::Stroke::new(1.0, p.border_l2),
         );
         inset_all(rect, pad)
@@ -44,3 +56,7 @@ impl Default for Panel {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "container_tests.rs"]
+mod tests;
