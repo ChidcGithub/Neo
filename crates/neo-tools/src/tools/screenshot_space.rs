@@ -44,7 +44,10 @@ impl ImageSpace {
             return Err(ToolError::bad_args("截图引用必须绑定原尺寸图像，不能猜测缩放关系"));
         }
         let bounds = screen::monitor_bounds(&topology)?;
-        require_rect_inside(source, bounds)?;
+        // 这里的 bounds 是虚拟桌面：越界要说清合法范围（与 screen.rs 的 outside_error 同约）。
+        if !rect_inside(source, bounds) {
+            return Err(bounds.outside_rect_error("截图区域", source));
+        }
         if screen::monitor_coverage(source, &topology) == 0 {
             return Err(ToolError::bad_args("截图区域完全落在显示器空洞中"));
         }
@@ -78,10 +81,14 @@ impl ImageSpace {
     }
 }
 
+fn rect_inside(rect: Rect, bounds: Rect) -> bool {
+    rect.width > 0 && rect.height > 0 && bounds.contains(rect.x, rect.y)
+        && i64::from(rect.x) + i64::from(rect.width) <= i64::from(bounds.x) + i64::from(bounds.width)
+        && i64::from(rect.y) + i64::from(rect.height) <= i64::from(bounds.y) + i64::from(bounds.height)
+}
+
 pub fn require_rect_inside(rect: Rect, bounds: Rect) -> Result<(), ToolError> {
-    if rect.width <= 0 || rect.height <= 0 || !bounds.contains(rect.x, rect.y)
-        || i64::from(rect.x) + i64::from(rect.width) > i64::from(bounds.x) + i64::from(bounds.width)
-        || i64::from(rect.y) + i64::from(rect.height) > i64::from(bounds.y) + i64::from(bounds.height) {
+    if !rect_inside(rect, bounds) {
         return Err(ToolError::bad_args("区域宽高必须为正，且整个区域必须在参考坐标范围内；width/height 不是 right/bottom"));
     }
     Ok(())

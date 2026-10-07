@@ -138,6 +138,12 @@ jobs:
       - name: Complete release variant regressions
         run: python -B -m unittest tools.test_verify_release_variants -v
 
+      - name: Docs consistency regressions
+        run: python -B -m unittest tools.test_check_docs_consistency -v
+
+      - name: Check docs consistency
+        run: python -B tools/check_docs_consistency.py
+
       - name: Prepare mandatory no-TTS Sherpa native
         timeout-minutes: 30
         run: python -B tools/prepare_sherpa_ci.py --budget-seconds 1500 --validation-seconds 180 --max-download-mib 256
@@ -187,6 +193,11 @@ jobs:
 
       - name: UIA validation and search contracts (no live desktop probe)
         run: 'cargo test --locked -p neo-tools --lib --target x86_64-pc-windows-msvc -- screen_uia:: screen_elements:: screen_element_search:: click::tests:: --test-threads=1'
+
+      # tests/tools.rs 集成测试覆盖整个工具表面；截屏/点击等桌面用例在无头会话里自行跳过，
+      # 真动鼠标的用例默认跳过（需显式 NEO_TEST_INPUT=1），bash 用例在无 Git Bash 时自行跳过。
+      - name: Tool integration tests (desktop and input cases self-skip)
+        run: 'cargo test --locked -p neo-tools --test tools --target x86_64-pc-windows-msvc -- --test-threads=1'
 
       # 原生命中测试使用从不激活的私有 desktop，无截图/输入注入；GPU 测试仍 opt-in。
       - name: Overlay contracts and native hit testing

@@ -102,6 +102,22 @@ impl Rect {
         ))
         .with_hint("使用 screenshot 返回的 screenshot_id 加图内 x/y；无引用时必须给桌面物理坐标")
     }
+
+    /// 区域版本的 [`Rect::outside_error`] —— 同一条约定：**带上合法范围**。
+    pub fn outside_rect_error(&self, what: &str, rect: Rect) -> ToolError {
+        ToolError::bad_args(format!(
+            "{what} ({}, {}) {}×{} 不在屏幕内：虚拟桌面 x {}…{}、y {}…{}；width/height 是宽高，不是 right/bottom",
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            self.x,
+            i64::from(self.x) + i64::from(self.width) - 1,
+            self.y,
+            i64::from(self.y) + i64::from(self.height) - 1
+        ))
+        .with_hint("按 virtual_screen 的合法范围改 x/y/width/height；或使用 screenshot_id 加图内坐标")
+    }
 }
 
 /// 显示器矩形的包围盒；不把包围盒中的空洞当作显示器。

@@ -77,9 +77,16 @@ fn registry_is_well_formed() {
                     p.name
                 );
             } else {
+                // 唯一例外：screenshot 的四个区域参数 —— “全省略 = 整屏”靠
+                // `Args::has` 区分“没给”与“给了值”，给默认值反而会让模型漏填时
+                // 被静默当成 0（见 spec.rs 对坐标参数的说明）。schema 里也因此没有
+                // default（lib 测试 region_all_sixteen_combinations_and_schema_are_strict
+                // 盯着这件事）。其它可选参数仍必须有默认值。
+                let all_or_none_region =
+                    t.name == "screenshot" && matches!(p.name, "x" | "y" | "width" | "height");
                 assert!(
-                    p.default.is_some(),
-                    "{} 的可选参数 {} 必须有默认值",
+                    p.default.is_some() || all_or_none_region,
+                    "{} 的可选参数 {} 必须有默认值（省略本身有意义的参数除外）",
                     t.name,
                     p.name
                 );
@@ -282,13 +289,15 @@ fn edit_replaces_exactly_one_and_refuses_ambiguity() {
 #[test]
 fn view_image_reads_png_header() {
     let (_dir, scope) = workspace("img");
-    let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-    png.extend_from_slice(&[0, 0, 0, 13]);
-    png.extend_from_slice(b"IHDR");
-    png.extend_from_slice(&800u32.to_be_bytes());
-    png.extend_from_slice(&600u32.to_be_bytes());
-    png.extend_from_slice(&[8, 6, 0, 0, 0]);
-    std::fs::write(scope.root().join("pic.png"), &png).unwrap();
+    // 要测 include_data 就得写真 PNG：附图路径会有界解码再转码（防解码炸弹、
+    // 限制回灌体积），伪造的“只有文件头、没有 IDAT”的 PNG 过不了解码 ——
+    // 那是设计（见 view_image 模块文档），不是回归。元数据路径仍只读文件头。
+    let img = image::RgbImage::from_fn(800, 600, |x, y| {
+        image::Rgb([(x % 251) as u8, (y % 239) as u8, 128])
+    });
+    let mut png = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut png, image::ImageFormat::Png).unwrap();
+    std::fs::write(scope.root().join("pic.png"), png.get_ref()).unwrap();
 
     let out = dispatch(&scope, "view_image", &json!({ "path": "pic.png" }));
     assert!(out.is_ok());
@@ -741,14 +750,18 @@ fn screenshot_captures_a_region_and_attaches_the_image() {
     // 区域与桌面尺寸都要报出来 —— 桌面尺寸是模型写坐标的依据
     assert_eq!(out.data["region"]["width"], region["width"]);
     assert_eq!(out.data["virtual_screen"]["width"], vs.width);
+    // 人读字段写明坐标映射（图内像素 + 原点偏移）；“物理像素”这一事实由
+    // 结构化 metadata 承载 —— 模型消费的是它，不随人读措辞漂移。
     assert!(
         out.data["coordinate_space"]
             .as_str()
             .unwrap()
-            .contains("物理像素"),
+            .contains("图内像素"),
         "必须写明坐标空间：{}",
         out.data["coordinate_space"]
     );
+    assert_eq!(out.data["image_space"]["unit"], "physical_pixel");
+    assert_eq!(out.data["desktop_space"]["unit"], "physical_pixel");
 
     // 图要附上（多模态模型靠它"看见"屏幕）
     assert_eq!(out.data["image_attached"], true);
