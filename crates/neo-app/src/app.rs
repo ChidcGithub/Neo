@@ -2520,7 +2520,11 @@ impl NeoApp {
         {
             self.drawing.cancel_host_tasks();
         }
-        self.drawing.set_services(self.state.llm_config(), &ctx);
+        // 无画板时跳过服务配置：llm_config() 每帧克隆 3 个 String，
+        // 画板关闭时这些配置根本用不上。
+        if !self.drawing.closed() {
+            self.drawing.set_services(self.state.llm_config(), &ctx);
+        }
         self.drawing.poll(self.state.classroom_safe);
         self.tick_drawing_barrier(&ctx);
         let consent = self.drawing.consent_pending();
@@ -2747,7 +2751,11 @@ impl NeoApp {
         }
         self.class_dot.tick(overlay, self.theme);
         // 状态行同步给设置页（开关下方的「记录中…」提示）。
-        self.state.class_status = self.class.status().map(|s| s.to_owned());
+        // 只在变化时分配新 String，避免每帧无谓堆分配。
+        let new_status = self.class.status();
+        if self.state.class_status.as_deref() != new_status {
+            self.state.class_status = new_status.map(|s| s.to_owned());
+        }
         // 忙→闲沿：任务收尾，弹一条 Windows 原生通知。被打断
         // （round_cancelled）或出错的轮次不报「完成」——那不是完成。
         let busy = self.state.generating || self.state.tool_open || self.state.tool_round;

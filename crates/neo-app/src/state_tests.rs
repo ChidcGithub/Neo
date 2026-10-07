@@ -10,6 +10,7 @@
 
     #[test]
     fn diagnostics_correlate_confirmation_execution_delivery_and_do_not_collect_content() {
+        let _serial = screenshot_space_lock();
         use super::*;
         let mut state = AppState::default();
         state.classroom_safe = false;
@@ -46,6 +47,7 @@
 
     #[test]
     fn diagnostics_cover_denial_unknown_tool_malformed_args_and_cancel() {
+        let _serial = screenshot_space_lock();
         use super::*;
         let mut state = AppState::default();
         let view = diagnostics::capture_for_test(|| {
@@ -189,6 +191,7 @@
 
     #[test]
     fn diagnostics_compaction_failure_and_cancellation_keep_task_link() {
+        let _serial = screenshot_space_lock();
         let mut state = AppState::default();
         let view = diagnostics::capture_for_test(|| {
             state.begin_task();
@@ -217,6 +220,7 @@
 
     #[test]
     fn diagnostics_model_rounds_share_task_parent_but_not_operation_id() {
+        let _serial = screenshot_space_lock();
         use super::*;
         let mut state = AppState::default();
         let view = diagnostics::capture_for_test(|| {
@@ -494,6 +498,13 @@
         assert!(outcome.error.as_ref().unwrap().message.contains("屏障未安装"));
     }
 
+    /// screenshot_space 是进程级全局缓存（OnceLock<Mutex<Cache>>），cancel/new_session 都会
+    /// invalidate() 整个空间；并行跑这些测试会互相失效导致 flaky，故用文件级互斥串行化。
+    fn screenshot_space_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn queue_synthetic_screenshot_job(state: &mut AppState, failed: bool) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
         use base64::Engine;
         use neo_tools::tools::{screen::Rect, screenshot_space};
@@ -527,6 +538,7 @@
 
     #[test]
     fn screenshot_job_delivery_survives_drop_and_resolves_next_click_until_cancel_or_session_reset() {
+        let _serial = screenshot_space_lock();
         use neo_tools::tools::{screen, screenshot_space};
         use std::sync::atomic::Ordering;
         for switch_session in [false, true] {
@@ -560,6 +572,7 @@
 
     #[test]
     fn screenshot_job_stale_delivery_keeps_history_image_but_not_live_reference() {
+        let _serial = screenshot_space_lock();
         use neo_tools::tools::screenshot_space;
         for invalidate_all in [false, true] {
             let mut state = AppState::with_store(false, None);
@@ -588,6 +601,7 @@
 
     #[test]
     fn screenshot_job_failed_cancelled_and_undelivered_results_never_detach() {
+        let _serial = screenshot_space_lock();
         use neo_tools::tools::screenshot_space;
         use std::sync::atomic::Ordering;
         for variant in 0..5 {
@@ -612,6 +626,7 @@
 
     #[test]
     fn safety_jobs_cancel_on_drop_and_do_not_spawn_twice() {
+        let _serial = screenshot_space_lock();
         use std::sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -808,6 +823,7 @@
 
     #[test]
     fn attachments_cancel_switch_and_disconnect_are_isolated() {
+        let _serial = screenshot_space_lock();
         let mut state = AppState::default();
         let (tx, rx) = std::sync::mpsc::channel();
         state.attachment_job = Some(rx);
@@ -901,6 +917,7 @@
 
     #[test]
     fn task_epoch_submit_retry_and_session_boundaries_are_monotonic() {
+        let _serial = screenshot_space_lock();
         let mut state = AppState::default();
         assert_eq!(state.task_epoch, 0);
         assert!(!state.submit());
@@ -1009,6 +1026,7 @@
 
     #[test]
     fn cancel_keeps_partial() {
+        let _serial = screenshot_space_lock();
         let mut s = AppState {
             draft: "问题".to_owned(),
             ..AppState::default()
@@ -1028,6 +1046,7 @@
 
     #[test]
     fn cancel_also_stops_tool_round() {
+        let _serial = screenshot_space_lock();
         // 回归：停止与 Done(tool_calls) 同帧到达时，工具已登记、后台任务在跑。
         // 旧实现只停当前流 —— 工具跑完自动回灌开新一轮，看着像停止没生效。
         let mut s = AppState {
@@ -1164,6 +1183,7 @@
     /// 分支 —— 模型每轮收到一条空的 tool 消息，严苛的服务端直接 400。
     #[test]
     fn cancelled_tool_round_feeds_real_content_back() {
+        let _serial = screenshot_space_lock();
         let mut s = AppState::default();
         let call = neo_llm::ToolCall {
             id: "call_1".into(),
@@ -1841,6 +1861,7 @@
 
     #[test]
     fn compaction_failure_cancel_session_and_config_ignore_late_results() {
+        let _serial = screenshot_space_lock();
         for action in 0..5 {
             let mut state = compaction_fixture();
             let tx = mock_compaction(&mut state);
@@ -1909,6 +1930,7 @@
 
     #[test]
     fn task_tool_limit_counts_errors_denials_and_ask_across_rounds() {
+        let _serial = screenshot_space_lock();
         let mut state = AppState::default();
         state.messages.push(ChatMessage::new(Role::User, "工具任务"));
         for i in 0..502 {

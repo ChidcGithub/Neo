@@ -11,7 +11,7 @@
 
 use egui::{Rect, Sense, Ui, Vec2};
 use neo_theme::fonts::LoadedFonts;
-use neo_ui::{FieldRow, Icon, IconButton, NavItem, Panel, Switch, TextField};
+use neo_ui::{FieldRow, Icon, IconButton, NavItem, NumberField, Panel, Switch, TextField};
 
 use super::{at, Skin};
 use crate::i18n::{set_language, tf, tr, Language};
@@ -130,30 +130,30 @@ pub fn panel(
             let _ = nav;
         });
 
-            Rect::from_min_max(egui::pos2(inner.left(), nav_rect.bottom()), inner.max)
-        } else {
-            let nav_rect = Rect::from_min_size(inner.min, Vec2::new(nav_w, inner.height()));
-            at(ui, nav_rect, |ui| {
-                ui.label(egui::RichText::new(tr("设置")).strong());
-                ui.add_space(m.s(16.0));
-                egui::ScrollArea::vertical()
-                    .id_salt("settings-navigation")
-                    .show(ui, |ui| {
-                        for &(tab, name) in SettingsTab::ALL {
-                            if NavItem::new(tr(name), nav_icon(tab))
-                                .active(state.settings_tab == tab)
-                                .id_salt(("settings-nav", name))
-                                .show(ui, &d, nav_w)
-                                .clicked()
-                            {
-                                state.settings_tab = tab;
-                            }
-                            ui.add_space(m.s(4.0));
+        Rect::from_min_max(egui::pos2(inner.left(), nav_rect.bottom()), inner.max)
+    } else {
+        let nav_rect = Rect::from_min_size(inner.min, Vec2::new(nav_w, inner.height()));
+        at(ui, nav_rect, |ui| {
+            ui.label(egui::RichText::new(tr("设置")).strong());
+            ui.add_space(m.s(16.0));
+            egui::ScrollArea::vertical()
+                .id_salt("settings-navigation")
+                .show(ui, |ui| {
+                    for &(tab, name) in SettingsTab::ALL {
+                        if NavItem::new(tr(name), nav_icon(tab))
+                            .active(state.settings_tab == tab)
+                            .id_salt(("settings-nav", name))
+                            .show(ui, &d, nav_w)
+                            .clicked()
+                        {
+                            state.settings_tab = tab;
                         }
-                    });
-            });
-            Rect::from_min_max(egui::pos2(nav_rect.right() + gap, inner.top()), inner.max)
-        };
+                        ui.add_space(m.s(4.0));
+                    }
+                });
+        });
+        Rect::from_min_max(egui::pos2(nav_rect.right() + gap, inner.top()), inner.max)
+    };
 
     // ---- 右：页标题 + 描述 + 滚动内容 ----
     at(ui, content_rect, |ui| {
@@ -531,10 +531,14 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     ui.add_space(m.s(16.0));
 
     section_label_row(ui, skin, width, tr("上下文预算（估算 token）"));
-    ui.add(
-        egui::DragValue::new(&mut state.context_tokens)
-            .range(neo_llm::MIN_CONTEXT_TOKENS..=neo_llm::MAX_CONTEXT_TOKENS)
-            .speed(1024.0),
+    number_row(
+        ui,
+        skin,
+        width,
+        &mut state.context_tokens,
+        neo_llm::MIN_CONTEXT_TOKENS..=neo_llm::MAX_CONTEXT_TOKENS,
+        1024,
+        "neo-context-tokens",
     );
     hint_row(ui, skin, width, tr("默认 1,000,000，按接口与模型能力调整，含输出和工具预留。接近预算时后台摘要，保留原记录；失败不丢弃历史。"));
     hint_row(
@@ -1399,6 +1403,31 @@ fn input_row(
         tf = tf.secret(true);
     }
     let response = tf.show(ui, &d, width);
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(egui::Id::new(("settings-input-probe", salt)), response.rect)
+    });
+    let _ = response;
+}
+
+/// 单行数值输入框 —— [`neo_ui::NumberField`]：范围、步长、方向键与禁用态都在组件里。
+///
+/// `salt` 同 [`input_row`]：必须常量，不能随值变。
+fn number_row(
+    ui: &mut Ui,
+    skin: &Skin<'_>,
+    width: f32,
+    value: &mut usize,
+    range: std::ops::RangeInclusive<usize>,
+    step: usize,
+    salt: &str,
+) {
+    let d = skin.d();
+    let response = NumberField::new(value)
+        .id_salt(salt)
+        .range(range)
+        .step(step)
+        .show(ui, &d, width);
     #[cfg(test)]
     ui.ctx().data_mut(|data| {
         data.insert_temp(egui::Id::new(("settings-input-probe", salt)), response.rect)

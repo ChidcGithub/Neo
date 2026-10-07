@@ -1301,3 +1301,86 @@ fn failed_memory_save_keeps_draft_and_paints_error() {
         );
     }
 }
+
+/// 上下文预算从裸 `egui::DragValue` 换成 `neo_ui::NumberField` 后：
+/// 中文标签在、范围与方向键步进仍生效、矩形与同表单输入框一致。
+#[test]
+fn context_budget_uses_number_field_with_chinese_label_and_clamped_steps() {
+    use neo_ui::{NumberField, TextField};
+
+    for scale in [0.85, 1.0, 1.75] {
+        let ctx = context();
+        let theme = neo_theme::Theme::from_metrics(
+            neo_theme::ThemeMode::Light,
+            neo_theme::Metrics::from_scale(scale),
+        );
+        theme.apply(&ctx);
+        let mut state = AppState::default();
+        state.context_tokens = neo_llm::MIN_CONTEXT_TOKENS;
+        let width = 640.0;
+        let size = egui::vec2(width, 6000.0);
+        // 固定同一个 scale 的 Skin 渲染，探针矩形与组件高度才能逐字节对账。
+        let mut run = |events: Vec<egui::Event>| {
+            let whale = crate::brand::WhaleMark::cached(&ctx);
+            let skin = Skin::new(theme, &whale);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.set_max_width(width - 16.0);
+                    model_tab(ui, &skin, width - 16.0, &mut state);
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let d = neo_ui::Design::new(theme);
+
+        // 首帧：中文小标题与默认提示都在，字段矩形与同表单文本框同高。
+        let output = run(vec![]);
+        assert!(
+            output.shapes.iter().any(|clipped| {
+                matches!(&clipped.shape, egui::Shape::Text(text)
+                if text.galley.text() == "上下文预算（估算 token）")
+            }),
+            "上下文预算的中文标签没有画出来"
+        );
+        let budget: Rect = probe(&ctx, ("settings-input-probe", "neo-context-tokens"));
+        let api_base: Rect = probe(&ctx, ("settings-input-probe", "neo-api-base"));
+        // 与同一表单里 TextField 的探针矩形同高同宽：两者经由同一形态的 row helper，
+        // 证明预算输入框走了组件库而不是裸 `DragValue` 的默认高度。
+        assert_eq!(
+            budget,
+            api_base.translate(egui::vec2(0.0, budget.top() - api_base.top())),
+            "预算输入框与同表单文本输入框的几何不一致"
+        );
+        // 组件约定本身不回归：NumberField 与 TextField 同高。
+        assert_eq!(NumberField::height(&d), TextField::height(&d));
+        assert!(budget.width() <= width - 16.0);
+
+        // 聚焦后按 ↑：从最小值步进 1024；按 ↓ 回到最小值并被夹住不再降。
+        ctx.memory_mut(|m| m.request_focus(neo_ui::hash_id("neo-context-tokens").with("edit")));
+        run(vec![]);
+        run(vec![egui::Event::Key {
+            key: egui::Key::ArrowUp,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        for _ in 0..4 {
+            run(vec![egui::Event::Key {
+                key: egui::Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        // 光标回到最小值：先升 1024，再按 4 次 ↓ 全部被夹住。
+        assert_eq!(state.context_tokens, neo_llm::MIN_CONTEXT_TOKENS);
+    }
+}

@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn fallback_input(root_scale: f32, child_scale: f32) -> egui::RawInput {
@@ -1412,4 +1411,93 @@ fn beam_synthetic_frames_reuse_buffers_and_reduce_rebuilds() {
     assert_eq!(rebuilds, 1);
     eprintln!("{FRAMES} 合成帧：几何重建 {FRAMES} -> {rebuilds}，端点查找 {} -> {}；缓存命中不分配几何 Vec；未缓存 {:?}，缓存 {:?}（仅本机合成 CPU 路径）",
             FRAMES * 56, FRAMES * 29, uncached, start.elapsed());
+}
+
+#[test]
+fn snapshot_cache_skips_rebuild_when_messages_unchanged() {
+    use crate::state::{ChatMessage, Role};
+
+    let ctx = Context::default();
+    let mut mini = MiniWin::default();
+    let mut state = AppState::default();
+    state
+        .messages
+        .push(ChatMessage::new(Role::User, String::from("画一个圆")));
+    let mut assistant = ChatMessage::new(Role::Assistant, String::from("好的，正在绘制…"));
+    assistant.streaming = false;
+    state.messages.push(assistant);
+
+    let theme = theme();
+    let monitor = Vec2::new(1920.0, 1080.0);
+
+    // 第一次构建：无缓存，走全量。
+    let snap1 = mini.snapshot_for(&state, theme, 340.0, 200.0, monitor, false);
+    assert!(mini.cached_snap.is_some());
+
+    // 相同状态再取：指纹命中，不应重建（指针相同意味着复用了缓存）。
+    let snap2 = mini.snapshot_for(&state, theme, 340.0, 200.0, monitor, false);
+    // 内容相同（克隆自同一缓存）。
+    assert_eq!(snap1.body, snap2.body);
+    assert_eq!(snap1.steps.len(), snap2.steps.len());
+    assert_eq!(snap1.streaming, snap2.streaming);
+
+    // 修改消息内容（模拟流式追加）：指纹不命中，重建。
+    state.messages[1].content.push_str("更多内容");
+    let snap3 = mini.snapshot_for(&state, theme, 340.0, 200.0, monitor, false);
+    assert!(snap3.body.contains("更多内容"));
+
+    // 新增消息：指纹不命中，重建。
+    state
+        .messages
+        .push(ChatMessage::new(Role::User, String::from("再画一个")));
+    let _snap4 = mini.snapshot_for(&state, theme, 340.0, 200.0, monitor, false);
+    assert!(mini.cached_snap.is_some());
+
+    // 只有几何参数变化（宽高/显示器），内容指纹不变，仍应复用。
+    let snap5 = mini.snapshot_for(&state, theme, 500.0, 300.0, Vec2::new(2560.0, 1440.0), true);
+    assert_eq!(snap5.width, 500.0);
+    assert_eq!(snap5.target_h, 300.0);
+    assert_eq!(snap5.monitor, Vec2::new(2560.0, 1440.0));
+    assert!(snap5.done);
+}
+
+#[test]
+fn snapshot_cache_invalidates_on_tool_state_change() {
+    use crate::state::{ChatMessage, Role, ToolMeta, ToolState};
+
+    let ctx = Context::default();
+    let mut mini = MiniWin::default();
+    let mut state = AppState::default();
+    state
+        .messages
+        .push(ChatMessage::new(Role::User, String::from("执行命令")));
+    let mut tool_msg = ChatMessage::new(Role::Tool, String::new());
+    tool_msg.tool = Some(ToolMeta {
+        call_id: "call-1".into(),
+        name: "powershell".into(),
+        title: "命令",
+        risk: "exec",
+        args: serde_json::json!({"command": "echo hello"}),
+        preview: String::new(),
+        state: ToolState::Running,
+        outcome: None,
+    });
+    state.messages.push(tool_msg);
+    let mut assistant = ChatMessage::new(Role::Assistant, String::from("执行中…"));
+    assistant.streaming = true;
+    state.messages.push(assistant);
+
+    let theme = theme();
+    let monitor = Vec2::new(1920.0, 1080.0);
+
+    // 构建初始快照。
+    let _snap1 = mini.snapshot_for(&state, theme, 340.0, 200.0, monitor, false);
+    assert!(mini.cached_snap.is_some());
+
+    // 工具状态变化（Running → Done）：指纹不命中，重建。
+    state.messages[1].tool.as_mut().unwrap().state = ToolState::Done;
+    let _snap2 = mini.snapshot_for(&state, theme, 340.0, 200.0, monitor, false);
+    // 确认缓存被更新（tool_states 指纹已变）。
+    let cached = mini.cached_snap.as_ref().unwrap();
+    assert_eq!(cached.tool_states, vec![ToolState::Done]);
 }

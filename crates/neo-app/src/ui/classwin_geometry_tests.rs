@@ -138,10 +138,11 @@ fn dot_alpha_envelope_fades_in_then_out_and_stays_bounded() {
         let a = (k / 0.03_f32).min(1.0) * (1.0 - ((k - 0.92) / 0.08).clamp(0.0, 1.0));
         assert!((0.0..=1.0).contains(&a), "k={k}");
         match k {
-            // f32 的 0.03/0.08 不精确，端点用 epsilon 比较。
+            // f32 的 0.03/0.08 不精确：k=1 时 (1.0-0.92)/0.08 ≈ 0.99999988（差一个 ulp），
+            // 残余 a ≈ 1.8e-7 而非 0.0，端点容差取 EPSILON 量级而非 1e-5。
             0.0 => assert!(a < 1e-5, "k=0 必须全隐"),
             0.5 => assert!((a - 1.0).abs() < 1e-5, "k=0.5 必须全亮"),
-            1.0 => assert!(a < 1e-5, "k=1 必须收完"),
+            1.0 => assert!(a < 4.0 * f32::EPSILON, "k=1 必须收完（实际 {a:e}）"),
             _ => {}
         }
     }

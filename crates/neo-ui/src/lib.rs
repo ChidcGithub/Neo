@@ -59,11 +59,11 @@ pub use badge::{Badge, BadgeTone};
 pub use button::{Button, Chip, IconButton, IconButtonStyle, Segmented, Variant};
 pub use container::Panel;
 pub use feedback::{toast, toast_at, toasts, InlineNotice, NoticeTone, Spinner};
-pub use toasts::{Toast, ToastKind, ToastOptions, Toasts};
-pub use field::{FieldRow, Switch, TextField};
+pub use field::{FieldRow, NumberField, Switch, TextField};
 pub use icons::Icon;
 pub use list::{ListRow, NavItem};
 pub use modal::{Modal, ModalSize};
+pub use toasts::{Toast, ToastKind, ToastOptions, Toasts};
 
 /// 组件库的公共绘制先导 —— 所有组件都接受 `&Design`。
 ///

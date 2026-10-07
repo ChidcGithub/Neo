@@ -89,15 +89,20 @@ impl ScreenGeometry {
 #[cfg(all(windows, not(test)))]
 fn primary_geometry() -> ScreenGeometry {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-    let _dpi = neo_tools::tools::screen::physical_pixels().ok();
-    let ppp = neo_tools::tools::screen::dpi_scale_at(0, 0).unwrap_or(1.0) as f32;
-    let size = unsafe {
-        Vec2::new(
-            GetSystemMetrics(SM_CXSCREEN) as f32,
-            GetSystemMetrics(SM_CYSCREEN) as f32,
-        )
-    };
-    ScreenGeometry::from_physical(size, ppp)
+    // 屏幕分辨率/DPI 在运行时几乎不变，缓存结果避免每帧 2 次 Win32 调用。
+    // 不监听 WM_DISPLAYCHANGE：变化概率极低，下次启动自然纠正。
+    static CACHED: std::sync::OnceLock<ScreenGeometry> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let _dpi = neo_tools::tools::screen::physical_pixels().ok();
+        let ppp = neo_tools::tools::screen::dpi_scale_at(0, 0).unwrap_or(1.0) as f32;
+        let size = unsafe {
+            Vec2::new(
+                GetSystemMetrics(SM_CXSCREEN) as f32,
+                GetSystemMetrics(SM_CYSCREEN) as f32,
+            )
+        };
+        ScreenGeometry::from_physical(size, ppp)
+    })
 }
 
 #[cfg(any(not(windows), test))]
@@ -290,6 +295,7 @@ enum StepTone {
 }
 
 /// 工具流水里的一步：单行摘要 + 状态色。
+#[derive(Clone)]
 struct Step {
     line: String,
     tone: StepTone,
@@ -317,6 +323,7 @@ fn last_paragraph(text: &str) -> String {
 /// 注意**没有** fade、位置与高度：主视口藏托盘后被 eframe 节流到 10fps，
 /// 这些动画量改由回调自驱（fade 走共享槽、位置走 `OuterPosition`、
 /// 高度朝 `target_h` 做 egui 动画）。
+#[derive(Clone)]
 struct Snapshot {
     theme: Theme,
     /// 卡片宽（避让端点判定要用）。
@@ -692,6 +699,27 @@ impl TaskIdentity {
     }
 }
 
+/// 快照缓存：内容指纹 + 构建好的 Snapshot。
+/// 指纹只跟踪「内容会不会变」的字段，不含几何/动画参数。
+///
+/// 不走 `Default`：`Option<CachedSnapshot>` 的 `None` 就是默认态。
+struct CachedSnapshot {
+    /// 最后一条 Assistant 消息的指针（内容、流式态、错误、工具流水都挂在它后面）。
+    last_assistant_ptr: usize,
+    /// 最后一条 Assistant 消息的内容长度（流式期间每帧都在长）。
+    last_assistant_len: usize,
+    /// 最后一条 Assistant 消息的流式标记。
+    last_assistant_streaming: bool,
+    /// 消息总数（新消息到来时指纹变）。
+    messages_len: usize,
+    /// 本轮工具状态指纹（自最后一条 User 起的 ToolState 序列）。
+    tool_states: Vec<ToolState>,
+    /// 完成后驻留标记（切换时正文从流式尾巴换成最后一段完整渲染）。
+    done: bool,
+    /// 构建好的快照。
+    snapshot: Snapshot,
+}
+
 /// 迷你窗运行时状态，挂在 `NeoApp` 上，每帧由 [`MiniWin::tick`] 驱动。
 #[derive(Default)]
 pub struct MiniWin {
@@ -740,6 +768,8 @@ pub struct MiniWin {
     /// 渲染层卡片的共享矩形（主屏点）：tick 写静止位、绘制闭包写避让位。
     /// 仅供层的 Area 定位；穿透的状态牌不能成为打断请求的排除区。
     layer_rect: Arc<Mutex<[f32; 4]>>,
+    /// 快照缓存：消息指针 + 工具状态指纹，没变就不重建 Snapshot。
+    cached_snap: Option<CachedSnapshot>,
 }
 
 impl Drop for MiniWin {
@@ -945,6 +975,85 @@ impl MiniWin {
             .with_inner_size(if open { size } else { Vec2::new(1.0, 1.0) })
     }
 
+    /// 获取内容快照：指纹没变就复用缓存，变了才重建。
+    ///
+    /// 快照依赖 `state.messages` 的内容（最后一条 Assistant + 工具流水）。
+    /// 流式生成期间内容每帧都在变，指纹自然不命中，走全量构建；
+    /// 但驻留/淡出/静息期间内容不变，指纹命中，零字符串分配。
+    fn snapshot_for(
+        &mut self,
+        state: &AppState,
+        theme: Theme,
+        width: f32,
+        target_h: f32,
+        monitor: Vec2,
+        done: bool,
+    ) -> Snapshot {
+        let last_assistant = state
+            .messages
+            .iter()
+            .rev()
+            .find(|msg| msg.role == Role::Assistant);
+        let ptr = last_assistant.map_or(0, |m| m as *const _ as usize);
+        let len = last_assistant.map_or(0, |m| m.content.len());
+        let streaming = last_assistant.is_some_and(|m| m.streaming);
+        let messages_len = state.messages.len();
+        // 本轮工具状态指纹（自最后一条 User 起，最多 MAX_STEPS 个）。
+        let mut tool_states = Vec::new();
+        for msg in state.messages.iter().rev() {
+            if msg.role == Role::User {
+                break;
+            }
+            if let Some(tool) = &msg.tool {
+                tool_states.push(tool.state);
+                if tool_states.len() >= MAX_STEPS {
+                    break;
+                }
+            }
+        }
+        tool_states.reverse();
+
+        // 指纹比对：全等才复用。
+        if let Some(cached) = &self.cached_snap {
+            if cached.last_assistant_ptr == ptr
+                && cached.last_assistant_len == len
+                && cached.last_assistant_streaming == streaming
+                && cached.messages_len == messages_len
+                && cached.tool_states == tool_states
+                && cached.done == done
+            {
+                // 几何参数（宽高/显示器）可能变了，更新它们但不重建内容。
+                let mut snap = cached.snapshot.clone();
+                snap.theme = theme;
+                snap.width = width;
+                snap.target_h = target_h;
+                snap.monitor = monitor;
+                self.cached_snap = Some(CachedSnapshot {
+                    last_assistant_ptr: ptr,
+                    last_assistant_len: len,
+                    last_assistant_streaming: streaming,
+                    messages_len,
+                    tool_states,
+                    done,
+                    snapshot: snap.clone(),
+                });
+                return snap;
+            }
+        }
+
+        let snapshot = Snapshot::build(state, theme, width, target_h, monitor, done);
+        self.cached_snap = Some(CachedSnapshot {
+            last_assistant_ptr: ptr,
+            last_assistant_len: len,
+            last_assistant_streaming: streaming,
+            messages_len,
+            tool_states,
+            done,
+            snapshot: snapshot.clone(),
+        });
+        snapshot
+    }
+
     /// 每帧驱动一次。放在 `tick()` 里而不是 `render()` 里：
     /// 主窗隐藏时渲染循环走 logic-only 路径，两者都经过 `tick()`。
     ///
@@ -1109,15 +1218,11 @@ impl MiniWin {
         //    渲染层路径：每帧覆写卡片（与旧视口「每帧注册防回收」同构），
         //    避让/淡入动画由卡片的绘制闭包在层里以 vsync 自驱 —— 主视口
         //    托盘态 10fps 的节拍只负责内容快照，与旧架构的权责划分一致。
+        //
+        //    快照有内容指纹：消息没变时不重建，省去每帧的字符串克隆与遍历。
+        let done = !busy && (lingering || fading);
         let snapshot = if open {
-            Some(Snapshot::build(
-                state,
-                theme,
-                width,
-                target_h,
-                monitor,
-                !busy && (lingering || fading),
-            ))
+            Some(self.snapshot_for(state, theme, width, target_h, monitor, done))
         } else {
             // 隐藏中不供内容：回调空转，Visible(false) 生效前的缝隙帧
             // 不会画出一张空卡片。
