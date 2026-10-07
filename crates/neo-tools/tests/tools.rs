@@ -161,7 +161,7 @@ fn write_file_new_path_cannot_escape_via_dir_link() {
     std::fs::create_dir_all(&outside).unwrap();
 
     #[cfg(windows)]
-    let linked = std::os::windows::fs::symlink_dir(&outside, &dir.join("link"));
+    let linked = std::os::windows::fs::symlink_dir(&outside, dir.join("link"));
     #[cfg(not(windows))]
     let linked = std::os::unix::fs::symlink(&outside, dir.join("link"));
     let Ok(()) = linked else {

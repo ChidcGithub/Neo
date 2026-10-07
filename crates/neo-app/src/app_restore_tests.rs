@@ -2427,7 +2427,7 @@ fn uia_restore_session_isolation_rejects_old_reference_and_late_publication() {
     };
     for switch in [false, true] {
         let id = screen_uia::cache_store_checked(
-            &[element.clone()],
+            std::slice::from_ref(&element),
             &scope,
             screen_uia::cache_generation(),
         )
@@ -2440,7 +2440,7 @@ fn uia_restore_session_isolation_rejects_old_reference_and_late_publication() {
             state.cancel();
         }
         assert!(screen_uia::cache_consume(&id, 1).is_none());
-        assert!(screen_uia::cache_store_checked(&[element.clone()], &scope, generation).is_err());
+        assert!(screen_uia::cache_store_checked(std::slice::from_ref(&element), &scope, generation).is_err());
         assert!(screen_uia::cache_snapshot().is_none());
     }
 }

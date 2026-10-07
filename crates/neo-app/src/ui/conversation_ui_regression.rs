@@ -174,7 +174,7 @@ fn long_code_and_wide_table_stay_readable_inside_message_column() {
                     .map(|i| format!("Header{i}"))
                     .collect::<Vec<_>>()
                     .join(" | "),
-                vec!["---"; 12].join(" | "),
+                ["---"; 12].join(" | "),
                 (0..12)
                     .map(|i| format!("Cell{i} {}", "longword".repeat(10)))
                     .collect::<Vec<_>>()

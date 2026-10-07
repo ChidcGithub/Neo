@@ -590,9 +590,8 @@ fn guarded_reply_queue_full_can_retry_after_revocation() {
     assert!(handle
         .reply_host_guarded("runtime:retry", Ok(Value::Null), valid.clone())
         .is_err());
-    assert_eq!(
-        h.output.shared.host_requests.lock().unwrap().ids["runtime:retry"],
-        false
+    assert!(
+        !h.output.shared.host_requests.lock().unwrap().ids["runtime:retry"]
     );
     for _ in 0..QUEUE {
         commands.try_recv().unwrap();

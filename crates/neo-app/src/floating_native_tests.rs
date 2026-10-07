@@ -71,7 +71,7 @@ fn precomputed_geometry_and_reused_coverage_match_original_pixels() {
         for scale in [0.5, 1.0, 1.25, 2.0, 4.0] {
             let size = (EXTENT * scale) as i32;
             let glass: Vec<_> = (0..size * size)
-                .map(|i| 0xff000000 | (i as u32 * 7919 & 0x00ffffff))
+                .map(|i| 0xff000000 | ((i as u32 * 7919) & 0x00ffffff))
                 .collect();
             for language in [crate::i18n::Language::ZhCn, crate::i18n::Language::EnUs] {
                 crate::i18n::with_language(language, || {

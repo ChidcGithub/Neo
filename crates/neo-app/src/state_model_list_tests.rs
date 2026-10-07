@@ -198,8 +198,10 @@
     #[test]
     fn restore_models_empty_list_keeps_zero_index() {
         for selected in [None, Some("999"), Some("1")] {
-            let mut st = AppState::default();
-            st.model = usize::MAX;
+            let mut st = AppState {
+                model: usize::MAX,
+                ..Default::default()
+            };
             st.restore_models("", selected);
             assert!(st.models.is_empty());
             assert_eq!(st.model, 0);

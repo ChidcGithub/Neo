@@ -24,7 +24,6 @@ fn settings_i18n_language_switch_applies_immediately_and_round_trips() {
             // 后面的设置行必须在点击的同一帧使用新语言。
             assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
                 egui::Shape::Text(text) if text.galley.text() == "Classroom safety mode")));
-            drop(render);
             assert_eq!(state.language, Language::EnUs);
             assert_eq!(page_name(SettingsTab::General), "General");
             assert_ne!(page_desc(SettingsTab::Model), "接口、密钥与模型列表");
@@ -268,7 +267,6 @@ fn settings_i18n_english_memory_keeps_user_content_and_error_verbatim() {
         frame(&ctx, size, vec![], &mut render);
         let error: String = probe(&ctx, "neo-memory-write-error");
         assert_eq!(error, format!("Save failed: {raw_error} (draft kept)"));
-        drop(render);
         assert_eq!(state.memory_editing, Some((7, content.into())));
         state.memory_editing = None;
         ctx.data_mut(|data| {
@@ -594,7 +592,6 @@ fn five_thinking_choices_wrap_without_overlap_and_all_click() {
                     }
                 }
             }
-            drop(draw);
             for (i, rect) in rects.iter().enumerate() {
                 for pressed in [true, false] {
                     let mut output = ctx.run_ui(
@@ -747,7 +744,6 @@ fn long_page_title_reserves_clickable_close_target() {
             assert!(found);
             render(pointer(close.center(), true));
             render(pointer(close.center(), false));
-            drop(render);
             assert!(closed, "close not operable {width}/{scale}");
         }
     }
@@ -1026,7 +1022,6 @@ fn memory_list_aligned_edit_action_selects_the_long_memory() {
         assert!((pen.top() - trash.top()).abs() < 0.1);
         frame(&ctx, size, pointer(pen.center(), true), &mut render);
         frame(&ctx, size, pointer(pen.center(), false), &mut render);
-        drop(render);
         assert_eq!(state.memory_editing, Some((2, content)));
         assert_eq!(state.memories.len(), 2);
         assert!(ctx
@@ -1124,7 +1119,6 @@ fn memory_delete_requires_confirmation_and_targets_do_not_overlap() {
                         if cancel { 0 } else { 1 },
                         "后续帧不得重复删除"
                     );
-                    drop(render);
                     assert_eq!(state.memories.len(), if cancel { 3 } else { 2 });
                     assert_eq!(state.memories[0].id, if cancel { 1 } else { 2 });
                 }
@@ -1200,7 +1194,6 @@ fn long_memory_list_scrolls_back_to_error_owner_and_preserves_draft() {
         clip.contains_rect(notice),
         "应从列表底部回到草稿所在行: {notice:?}/{clip:?}"
     );
-    drop(render);
     assert_eq!(state.memory_editing, Some((1, "unsaved draft".into())));
     assert_eq!(state.memories.len(), 80);
 }

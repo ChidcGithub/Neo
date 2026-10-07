@@ -767,9 +767,11 @@ fn interrupt_backend_switch_preserves_valid_answer() {
 fn flash_fallback_suspension_hides_and_skips_stale_callback() {
     let ctx = Context::default();
     ctx.set_embed_viewports(false);
-    let mut flash = ShotFlash::default();
-    flash.shot_seen = neo_tools::tools::screen::SCREENSHOT_AT.load(Ordering::Relaxed);
-    flash.flashing_since = Some(Instant::now() - Duration::from_millis(100));
+    let mut flash = ShotFlash {
+        shot_seen: neo_tools::tools::screen::SCREENSHOT_AT.load(Ordering::Relaxed),
+        flashing_since: Some(Instant::now() - Duration::from_millis(100)),
+        ..Default::default()
+    };
     ctx.begin_pass(egui::RawInput::default());
     flash.tick(&ctx, None);
     let mut output = ctx.end_pass();
@@ -1417,7 +1419,7 @@ fn beam_synthetic_frames_reuse_buffers_and_reduce_rebuilds() {
 fn snapshot_cache_skips_rebuild_when_messages_unchanged() {
     use crate::state::{ChatMessage, Role};
 
-    let ctx = Context::default();
+    let _ctx = Context::default();
     let mut mini = MiniWin::default();
     let mut state = AppState::default();
     state
@@ -1465,7 +1467,7 @@ fn snapshot_cache_skips_rebuild_when_messages_unchanged() {
 fn snapshot_cache_invalidates_on_tool_state_change() {
     use crate::state::{ChatMessage, Role, ToolMeta, ToolState};
 
-    let ctx = Context::default();
+    let _ctx = Context::default();
     let mut mini = MiniWin::default();
     let mut state = AppState::default();
     state

@@ -1030,6 +1030,7 @@ mod imp {
     }
 
     /// 显式栈的 DFS（不用递归 —— UIA 树深度不可控，防栈溢出）。
+#[allow(clippy::too_many_arguments)] // Win32/UIA wrapper; grouping would obscure the API
     fn dfs(
         walker: &IUIAutomationTreeWalker,
         window_el: &IUIAutomationElement,

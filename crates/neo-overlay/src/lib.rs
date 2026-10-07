@@ -843,6 +843,7 @@ pub fn start() -> Result<OverlayHandle, String> {
 }
 
 /// 窗口线程主函数。
+#[allow(clippy::too_many_arguments)] // window-thread entry; grouping would obscure the startup contract
 fn run(
     ready: Sender<Result<u32, String>>,
     cmd_rx: Receiver<Cmd>,

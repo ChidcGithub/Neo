@@ -232,7 +232,7 @@ fn image_metadata_and_count_budget_not_base64_tokens() {
     assert!(validate_image(&jpeg).is_ok());
     let mut msg = Msg::new(Role::User, "图片");
     msg.images = vec![png_url(1, 1, 0); 5];
-    assert!(budget_messages(&Config::deepseek("k"), &mut vec![msg], &[]).is_err());
+    assert!(budget_messages(&Config::deepseek("k"), &mut [msg], &[]).is_err());
 }
 
 #[test]

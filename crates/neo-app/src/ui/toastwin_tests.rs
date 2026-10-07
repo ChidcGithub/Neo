@@ -158,8 +158,10 @@
     fn toast_overlay_loss_keeps_deadline_and_registers_passive_fallback_each_frame() {
         let ctx = Context::default();
         ctx.set_embed_viewports(false);
-        let mut win = ToastWin::default();
-        win.overlay_key = Some(123); // fake 原后端，禁止创建真实 overlay。
+        let mut win = ToastWin {
+            overlay_key: Some(123), // fake 原后端，禁止创建真实 overlay。
+            ..Default::default()
+        };
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut pending = vec![(ToastKind::Info, "后台提示".into(), deadline)];
         for _ in 0..3 {

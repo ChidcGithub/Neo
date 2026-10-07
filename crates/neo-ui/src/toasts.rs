@@ -33,7 +33,7 @@ pub enum ToastKind {
 }
 
 /// 一条待显示的 toast。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Toast {
     pub kind: ToastKind,
     pub text: String,
@@ -61,15 +61,10 @@ impl Toast {
     }
 }
 
-impl Default for Toast {
-    fn default() -> Self {
-        Self {
-            kind: ToastKind::default(),
-            text: String::new(),
-            options: ToastOptions::default(),
-        }
-    }
-}
+
+
+/// Toast 的自绘函数类型。
+type ToastPainter = std::sync::Arc<dyn Fn(&mut Ui, &Toast) + Send + Sync>;
 
 /// 生命周期选项。`None` 时长 = 永不过期。
 #[derive(Debug, Copy, Clone)]
@@ -106,7 +101,7 @@ pub struct Toasts {
     direction: Direction,
     order: Order,
     gap: f32,
-    contents: std::sync::Arc<dyn Fn(&mut Ui, &Toast) + Send + Sync>,
+    contents: ToastPainter,
     added: Vec<Toast>,
 }
 

@@ -22,7 +22,8 @@ fn every_identity_and_snapshot_field_still_fails_closed() {
     assert_eq!(target_mismatch(&expected, &expected, true, false), None);
     assert_eq!(target_mismatch(&expected, &expected, false, false), Some("element_disabled"));
     assert_eq!(target_mismatch(&expected, &expected, true, true), Some("element_offscreen"));
-    let cases: &[(&str, fn(&mut ScreenElement))] = &[
+    type Case = (&'static str, fn(&mut ScreenElement));
+    let cases: &[Case] = &[
         ("window_handle_changed", |e| e.identity.hwnd += 1),
         ("element_process_changed", |e| e.identity.process_id += 1),
         ("element_process_changed", |e| e.identity.process_started += 1),

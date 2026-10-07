@@ -210,6 +210,7 @@ fn near_window_top(rect: [i32; 4], top: [i32; 4]) -> bool {
     super::super::intersects(rect, band)
 }
 
+#[allow(clippy::too_many_arguments)] // UIA probe helper; grouping would obscure the walk contract
 fn raw_chain(uia: &IUIAutomation, raw: &IUIAutomationTreeWalker, start: &IUIAutomationElement,
     top: &IUIAutomationElement, top_identity: &ElementIdentity, other: &IUIAutomationElement,
     hwnd: NativeHwnd, started: Instant) -> Result<Value, String> {

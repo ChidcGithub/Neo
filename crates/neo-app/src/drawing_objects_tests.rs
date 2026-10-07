@@ -197,8 +197,8 @@ fn snapshot_ids_match_runtime_utf8_semantics() {
     let id = format!("板书-{}", "界".repeat(200));
     let object = text(&id);
     valid(object.clone());
-    response(vec![operation("update", object.clone())], &[object.clone()]).unwrap();
-    let wire = response(vec![json!({"op":"delete","id":id})], &[object.clone()]).unwrap();
+    response(vec![operation("update", object.clone())], std::slice::from_ref(&object)).unwrap();
+    let wire = response(vec![json!({"op":"delete","id":id})], std::slice::from_ref(&object)).unwrap();
     assert_eq!(wire["operations"][0]["id"], id);
     assert!(validate_snapshot(&[object.clone(), object]).is_err());
     assert!(response(vec![], &[text("")]).is_err());

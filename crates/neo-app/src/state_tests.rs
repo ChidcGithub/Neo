@@ -12,8 +12,10 @@
     fn diagnostics_correlate_confirmation_execution_delivery_and_do_not_collect_content() {
         let _serial = screenshot_space_lock();
         use super::*;
-        let mut state = AppState::default();
-        state.classroom_safe = false;
+        let mut state = AppState {
+            classroom_safe: false,
+            ..Default::default()
+        };
         let view = diagnostics::capture_for_test(|| {
             state.begin_task();
             let index = diagnostic_call(&mut state, "powershell", r#"{"command":"PRIVATE_COMMAND"}"#);
@@ -392,10 +394,12 @@
 
     #[test]
     fn safety_plan_policy_blocks_side_effects_even_with_approval() {
-        let mut state = super::AppState::default();
-        state.classroom_safe = false;
-        state.plan_mode = true;
-        state.auto_approve_tools = true;
+        let state = super::AppState {
+            classroom_safe: false,
+            plan_mode: true,
+            auto_approve_tools: true,
+            ..Default::default()
+        };
         let policy = state.tool_policy();
         for (name, args) in [
             ("write_file", serde_json::json!({"path":"a", "content":"b"})),
@@ -719,9 +723,11 @@
 
     #[test]
     fn safety_model_fetch_key_change_rejects_old_error_and_accepts_current_result() {
-        let mut state = super::AppState::default();
-        state.api_base = "http://127.0.0.1:9".into();
-        state.api_key = "new-test-key".into();
+        let mut state = super::AppState {
+            api_base: "http://127.0.0.1:9".into(),
+            api_key: "new-test-key".into(),
+            ..Default::default()
+        };
         state.set_models_from_provider(vec!["keep".into()]);
         let (tx, rx) = std::sync::mpsc::channel();
         state.model_fetch = Some(rx);
@@ -745,8 +751,10 @@
     fn safety_editing_model_config_never_starts_http_or_retries() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut state = super::AppState::default();
-        state.api_key = "old-test-key".into();
+        let mut state = super::AppState {
+            api_key: "old-test-key".into(),
+            ..Default::default()
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         state.model_fetch = Some(rx);
         state.model_fetch_config = Some((state.api_base.clone(), state.api_key.clone()));

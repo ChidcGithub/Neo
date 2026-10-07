@@ -154,7 +154,7 @@ fn executable(path: &str) -> bool {
             let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
                 || (stem.len() == 4
                     && (stem.starts_with("COM") || stem.starts_with("LPT"))
-                    && matches!(stem.as_bytes()[3], b'0'..=b'9'));
+                    && stem.as_bytes()[3].is_ascii_digit());
             !part.is_empty()
                 && part != "."
                 && part != ".."

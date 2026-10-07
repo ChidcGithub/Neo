@@ -11,42 +11,45 @@ use super::*;
 
 /// 从指针位置构造一次 RawInput（悬停或按下）。
 fn pointer_input(pos: egui::Pos2, button_down: bool) -> egui::RawInput {
-    let mut input = egui::RawInput::default();
-    input.screen_rect = Some(Rect::from_min_size(
-        egui::Pos2::ZERO,
-        egui::vec2(800.0, 600.0),
-    ));
-    input.events = vec![
-        egui::Event::PointerMoved(pos),
-        egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed: button_down,
-            modifiers: egui::Modifiers::NONE,
-        },
-    ];
-    input
+    egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        events: vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: button_down,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+        ..Default::default()
+    }
 }
 
 /// 只有指针移动（无点击）的 RawInput。
 fn hover_input(pos: egui::Pos2) -> egui::RawInput {
-    let mut input = egui::RawInput::default();
-    input.screen_rect = Some(Rect::from_min_size(
-        egui::Pos2::ZERO,
-        egui::vec2(800.0, 600.0),
-    ));
-    input.events = vec![egui::Event::PointerMoved(pos)];
-    input
+    egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        events: vec![egui::Event::PointerMoved(pos)],
+        ..Default::default()
+    }
 }
 
 /// 无任何输入（idle 态）的 RawInput。
 fn idle_input() -> egui::RawInput {
-    let mut input = egui::RawInput::default();
-    input.screen_rect = Some(Rect::from_min_size(
-        egui::Pos2::ZERO,
-        egui::vec2(800.0, 600.0),
-    ));
-    input
+    egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        ..Default::default()
+    }
 }
 
 fn setup_ctx(mode: neo_theme::ThemeMode, scale: f32) -> (egui::Context, Design) {

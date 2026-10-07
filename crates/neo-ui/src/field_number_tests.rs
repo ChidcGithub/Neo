@@ -8,12 +8,13 @@ use super::*;
 use egui::{Key, Modifiers};
 
 fn idle_input() -> egui::RawInput {
-    let mut input = egui::RawInput::default();
-    input.screen_rect = Some(Rect::from_min_size(
-        egui::Pos2::ZERO,
-        egui::vec2(800.0, 600.0),
-    ));
-    input
+    egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        ..Default::default()
+    }
 }
 
 fn hover_input(pos: egui::Pos2) -> egui::RawInput {

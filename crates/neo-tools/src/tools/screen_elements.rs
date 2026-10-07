@@ -208,6 +208,7 @@ fn intent_hint(role: &str) -> &'static str {
 
 fn page_summary(count: usize) -> String { format!("屏幕上 {count} 个元素（阅读顺序编号）") }
 
+#[allow(clippy::too_many_arguments)] // Win32/UIA wrapper; grouping would obscure the API
 fn page_data(snapshot: &str, count: usize, items: &[Value], page: usize, pages: usize,
     has_more: bool, truncated: bool, all: bool, vs: screen::Rect, expires: u64) -> Value {
     json!({

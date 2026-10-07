@@ -243,7 +243,7 @@ fn read_bounded_attaches_concrete_io_source_only_when_enabled() {
         let trace = error.diagnostic.unwrap();
         assert!(trace.location.file.ends_with("read_file.rs"));
         if !trace.truncated {
-            assert_eq!(trace.causes, [expected.clone()]);
+            assert_eq!(trace.causes, std::slice::from_ref(&expected));
         }
     });
     with_enabled_for_test(false, || {

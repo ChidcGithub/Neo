@@ -363,7 +363,7 @@ unsafe fn memory_glyphs(g: &Layout, scale: f32, caption: &str) -> Vec<u8> {
 fn cached_plate_preserves_glass_brand_and_animation_bounds() {
     let g = layout(1.);
     let mask = unsafe { memory_glyphs(&g, 1., "正在启动") };
-    assert!(mask.iter().any(|v| *v == 255));
+    assert!(mask.contains(&255));
     let (icon, _, _) = crate::brand::whale_rgba(76);
     let glass = vec![0xffbbc9d8; (g.width * g.height) as usize];
     let palette = Palette::light();

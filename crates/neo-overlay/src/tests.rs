@@ -876,7 +876,7 @@ fn weaker_refraction_preserves_color_and_alpha_offscreen() {
 
     let mut patterned = flat;
     for (i, pixel) in patterned.chunks_exact_mut(4).enumerate() {
-        let value = if (i % W as usize / 4 + i / W as usize / 4) % 2 == 0 {
+        let value = if (i % W as usize / 4 + i / W as usize / 4).is_multiple_of(2) {
             40
         } else {
             210
