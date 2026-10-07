@@ -42,8 +42,9 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
     );
     let headline_h = title.size().y.max(t.headline_lh);
     let chip_h = m.hit_target(m.s(28.0));
-    let gap = m.s(8.0);
-    let head_gap = m.s(20.0);
+    let gap = m.stack_gap();
+    // Larger gap after the headline for visual separation; stack uses stack_gap.
+    let head_gap = m.stack_gap() + m.s(8.0);
 
     let fixed = headline_h + head_gap + chip_h + gap;
     // 卡片高 clamp 进剩余空间：长草稿 + 矮窗口（如四分屏）时文本区变矮

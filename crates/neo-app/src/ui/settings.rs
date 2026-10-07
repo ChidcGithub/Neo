@@ -101,6 +101,10 @@ pub fn panel(
     let content_rect = if compact {
         let nav_rect = Rect::from_min_size(inner.min, Vec2::new(inner.width(), m.s(32.0)));
         at(ui, nav_rect, |ui| {
+            // Compact navigation intentionally uses the native egui ComboBox: neo_ui
+            // has no select/dropdown component yet, and this is the only place
+            // where a narrow settings page needs one. The button is styled to
+            // match the design system as closely as egui allows.
             let nav = egui::ComboBox::from_id_salt("settings-compact-nav")
                 .selected_text(page_name(state.settings_tab))
                 .width((inner.width() - m.s(12.0)).max(0.0))
@@ -125,30 +129,31 @@ pub fn panel(
             });
             let _ = nav;
         });
-        Rect::from_min_max(egui::pos2(inner.left(), nav_rect.bottom()), inner.max)
-    } else {
-        let nav_rect = Rect::from_min_size(inner.min, Vec2::new(nav_w, inner.height()));
-        at(ui, nav_rect, |ui| {
-            ui.label(egui::RichText::new(tr("设置")).strong());
-            ui.add_space(m.s(16.0));
-            egui::ScrollArea::vertical()
-                .id_salt("settings-navigation")
-                .show(ui, |ui| {
-                    for &(tab, name) in SettingsTab::ALL {
-                        if NavItem::new(tr(name), nav_icon(tab))
-                            .active(state.settings_tab == tab)
-                            .id_salt(("settings-nav", name))
-                            .show(ui, &d, nav_w)
-                            .clicked()
-                        {
-                            state.settings_tab = tab;
+
+            Rect::from_min_max(egui::pos2(inner.left(), nav_rect.bottom()), inner.max)
+        } else {
+            let nav_rect = Rect::from_min_size(inner.min, Vec2::new(nav_w, inner.height()));
+            at(ui, nav_rect, |ui| {
+                ui.label(egui::RichText::new(tr("设置")).strong());
+                ui.add_space(m.s(16.0));
+                egui::ScrollArea::vertical()
+                    .id_salt("settings-navigation")
+                    .show(ui, |ui| {
+                        for &(tab, name) in SettingsTab::ALL {
+                            if NavItem::new(tr(name), nav_icon(tab))
+                                .active(state.settings_tab == tab)
+                                .id_salt(("settings-nav", name))
+                                .show(ui, &d, nav_w)
+                                .clicked()
+                            {
+                                state.settings_tab = tab;
+                            }
+                            ui.add_space(m.s(4.0));
                         }
-                        ui.add_space(m.s(4.0));
-                    }
-                });
-        });
-        Rect::from_min_max(egui::pos2(nav_rect.right() + gap, inner.top()), inner.max)
-    };
+                    });
+            });
+            Rect::from_min_max(egui::pos2(nav_rect.right() + gap, inner.top()), inner.max)
+        };
 
     // ---- 右：页标题 + 描述 + 滚动内容 ----
     at(ui, content_rect, |ui| {
@@ -585,6 +590,8 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
             .x
             + m.s(32.0);
         let refresh = if width < refresh_width {
+            // Narrow fallback keeps wrapping so the page never overflows; the
+            // wide path uses the neo_ui button for consistent styling.
             ui.add(egui::Button::new(tr("从模型商刷新")).wrap())
         } else {
             neo_ui::Button::new(tr("从模型商刷新"))
@@ -647,6 +654,8 @@ fn about_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState, loa
         "neo-set-auto-updates",
     );
     let checking = matches!(state.update_status, crate::updates::Status::Checking);
+    // Keep wrapping so narrow pages never overflow; the button is small enough
+    // that the plain egui style is acceptable here.
     if ui
         .add_enabled(!checking, egui::Button::new(tr("立即检查")).wrap())
         .clicked()

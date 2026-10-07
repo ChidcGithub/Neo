@@ -268,7 +268,7 @@ fn draw_one(
                 let h = galley.size().y + m.s(12.0);
                 let (r, _) = ui.allocate_exact_size(Vec2::new(content_w, h), Sense::hover());
                 ui.painter()
-                    .squircle_filled(r, m.s(8.0), p.error.gamma_multiply(0.12));
+                    .squircle_filled(r, m.s(8.0), skin.d().c().error_soft);
                 ui.painter().galley(
                     egui::pos2(r.left() + m.s(8.0), r.top() + m.s(6.0)),
                     galley,
