@@ -2117,5 +2117,9 @@ mod perf_tests;
 mod regression_tests;
 
 #[cfg(test)]
+#[path = "dpi_move_tests.rs"]
+mod dpi_move_tests;
+
+#[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

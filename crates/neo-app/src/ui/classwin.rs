@@ -406,3 +406,7 @@ impl ClassDot {
 #[cfg(test)]
 #[path = "classwin_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "classwin_geometry_tests.rs"]
+mod geometry_tests;

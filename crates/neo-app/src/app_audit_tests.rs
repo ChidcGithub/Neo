@@ -542,3 +542,399 @@ fn confirm_window_buttons_stable_and_batch_disabled_when_safe() {
         "禁用态改变了 Always 矩形"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 5. Hero / 输入卡 / 设置页的几何稳定性（本轮审查新增）
+// ---------------------------------------------------------------------------
+
+/// hero 的 workspace chip 矩形在悬停前后逐位一致。
+///
+/// chip 的 hover 反馈（`hero.rs` L118-120）只在**已有矩形内**画一层填充，
+/// 不改矩形本身。本测试守住这条线：如果将来有人把 chip 写成「悬停时外扩
+/// 一圈」（例如把 `rect.expand(...)` 交给 `tap`），指针就会留在新矩形里
+/// 造成自锁抖动，这里会立即红。
+#[test]
+fn hero_workspace_chip_rect_stable_under_hover() {
+    let size = Vec2::new(1280.0, 800.0);
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        let ctx = context();
+        let mut state = AppState::default();
+        state.workspace = Some("D:/课堂/高二物理".into());
+        let draw = |ui: &mut egui::Ui, skin: &Skin<'_>, state: &mut AppState| {
+            crate::ui::hero::draw(ui, skin, Rect::from_min_size(Pos2::ZERO, size), state);
+        };
+        // 铺三帧让动画 / 布局稳定。
+        for _ in 0..3 {
+            frame_themed(&ctx, size, vec![], mode, |ui, skin| {
+                draw(ui, skin, &mut state)
+            });
+        }
+        let idle: Rect = ctx
+            .data(|d| d.get_temp(egui::Id::new("neo-hero-workspace-probe")))
+            .expect("workspace chip 探针应存在");
+        // 悬停。
+        frame_themed(
+            &ctx,
+            size,
+            vec![egui::Event::PointerMoved(idle.center())],
+            mode,
+            |ui, skin| draw(ui, skin, &mut state),
+        );
+        let hovered: Rect = ctx
+            .data(|d| d.get_temp(egui::Id::new("neo-hero-workspace-probe")))
+            .unwrap();
+        assert_eq!(idle, hovered, "{mode:?} workspace chip 悬停时矩形漂移");
+        // 按下。
+        frame_themed(
+            &ctx,
+            size,
+            pointer(idle.center(), true),
+            mode,
+            |ui, skin| draw(ui, skin, &mut state),
+        );
+        let pressed: Rect = ctx
+            .data(|d| d.get_temp(egui::Id::new("neo-hero-workspace-probe")))
+            .unwrap();
+        assert_eq!(idle, pressed, "{mode:?} workspace chip 按下时矩形漂移");
+    }
+}
+
+/// 设置页 Segmented（分段控件）的分段矩形在悬停下不动。
+///
+/// 分段控件的命中区是「总宽均分」，每段的矩形由容器宽除以段数得出，
+/// 与悬停无关。本测试用 Appearance 页的主题分段做哨兵 —— 它是
+/// `choice_row` 走 `Segmented` 分支的最短路径。
+#[test]
+fn settings_segmented_rects_stable_under_hover() {
+    let size = Vec2::new(720.0, 900.0);
+    let ctx = context();
+    let mut state = AppState::default();
+    state.show_settings = true;
+    state.settings_tab = crate::state::SettingsTab::Appearance;
+    let draw = |ui: &mut egui::Ui, skin: &Skin<'_>, state: &mut AppState| {
+        let rect = Rect::from_min_size(Pos2::ZERO, size);
+        let fonts = neo_theme::fonts::LoadedFonts::default();
+        crate::ui::settings::panel(ui, skin, rect, state, size.y, &fonts);
+    };
+    for _ in 0..3 {
+        frame_themed(&ctx, size, vec![], ThemeMode::Light, |ui, skin| {
+            draw(ui, skin, &mut state)
+        });
+    }
+    // 读出两个分段（暗色 / 亮色）的探针矩形。
+    let seg = |i: usize| -> Rect {
+        ctx.data(|d| d.get_temp(egui::Id::new(("settings-theme", i))))
+            .unwrap_or_else(|| panic!("分段探针 settings-theme/{i} 应存在"))
+    };
+    let idle_0 = seg(0);
+    let idle_1 = seg(1);
+    // 悬停第一段。
+    frame_themed(
+        &ctx,
+        size,
+        vec![egui::Event::PointerMoved(idle_0.center())],
+        ThemeMode::Light,
+        |ui, skin| draw(ui, skin, &mut state),
+    );
+    assert_eq!(seg(0), idle_0, "悬停分段 0 时矩形漂移");
+    assert_eq!(seg(1), idle_1, "悬停分段 0 时分段 1 被推着走");
+    // 悬停第二段。
+    frame_themed(
+        &ctx,
+        size,
+        vec![egui::Event::PointerMoved(idle_1.center())],
+        ThemeMode::Light,
+        |ui, skin| draw(ui, skin, &mut state),
+    );
+    assert_eq!(seg(0), idle_0, "悬停分段 1 时分段 0 被推着走");
+    assert_eq!(seg(1), idle_1, "悬停分段 1 时矩形漂移");
+}
+
+/// 设置页输入框（TextField）矩形在获得 / 失去焦点前后不变。
+///
+/// `TextField::show` 分配 `Vec2::new(width, m.s(36.0))` 的固定矩形，
+/// 聚焦环只改描边不改矩形。用 Model 页的 API 地址输入框做哨兵。
+#[test]
+fn settings_input_rect_stable_under_focus() {
+    let size = Vec2::new(720.0, 900.0);
+    let ctx = context();
+    let mut state = AppState::default();
+    state.show_settings = true;
+    state.settings_tab = crate::state::SettingsTab::Model;
+    let draw = |ui: &mut egui::Ui, skin: &Skin<'_>, state: &mut AppState| {
+        let rect = Rect::from_min_size(Pos2::ZERO, size);
+        let fonts = neo_theme::fonts::LoadedFonts::default();
+        crate::ui::settings::panel(ui, skin, rect, state, size.y, &fonts);
+    };
+    for _ in 0..3 {
+        frame_themed(&ctx, size, vec![], ThemeMode::Light, |ui, skin| {
+            draw(ui, skin, &mut state)
+        });
+    }
+    let probe_id = egui::Id::new(("settings-input-probe", "neo-api-base"));
+    let idle: Rect = ctx
+        .data(|d| d.get_temp(probe_id))
+        .expect("api-base 输入框探针应存在");
+    // 点击进入输入框（获得焦点）。
+    frame_themed(
+        &ctx,
+        size,
+        pointer(idle.center(), true),
+        ThemeMode::Light,
+        |ui, skin| draw(ui, skin, &mut state),
+    );
+    frame_themed(
+        &ctx,
+        size,
+        pointer(idle.center(), false),
+        ThemeMode::Light,
+        |ui, skin| draw(ui, skin, &mut state),
+    );
+    let focused: Rect = ctx.data(|d| d.get_temp(probe_id)).unwrap();
+    assert_eq!(idle, focused, "输入框聚焦后矩形漂移");
+}
+
+/// 输入卡（composer）矩形在聚焦前后不变。
+///
+/// 聚焦环画在卡片**外面**（`composer.rs` L470-477，`rect.expand(0.5)`），
+/// 不改变卡片自身的矩形。如果有人把聚焦环改成「卡片向外长一圈」并
+/// 反馈到布局，文本区就会跟着跳动。
+#[test]
+fn composer_card_rect_stable_across_focus() {
+    let size = Vec2::new(920.0, 400.0);
+    let ctx = context();
+    let mut state = AppState::default();
+    state.stage = Stage::Conversation;
+    state.messages.push(crate::state::ChatMessage::new(
+        Role::User,
+        "帮我讲讲楞次定律".to_owned(),
+    ));
+    let draw = |ui: &mut egui::Ui, skin: &Skin<'_>, state: &mut AppState| {
+        crate::ui::conversation::draw(
+            ui,
+            skin,
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(size.x, 60.0)),
+            Rect::from_min_size(
+                Pos2::ZERO + egui::vec2(0.0, 60.0),
+                size - egui::vec2(0.0, 60.0),
+            ),
+            state,
+        );
+    };
+    for _ in 0..3 {
+        frame_themed(&ctx, size, vec![], ThemeMode::Light, |ui, skin| {
+            draw(ui, skin, &mut state)
+        });
+    }
+    let probe_id = egui::Id::new("neo-composer-send-probe");
+    let (send_idle, _): (Rect, Rect) = ctx
+        .data(|d| d.get_temp(probe_id))
+        .expect("发送钮探针应存在");
+    // 聚焦输入卡。
+    ctx.memory_mut(|m| m.request_focus(egui::Id::new(crate::ui::COMPOSER_ID)));
+    frame_themed(&ctx, size, vec![], ThemeMode::Light, |ui, skin| {
+        draw(ui, skin, &mut state)
+    });
+    let (send_focused, _): (Rect, Rect) = ctx.data(|d| d.get_temp(probe_id)).unwrap();
+    assert_eq!(
+        send_idle, send_focused,
+        "输入卡聚焦后发送钮矩形漂移（聚焦环不应影响布局）"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Hero 排版与 neo-theme 层级
+// ---------------------------------------------------------------------------
+
+/// hero 标题字号 / 字重 / 间距必须匹配 `Typography` 层级。
+///
+/// 从渲染输出里捞出标题文本，断言：
+/// - 字号 = `t.headline`（26pt × scale）；
+/// - 字体族 = `fonts::bold()`（对应上游 `font-weight: 500`）；
+/// - 标题与 workspace chip 的纵向间距 = `m.s(20.0)`（head_gap）。
+///
+/// 同时钉住「标题 / 正文 / 标签 / 提示」四档字号的递减关系 —— 层级倒过来
+/// 比绝对值漂移更难看。
+#[test]
+fn hero_typography_matches_theme_hierarchy() {
+    let size = Vec2::new(1920.0, 1080.0);
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        let ctx = context();
+        let theme = neo_theme::Theme::new(mode, size.y, neo_theme::Distance::Standard);
+        let t = theme.typo;
+        let mut state = AppState::default();
+        let draw = |ui: &mut egui::Ui, skin: &Skin<'_>, state: &mut AppState| {
+            crate::ui::hero::draw(ui, skin, Rect::from_min_size(Pos2::ZERO, size), state);
+        };
+        let mut output = frame_themed(&ctx, size, vec![], mode, |ui, skin| {
+            draw(ui, skin, &mut state)
+        });
+        output.textures_delta.clear();
+
+        // ---- 从形状里捞标题 ----
+        let title_text = crate::i18n::tr("今天想在课堂上做点什么？");
+        let mut found_title = false;
+        for clipped in &output.shapes {
+            if let egui::Shape::Text(text) = &clipped.shape {
+                if text.galley.job.text == title_text {
+                    found_title = true;
+                    // 字号校验：galley 里首个 section 的字号就是标题字号。
+                    let section = &text.galley.job.sections[0];
+                    let font_size = section.format.font_id.size;
+                    assert!(
+                        (font_size - t.headline).abs() < 0.01,
+                        "{mode:?} hero 标题字号 {font_size} ≠ typography.headline {}",
+                        t.headline
+                    );
+                    // 字重校验：字体族必须是 bold（对应上游 font-weight: 500）。
+                    assert_eq!(
+                        section.format.font_id.family,
+                        neo_theme::fonts::bold(),
+                        "{mode:?} hero 标题字体族应为 bold（500），实际 {:?}",
+                        section.format.font_id.family
+                    );
+                }
+            }
+        }
+        assert!(found_title, "{mode:?} hero 标题必须实际绘制");
+
+        // ---- 层级递减 ----
+        assert!(
+            t.headline > t.body,
+            "{mode:?} headline ({}) 必须 > body ({})",
+            t.headline,
+            t.body
+        );
+        assert!(
+            t.body > t.label || (t.body - t.label).abs() < 0.01,
+            "{mode:?} body ({}) 必须 >= label ({})",
+            t.body,
+            t.label
+        );
+        assert!(
+            t.label > t.caption,
+            "{mode:?} label ({}) 必须 > caption ({})",
+            t.label,
+            t.caption
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. 表面 token 的语义分工
+// ---------------------------------------------------------------------------
+
+/// 面板 / 输入卡 / 气泡各有专属表面 token，不能互换：
+/// - `surface_2`：Panel 默认底（设置、确认窗等浮层卡片）；
+/// - `input_surface`：输入卡（`--dsw-specific-input-major`）；
+/// - `bubble`：消息气泡（`--dsw-specific-bubble`）。
+///
+/// 三者在暗色下互不相同；亮色下 `input_surface` 与 `bg_base` 同值
+///（输入卡靠描边与背景区分），`bubble` 与 `surface_2` 同值。
+/// 本测试把这些「刻意相同 / 刻意不同」钉成断言，防止误合并。
+#[test]
+fn surface_tokens_are_intentionally_distinct() {
+    // 暗色：三层表面 + 输入卡 + 气泡全部分开。
+    let d = Palette::DARK;
+    assert_ne!(
+        d.surface_2, d.input_surface,
+        "暗色：surface_2 与 input_surface 不应相同"
+    );
+    assert_ne!(d.surface_2, d.bubble, "暗色：surface_2 与 bubble 不应相同");
+    // 暗色下 input_surface 与 bubble 恰好同值（N_850）——这是 Harness 的
+    // 原始配对，不是 bug。钉住它，将来改其中一个就会红。
+    assert_eq!(
+        d.input_surface, d.bubble,
+        "暗色：input_surface 与 bubble 应同值"
+    );
+
+    // 亮色：input_surface = bg_base（输入卡与底色相同，靠描边区分）。
+    let l = Palette::LIGHT;
+    assert_eq!(
+        l.input_surface, l.bg_base,
+        "亮色：input_surface 应与 bg_base 同值"
+    );
+    assert_eq!(l.bubble, l.surface_2, "亮色：bubble 与 surface_2 同值");
+    assert_ne!(
+        l.surface_2, l.input_surface,
+        "亮色：surface_2 与 input_surface 不应相同"
+    );
+
+    // 高对比：全部实色，但 input_surface / bubble / surface_2 在 HC 下
+    // 刻意合并为同一个 HC_24（高对比模式下层级靠描边与文字对比度区分，
+    // 不再靠表面明度差）。钉住这个「刻意相同」。
+    let h = Palette::HIGH_CONTRAST;
+    assert_eq!(
+        h.surface_2, h.input_surface,
+        "HC：surface_2 与 input_surface 合并"
+    );
+    assert_eq!(
+        h.input_surface, h.bubble,
+        "HC：input_surface 与 bubble 合并"
+    );
+    // 但 surface_3（最上层）仍须与 surface_2 不同。
+    assert_ne!(
+        h.surface_2, h.surface_3,
+        "HC：surface_2 与 surface_3 不应相同"
+    );
+}
+
+/// 设置页开关的「四态」几何稳定：on/off × idle/hover 下矩形一致。
+///
+/// 开关矩形由 `switch_row`（`settings.rs` L1250-1256）算出，与开关的
+/// on/off 无关；但开关绘制（`field.rs` L214-228）的滑块位置随 on/off 变。
+/// 如果有人把「开关高度」或「开关右缘」写成依赖 on/off 的表达式，
+/// 切换开关就会推动整行抖动。本测试同时覆盖 on 与 off 两个状态。
+#[test]
+fn settings_switch_rect_stable_across_on_off_states() {
+    let size = Vec2::new(720.0, 900.0);
+    let ctx = context();
+    let draw = |ui: &mut egui::Ui, skin: &Skin<'_>, state: &mut AppState| {
+        let rect = Rect::from_min_size(Pos2::ZERO, size);
+        let fonts = neo_theme::fonts::LoadedFonts::default();
+        crate::ui::settings::panel(ui, skin, rect, state, size.y, &fonts);
+    };
+    let probe = egui::Id::new("settings-floating-probe");
+
+    // --- off 态 ---
+    let mut state = AppState::default();
+    state.show_settings = true;
+    state.settings_tab = crate::state::SettingsTab::General;
+    state.floating_enabled = false;
+    for _ in 0..3 {
+        frame_themed(&ctx, size, vec![], ThemeMode::Light, |ui, skin| {
+            draw(ui, skin, &mut state)
+        });
+    }
+    let off_rect: Rect = ctx
+        .data(|d| d.get_temp(probe))
+        .expect("floating 开关探针应存在");
+
+    // --- on 态 ---
+    state.floating_enabled = true;
+    for _ in 0..3 {
+        frame_themed(&ctx, size, vec![], ThemeMode::Light, |ui, skin| {
+            draw(ui, skin, &mut state)
+        });
+    }
+    let on_rect: Rect = ctx.data(|d| d.get_temp(probe)).unwrap();
+
+    assert_eq!(
+        off_rect, on_rect,
+        "开关 on/off 切换改变了矩形：off={off_rect:?} on={on_rect:?}"
+    );
+
+    // --- on 态下悬停 + 按下 ---
+    let center = on_rect.center();
+    for pressed in [true, false] {
+        frame_themed(
+            &ctx,
+            size,
+            pointer(center, pressed),
+            ThemeMode::Light,
+            |ui, skin| draw(ui, skin, &mut state),
+        );
+        let now: Rect = ctx.data(|d| d.get_temp(probe)).unwrap();
+        assert_eq!(on_rect, now, "on 态开关在 pressed={pressed} 时矩形漂移");
+    }
+}

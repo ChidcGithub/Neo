@@ -367,3 +367,41 @@
         assert_eq!(out[0][0], [2.0, 3.0]);
         assert_eq!(out[0][2], [3.0, 4.0]);
     }
+
+    /// \widehat 等的填充路径光栅化成纹理存进 `Context::insert_temp`，egui 只在
+    /// 进程退出时清理 temp 数据 —— 缓存必须自己限量，不能让滚动过的公式堆到重启。
+    #[test]
+    fn path_texture_cache_is_bounded() {
+        let ctx = egui::Context::default();
+        neo_theme::fonts::install(&ctx);
+        let dl = layout(r"\widehat{a0}", false).unwrap();
+        assert!(dl.items.iter().any(|i| matches!(i, DisplayItem::Path { fill: true, .. })));
+        for i in 0..(MAX_PATH_TEXTURES + 8) {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                render(ui, Color32::WHITE, r"\widehat{a0}", 8.0 + i as f32, false).unwrap();
+            });
+            output.textures_delta.clear();
+        }
+        let keys = ctx.data(|d| {
+            d.get_temp::<PathTextureCache>(path_texture_cache_id())
+                .map(|c| c.keys.len())
+                .unwrap_or(0)
+        });
+        assert_eq!(keys, MAX_PATH_TEXTURES);
+        // 重复渲染一个已在缓存里的键：是命中，不得再 push（否则 key 重复入账）。
+        let newest_size = 8.0 + (MAX_PATH_TEXTURES + 7) as f32;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            render(ui, Color32::WHITE, r"\widehat{a0}", newest_size, false).unwrap();
+            render(ui, Color32::WHITE, r"\widehat{a0}", newest_size, false).unwrap();
+        });
+        output.textures_delta.clear();
+        let keys = ctx.data(|d| d.get_temp::<PathTextureCache>(path_texture_cache_id()).unwrap().keys.len());
+        assert_eq!(keys, MAX_PATH_TEXTURES, "命中不得重复入账");
+        // 最旧的一条已被逐出；重渲染它要重光栅化、并逐出另一条，总量不变。
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            render(ui, Color32::WHITE, r"\widehat{a0}", 8.0, false).unwrap();
+        });
+        output.textures_delta.clear();
+        let after = ctx.data(|d| d.get_temp::<PathTextureCache>(path_texture_cache_id()).unwrap().keys.len());
+        assert_eq!(after, keys);
+    }

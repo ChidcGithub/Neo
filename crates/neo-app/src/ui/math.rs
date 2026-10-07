@@ -93,6 +93,24 @@ const MAX_CACHE_ENTRIES: usize = 128;
 const MAX_CACHE_SOURCE_BYTES: usize = 8 * 1024;
 const MAX_CACHE_ENTRY_BYTES: usize = 256 * 1024;
 const MAX_CACHE_BYTES: usize = 2 * 1024 * 1024;
+/// 光栅化路径纹理（sqrt 根号、\widehat、圆括号等填充字形）的缓存上限。
+/// 与上面的排版缓存不同，这些纹理存在 `Context::insert_temp` 里 —— egui 只在
+/// 进程退出时清理 temp 数据，不设上限会让滚动过的每个不同公式路径留一张纹理
+/// 直到重启。数量与 `LayoutCache` 对齐：纹理由其排版项驱动，同幅公式一并淘汰。
+const MAX_PATH_TEXTURES: usize = MAX_CACHE_ENTRIES;
+
+/// 已插入的路径纹理键（插入序）；`data_temp` 自带淘汰不够，必须自己限量。
+/// FIFO 而非 LRU：命中路径纹理的开销（重光栅化 ≤512² 像素）远低于拖动可见
+/// 公式时哈希全表查命中序的成本；同帧重复引用的路径共享第一次插入的键。
+#[derive(Default, Clone)]
+struct PathTextureCache {
+    keys: VecDeque<egui::Id>,
+}
+
+/// `PathTextureCache` 在 `Context` 数据里的键。
+fn path_texture_cache_id() -> Id {
+    Id::new("neo-math-path-textures")
+}
 
 struct LayoutEntry {
     latex: Box<str>,
@@ -417,7 +435,16 @@ fn paint_path(
                 egui::ColorImage::new([px_w, px_h], pixels),
                 TextureOptions::LINEAR,
             );
-            ctx.data_mut(|d| d.insert_temp(id, t.clone()));
+            ctx.data_mut(|d| {
+                d.insert_temp(id, t.clone());
+                let cache = d.get_temp_mut_or_default::<PathTextureCache>(path_texture_cache_id());
+                cache.keys.push_back(id);
+                if cache.keys.len() > MAX_PATH_TEXTURES {
+                    if let Some(oldest) = cache.keys.pop_front() {
+                        d.remove::<TextureHandle>(oldest);
+                    }
+                }
+            });
             t
         }
     };
