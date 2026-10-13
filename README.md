@@ -4,8 +4,7 @@
 
 **A voice-first AI teaching assistant for classroom big screens.**
 
-Say *“Hi, Neo”* — a liquid-glass lens wakes along the screen edges, refracting the live desktop
-beneath a band of flowing color. Speak, and Neo transcribes, reasons, answers in streaming
+Say *“Hi, Neo”* Then speak, and Neo transcribes, reasons, answers in streaming
 Markdown / KaTeX, and operates the machine through a gated local tool chain. When the work
 is done, it fades back into the system tray and waits for the next call.
 
