@@ -564,7 +564,7 @@ impl Host {
         };
         self.replies.push_back((id, result));
     }
-#[allow(clippy::too_many_arguments)] // internal coordinator; grouping would obscure the call contract
+    #[allow(clippy::too_many_arguments)] // internal coordinator; grouping would obscure the call contract
     pub fn request(
         &mut self,
         id: String,
@@ -1014,8 +1014,9 @@ impl Host {
 }
 
 /// Only metadata is rendered; no thumbnails/resource reads happen in this panel.
-pub(super) fn panel(host: &mut Host, ctx: &egui::Context) {
+pub(super) fn panel(host: &mut Host, ctx: &egui::Context, theme: neo_theme::Theme) {
     use crate::i18n::tr;
+    let d = neo_ui::Design::new(theme);
     let mut decision = None;
     if let Some(c) = host.consent() {
         egui::Window::new(tr("画板 Agent 授权")).id(egui::Id::new("drawing-host-consent"))
@@ -1036,8 +1037,8 @@ pub(super) fn panel(host: &mut Host, ctx: &egui::Context) {
                                 }
                 if !c.assets.is_empty() { ui.checkbox(&mut c.vision_confirmed, tr("我确认此模型支持图片输入，并同意发送这些图片")); }
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(c.assets.is_empty() || c.vision_confirmed, egui::Button::new(tr("允许发送"))).clicked() { decision = Some(true); }
-                    if ui.button(tr("拒绝发送")).clicked() { decision = Some(false); }
+                    if neo_ui::Button::new(tr("允许发送")).elevated().enabled(c.assets.is_empty() || c.vision_confirmed).show(ui, &d).clicked() { decision = Some(true); }
+                    if neo_ui::Button::new(tr("拒绝发送")).ghost().show(ui, &d).clicked() { decision = Some(false); }
                 });
             });
     } else if host.busy() && !host.capture_active() {
@@ -1045,7 +1046,11 @@ pub(super) fn panel(host: &mut Host, ctx: &egui::Context) {
             .collapsible(false)
             .show(ctx, |ui| {
                 ui.label(tr("取消会阻止回答写回，但无法撤回已经上传的数据。"));
-                if ui.button(tr("取消画板任务")).clicked() {
+                if neo_ui::Button::new(tr("取消画板任务"))
+                    .danger()
+                    .show(ui, &d)
+                    .clicked()
+                {
                     decision = Some(false);
                 }
             });

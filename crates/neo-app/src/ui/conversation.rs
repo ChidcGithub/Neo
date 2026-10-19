@@ -277,7 +277,9 @@ fn draw_one(
             }
 
             // 元信息（模型 · 耗时 / 已停止）。
-            if !msg.meta.is_empty() && !msg.streaming {
+            // 流式期间 meta 一般为空；自动重试等待时会写「N 秒后自动重试」，
+            // 这是用户能看到重试进度的唯一位置，不能被 streaming 挡掉。
+            if !msg.meta.is_empty() {
                 let meta_font = skin.prop(skin.t().caption);
                 let (r, _) =
                     ui.allocate_exact_size(Vec2::new(content_w, m.s(16.0)), Sense::hover());

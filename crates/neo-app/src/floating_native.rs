@@ -156,11 +156,12 @@ struct Dib {
     bitmap: HBITMAP,
     old: HGDIOBJ,
     bits: *mut u32,
-    size: i32,
+    width: i32,
+    height: i32,
 }
 impl Dib {
-    unsafe fn new(size: i32) -> Result<Self, String> {
-        if !(1..=720).contains(&size) {
+    unsafe fn new(width: i32, height: i32) -> Result<Self, String> {
+        if !(1..=1024).contains(&width) || !(1..=1024).contains(&height) {
             return Err("floating invalid surface size".into());
         }
         let dc = CreateCompatibleDC(null_mut());
@@ -170,8 +171,8 @@ impl Dib {
         let mut info: BITMAPINFO = std::mem::zeroed();
         info.bmiHeader = BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: size,
-            biHeight: -size,
+            biWidth: width,
+            biHeight: -height,
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB,
@@ -197,13 +198,14 @@ impl Dib {
             bitmap,
             old,
             bits: bits.cast(),
-            size,
+            width,
+            height,
         };
         dib.pixels().fill(0);
         Ok(dib)
     }
     unsafe fn pixels(&mut self) -> &mut [u32] {
-        std::slice::from_raw_parts_mut(self.bits, (self.size * self.size) as usize)
+        std::slice::from_raw_parts_mut(self.bits, (self.width * self.height) as usize)
     }
 }
 impl Drop for Dib {
@@ -240,7 +242,8 @@ unsafe fn monitor(point: POINT) -> Result<(RECT, u32), String> {
 struct Surface {
     origin: Point,
     scale: f32,
-    size: i32,
+    width: i32,
+    height: i32,
     work: RECT,
     glass: Option<Vec<u32>>,
     gesture: Gesture,
@@ -279,7 +282,8 @@ impl Surface {
             self.work.top,
             self.work.right,
             self.work.bottom,
-            self.size,
+            self.width,
+            self.height,
         );
         self.origin.x = self.origin.x.round();
         self.origin.y = self.origin.y.round();
@@ -288,9 +292,10 @@ impl Surface {
         let (work, dpi) = monitor(point)?;
         let old_scale = self.scale;
         self.scale = fit_scale(dpi, work.right - work.left, work.bottom - work.top);
-        self.size = (EXTENT * self.scale).round().max(1.0) as i32;
-        self.origin.x += 90.0 * (old_scale - self.scale);
-        self.origin.y += 90.0 * (old_scale - self.scale);
+        self.width = (EXTENT_W * self.scale).round().max(1.0) as i32;
+        self.height = (EXTENT_H * self.scale).round().max(1.0) as i32;
+        self.origin.x += MAIN_X * (old_scale - self.scale);
+        self.origin.y += MAIN_Y * (old_scale - self.scale);
         self.work = work;
         self.clamp();
         // Monitor polling during a drag is not itself a pixel change.
@@ -316,8 +321,9 @@ unsafe fn capture(surface: &Surface, shared: &Shared, revision: u64) -> Option<V
     if !shared.may_capture(revision) {
         return None;
     }
-    let size = (surface.size + 3) / 4;
-    let mut dib = Dib::new(size).ok()?;
+    let width = (surface.width + 3) / 4;
+    let height = (surface.height + 3) / 4;
+    let mut dib = Dib::new(width, height).ok()?;
     if !shared.may_capture(revision) {
         return None;
     }
@@ -335,13 +341,13 @@ unsafe fn capture(surface: &Surface, shared: &Shared, revision: u64) -> Option<V
         dib.dc,
         0,
         0,
-        size,
-        size,
+        width,
+        height,
         screen,
         surface.origin.x as i32,
         surface.origin.y as i32,
-        surface.size,
-        surface.size,
+        surface.width,
+        surface.height,
         SRCCOPY | CAPTUREBLT,
     );
     let flushed = GdiFlush();
@@ -350,8 +356,8 @@ unsafe fn capture(surface: &Surface, shared: &Shared, revision: u64) -> Option<V
         return None;
     }
     let pixels = dib.pixels();
-    let mut image = image::RgbImage::from_fn(size as u32, size as u32, |x, y| {
-        let p = pixels[(y * size as u32 + x) as usize];
+    let mut image = image::RgbImage::from_fn(width as u32, height as u32, |x, y| {
+        let p = pixels[(y * width as u32 + x) as usize];
         image::Rgb([(p >> 16) as u8, (p >> 8) as u8, p as u8])
     });
     pixels.fill(0);
@@ -359,8 +365,8 @@ unsafe fn capture(surface: &Surface, shared: &Shared, revision: u64) -> Option<V
     image.as_mut().fill(0);
     let mut expanded = image::imageops::resize(
         &blurred,
-        surface.size as u32,
-        surface.size as u32,
+        surface.width as u32,
+        surface.height as u32,
         image::imageops::FilterType::Triangle,
     );
     blurred.as_mut().fill(0);
@@ -565,9 +571,19 @@ struct LabelKey {
 }
 
 impl RenderCache {
-    unsafe fn prepare(&mut self, size: i32, scale: f32, amount: f32) -> Result<(), String> {
-        if self.dib.as_ref().is_none_or(|dib| dib.size != size) {
-            self.dib = Some(Dib::new(size)?);
+    unsafe fn prepare(
+        &mut self,
+        width: i32,
+        height: i32,
+        scale: f32,
+        amount: f32,
+    ) -> Result<(), String> {
+        if self
+            .dib
+            .as_ref()
+            .is_none_or(|dib| dib.width != width || dib.height != height)
+        {
+            self.dib = Some(Dib::new(width, height)?);
             #[cfg(test)]
             {
                 self.work.dibs += 1;
@@ -642,24 +658,25 @@ fn blend(base: u32, rgb: [u8; 3], alpha: u32) -> u32 {
 
 unsafe fn paint(
     cache: &mut RenderCache,
-    size: i32,
+    width: i32,
+    height: i32,
     scale: f32,
     amount: f32,
     glass: Option<&[u32]>,
 ) -> Result<(), String> {
-    cache.prepare(size, scale, amount)?;
+    cache.prepare(width, height, scale, amount)?;
     let icon = if amount > 0.0 {
         &cache.blurred.as_ref().unwrap().1
     } else {
         cache.icon.as_ref().unwrap()
     };
     let icon_size = icon.width() as i32;
-    let icon_left = (90.0 * scale).round() as i32 - icon_size / 2;
+    let icon_left = (MAIN_X * scale).round() as i32 - icon_size / 2;
     let frame_circles: Vec<_> = animated_circles(amount).collect(); // At most four.
     let pixels = cache.dib.as_mut().unwrap().pixels();
     pixels.fill(0);
-    for y in 0..size {
-        for x in 0..size {
+    for y in 0..height {
+        for x in 0..width {
             let p = Point {
                 x: (x as f32 + 0.5) / scale,
                 y: (y as f32 + 0.5) / scale,
@@ -670,7 +687,7 @@ unsafe fn paint(
             }) else {
                 continue;
             };
-            let index = (y * size + x) as usize;
+            let index = (y * width + x) as usize;
             let distance = p.distance(circle.center);
             let mut color = glass.map_or(0xffc1c1c1, |v| v[index]);
             // Soft inner rim; outside pixels stay exactly alpha zero.
@@ -739,8 +756,8 @@ unsafe fn render(hwnd: HWND, surface: &Surface, cache: &mut RenderCache) -> Resu
         return Err(error("SetWindowRgn"));
     }
     let size = SIZE {
-        cx: surface.size,
-        cy: surface.size,
+        cx: surface.width,
+        cy: surface.height,
     };
     let source = POINT { x: 0, y: 0 };
     let destination = POINT {
@@ -755,7 +772,8 @@ unsafe fn render(hwnd: HWND, surface: &Surface, cache: &mut RenderCache) -> Resu
     };
     paint(
         cache,
-        surface.size,
+        surface.width,
+        surface.height,
         surface.scale,
         amount,
         surface.glass.as_deref(),
@@ -905,14 +923,16 @@ unsafe fn run_inner(
     GetCursorPos(&mut cursor);
     let (work, dpi) = monitor(cursor)?;
     let scale = fit_scale(dpi, work.right - work.left, work.bottom - work.top);
-    let size = (EXTENT * scale).round().max(1.0) as i32;
+    let width = (EXTENT_W * scale).round().max(1.0) as i32;
+    let height = (EXTENT_H * scale).round().max(1.0) as i32;
     let mut surface = Surface {
         origin: Point {
-            x: (work.right - size) as f32,
-            y: (work.top + (work.bottom - work.top - size) / 2) as f32,
+            x: (work.right - width) as f32,
+            y: (work.top + (work.bottom - work.top - height) / 2) as f32,
         },
         scale,
-        size,
+        width,
+        height,
         work,
         glass: None,
         gesture: Gesture::default(),
@@ -1013,6 +1033,10 @@ unsafe fn run_inner(
                 apply(effect, &mut surface, shared, ctx, send);
             }
         }
+        let effect = surface
+            .gesture
+            .tick(clock.elapsed().as_millis() as u64);
+        apply(effect, &mut surface, shared, ctx, send);
         let now = Instant::now();
         surface.dirty |= surface.menu_animation.advance(
             surface.gesture.menu,
@@ -1022,8 +1046,8 @@ unsafe fn run_inner(
         let dragging = matches!(surface.gesture.phase, Phase::Drag { .. });
         if input.layout.replace(false) || dragging {
             let center = POINT {
-                x: (surface.origin.x + 90.0 * surface.scale) as i32,
-                y: (surface.origin.y + 90.0 * surface.scale) as i32,
+                x: (surface.origin.x + MAIN_X * surface.scale) as i32,
+                y: (surface.origin.y + MAIN_Y * surface.scale) as i32,
             };
             // While dragging, choose the cursor monitor (allows crossing gaps
             // and clamped monitor edges); otherwise keep the current monitor.
@@ -1105,7 +1129,10 @@ unsafe fn run_inner(
             let _ = ready.send(Ok(()));
         }
         std::thread::sleep(Duration::from_millis(
-            if surface.gesture.active() || surface.menu_animation.active(surface.gesture.menu) {
+            if surface.gesture.active()
+                || surface.gesture.waiting()
+                || surface.menu_animation.active(surface.gesture.menu)
+            {
                 16
             } else {
                 40

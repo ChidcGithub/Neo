@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{RichText, Ui};
-use neo_ui::{Button, Segmented, TextField};
+use neo_ui::{at, Button, Modal, ModalSize, Segmented, TextField};
 
 use super::Skin;
 use crate::diagnostics::{self, Entry, Level, Snapshot};
+use crate::state::AppState;
 
 /// 保存交互状态及当前筛选索引，共享一份有界脱敏快照；默认自动跟随。
 #[derive(Clone)]
@@ -46,12 +47,37 @@ impl Default for LogViewState {
 
 /// 无需给 AppState 增加字段；筛选和跟随状态保存在当前 egui 上下文的临时数据中。
 /// 调用方给出内容区宽度即可，不需要在模型消息或持久化配置中保存任何内容。
-pub fn draw(ui: &mut Ui, skin: &Skin<'_>, width: f32) {
-    let id = ui.id().with("neo-log-view-state");
+///
+/// id 是全局的：列表在设置页的滚动区里绘制，详情模态在滚动区之外绘制，
+/// 两处必须读写同一份状态。
+fn state_id() -> egui::Id {
+    egui::Id::new("neo-log-view-state")
+}
+
+/// 详情模态是否正打开。设置面板据此把这记 Esc 让给模态，而不是关掉设置页。
+pub fn detail_modal_open(ctx: &egui::Context) -> bool {
+    ctx.data(|data| {
+        data.get_temp::<LogViewState>(state_id())
+            .is_some_and(|state| state.selected.is_some())
+    })
+}
+
+pub fn draw(ui: &mut Ui, skin: &Skin<'_>, width: f32, app: &mut AppState) {
+    let id = state_id();
     let mut state = ui
         .ctx()
         .data_mut(|data| data.get_temp::<LogViewState>(id).unwrap_or_default());
-    state.draw(ui, skin, width);
+    state.draw(ui, skin, width, app);
+    ui.ctx().data_mut(|data| data.insert_temp(id, state));
+}
+
+/// 在未被滚动区裁剪的 Ui 上绘制日志详情模态；由设置面板在滚动区之后调用。
+pub fn draw_detail_modal(ui: &mut Ui, skin: &Skin<'_>, escape_pressed: bool) {
+    let id = state_id();
+    let mut state = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<LogViewState>(id).unwrap_or_default());
+    state.draw_detail_modal(ui, skin, escape_pressed);
     ui.ctx().data_mut(|data| data.insert_temp(id, state));
 }
 
@@ -85,14 +111,21 @@ impl LogViewState {
     }
 
     /// 也可由调用方自行保存独立 LogViewState，并直接调用此方法。
-    pub fn draw(&mut self, ui: &mut Ui, skin: &Skin<'_>, width: f32) {
+    pub fn draw(&mut self, ui: &mut Ui, skin: &Skin<'_>, width: f32, app: &mut AppState) {
         let view = diagnostics::snapshot();
-        self.draw_snapshot(ui, skin, width, view);
+        self.draw_snapshot(ui, skin, width, view, app);
         // 后台线程无须知道 egui；只有打开日志页时才定期刷新。
         ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
 
-    fn draw_snapshot(&mut self, ui: &mut Ui, skin: &Skin<'_>, width: f32, mut view: Snapshot) {
+    fn draw_snapshot(
+        &mut self,
+        ui: &mut Ui,
+        skin: &Skin<'_>,
+        width: f32,
+        mut view: Snapshot,
+        app: &mut AppState,
+    ) {
         let enabled = diagnostics::details_enabled();
         if enabled != self.details_were_enabled {
             self.reset_details();
@@ -106,7 +139,7 @@ impl LogViewState {
             ui.set_max_width(width);
             ui.spacing_mut().item_spacing = egui::vec2(m.s(8.0), m.s(8.0));
             ui.add(egui::Label::new(
-                RichText::new(tr("诊断仅存内存，重启清空，不上传、不发送给模型。启动故障另记本地概括日志，不含聊天或工具原文，也不受此处清空影响。"))
+                RichText::new(tr("诊断同时保留内存视图与本地文件日志；均不上传、不发送给模型。启动故障另记本地概括日志，不受此处清空影响。"))
                     .font(skin.prop(skin.t().caption)).color(p.label_secondary),
             ).wrap());
             ui.add(egui::Label::new(RichText::new(
@@ -117,7 +150,7 @@ impl LogViewState {
             #[cfg(test)]
             ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-logs-details-toggle"), toggle.rect));
             ui.add(egui::Label::new(RichText::new(
-                tr("详情可能含密钥等秘密，仅记录开启后的新错误。关闭后清除已保留详情，但不能撤回复制内容或擦除在途错误；不上传、不落盘、不发送给模型。")
+                tr("详情可能含密钥等秘密，仅记录开启后的新错误。关闭后清除已保留详情，但不能撤回复制内容或擦除在途错误；不上传、不发送给模型。")
             ).font(skin.prop(skin.t().caption)).color(p.warn)).wrap());
             if toggle.changed() {
                 diagnostics::set_details_enabled(enabled);
@@ -128,9 +161,75 @@ impl LogViewState {
             if let Some(dir) = crate::startup::log_dir() {
                 super::settings::kv_row(ui, skin, width, tr("启动日志目录"), &dir.display().to_string());
             }
+            let mut file_on = app.file_logging;
+            let file_label = tr("落盘详细日志").to_string();
+            let label_width = ui
+                .painter()
+                .layout_no_wrap(
+                    file_label.clone(),
+                    skin.prop(skin.t().label),
+                    p.label_primary,
+                )
+                .size()
+                .x;
+            let switch_fits = label_width + m.s(16.0) + neo_ui::Switch::size(&d).x <= width;
+            let mut file_switch = |ui: &mut egui::Ui| {
+                let response = neo_ui::Switch::new(file_on)
+                    .id_salt("neo-logs-file-toggle")
+                    .show(ui, &d);
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new("neo-logs-file-toggle-probe"), response.rect)
+                });
+                if response.changed() {
+                    file_on = !file_on;
+                }
+            };
+            if switch_fits {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(file_label)
+                            .font(skin.prop(skin.t().label))
+                            .color(p.label_primary),
+                    );
+                    file_switch(ui);
+                });
+            } else {
+                ui.scope(|ui| {
+                    ui.set_max_width(width);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(file_label)
+                                .font(skin.prop(skin.t().label))
+                                .color(p.label_primary),
+                        )
+                        .wrap(),
+                    );
+                    file_switch(ui);
+                });
+            }
+            if file_on != app.file_logging {
+                app.file_logging = file_on;
+                crate::filelog::set_enabled(file_on);
+            }
+            let file_stats = crate::filelog::stats();
+            let file_path = crate::filelog::path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| tr("不可用").to_string());
+            super::settings::kv_row(ui, skin, width, tr("运行日志数据库"), &file_path);
+            ui.add(egui::Label::new(RichText::new(tf(
+                "已写入 {lines} 行 · {bytes} KiB · 丢弃 {dropped} 行 · 容量上限 {limit} MiB · 保留 {days} 天",
+                &[
+                    ("lines", file_stats.lines.to_string()),
+                    ("bytes", (file_stats.bytes / 1024).to_string()),
+                    ("dropped", file_stats.dropped.to_string()),
+                    ("limit", (crate::filelog::MAX_DB_BYTES / (1024 * 1024)).to_string()),
+                    ("days", (crate::filelog::RETENTION_MS / 86_400_000).to_string()),
+                ],
+            )).font(skin.prop(skin.t().caption)).color(p.label_secondary)).wrap());
             let selected = self.level.and_then(|level| Level::ALL.iter().position(|value| *value == level))
                 .map_or(0, |index| index + 1);
-            let options = [tr("全部"), tr("调试"), tr("信息"), tr("警告"), tr("错误")];
+            let options = [tr("全部"), tr("追踪"), tr("调试"), tr("信息"), tr("警告"), tr("错误")];
             let mut selection = None;
             let segment_width = options.iter().map(|label| {
                 ui.painter().layout_no_wrap((*label).to_owned(), d.font_bold(d.t().label), p.label_primary)
@@ -164,6 +263,7 @@ impl LogViewState {
                 self.keyword.truncate(end);
             }
             let mut copy = false;
+            let mut export_clicked = false;
             let mut resume_follow = false;
             ui.horizontal_wrapped(|ui| {
                 let mut action = |label: &str, salt: &str| {
@@ -189,12 +289,18 @@ impl LogViewState {
                     view = diagnostics::snapshot();
                 }
                 copy = action(tr("复制筛选结果"), "neo-logs-copy");
+                export_clicked = action(tr("导出…"), "neo-logs-export");
             });
             let filtered = self.filtered_entries(&view);
             let entries = &filtered.indices;
             if copy {
                 // 只复制当前快照中匹配的脱敏条目，不复制输入条件或原始错误。
                 ui.ctx().copy_text(export(entries.iter().map(|&index| &view.entries[index])));
+            }
+            if export_clicked {
+                // 与「复制筛选结果」同一份脱敏文本，落到用户选定的 .log 文件。
+                let text = export(entries.iter().map(|&index| &view.entries[index]));
+                app.export_logs_dialog(ui.ctx(), text, entries.len());
             }
             ui.add(egui::Label::new(RichText::new(tf(
                 "显示 {shown} / {total} 条 · 文本 {bytes} / {max_bytes} KiB · 上限 {max_entries} 条、单条 {max_entry_bytes} 字节\n收到 {received} 次 · 聚合重复 {merged} 次 · 容量丢弃 {dropped} 次 · 截断 {truncated} 次（自清空起）",
@@ -238,15 +344,34 @@ impl LogViewState {
                 ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-logs-scroll-probe"),
                     (scroll.state.offset.y, scroll.inner_rect, scroll.content_size.y, scroll.inner)));
             }
-            if let Some(entry) = self.selected.and_then(|id| view.entries.iter().find(|entry| entry.id == id)) {
-                self.draw_detail(ui, entry);
-            } else if self.selected.take().is_some() {
-                self.copy_details_confirmed = false;
-                ui.label(tr("所选记录已被淘汰或清空。"));
-            } else {
-                ui.label(tr("选择记录查看位置与已捕获堆栈。"));
-            }
         });
+    }
+
+    /// 详情以模态呈现：设置面板在滚动区之外调用它，避免内容被裁剪。
+    pub fn draw_detail_modal(&mut self, ui: &mut Ui, skin: &Skin<'_>, escape_pressed: bool) {
+        let Some(entry_id) = self.selected else { return; };
+        let view = diagnostics::snapshot();
+        let Some(entry) = view.entries.iter().find(|entry| entry.id == entry_id) else {
+            self.selected = None;
+            self.copy_details_confirmed = false;
+            return;
+        };
+        let d = skin.d();
+        let m = skin.m();
+        let rhythm = neo_ui::modal::ModalRhythm::new(&d);
+        let content_h = (ui.ctx().content_rect().height() * 0.9 - rhythm.chrome()).max(m.s(120.0));
+        let modal = Modal::new(tr("日志详情"), ModalSize::Lg);
+        let Some(body) = modal.begin(ui, &d, Modal::height(&d, ModalSize::Lg, content_h)) else {
+            return;
+        };
+        at(ui, body, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(m.s(8.0), m.s(8.0));
+            self.draw_detail(ui, entry);
+        });
+        if modal.end(ui, &d) || escape_pressed {
+            self.selected = None;
+            self.copy_details_confirmed = false;
+        }
     }
 
     fn reset_details(&mut self) {
@@ -256,7 +381,6 @@ impl LogViewState {
     }
 
     fn draw_detail(&mut self, ui: &mut Ui, entry: &Entry) {
-        ui.separator();
         ui.label(tr(
             "错误详情 · 编译优化或缺少调试符号时，部分帧可能显示 unknown / <unknown>",
         ));
@@ -288,7 +412,7 @@ impl LogViewState {
         // Default label Copy/Cut bypasses consent; only the explicit button may export.
         egui::ScrollArea::both()
             .id_salt("neo-logs-detail-scroll")
-            .max_height(260.0)
+            .max_height(ui.available_height())
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 let report = ui.add(
@@ -344,6 +468,7 @@ impl LogViewState {
                     Level::Warn => skin.p().warn,
                     Level::Info => skin.p().label_primary,
                     Level::Debug => skin.p().label_secondary,
+                    Level::Trace => skin.p().label_tertiary,
                 };
                 let text = format_entry(entry);
                 let response = ui
@@ -373,7 +498,8 @@ fn matches_filter(entry: &Entry, level: Option<Level>, keyword: &str) -> bool {
     level.is_none_or(|level| entry.level == level)
         && (keyword.is_empty()
             || entry.component.to_lowercase().contains(keyword)
-            || entry.message.to_lowercase().contains(keyword))
+            || entry.message.to_lowercase().contains(keyword)
+            || entry.thread.to_lowercase().contains(keyword))
 }
 
 fn relative_time(ms: u64) -> String {
@@ -408,14 +534,22 @@ fn format_entry(entry: &Entry) -> String {
 
 fn detail_report(entry: &Entry) -> String {
     let mut text = tf(
-        "{entry}\n记录位置（非上游错误源）: {file}:{line}:{column}\n",
+        "{entry}\n线程: {thread}\n记录时间: {wall}\n记录位置（非上游错误源）: {file}:{line}:{column}\n",
         &[
             ("entry", format_entry(entry)),
+            ("thread", entry.thread.to_string()),
+            ("wall", crate::filelog::utc_millis(entry.wall_ms)),
             ("file", entry.source.file.to_owned()),
             ("line", entry.source.line.to_string()),
             ("column", entry.source.column.to_string()),
         ],
     );
+    if !entry.fields.is_empty() {
+        text.push_str(tr("结构化字段（已脱敏）：\n"));
+        for (key, value) in &entry.fields {
+            let _ = writeln!(text, "{key} = {value}");
+        }
+    }
     if !diagnostics::details_enabled() {
         text.push_str(tr("未捕获详情或详情已清除；详细诊断已关闭。\n"));
         return text;
@@ -468,12 +602,12 @@ fn detail_report(entry: &Entry) -> String {
 }
 
 fn export<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
-    let mut text = tf("Neo {version} · {os} / {arch} · diagnostics v1\n进程内相对时间；筛选结果可能不完整；不含配置、正文或命令。\n", &[
+    let mut text = tf("Neo {version} · {os} / {arch} · diagnostics v2\n进程内相对时间与线程名；筛选结果可能不完整；不含配置、正文或命令。\n", &[
             ("version", env!("CARGO_PKG_VERSION").to_owned()),
             ("os", std::env::consts::OS.to_owned()), ("arch", std::env::consts::ARCH.to_owned()),
         ]);
     for entry in entries {
-        let _ = writeln!(text, "{}", format_entry(entry));
+        let _ = writeln!(text, "{} · thread={}", format_entry(entry), entry.thread);
     }
     text
 }

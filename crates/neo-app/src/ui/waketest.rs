@@ -35,15 +35,17 @@ pub fn draw(ui: &mut egui::Ui, skin: &Skin<'_>, width: f32, state: &mut AppState
         ui.add(egui::Label::new(reason).wrap());
     }
     let active = test.requested || test.running;
-    let button = ui.add_enabled(
-        active || blocked.is_none(),
-        egui::Button::new(if active {
-            tr("停止测试")
-        } else {
-            tr("开始测试")
-        })
-        .wrap(),
-    );
+    let d = skin.d();
+    let button = neo_ui::Button::new(if active {
+        tr("停止测试")
+    } else {
+        tr("开始测试")
+    })
+    .elevated()
+    .enabled(active || blocked.is_none())
+    .wrap()
+    .id_salt("wake-test-button")
+    .show(ui, &d);
     #[cfg(test)]
     ui.ctx().data_mut(|data| {
         data.insert_temp(

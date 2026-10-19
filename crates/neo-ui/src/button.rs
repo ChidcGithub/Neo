@@ -54,6 +54,8 @@ pub struct Button<'a> {
     enabled: bool,
     /// 加载态：显示转圈、点击无效。
     loading: bool,
+    /// 文本过宽时换行而不是省略（窄列 / 窄屏回退用）。
+    wrap: bool,
     touch_layout: bool,
     id_salt: Option<egui::Id>,
 }
@@ -68,6 +70,7 @@ impl<'a> Button<'a> {
             full_width: false,
             enabled: true,
             loading: false,
+            wrap: false,
             touch_layout: false,
             id_salt: None,
         }
@@ -126,6 +129,15 @@ impl<'a> Button<'a> {
         self
     }
 
+    /// 文本超出可用宽度时换行（高度随行数增长），而非省略号截断。
+    ///
+    /// 窄列 / 窄屏回退用：标签短时与默认行为一致（按内容定宽），
+    /// 长到放不下时才换行 —— 与 `egui::Button::wrap` 同义。
+    pub fn wrap(mut self) -> Self {
+        self.wrap = true;
+        self
+    }
+
     /// 显式让触控热区占据布局，旧消费端尺寸保持不变。
     pub fn touch_layout(mut self) -> Self {
         self.touch_layout = true;
@@ -144,8 +156,8 @@ impl<'a> Button<'a> {
     /// 绘制并返回交互结果。
     pub fn show(self, ui: &mut Ui, d: &Design) -> Response {
         let m = d.m();
-        let h = self.height(d);
         let font = d.font_bold(d.t().label);
+        let pad_x = m.s(16.0);
 
         // 先量出所需宽度。
         let icon_w = if self.icon.is_some() {
@@ -158,16 +170,38 @@ impl<'a> Button<'a> {
         } else {
             0.0
         };
-        let text_w = ui
-            .painter()
-            .layout_no_wrap(self.label.to_owned(), font.clone(), egui::Color32::WHITE)
-            .size()
-            .x;
+        // 换行模式：按可用宽度排版一次，既拿宽度也拿行高。字色用占位符，
+        // 真正上色在拿到交互态之后（`galley` 的 fallback 会替换 PLACEHOLDER）。
+        let wrapped = if self.wrap {
+            let budget = (ui.available_width() - pad_x * 2.0 - icon_w - spinner_w).max(m.s(20.0));
+            Some(ui.painter().layout(
+                self.label.to_owned(),
+                font.clone(),
+                egui::Color32::PLACEHOLDER,
+                budget,
+            ))
+        } else {
+            None
+        };
+        let text_w = if let Some(g) = &wrapped {
+            g.size().x
+        } else {
+            ui.painter()
+                .layout_no_wrap(self.label.to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        };
+        // 换行时高度随行数增长；单行仍回落到标准高度，与非换行路径一致。
+        let h = if let Some(g) = &wrapped {
+            (g.size().y + m.s(8.0) * 2.0).max(self.height(d))
+        } else {
+            self.height(d)
+        };
         let content_w = icon_w + spinner_w + text_w;
         let width = if self.full_width {
             ui.available_width()
         } else {
-            content_w + m.s(16.0) * 2.0
+            content_w + pad_x * 2.0
         };
 
         let size = if self.touch_layout {
@@ -323,19 +357,26 @@ impl<'a> Button<'a> {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(60));
         }
-        let text_rect = if self.touch_layout && self.icon.is_none() && !self.loading {
-            draw_rect
+        if let Some(galley) = wrapped {
+            // 换行文本：整块水平贴内容、垂直居中于按钮。
+            let top_left = egui::pos2(cx, draw_rect.center().y - galley.size().y * 0.5);
+            painter.galley(top_left, galley, label_color);
         } else {
-            Rect::from_center_size(
-                egui::pos2(cx + text_w * 0.5, draw_rect.center().y),
-                Vec2::new(text_w, draw_rect.height()),
-            )
-        };
-        // 省略预算按按钮实际分到的宽度倒推（文本实测宽恒不大于它本身，
-        // 拿实测宽当预算是永远不会省略的死逻辑）。
-        let text_budget = (draw_rect.width() - m.s(16.0) * 2.0 - icon_w - spinner_w).max(m.s(20.0));
-        let shown = elide(painter, self.label, &font, text_budget);
-        text_center(painter, text_rect, &shown, font, label_color);
+            let text_rect = if self.touch_layout && self.icon.is_none() && !self.loading {
+                draw_rect
+            } else {
+                Rect::from_center_size(
+                    egui::pos2(cx + text_w * 0.5, draw_rect.center().y),
+                    Vec2::new(text_w, draw_rect.height()),
+                )
+            };
+            // 省略预算按按钮实际分到的宽度倒推（文本实测宽恒不大于它本身，
+            // 拿实测宽当预算是永远不会省略的死逻辑）。
+            let text_budget =
+                (draw_rect.width() - m.s(16.0) * 2.0 - icon_w - spinner_w).max(m.s(20.0));
+            let shown = elide(painter, self.label, &font, text_budget);
+            text_center(painter, text_rect, &shown, font, label_color);
+        }
 
         resp
     }

@@ -1807,6 +1807,124 @@ fn settings_model_empty_1080p() {
     assert!(p.is_file());
 }
 
+/// MOD 页 fixture 清单（ASCII 路径，避免 CJK 字形问题）。
+fn mods_fixture_manifest(id: &str, revision: u32, tools: usize) -> neo_tools::mods::Manifest {
+    let schema = serde_json::json!({
+        "type": "object", "properties": {}, "required": [],
+        "additionalProperties": false
+    });
+    let tool_list: Vec<serde_json::Value> = (0..tools)
+        .map(|index| {
+            serde_json::json!({
+                "name": format!("tool_{index}"),
+                "description": format!("演示工具 {index}"),
+                "input_schema": schema,
+                "output_schema": schema,
+            })
+        })
+        .collect();
+    serde_json::from_value(serde_json::json!({
+        "api_version": 1,
+        "id": id,
+        "revision": revision,
+        "executable": format!("bin/{id}.exe"),
+        "capabilities": ["workspace_read", "network"],
+        "limits": {
+            "timeout_ms": 5000, "memory_mib": 64, "max_in_flight": 2,
+            "max_message_bytes": 65536, "max_result_bytes": 32768
+        },
+        "tools": tool_list,
+    }))
+    .expect("fixture manifest")
+}
+
+fn seed_mod_row(app: &mut NeoApp, id: &str, revision: u32, tools: usize) {
+    app.state.mods.push(crate::mods::ModRow {
+        manifest: mods_fixture_manifest(id, revision, tools),
+        directory: std::path::PathBuf::from(format!("mods/{id}")),
+        executable: std::path::PathBuf::from(format!("bin/{id}.exe")),
+        status: crate::mods::ModStatus::Off,
+        expanded: false,
+    });
+}
+
+/// MOD 页的"目录是空的"现场：引导怎么放包、怎么重扫。
+#[test]
+fn settings_mods_empty_1080p() {
+    let p = shoot(
+        "31-settings-mods-empty-1080p",
+        Vec2::new(1920.0, 1080.0),
+        |app| {
+            app.state.theme_mode = ThemeMode::Dark;
+            app.state.distance = Distance::Classroom;
+            app.state.show_settings = true;
+            app.state.settings_tab = crate::state::SettingsTab::Mods;
+            app.state.mods_scanned = true;
+        },
+    );
+    assert!(p.is_file());
+}
+
+/// MOD 页列表：已允许 / 未允许 / 需重新确认三种状态并排。
+#[test]
+fn settings_mods_list_1080p() {
+    let p = shoot(
+        "32-settings-mods-list-1080p",
+        Vec2::new(1920.0, 1080.0),
+        |app| {
+            app.state.theme_mode = ThemeMode::Dark;
+            app.state.distance = Distance::Classroom;
+            app.state.show_settings = true;
+            app.state.settings_tab = crate::state::SettingsTab::Mods;
+            app.state.mods_scanned = true;
+            seed_mod_row(app, "org.example.notes", 1, 1);
+            seed_mod_row(app, "org.example.screencast", 2, 0);
+            seed_mod_row(app, "org.example.deck", 3, 2);
+            app.state.mod_grants.insert(
+                "org.example.notes".to_owned(),
+                crate::mods::Grant::from_manifest(&app.state.mods[0].manifest),
+            );
+            // 清单已到 revision 3，意图还停在 1 → 需重新确认。
+            app.state.mod_grants.insert(
+                "org.example.deck".to_owned(),
+                crate::mods::Grant {
+                    revision: 1,
+                    capabilities: app.state.mods[2].manifest.capabilities.clone(),
+                },
+            );
+            crate::mods::reconcile(&mut app.state.mods, &app.state.mod_grants);
+        },
+    );
+    assert!(p.is_file());
+}
+
+/// MOD 页展开详情：声明的能力 / 限制 / 工具全部是清单声明值。
+#[test]
+fn settings_mods_reconfirm_1080p() {
+    let p = shoot(
+        "33-settings-mods-reconfirm-1080p",
+        Vec2::new(1920.0, 1080.0),
+        |app| {
+            app.state.theme_mode = ThemeMode::Dark;
+            app.state.distance = Distance::Classroom;
+            app.state.show_settings = true;
+            app.state.settings_tab = crate::state::SettingsTab::Mods;
+            app.state.mods_scanned = true;
+            seed_mod_row(app, "org.example.deck", 3, 2);
+            app.state.mods[0].expanded = true;
+            app.state.mod_grants.insert(
+                "org.example.deck".to_owned(),
+                crate::mods::Grant {
+                    revision: 1,
+                    capabilities: app.state.mods[0].manifest.capabilities.clone(),
+                },
+            );
+            crate::mods::reconcile(&mut app.state.mods, &app.state.mod_grants);
+        },
+    );
+    assert!(p.is_file());
+}
+
 // ------------------------------------------------------------------
 // 审查截图：供 docs-pri/screens 肉眼核对（与断言型审查互补）
 // ------------------------------------------------------------------

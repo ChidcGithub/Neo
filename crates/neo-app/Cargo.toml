@@ -19,8 +19,10 @@ neo-tools = { workspace = true }
 neo-wake = { workspace = true }
 neo-stt = { workspace = true }
 neo-overlay = { workspace = true }
+neo-log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rusqlite = { workspace = true }
 reqwest = { workspace = true }
 semver = "1"
 base64 = "0.22.1"

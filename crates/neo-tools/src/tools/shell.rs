@@ -369,6 +369,7 @@ pub fn exec(
         // 只报告"已启动"：句柄丢弃后进程继续跑（关句柄 ≠ 杀进程）。
         drop(child);
         let head: String = command.chars().take(60).collect();
+        neo_log::info!("tools", "shell started"; "tool" => tool, "pid" => pid, "background" => true);
         return Ok(Outcome::ok(
             tool,
             format!("已在后台启动：`{head}`（PID {pid}）"),
@@ -399,6 +400,7 @@ pub fn exec(
     } else {
         format!("`{head}` 退出码 {exit_code}（{elapsed_ms} ms）")
     };
+    neo_log::info!("tools", "shell finished"; "tool" => tool, "exit" => exit_code, "elapsed_ms" => elapsed_ms);
 
     Ok(Outcome::ok(
         tool,

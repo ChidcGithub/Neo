@@ -1,9 +1,11 @@
-use super::{BoardKind, Permissions, MAX_LINE};
+use super::{BoardKind, LogRecord, Permissions, MAX_LINE, MAX_LOG_FIELDS, MAX_LOG_FIELD_KEY};
+use crate::diagnostics::Level;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::time::Instant;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RpcError {
@@ -107,6 +109,43 @@ fn parse_permissions(value: &Value) -> Result<Permissions, String> {
         return Err("classroom_safe forbids desktop capture".into());
     }
     Ok(Permissions::new(safe, capture, agent))
+}
+
+/// Strict, forward-compatible: unknown extra keys are ignored, but every supplied
+/// value must already be a string so the child cannot smuggle unbounded JSON.
+pub(super) fn parse_log(data: &Value) -> Result<LogRecord, String> {
+    let level = match data["level"].as_str() {
+        Some("trace") => Level::Trace,
+        Some("debug") => Level::Debug,
+        Some("info") => Level::Info,
+        Some("warn") => Level::Warn,
+        Some("error") => Level::Error,
+        _ => return Err("invalid log level".into()),
+    };
+    let message = data["message"]
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= MAX_LINE)
+        .ok_or("invalid log message")?
+        .to_owned();
+    let mut fields: Vec<(Box<str>, Box<str>)> = Vec::new();
+    if let Some(value) = data.get("fields") {
+        let object = value.as_object().ok_or("log fields must be an object")?;
+        if object.len() > MAX_LOG_FIELDS {
+            return Err("too many log fields".into());
+        }
+        for (key, value) in object {
+            if key.is_empty() || key.len() > MAX_LOG_FIELD_KEY {
+                return Err("invalid log field key".into());
+            }
+            let value = value.as_str().ok_or("log field values must be strings")?;
+            fields.push((key.as_str().into(), value.into()));
+        }
+    }
+    Ok(LogRecord {
+        level,
+        message,
+        fields: fields.into_boxed_slice(),
+    })
 }
 
 pub(super) fn validate_outbound(method: &str, params: &Value) -> Result<(), String> {
@@ -414,4 +453,9 @@ pub(super) struct Session {
     pub configured: bool,
     pub closed: bool,
     pub pending: HashMap<String, Pending>,
+    /// Rolling one-second window for child log events.
+    pub log_window: Instant,
+    pub log_count: u32,
+    pub bad_log_reported: bool,
+    pub log_drop_reported: bool,
 }

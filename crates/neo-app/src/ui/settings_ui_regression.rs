@@ -80,6 +80,7 @@ fn settings_i18n_english_pages_wrap_at_narrow_widths() {
                     SettingsTab::Display,
                     SettingsTab::Model,
                     SettingsTab::Memory,
+                    SettingsTab::Mods,
                     SettingsTab::About,
                 ] {
                     let ctx = context();
@@ -94,6 +95,8 @@ fn settings_i18n_english_pages_wrap_at_narrow_widths() {
                     state.language = Language::EnUs;
                     state.settings_tab = tab;
                     state.api_key = "PRIVATE-KEY-NOT-FOR-DISPLAY".into();
+                    // MOD 页守卫不触发真实扫描线程，直接给空结果。
+                    state.mods_scanned = true;
                     let size = egui::vec2(width, 16000.0);
                     let mut output = ctx.run_ui(
                         egui::RawInput {
@@ -119,6 +122,9 @@ fn settings_i18n_english_pages_wrap_at_narrow_widths() {
                                     |_, _| panic!("unexpected edit"),
                                     |_| panic!("unexpected delete"),
                                 ),
+                                SettingsTab::Mods => {
+                                    super::super::mods::draw(ui, &skin, w, &mut state)
+                                }
                                 SettingsTab::About => {
                                     about_tab(ui, &skin, w, &mut state, &LoadedFonts::default())
                                 }
@@ -213,6 +219,7 @@ fn settings_i18n_english_narrow_navigation_and_close_remain_reachable() {
                     &mut state,
                     size.y,
                     &LoadedFonts::default(),
+                    false,
                 ));
             };
             for _ in 0..2 {
@@ -332,6 +339,7 @@ fn ui_safety_narrow_settings_log_navigation_is_reachable() {
                 &mut state,
                 size.y,
                 &loaded,
+                false,
             );
         };
         for _ in 0..2 {
@@ -405,6 +413,7 @@ fn narrow_scaled_settings_keep_warnings_and_scrolled_safety_text_readable() {
                             &mut state,
                             size.y,
                             &LoadedFonts::default(),
+                            false,
                         );
                     });
                     output.textures_delta.clear();
@@ -717,6 +726,7 @@ fn long_page_title_reserves_clickable_close_target() {
                             &mut state,
                             size.y,
                             &loaded,
+                            false,
                         );
                     },
                 );
@@ -802,6 +812,7 @@ fn low_height_large_scale_keeps_body_scrollable_and_close_clear() {
                         &mut state,
                         height,
                         &LoadedFonts::default(),
+                        false,
                     );
                 },
             );

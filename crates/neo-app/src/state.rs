@@ -299,6 +299,7 @@ pub enum SettingsTab {
     Display,
     Model,
     Memory,
+    Mods,
     Logs,
     About,
 }
@@ -311,6 +312,7 @@ impl SettingsTab {
         (Self::Display, "显示"),
         (Self::Model, "模型"),
         (Self::Memory, "记忆"),
+        (Self::Mods, "MOD"),
         (Self::Logs, "日志"),
         (Self::About, "关于"),
     ];
@@ -321,6 +323,12 @@ pub enum MemoryIoMsg {
     /// 导入完成：Ok(新增数, 跳过数)。
     Imported(Result<(usize, usize), String>),
     /// 导出完成：Ok(条数)。
+    Exported(Result<usize, String>),
+}
+
+/// 日志导出对话框的回执。
+pub enum LogExportMsg {
+    /// 导出完成：Ok(写入的条数)。
     Exported(Result<usize, String>),
 }
 
@@ -680,6 +688,34 @@ impl Drop for CompactionJob {
     }
 }
 
+/// 一轮真实请求失败后的自动重试上限与退避。
+///
+/// 只重试传输类失败（连接失败、限流、5xx、流中断，分类见
+/// `neo_llm::retryable_failure`）；DeepSeek 偶发的 429/5xx 与网络抖动通常
+/// 一次退避就能过，三次都失败说明服务真的不可用，转成普通错误交给用户。
+pub const MAX_STREAM_RETRIES: u32 = 3;
+
+/// 第 `attempt` 次（从 1 起）重试前的等待：2s → 4s → 8s 指数退避。
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    debug_assert!(attempt >= 1);
+    std::time::Duration::from_secs(2u64 << (attempt - 1).min(2))
+}
+
+/// 一轮生成失败后的自动重试排程（见 [`AppState::schedule_retry`]）。
+///
+/// 排程记录**存活到下一次失败或成功收尾**：到点重发只置 `fired`，不清记录 ——
+/// 重发再失败时，`schedule_retry` 靠它知道这是第几次，才能递增到上限。
+pub struct RetryState {
+    /// 即将进行/刚发起的重试序号（从 1 起）。
+    pub attempt: u32,
+    /// 到点时刻；由 tick 里的重试块发起重发。
+    pub due: std::time::Instant,
+    /// 已在界面播报过（toast 只发一次）。
+    pub announced: bool,
+    /// 已到点重发过；等待期（未 fired）时 pump 保持生成态不读流。
+    pub fired: bool,
+}
+
 pub struct AppState {
     pub language: crate::i18n::Language,
     // ---- 外观 ----
@@ -723,6 +759,8 @@ pub struct AppState {
     pub memory_editing: Option<(u64, String)>,
     /// 记忆导入导出对话框的结果通道（rfd 是阻塞调用，挪到独立线程）。
     pub memory_io_rx: Option<std::sync::mpsc::Receiver<MemoryIoMsg>>,
+    /// 日志导出对话框的结果通道。
+    pub log_export_rx: Option<std::sync::mpsc::Receiver<LogExportMsg>>,
     /// 关闭窗口时最小化到系统托盘（后台运行），而不是直接退出。
     pub minimize_to_tray: bool,
     /// "Hi, Neo" 语音唤醒开关。
@@ -740,6 +778,8 @@ pub struct AppState {
     pub silent_startup_errors: bool,
     /// 每次运行延后检查一次 GitHub 发布，不自动下载。
     pub auto_check_updates: bool,
+    /// 详细日志落盘开关（默认开）；关闭后仅保留内存诊断视图。
+    pub file_logging: bool,
     pub update_check_requested: bool,
     pub update_status: crate::updates::Status,
     /// 课堂总结状态行（「记录中…」「等待收尾…」），由 app 每帧从 ClassMonitor 同步。
@@ -772,6 +812,8 @@ pub struct AppState {
     pub pending_persist: usize,
     /// submit 后请求一条离线演示回复（未配置密钥时的降级路径）。
     pub wants_demo_reply: bool,
+    /// 待执行的自动重试（传输类失败后排程；None = 没有在等重试）。
+    pub retry: Option<RetryState>,
 
     // ---- 工具调用 ----
     /// 本轮流式里收到的工具调用分片（按 index 聚合，见 `neo_llm::assemble`）。
@@ -801,6 +843,10 @@ pub struct AppState {
     /// 工具可能是几分钟的编译，**不能在渲染循环里同步跑**；这里只存句柄，
     /// 结果由 [`AppState::poll_tool_jobs`] 逐帧收。
     tool_jobs: Vec<ToolJob>,
+    /// 用户在屏幕任务运行期间从任务栏唤回了主窗口：本轮不再派发桌面
+    /// 工具（再最小化会和用户抢窗口），由 `spawn_ready_tools` 快速失败。
+    /// 新任务（`begin_task`）自动恢复。
+    pub desktop_user_restored: bool,
     pub(crate) desktop_execution: Option<DesktopExecution>,
 
     /// 可选模型列表。**默认为空** —— 只由模型商提供：
@@ -812,6 +858,18 @@ pub struct AppState {
     model_fetch_config: Option<(String, String)>,
     /// 最近一次拉取的失败原因（成功则为 None）。
     pub model_fetch_error: Option<String>,
+
+    // ---- MOD（只读发现 + 启用意图；Phase 1 不启动任何进程）----
+    /// 扫描出的 MOD 行。空 = 还没扫过或没有发现。
+    pub mods: Vec<crate::mods::ModRow>,
+    /// 后台扫描的结果通道。
+    pub mods_scan: Option<std::sync::mpsc::Receiver<Result<Vec<crate::mods::ModRow>, String>>>,
+    /// 最近一次扫描的失败原因（契约层静态文案）。
+    pub mods_scan_error: Option<String>,
+    /// 是否已完成首次扫描（含失败）；防止错误后每帧自动重试。
+    pub mods_scanned: bool,
+    /// 启用意图表：MOD id → 绑定 revision + 能力集的授权。
+    pub mod_grants: std::collections::BTreeMap<String, crate::mods::Grant>,
 
     // ---- 模型配置（设置面板里可编辑）----
     pub api_base: String,
@@ -868,6 +926,7 @@ impl Default for AppState {
             memory_draft: String::new(),
             memory_editing: None,
             memory_io_rx: None,
+            log_export_rx: None,
             minimize_to_tray: true,
             wake_enabled: true,
             floating_enabled: false,
@@ -877,6 +936,7 @@ impl Default for AppState {
             classroom_safe: true,
             silent_startup_errors: false,
             auto_check_updates: true,
+            file_logging: true,
             update_check_requested: false,
             update_status: crate::updates::Status::Idle,
             class_status: None,
@@ -894,6 +954,8 @@ impl Default for AppState {
             stream_started: None,
             pending_persist: 0,
             wants_demo_reply: false,
+            retry: None,
+            desktop_user_restored: false,
             tool_frags: Vec::new(),
             tool_round: false,
             tool_open: false,
@@ -916,6 +978,11 @@ impl Default for AppState {
             model_fetch: None,
             model_fetch_config: None,
             model_fetch_error: None,
+            mods: Vec::new(),
+            mods_scan: None,
+            mods_scan_error: None,
+            mods_scanned: false,
+            mod_grants: std::collections::BTreeMap::new(),
             api_base: "https://api.deepseek.com".to_owned(),
             api_key: String::new(),
             db_path: None,
@@ -1154,6 +1221,88 @@ impl AppState {
                 false
             }
         }
+    }
+
+    /// 发起一次后台 MOD 扫描（不阻塞界面）。已有扫描在飞就忽略。
+    ///
+    /// 扫描是只读的：不创建根目录、不启动进程。首次扫描由设置页首绘触发，
+    /// 失败后不自动重试（[`AppState::mods_scanned`] 已置位），只能手动重扫。
+    pub fn start_mods_scan(&mut self) {
+        if self.mods_scan.is_some() {
+            return;
+        }
+        self.mods_scan_error = None;
+        let root = crate::mods::root();
+        let (tx, rx) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("neo-mods-scan".to_owned())
+            .spawn(move || {
+                let _ = tx.send(crate::mods::scan(&root));
+            }) {
+            Ok(_) => self.mods_scan = Some(rx),
+            Err(error) => {
+                diagnostics::record_error("mods", "MOD 扫描线程启动失败", &error);
+                self.mods = Vec::new();
+                self.mods_scanned = true;
+                self.mods_scan_error = Some(error.to_string());
+            }
+        }
+    }
+
+    /// 收扫描结果。返回 `true` 表示本帧拿到了结果（列表或错误变了）。
+    ///
+    /// 失败整批作废（fail-closed）：清空已展示的列表，只留静态错误文案。
+    pub fn poll_mods_scan(&mut self) -> bool {
+        let Some(rx) = self.mods_scan.as_ref() else {
+            return false;
+        };
+        let received = rx.try_recv();
+        match received {
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.mods_scan = None;
+                self.mods_scanned = true;
+                self.mods = Vec::new();
+                self.mods_scan_error = Some(tf("MOD 扫描意外中断", &[]));
+                true
+            }
+            Ok(result) => {
+                self.mods_scan = None;
+                self.mods_scanned = true;
+                match result {
+                    Ok(mut rows) => {
+                        crate::mods::reconcile(&mut rows, &self.mod_grants);
+                        self.mods = rows;
+                        self.mods_scan_error = None;
+                    }
+                    Err(error) => {
+                        self.mods = Vec::new();
+                        self.mods_scan_error = Some(error);
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    /// 翻转一个 MOD 的启用意图：开 → 记入当前 manifest 的授权；
+    /// 关 → 撤掉授权。之后按授权表重算所有行的状态。
+    ///
+    /// `NeedsReconfirm` 的行开关显示为关：再打开一次就是**重新确认**
+    /// （旧授权被当前 manifest 的授权覆盖，而不是叠加）。
+    pub fn toggle_mod(&mut self, id: &str) {
+        let Some(row) = self.mods.iter().find(|row| row.manifest.id == id) else {
+            return;
+        };
+        if row.status == crate::mods::ModStatus::On {
+            self.mod_grants.remove(id);
+        } else {
+            self.mod_grants.insert(
+                id.to_owned(),
+                crate::mods::Grant::from_manifest(&row.manifest),
+            );
+        }
+        crate::mods::reconcile(&mut self.mods, &self.mod_grants);
     }
 
     /// 用模型商给的 id 列表替换可选模型（也是从库里读回时的入口）。
@@ -2030,6 +2179,36 @@ impl AppState {
         }
     }
 
+    /// 弹出「导出日志」保存框，把 UI 线程算好的日志文本写成 .log 文件。
+    ///
+    /// 文本在调用前就已序列化完毕：rfd 与写盘都挪进独立线程，不卡绘制。
+    pub fn export_logs_dialog(&mut self, ctx: &egui::Context, text: String, count: usize) {
+        if self.log_export_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repaint = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("neo-log-export".into())
+            .spawn(move || {
+                let picked = rfd::FileDialog::new()
+                    .set_title(tr("导出日志"))
+                    .set_file_name("neo-runtime.log")
+                    .add_filter(tr("日志文件"), &["log"])
+                    .save_file();
+                let Some(path) = picked else { return };
+                let result = std::fs::write(&path, text)
+                    .map(|()| count)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(LogExportMsg::Exported(result));
+                repaint.request_repaint();
+            });
+        match spawned {
+            Ok(_) => self.log_export_rx = Some(rx),
+            Err(error) => diagnostics::record_error("logs", "日志导出线程启动失败", &error),
+        }
+    }
+
     // ---- 工具执行 ----
 
     /// 工具的工作区根目录。
@@ -2271,6 +2450,33 @@ impl AppState {
             }
             let tool_name = diagnostics::known_tool(&name);
             let span = self.tool_diagnostic(i);
+            // 用户在整轮暂避期间从任务栏唤回了主窗口：本轮不再执行任何
+            // 需要暂避的桌面操作 —— 再最小化就是和用户抢窗口。快速失败
+            // 并把原因写回给模型；文字/文件类工具不受影响，任务照常继续。
+            // （旧行为是整个任务被 cancel，气泡只剩「（空回复）已停止」。）
+            if self.desktop_user_restored && needs_desktop(&name, &args) {
+                span.event(
+                    Phase::Denied,
+                    Details {
+                        failure: Some(Failure::Tool(neo_tools::ErrorKind::NotAllowed)),
+                        ..Details::tool(tool_name)
+                    },
+                );
+                self.tool_diagnostics.remove(&i);
+                store_outcome(
+                    &mut self.messages[i],
+                    neo_tools::Outcome::fail(
+                        tool_name,
+                        neo_tools::ToolError::new(
+                            neo_tools::ErrorKind::NotAllowed,
+                            "用户已从任务栏唤回 Neo 主窗口，本轮的屏幕操作已停用",
+                        )
+                        .with_hint("不要重试屏幕操作；请直接用文字说明或继续其余部分，屏幕操作需用户重新发起任务"),
+                    ),
+                );
+                self.messages[i].tool.as_mut().unwrap().state = ToolState::Denied;
+                continue;
+            }
             if let Some(tool) = neo_tools::find(&name) {
                 if let neo_tools::Decision::Deny(reason) = policy.decide(tool, &args) {
                     span.event(
@@ -2594,6 +2800,8 @@ impl AppState {
         self.round_cancelled = false;
         self.task_tool_calls = 0;
         self.task_limit_reached = false;
+        self.retry = None;
+        self.desktop_user_restored = false;
     }
 
     pub(crate) fn finish_task_diagnostic(&mut self, phase: Phase, failure: Option<Failure>) {
@@ -2667,6 +2875,12 @@ impl AppState {
         if self.compaction.is_some() {
             return true;
         }
+        // 等待自动重试：上一条流已结束，到点前保持生成态；
+        // 到点重发由调用方（tick）负责，这里什么都不做。
+        // fired = 已重发、正在读新流，不在此拦。
+        if self.retry.as_ref().is_some_and(|r| !r.fired) {
+            return true;
+        }
         if !self.generating {
             return false;
         }
@@ -2705,6 +2919,12 @@ impl AppState {
                             // 上一轮未执行的工具幽灵复活（已「本会话都允许」时
                             // 会不经询问直接跑旧命令）。cancel() 同样清。
                             self.tool_frags.clear();
+                            // 传输类失败自动重试；排程成功时保持生成态，
+                            // 占位消息转显示「N 秒后自动重试」。
+                            let retryable = neo_llm::retryable_failure(&msg);
+                            if self.schedule_retry(&msg, retryable) {
+                                return false;
+                            }
                             self.end_stream(Some(msg));
                             return false;
                         }
@@ -2723,7 +2943,11 @@ impl AppState {
                             },
                         );
                     }
-                    self.end_stream(Some(tr("连接异常中断（流线程退出），请重试").to_owned()));
+                    let reason = tr("连接异常中断（流线程退出），请重试").to_owned();
+                    // 线程退出多为基础网络故障，同样走自动重试。
+                    if !self.schedule_retry(&reason, true) {
+                        self.end_stream(Some(reason));
+                    }
                     return false;
                 }
             }
@@ -2769,6 +2993,8 @@ impl AppState {
 
     /// 结束生成。`error` 非空表示失败。
     fn end_stream(&mut self, error: Option<String>) {
+        // 流已出终态：上一轮的排程记录（若有）就此作废。
+        self.retry = None;
         if let Some(span) = self.stream_diagnostic.take() {
             span.event(
                 if error.is_some() {
@@ -2812,6 +3038,100 @@ impl AppState {
         self.end_stream(error);
     }
 
+    /// 一轮真实请求失败后的自动重试排程。返回 `true` 表示已排程。
+    ///
+    /// 只重试传输类失败（`retryable` 由 `neo_llm::retryable_failure` 判定）；
+    /// 参数/鉴权/预算/协议守卫类失败重试也不会好，直接走普通失败收尾。
+    /// 排程后**保持生成态**：占位消息里的半截输出作废清空，meta 行改为
+    /// 「N 秒后自动重试」；到点由 tick 调 [`AppState::resume_generation`] 重发，
+    /// 仍然复用同一条占位消息，不新开气泡。
+    pub fn schedule_retry(&mut self, error: &str, retryable: bool) -> bool {
+        if !retryable
+            || self.round_cancelled
+            || self.compaction.is_some()
+            || !self.can_call_real()
+        {
+            return false;
+        }
+        let attempt = self.retry.as_ref().map_or(0, |r| r.attempt);
+        if attempt >= MAX_STREAM_RETRIES {
+            return false;
+        }
+        let attempt = attempt + 1;
+        let delay = retry_delay(attempt);
+        // meta 一行放不下长错误正文，只保留开头一段给用户看个大概。
+        let reason: String = error.chars().take(60).collect();
+        if let Some(last) = self.messages.last_mut() {
+            if last.streaming {
+                // 半截输出作废：重试是整轮重发，续在残句上只会更乱。
+                last.content.clear();
+                last.reasoning.clear();
+                last.meta = tf(
+                    "接口中断，{secs} 秒后自动重试（{attempt}/{max}）：{reason}",
+                    &[
+                        ("secs", delay.as_secs().to_string()),
+                        ("attempt", attempt.to_string()),
+                        ("max", MAX_STREAM_RETRIES.to_string()),
+                        ("reason", reason.clone()),
+                    ],
+                );
+            }
+        }
+        // 上一条流按失败记账；重试成功后续流会有自己的 Started 事件。
+        if let Some(span) = self.stream_diagnostic.take() {
+            span.event(
+                Phase::Failed,
+                Details {
+                    failure: Some(Failure::Transport),
+                    ..Details::default()
+                },
+            );
+        }
+        self.retry = Some(RetryState {
+            attempt,
+            due: std::time::Instant::now() + delay,
+            announced: false,
+            fired: false,
+        });
+        true
+    }
+
+    /// 重试到点后续流：占位消息仍在流式状态，直接复用，不新开气泡。
+    pub fn resume_generation(&mut self, source: StreamSource) {
+        let span = self.child_diagnostic(if matches!(&source, StreamSource::Real(_)) {
+            "model"
+        } else {
+            "demo"
+        });
+        span.event(Phase::Started, Details::default());
+        self.stream_diagnostic = Some(span);
+        self.stream_started = Some(std::time::Instant::now());
+        self.stream = Some(source);
+    }
+
+    /// 生成态强制收尾（重试发起失败等）：占位消息落错误，不留悬空的生成态。
+    pub fn abort_generation(&mut self, error: String) {
+        self.retry = None;
+        if let Some(span) = self.stream_diagnostic.take() {
+            span.event(
+                Phase::Failed,
+                Details {
+                    failure: Some(diagnostics::model_failure(&error)),
+                    ..Details::default()
+                },
+            );
+        }
+        self.stream = None;
+        self.generating = false;
+        self.stream_started = None;
+        if let Some(last) = self.messages.last_mut() {
+            if last.streaming {
+                last.streaming = false;
+                last.error = Some(error);
+            }
+        }
+    }
+
     /// 取消当前这一「轮」（发送位上的停止按钮 / Esc）。已生成的部分保留。
     ///
     /// 不止停当前流：没拼完的工具分片、排队与执行中的工具一起收掉。
@@ -2850,6 +3170,8 @@ impl AppState {
         self.tool_open = false;
         // ToolJob::drop 先置取消 token，再丢接收端；已发生的副作用无法回滚。
         self.tool_jobs.clear();
+        // 到点未发的重试一并取消。
+        self.retry = None;
         neo_tools::tools::screenshot_space::invalidate();
         neo_tools::tools::screen_uia::cache_invalidate();
         // 挂起/执行中的工具标记为已取消，并补上对模型可见的结果：

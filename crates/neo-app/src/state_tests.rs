@@ -1983,3 +1983,31 @@
         assert_eq!(s.api_messages(10).len(), 31); // system + 全部历史
         assert_eq!(s.api_messages(10)[1].content, "m0");
     }
+
+    #[test]
+    fn user_restored_window_fails_desktop_tools_fast_without_hide() {
+        let mut state = AppState::with_store(false, None);
+        state.classroom_safe = false;
+        state.desktop_user_restored = true;
+        let (requests, rx) = std::sync::mpsc::channel();
+        state.desktop_execution = Some(DesktopExecution { requests, active: Default::default(), overlay: None });
+        let mut meta = ToolMeta::restored("screenshot");
+        meta.name = "screenshot".into();
+        meta.state = ToolState::Running;
+        meta.args = serde_json::json!({});
+        state.messages.push(ChatMessage::tool_result(meta, String::new()));
+        assert_eq!(state.spawn_ready_tools(&neo_tools::Scope::new(std::env::temp_dir())), 0);
+        assert!(rx.try_recv().is_err(), "不得请求窗口暂避");
+        assert!(state.tool_jobs.is_empty(), "不得派发工具线程");
+        let tool = state.messages[0].tool.as_ref().unwrap();
+        assert_eq!(tool.state, ToolState::Denied);
+        assert!(tool
+            .outcome
+            .as_ref()
+            .unwrap()
+            .to_model_json(usize::MAX)
+            .contains("屏幕操作已停用"));
+        // 新任务自动恢复屏幕操作。
+        state.begin_task();
+        assert!(!state.desktop_user_restored);
+    }

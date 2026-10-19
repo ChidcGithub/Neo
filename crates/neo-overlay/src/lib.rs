@@ -683,12 +683,14 @@ impl OverlayHandle {
 
     /// 显示全屏跑马灯并开始渲染。
     pub fn show(&self) {
+        neo_log::debug!("overlay", "visibility changed"; "visible" => true);
         self.post(Cmd::Show);
     }
 
     /// 立即停止新采集，跑马灯用已有纹理淡出；卡片不受影响。
     /// 已取得许可的在途采集无法回滚，其迟到结果会被丢弃。
     pub fn hide(&self) {
+        neo_log::debug!("overlay", "visibility changed"; "visible" => false);
         self.post(Cmd::Hide);
     }
 
@@ -749,6 +751,7 @@ impl OverlayHandle {
 
     /// 立即关采集门并请求退出；不等待可能卡在驱动里的窗口线程。
     pub fn shutdown(&mut self) {
+        neo_log::info!("overlay", "overlay shutdown");
         self.stop.store(true, Ordering::Release);
         self.visible.store(false, Ordering::Relaxed);
         self.post(Cmd::Shutdown);
@@ -826,7 +829,7 @@ pub fn start() -> Result<OverlayHandle, String> {
             })
             .map_err(|e| format!("创建 neo-overlay 线程失败: {e}"))?
     };
-    OverlayHandle {
+    let handle = OverlayHandle {
         tx: cmd_tx,
         tid: 0,
         level,
@@ -839,7 +842,13 @@ pub fn start() -> Result<OverlayHandle, String> {
         #[cfg(test)]
         wake_count: None,
     }
-    .await_ready(ready_rx, START_TIMEOUT)
+    .await_ready(ready_rx, START_TIMEOUT);
+    if handle.is_ok() {
+        neo_log::info!("overlay", "overlay started");
+    } else {
+        neo_log::warn!("overlay", "overlay start failed"; "category" => "init");
+    }
+    handle
 }
 
 /// 窗口线程主函数。

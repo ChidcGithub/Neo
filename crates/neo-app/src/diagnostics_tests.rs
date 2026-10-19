@@ -14,12 +14,12 @@
         let mut buffer = Buffer::new(MAX_ENTRIES, MAX_BYTES, MAX_ENTRY_BYTES);
         let trace = synthetic_trace(60 * 1024, 7);
         buffer.push_event(Level::Error, "tool", "failed", 0, RecordLocation::default(),
-            Some((trace.clone(), TraceKind::Creation)));
+            Some((trace.clone(), TraceKind::Creation)), "", 0, &[]);
         let cached = buffer.snapshot();
         assert!(cached.entries[0].trace.as_ref().unwrap().inspect(|value| value.unwrap().backtrace.len()) > MAX_ENTRY_BYTES);
         for now in 1..100 {
             buffer.push_event(Level::Error, "tool", "failed", now, RecordLocation::default(),
-                Some((trace.clone(), TraceKind::Creation)));
+                Some((trace.clone(), TraceKind::Creation)), "", 0, &[]);
             assert!(buffer.stats.trace_bytes <= MAX_TRACE_BYTES);
             assert_eq!(buffer.stats.trace_bytes, buffer.traces.iter().map(|(_, _, bytes)| bytes).sum::<usize>());
         }
@@ -37,11 +37,11 @@
     fn detail_bounds_reject_oversize_and_summary_eviction_releases_trace() {
         let mut buffer = Buffer::new(1, 100, 40);
         buffer.push_event(Level::Error, "tool", "first", 0, RecordLocation::default(),
-            Some((synthetic_trace(MAX_TRACE_ENTRY_BYTES + 100, 1), TraceKind::Creation)));
+            Some((synthetic_trace(MAX_TRACE_ENTRY_BYTES + 100, 1), TraceKind::Creation)), "", 0, &[]);
         assert!(buffer.entries[0].trace.is_none());
         assert_eq!(buffer.stats.traces_dropped, 1);
         buffer.push_event(Level::Error, "tool", "second", 1, RecordLocation::default(),
-            Some((synthetic_trace(8_000, 2), TraceKind::Creation)));
+            Some((synthetic_trace(8_000, 2), TraceKind::Creation)), "", 0, &[]);
         let old = buffer.snapshot();
         buffer.push(Level::Info, "app", "third", 2);
         assert_eq!(buffer.stats.trace_bytes, 0);
@@ -61,7 +61,7 @@
         let mut buffer = Buffer::new(10, 1000, 100);
         for line in [1, 2] {
             buffer.push_event(Level::Error, "tool", "same", 0, RecordLocation::default(),
-                Some((synthetic_trace(100, line), TraceKind::Creation)));
+                Some((synthetic_trace(100, line), TraceKind::Creation)), "", 0, &[]);
         }
         assert_eq!(buffer.entries.len(), 2);
         assert_eq!(buffer.stats.merged, 0);
@@ -193,7 +193,7 @@
             let trace = synthetic_trace(60 * 1024, line);
             weak.push(Arc::downgrade(&trace));
             buffer.push_event(Level::Error, "tool", "failed", u64::from(line), RecordLocation::default(),
-                Some((trace, TraceKind::Creation)));
+                Some((trace, TraceKind::Creation)), "", 0, &[]);
             snapshots.push(buffer.snapshot());
         }
         assert!(weak[0].upgrade().is_none(), "budget eviction must free the raw allocation");

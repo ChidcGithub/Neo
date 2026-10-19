@@ -355,3 +355,31 @@ fn close_timeout_preserves_handle_and_blocks_exit() {
     assert!(!manager.closed());
     assert!(manager.boards[0].state.as_ref().unwrap().dirty);
 }
+
+#[test]
+fn board_log_events_land_in_diagnostics_with_the_board_component() {
+    let mut manager = DrawingManager::default();
+    let fake = ready(&mut manager, BoardKind::Blackboard, 22);
+    let fields = vec![
+        ("category".to_owned().into_boxed_str(), "gpu".to_owned().into_boxed_str()),
+    ]
+    .into_boxed_slice();
+    let snapshot = crate::diagnostics::capture_for_test(|| {
+        fake.emit(Event::Log(crate::drawing_runtime::LogRecord {
+            level: crate::diagnostics::Level::Warn,
+            message: "brush pipeline failed".into(),
+            fields,
+        }));
+        manager.poll(true);
+    });
+    let entry = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.message.contains("brush pipeline failed"))
+        .expect("board log must reach diagnostics");
+    assert_eq!(&*entry.component, "blackboard");
+    assert_eq!(entry.level, crate::diagnostics::Level::Warn);
+    assert!(entry.thread.ends_with("-child"), "{}", entry.thread);
+    assert_eq!(&*entry.fields[0].0, "category");
+    assert_eq!(&*entry.fields[0].1, "gpu");
+}

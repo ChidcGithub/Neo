@@ -90,6 +90,7 @@ impl SttEngine {
             ("VAD 模型", &cfg.vad_model),
         ] {
             if !p.is_file() {
+                neo_log::warn!("stt", "engine create failed"; "category" => "missing", "part" => label);
                 return Err(format!("{label}不存在：{}", p.display()));
             }
         }
@@ -127,6 +128,7 @@ impl SttEngine {
         let recognizer = OfflineRecognizer::create(&rec_cfg)
             .ok_or_else(|| "SenseVoice 初始化失败（模型文件可能不兼容）".to_string())?;
 
+        neo_log::info!("stt", "engine created"; "threads" => cfg.asr_threads, "language" => cfg.language.as_str());
         Ok(Self {
             vad,
             recognizer,
@@ -187,15 +189,22 @@ impl SttEngine {
     /// 空语音/无法识别时返回空串。
     pub fn transcribe(&self, samples: &[f32]) -> Result<String, String> {
         if samples.is_empty() {
+            neo_log::info!("stt", "transcribed"; "samples" => 0usize, "chars" => 0usize);
             return Ok(String::new());
         }
         let stream = self.recognizer.create_stream();
         stream.accept_waveform(SAMPLE_RATE, samples);
         self.recognizer.decode(&stream);
-        let result = stream
-            .get_result()
-            .ok_or_else(|| "SenseVoice 解码失败".to_string())?;
-        Ok(result.text.trim().to_string())
+        let result = match stream.get_result() {
+            Some(result) => result,
+            None => {
+                neo_log::warn!("stt", "transcribe failed"; "category" => "decode", "samples" => samples.len());
+                return Err("SenseVoice 解码失败".to_string());
+            }
+        };
+        let text = result.text.trim().to_string();
+        neo_log::info!("stt", "transcribed"; "samples" => samples.len(), "chars" => text.chars().count());
+        Ok(text)
     }
 }
 

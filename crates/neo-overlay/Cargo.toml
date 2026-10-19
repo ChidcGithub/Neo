@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 neo-tools = { workspace = true }
 neo-theme = { workspace = true }
+neo-log = { workspace = true }
 # 统一渲染层：卡片 UI 用内嵌的独立 egui 上下文绘制（与主界面 eframe
 # 互不干扰）。egui-wgpu 0.36 内部就是 wgpu 30，与本 crate 同源同 device。
 egui = "0.36.2"

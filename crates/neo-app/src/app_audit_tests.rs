@@ -329,7 +329,7 @@ fn settings_switch_rect_is_stable_and_inside_its_row() {
     let draw = |ui: &mut egui::Ui, skin: &Skin<'_>, state: &mut AppState| {
         let rect = Rect::from_min_size(Pos2::ZERO, size);
         let fonts = neo_theme::fonts::LoadedFonts::default();
-        crate::ui::settings::panel(ui, skin, rect, state, size.y, &fonts);
+        crate::ui::settings::panel(ui, skin, rect, state, size.y, &fonts, false);
     };
     // 稳定三帧。
     for _ in 0..3 {
@@ -614,7 +614,7 @@ fn settings_segmented_rects_stable_under_hover() {
     let draw = |ui: &mut egui::Ui, skin: &Skin<'_>, state: &mut AppState| {
         let rect = Rect::from_min_size(Pos2::ZERO, size);
         let fonts = neo_theme::fonts::LoadedFonts::default();
-        crate::ui::settings::panel(ui, skin, rect, state, size.y, &fonts);
+        crate::ui::settings::panel(ui, skin, rect, state, size.y, &fonts, false);
     };
     for _ in 0..3 {
         frame_themed(&ctx, size, vec![], ThemeMode::Light, |ui, skin| {
@@ -664,7 +664,7 @@ fn settings_input_rect_stable_under_focus() {
     let draw = |ui: &mut egui::Ui, skin: &Skin<'_>, state: &mut AppState| {
         let rect = Rect::from_min_size(Pos2::ZERO, size);
         let fonts = neo_theme::fonts::LoadedFonts::default();
-        crate::ui::settings::panel(ui, skin, rect, state, size.y, &fonts);
+        crate::ui::settings::panel(ui, skin, rect, state, size.y, &fonts, false);
     };
     for _ in 0..3 {
         frame_themed(&ctx, size, vec![], ThemeMode::Light, |ui, skin| {
@@ -892,7 +892,7 @@ fn settings_switch_rect_stable_across_on_off_states() {
     let draw = |ui: &mut egui::Ui, skin: &Skin<'_>, state: &mut AppState| {
         let rect = Rect::from_min_size(Pos2::ZERO, size);
         let fonts = neo_theme::fonts::LoadedFonts::default();
-        crate::ui::settings::panel(ui, skin, rect, state, size.y, &fonts);
+        crate::ui::settings::panel(ui, skin, rect, state, size.y, &fonts, false);
     };
     let probe = egui::Id::new("settings-floating-probe");
 
@@ -962,6 +962,7 @@ const PAGE_SOURCES: &[(&str, &str)] = &[
     ("ui/markdown.rs", include_str!("ui/markdown.rs")),
     ("ui/math.rs", include_str!("ui/math.rs")),
     ("ui/miniwin.rs", include_str!("ui/miniwin.rs")),
+    ("ui/mods.rs", include_str!("ui/mods.rs")),
     ("ui/settings.rs", include_str!("ui/settings.rs")),
     ("ui/sidebar.rs", include_str!("ui/sidebar.rs")),
     ("ui/toastwin.rs", include_str!("ui/toastwin.rs")),

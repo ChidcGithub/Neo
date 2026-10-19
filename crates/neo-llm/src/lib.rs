@@ -709,6 +709,34 @@ impl Stream {
     }
 }
 
+/// 判断一次 [`Event::Failed`] 是否值得自动重试。
+///
+/// 只重试**传输与服务端**故障：连接失败、限流（429）、请求超时（408）、
+/// 5xx，以及流式读取中途断开。参数、鉴权、预算、协议守卫类失败重试也不会
+/// 好，返回 `false`。
+///
+/// 本模块产生的失败文案都是固定前缀（见 `run` / `read_lines` /
+/// `consume_lines`），这里按前缀与状态码分类；新增失败文案时必须同步此表，
+/// `tests.rs` 有对账测试。
+pub fn retryable_failure(message: &str) -> bool {
+    const RETRYABLE_PREFIXES: &[&str] = &[
+        "请求失败：",     // 连接/发送阶段网络错误
+        "读取流失败：",   // 流式读取 IO 中断
+        "连接超时：",     // 长时间无数据（STALL_TIMEOUT）
+        "响应流提前结束", // EOF 未收到正常结束标志
+        "无法启动读取线程：",
+    ];
+    if RETRYABLE_PREFIXES.iter().any(|prefix| message.starts_with(prefix)) {
+        return true;
+    }
+    // "接口返回 {status}：…" —— 按状态码判断：408/429 与全部 5xx 可重试。
+    if let Some(rest) = message.strip_prefix("接口返回 ") {
+        let digits: &str = &rest[..rest.chars().take_while(char::is_ascii_digit).count()];
+        return matches!(digits, "408" | "429") || digits.starts_with('5');
+    }
+    false
+}
+
 /// 模型列表成功响应上限（UTF-8 JSON 字节），错误响应只读取 16 KiB。
 pub const MAX_MODELS_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_MODELS_ERROR_BYTES: usize = 16 * 1024;
@@ -750,7 +778,9 @@ pub fn list_models(config: &Config) -> Result<Vec<String>, String> {
         .bearer_auth(config.api_key.trim())
         .send()
         .map_err(|_| "模型列表请求失败，请检查接口地址、密钥或网络".to_owned())?;
-    read_models_response(resp.status(), resp)
+    let models = read_models_response(resp.status(), resp)?;
+    neo_log::info!("llm", "models listed"; "count" => models.len());
+    Ok(models)
 }
 
 fn read_models_response(
@@ -824,6 +854,8 @@ pub fn start_with_tools(
     messages: Vec<Msg>,
     tools: Vec<serde_json::Value>,
 ) -> Stream {
+    let model = normalize_model_id(&config.model).unwrap_or("invalid");
+    neo_log::info!("llm", "chat start"; "model" => model, "messages" => messages.len(), "tools" => tools.len());
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
 
@@ -1052,6 +1084,7 @@ fn run(
     tx: &Sender<Event>,
     cancel: &Arc<AtomicBool>,
 ) {
+    let started = Instant::now();
     if cancel.load(Ordering::Relaxed) {
         return;
     }
@@ -1092,6 +1125,7 @@ fn run(
     {
         Ok(r) => r,
         Err(e) => {
+            neo_log::warn!("llm", "request failed"; "category" => if e.is_timeout() { "timeout" } else { "http" });
             let _ = tx.send(Event::Failed(format!("请求失败：{e}")));
             return;
         }
@@ -1102,6 +1136,7 @@ fn run(
     }
     if !resp.status().is_success() {
         let status = resp.status();
+        neo_log::warn!("llm", "http error"; "status" => status.as_u16());
         // 错误响应也不允许无界分配。
         let mut body = String::new();
         let body = match resp.take(64 * 1024).read_to_string(&mut body) {
@@ -1144,6 +1179,7 @@ fn run(
         return;
     }
     consume_lines(line_rx, tx, cancel);
+    neo_log::info!("llm", "chat finished"; "elapsed_ms" => started.elapsed().as_millis() as u64);
 }
 
 fn read_lines(reader: impl Read, line_tx: &Sender<LineEvent>, reader_cancel: &AtomicBool) {
@@ -1215,6 +1251,7 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
                 // 思考型模型可以静默很久，但「五分钟一个字节都没有」基本等于
                 // 连接死透了（正常服务端至少会发 keepalive 注释行）。
                 if last_data.elapsed() > STALL_TIMEOUT {
+                    neo_log::warn!("llm", "stream stalled"; "silent_ms" => last_data.elapsed().as_millis() as u64);
                     let _ = tx.send(Event::Failed(
                         "连接超时：五分钟没有收到任何数据，请重试".to_owned(),
                     ));
@@ -1309,6 +1346,7 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
                     }
                 }
                 if let Some(reason) = chunk.finish_reason {
+                    neo_log::info!("llm", "stream done"; "finish_reason" => reason.as_str(), "tool_calls" => tool_frags.len());
                     if !matches!(reason.as_str(), "stop" | "tool_calls") {
                         let _ = tx.send(Event::Failed(format!("响应未正常完成：{reason}")));
                         return;

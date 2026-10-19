@@ -11,3 +11,4 @@ authors.workspace = true
 # 下载预编译 -lib 归档（Windows 为 win-x64-static-MT-Release）。
 # 若直连 GitHub 受限，可手动下载归档后用 SHERPA_ONNX_ARCHIVE_DIR 指过去。
 sherpa-onnx = "1.13"
+neo-log = { workspace = true }

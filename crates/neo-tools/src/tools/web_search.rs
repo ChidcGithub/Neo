@@ -107,6 +107,7 @@ fn search(args: &Args) -> Result<Outcome, ToolError> {
     if hits.is_empty() {
         data["note"] = json!("浏览器已打开结果页，但抓取解析失败；用户能看到网页，请如实转述");
     }
+    neo_log::info!("tools", "search finished"; "results" => hits.len(), "opened" => open_browser);
     Ok(Outcome::ok("web_search", summary, data))
 }
 

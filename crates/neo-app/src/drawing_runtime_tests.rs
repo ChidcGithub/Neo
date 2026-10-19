@@ -40,6 +40,10 @@ impl Harness {
                 configured: false,
                 closed: false,
                 pending: Default::default(),
+                log_window: Instant::now(),
+                log_count: 0,
+                bad_log_reported: false,
+                log_drop_reported: false,
             },
             output: Output {
                 events: events_tx,
@@ -1165,5 +1169,81 @@ fn paths_reject_relative_traversal_and_wrong_filename_without_launching() {
     .is_err());
     assert!(
         paths::validate_path(&std::env::temp_dir().join("cmd.exe"), BoardKind::Drawing).is_err()
+    );
+}
+
+
+#[test]
+fn child_log_events_reach_the_host_with_host_stamped_payload() {
+    let mut h = Harness::configured();
+    h.feed(json!({"version":1,"type":"event","event":"log","data":{
+        "level":"warn","message":"brush pipeline failed",
+        "fields":{"category":"gpu","retry":"1"}}}))
+        .unwrap();
+    match h.events.try_recv().unwrap() {
+        Event::Log(record) => {
+            assert_eq!(record.level, crate::diagnostics::Level::Warn);
+            assert_eq!(record.message, "brush pipeline failed");
+            let fields: Vec<(&str, &str)> = record
+                .fields
+                .iter()
+                .map(|(key, value)| (&**key, &**value))
+                .collect();
+            assert_eq!(fields, [("category", "gpu"), ("retry", "1")]);
+        }
+        other => panic!("expected a log event, got {other:?}"),
+    }
+}
+
+#[test]
+fn malformed_log_events_warn_once_and_never_break_the_connection() {
+    let mut h = Harness::configured();
+    for data in [
+        json!({"level":"fatal","message":"x"}),
+        json!({"level":"info","message":""}),
+        json!({"level":"info"}),
+        json!({"level":"info","message":"x","fields":[]}),
+        json!({"level":"info","message":"x","fields":{"counter":1}}),
+        json!({"level":"info","message":"x","fields":{"":""}}),
+    ] {
+        h.feed(json!({"version":1,"type":"event","event":"log","data":data}))
+            .unwrap();
+    }
+    assert!(
+        matches!(h.events.try_recv().unwrap(), Event::Log(r) if r.level == crate::diagnostics::Level::Warn),
+        "only the first malformed frame reports"
+    );
+    assert!(h.events.try_recv().is_err(), "later malformed frames stay silent");
+    // 连接仍然可用：状态事件照常到达。
+    h.feed(json!({"version":1,"type":"event","event":"state_changed","data":state()}))
+        .unwrap();
+    assert!(matches!(h.events.try_recv().unwrap(), Event::StateChanged(_)));
+}
+
+#[test]
+fn log_events_are_rate_limited_per_connection() {
+    let dropped_before = transport::dropped_log_events();
+    let mut h = Harness::configured();
+    // 钉住窗口起点，避免测试耗时跨过一秒让预算翻倍。
+    h.session.log_window = Instant::now() + Duration::from_secs(3600);
+    for _ in 0..(transport::LOG_BUDGET + 40) {
+        h.feed(json!({"version":1,"type":"event","event":"log","data":{
+            "level":"info","message":"tick"}}))
+            .unwrap();
+    }
+    let mut accepted = 0;
+    let mut warnings = 0;
+    while let Ok(event) = h.events.try_recv() {
+        accepted += 1;
+        if matches!(&event, Event::Log(r) if r.level == crate::diagnostics::Level::Warn) {
+            warnings += 1;
+        }
+    }
+    assert_eq!(accepted, transport::LOG_BUDGET as usize + 1, "budget plus one warning");
+    assert_eq!(warnings, 1, "the first drop warns exactly once per connection");
+    assert_eq!(
+        transport::dropped_log_events() - dropped_before,
+        40,
+        "host counts every dropped event"
     );
 }

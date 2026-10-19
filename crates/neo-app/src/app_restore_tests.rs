@@ -3155,3 +3155,21 @@ fn ignores_stale_session_id() {
     assert_eq!(state.active_session, None);
     assert_eq!(state.stage, Stage::Hero);
 }
+
+#[test]
+fn taskbar_restore_without_active_tool_keeps_task_and_disables_desktop_ops() {
+    let ctx = egui::Context::default();
+    let mut app = NeoApp::install(&ctx);
+    app.state.generating = true;
+    // 模拟整轮暂避：截图已执行完，窗口仍被屏障最小化，模型在续轮中。
+    app.desktop_windows.main_avoided = true;
+    app.note_manual_restore();
+    assert!(!app.state.round_cancelled, "任务栏恢复不再取消任务");
+    assert!(app.state.generating, "任务继续运行");
+    assert!(app.state.desktop_user_restored, "本轮屏幕操作应停用");
+    assert!(!app.desktop_windows.main_avoided, "窗口应立即恢复");
+    assert!(app
+        .pending_toasts
+        .iter()
+        .any(|(_, text, _)| text.contains("屏幕操作已停用")));
+}

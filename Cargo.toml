@@ -9,11 +9,12 @@ members = [
     "crates/neo-wake",
     "crates/neo-stt",
     "crates/neo-overlay",
+    "crates/neo-log",
     "crates/neo-app",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -28,6 +29,7 @@ neo-tools = { path = "crates/neo-tools" }
 neo-wake = { path = "crates/neo-wake" }
 neo-stt = { path = "crates/neo-stt" }
 neo-overlay = { path = "crates/neo-overlay" }
+neo-log = { path = "crates/neo-log" }
 eframe = "0.36.2"
 egui = "0.36.2"
 # 生态零件：egui-toast / egui_flex 均不直接依赖 ——

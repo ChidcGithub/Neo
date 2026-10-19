@@ -13,13 +13,23 @@ fn interactive_details_select_copy_and_disable_revoke_cached_reports() {
     let ctx = context();
     let size = egui::vec2(720.0, 1600.0);
     let mut state = LogViewState::default();
-    let render = |state: &mut LogViewState, events| {
-        frame(&ctx, size, events, |ui, skin| state.draw(ui, skin, 700.0))
+    let mut app = crate::state::AppState::default();
+    let render = |state: &mut LogViewState, app: &mut crate::state::AppState, events| {
+        frame(&ctx, size, events, |ui, skin| {
+            state.draw(ui, skin, 700.0, app);
+            state.draw_detail_modal(ui, skin, false);
+        })
     };
-    render(&mut state, vec![]);
+    let escape = |state: &mut LogViewState, app: &mut crate::state::AppState| {
+        frame(&ctx, size, vec![], |ui, skin| {
+            state.draw(ui, skin, 700.0, app);
+            state.draw_detail_modal(ui, skin, true);
+        })
+    };
+    render(&mut state, &mut app, vec![]);
     let toggle: egui::Rect = probe(&ctx, "neo-logs-details-toggle");
-    render(&mut state, pointer(toggle.center(), true));
-    render(&mut state, pointer(toggle.center(), false));
+    render(&mut state, &mut app, pointer(toggle.center(), true));
+    render(&mut state, &mut app, pointer(toggle.center(), false));
     assert!(diagnostics::details_enabled());
     let span = diagnostics::Span::new("tool", None);
     let mut error = neo_tools::ToolError::io("safe summary");
@@ -37,14 +47,14 @@ fn interactive_details_select_copy_and_disable_revoke_cached_reports() {
     assert!(!export([entry]).contains("PRIVATE_CAUSE"));
     assert!(!export([entry]).contains("FINAL_FRAME"));
     for _ in 0..3 {
-        render(&mut state, vec![]);
+        render(&mut state, &mut app, vec![]);
     }
     let row: egui::Rect = ctx.data(|data| {
         data.get_temp(egui::Id::new(("neo-logs-row", entry.id)))
             .unwrap()
     });
-    render(&mut state, pointer(row.center(), true));
-    render(&mut state, pointer(row.center(), false));
+    render(&mut state, &mut app, pointer(row.center(), true));
+    render(&mut state, &mut app, pointer(row.center(), false));
     assert_eq!(state.selected, Some(entry.id));
     let report = detail_report(entry);
     assert!(
@@ -56,18 +66,18 @@ fn interactive_details_select_copy_and_disable_revoke_cached_reports() {
             && report.contains("记录位置")
     );
     let copy: egui::Rect = probe(&ctx, "neo-logs-copy-detail");
-    render(&mut state, pointer(copy.center(), true));
-    let output = render(&mut state, pointer(copy.center(), false));
+    render(&mut state, &mut app, pointer(copy.center(), true));
+    let output = render(&mut state, &mut app, pointer(copy.center(), false));
     assert!(
         output.platform_output.commands.is_empty(),
         "explicit copy warning must be acknowledged"
     );
     let consent: egui::Rect = probe(&ctx, "neo-logs-detail-consent");
-    render(&mut state, pointer(consent.center(), true));
-    render(&mut state, pointer(consent.center(), false));
+    render(&mut state, &mut app, pointer(consent.center(), true));
+    render(&mut state, &mut app, pointer(consent.center(), false));
     assert!(state.copy_details_confirmed);
-    render(&mut state, pointer(copy.center(), true));
-    let output = render(&mut state, pointer(copy.center(), false));
+    render(&mut state, &mut app, pointer(copy.center(), true));
+    let output = render(&mut state, &mut app, pointer(copy.center(), false));
     assert!(output
         .platform_output
         .commands
@@ -75,9 +85,14 @@ fn interactive_details_select_copy_and_disable_revoke_cached_reports() {
         .any(|command| matches!(command,
             egui::OutputCommand::CopyText(text) if text == &report)));
     let cached = state.filtered.clone().unwrap();
+    // 模态遮罩会挡住下层页面：先 Esc 关掉详情，再空跑一帧，让悬停命中
+    // 按「没有模态」的那一帧重算，开关才收得到这记点击。
+    escape(&mut state, &mut app);
+    assert!(state.selected.is_none());
+    render(&mut state, &mut app, vec![]);
     let toggle: egui::Rect = probe(&ctx, "neo-logs-details-toggle");
-    render(&mut state, pointer(toggle.center(), true));
-    let output = render(&mut state, pointer(toggle.center(), false));
+    render(&mut state, &mut app, pointer(toggle.center(), true));
+    let output = render(&mut state, &mut app, pointer(toggle.center(), false));
     assert!(!diagnostics::details_enabled());
     assert!(state.selected.is_none() && !state.copy_details_confirmed);
     assert!(output.platform_output.commands.is_empty());
@@ -221,6 +236,9 @@ fn sample() -> Snapshot {
                 message: "执行失败：timeout".into(),
                 first_ms: 1,
                 last_ms: 2,
+                wall_ms: 0,
+                thread: "main".into(),
+                fields: Box::new([]),
                 occurrences: 3,
             },
             Entry {
@@ -232,6 +250,9 @@ fn sample() -> Snapshot {
                 message: "[已脱敏]".into(),
                 first_ms: 3,
                 last_ms: 3,
+                wall_ms: 0,
+                thread: "main".into(),
+                fields: Box::new([]),
                 occurrences: 1,
             },
         ]),
@@ -267,6 +288,9 @@ fn filter_cache_reuses_indices_and_refreshes_for_conditions_and_snapshot() {
                 message: format!("安全事件 {index}").into_boxed_str(),
                 first_ms: index as u64,
                 last_ms: index as u64,
+                wall_ms: 0,
+                thread: "main".into(),
+                fields: Box::new([]),
                 occurrences: 1,
             })
             .collect(),
@@ -301,7 +325,7 @@ fn filter_cache_reuses_indices_and_refreshes_for_conditions_and_snapshot() {
     state.level = Some(Level::Error);
     let errors = state.filtered_entries(&view);
     assert!(!Arc::ptr_eq(&first, &errors));
-    assert_eq!(errors.indices.len(), 500);
+    assert_eq!(errors.indices.len(), MAX_ENTRIES / 2);
     state.keyword = " TOOL ".into();
     let by_component = state.filtered_entries(&view);
     assert!(!Arc::ptr_eq(&errors, &by_component));
@@ -340,7 +364,7 @@ fn filters_and_copy_use_only_visible_safe_entries() {
     assert!(!copied.contains("timeout"));
     let header = export([]);
     assert!(header.contains(env!("CARGO_PKG_VERSION")));
-    assert!(header.contains("diagnostics v1"));
+    assert!(header.contains("diagnostics v2"));
     assert!(!header.contains("timeout") && !header.contains("[已脱敏]"));
 }
 
@@ -435,22 +459,26 @@ fn pointer_copy_pause_resume_and_wheel_match_the_visible_thousand_entry_view() {
                 message: format!("安全事件 {index}").into_boxed_str(),
                 first_ms: index as u64,
                 last_ms: index as u64,
+                wall_ms: 0,
+                thread: "main".into(),
+                fields: Box::new([]),
                 occurrences: 1,
             })
             .collect(),
     );
     let mut state = LogViewState::default();
-    let render = |state: &mut LogViewState, events| {
+    let mut app = crate::state::AppState::default();
+    let render = |state: &mut LogViewState, app: &mut crate::state::AppState, events| {
         frame(&ctx, size, events, |ui, skin| {
-            state.draw_snapshot(ui, skin, 444.0, view.clone())
+            state.draw_snapshot(ui, skin, 444.0, view.clone(), app)
         })
     };
     for _ in 0..3 {
-        render(&mut state, vec![]);
+        render(&mut state, &mut app, vec![]);
     }
     let cached = state.filtered.clone().unwrap();
     for _ in 0..60 {
-        render(&mut state, vec![]);
+        render(&mut state, &mut app, vec![]);
         assert!(Arc::ptr_eq(&cached, state.filtered.as_ref().unwrap()));
     }
     let (bottom, rect, content, count): (f32, egui::Rect, f32, usize) =
@@ -459,6 +487,7 @@ fn pointer_copy_pause_resume_and_wheel_match_the_visible_thousand_entry_view() {
     assert!((bottom + rect.height() - content).abs() < 1.0);
     render(
         &mut state,
+        &mut app,
         vec![
             egui::Event::PointerMoved(rect.center()),
             egui::Event::MouseWheel {
@@ -470,25 +499,27 @@ fn pointer_copy_pause_resume_and_wheel_match_the_visible_thousand_entry_view() {
         ],
     );
     for _ in 0..10 {
-        render(&mut state, vec![]);
+        render(&mut state, &mut app, vec![]);
     }
     assert!(!state.follow, "manual scroll must expose the resume action");
     let button: egui::Rect = probe(&ctx, "neo-logs-follow");
-    render(&mut state, pointer(button.center(), true));
-    render(&mut state, pointer(button.center(), false));
+    render(&mut state, &mut app, pointer(button.center(), true));
+    render(&mut state, &mut app, pointer(button.center(), false));
     assert!(state.follow);
     let (offset, rect, content, _): (f32, egui::Rect, f32, usize) =
         probe(&ctx, "neo-logs-scroll-probe");
     assert!((offset + rect.height() - content).abs() < 1.0);
-    render(&mut state, pointer(button.center(), true));
-    render(&mut state, pointer(button.center(), false));
+    render(&mut state, &mut app, pointer(button.center(), true));
+    render(&mut state, &mut app, pointer(button.center(), false));
     assert!(!state.follow);
     state.level = Some(Level::Error);
     state.keyword = "SAFE-TEST".into();
-    render(&mut state, vec![]);
+    render(&mut state, &mut app, vec![]);
     let copy: egui::Rect = probe(&ctx, "neo-logs-copy");
-    render(&mut state, pointer(copy.center(), true));
-    let output = render(&mut state, pointer(copy.center(), false));
+    let export_rect: egui::Rect = probe(&ctx, "neo-logs-export");
+    assert!(export_rect.width() > 0.0 && export_rect.height() > 0.0, "export action must be laid out");
+    render(&mut state, &mut app, pointer(copy.center(), true));
+    let output = render(&mut state, &mut app, pointer(copy.center(), false));
     let copied = output
         .platform_output
         .commands
@@ -507,7 +538,7 @@ fn pointer_copy_pause_resume_and_wheel_match_the_visible_thousand_entry_view() {
         .filter(|entry| entry.level == Level::Error)
         .collect();
     assert_eq!(copied, &export(filtered));
-    assert_eq!(copied.lines().count(), 502);
+    assert_eq!(copied.lines().count(), MAX_ENTRIES / 2 + 2);
     assert!(!state.follow);
 }
 
@@ -533,6 +564,7 @@ fn page_draws_headlessly_in_both_themes_and_narrow_widths() {
                     follow: false,
                     ..Default::default()
                 };
+                let mut app = crate::state::AppState::default();
                 let mut output = ctx.run_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
@@ -542,7 +574,7 @@ fn page_draws_headlessly_in_both_themes_and_narrow_widths() {
                         ..Default::default()
                     },
                     |ui| {
-                        state.draw_snapshot(ui, &skin, width - 16.0, sample());
+                        state.draw_snapshot(ui, &skin, width - 16.0, sample(), &mut app);
                         assert!(ui.min_rect().width() <= width, "窄屏布局不应横向溢出");
                     },
                 );

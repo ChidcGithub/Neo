@@ -329,6 +329,7 @@ impl WakeEngine {
     /// 启动后台采集 + 推理线程，返回事件接收端。
     /// 安装资源缺失时也会正常返回，错误通过 WakeEvent::Error 上报。
     pub fn start(config: WakeConfig) -> (Self, mpsc::Receiver<WakeEvent>) {
+        neo_log::info!("wake", "detector started"; "threshold" => config.threshold, "debounce_ms" => config.debounce.as_millis() as u64);
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
@@ -373,6 +374,7 @@ impl WakeEngine {
 
     /// 仅开关额外电平/得分遥测；不启停麦克风、不重载模型、不改变工作模式。
     pub fn set_diagnostics(&self, on: bool) {
+        neo_log::debug!("wake", "diagnostics toggled"; "on" => on);
         self.monitor.update(|s| {
             self.monitor.enabled.store(on, Ordering::Release);
             s.enabled = on;
@@ -406,6 +408,7 @@ impl WakeEngine {
     /// - true：停止唤醒词检测，改为把 16kHz 音频帧经 WakeEvent::Audio 转发出来
     /// - false：清空缓冲并回到唤醒词检测（带完整防抖间隔，防止残留音频立刻再触发）
     pub fn set_dictation(&self, on: bool) {
+        neo_log::debug!("wake", "dictation toggled"; "on" => on);
         self.mode.store(
             if on { MODE_DICTATE } else { MODE_DETECT },
             Ordering::Relaxed,
@@ -457,11 +460,13 @@ fn engine_main(
     let mut models = match load_models(&config.model_dir) {
         Ok(m) => m,
         Err(e) => {
+            neo_log::warn!("wake", "model load failed"; "category" => "models");
             monitor.fail(&e);
             let _ = tx.send(WakeEvent::Error(e));
             return;
         }
     };
+    neo_log::info!("wake", "models loaded");
 
     if stop.load(Ordering::Relaxed) {
         return;
@@ -606,6 +611,7 @@ fn engine_main(
                         streak = 0;
                     }
                     if streak >= CONFIRM_FRAMES && last_fire.elapsed() >= config.debounce {
+                        neo_log::info!("wake", "wake fired"; "streak" => streak, "debounce_ms" => config.debounce.as_millis() as u64);
                         streak = 0;
                         last_fire = Instant::now();
                         // 检测后清空缓冲，与 Python listener 的 pause 行为一致

@@ -39,7 +39,8 @@ fn test_db_path() -> std::path::PathBuf {
 
 #[cfg(test)]
 /// Stream factory type for the test seam.
-type StreamStart = fn(neo_llm::Config, Vec<neo_llm::Msg>, Vec<serde_json::Value>) -> neo_llm::Stream;
+type StreamStart =
+    fn(neo_llm::Config, Vec<neo_llm::Msg>, Vec<serde_json::Value>) -> neo_llm::Stream;
 
 #[cfg(test)]
 thread_local! {
@@ -367,6 +368,10 @@ pub struct NeoApp {
     saved_silent_startup_errors: bool,
     saved_auto_check_updates: bool,
     saved_floating_enabled: bool,
+    /// 上次落库的 MOD 启用意图（编码串，变化才写）。
+    saved_mod_grants: String,
+    /// 上次落库的文件日志开关。
+    saved_file_logging: bool,
     floating: Option<crate::floating::FloatingHandle>,
     floating_attempted: bool,
     drawing: crate::drawing_manager::DrawingManager,
@@ -530,6 +535,8 @@ impl NeoApp {
             saved_silent_startup_errors: false,
             saved_auto_check_updates: true,
             saved_floating_enabled: false,
+            saved_mod_grants: String::new(),
+            saved_file_logging: true,
             floating: None,
             floating_attempted: false,
             drawing: Default::default(),
@@ -637,6 +644,15 @@ impl NeoApp {
         // 动效基准：启动恢复不算「切换」，首帧不播入场。
         app.prev_stage = app.state.stage;
         app.prev_show_settings = app.state.show_settings;
+
+        // 日志门面装 sink：子项目经 neo-log 转送的记录进诊断内存与文件。
+        neo_log::set_sink(crate::diagnostics::forward);
+        #[cfg(not(test))]
+        if let Some(dir) = crate::startup::log_dir() {
+            crate::filelog::start(dir);
+        }
+        crate::filelog::set_enabled(app.state.file_logging);
+        app.saved_file_logging = app.state.file_logging;
 
         app
     }
@@ -1111,6 +1127,7 @@ impl NeoApp {
         }
         self.drawing_exit_pending = false;
         self.quitting = true;
+        crate::filelog::shutdown();
         drop(self.tray.take());
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         ctx.request_repaint();
@@ -1138,6 +1155,7 @@ impl NeoApp {
     }
 
     fn exit_dialog(&mut self, ctx: &egui::Context) {
+        let d = neo_ui::Design::new(self.theme);
         egui::Window::new(tr("退出前保存失败"))
             .collapsible(false).resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1154,20 +1172,20 @@ impl NeoApp {
                 }
                 if self.confirm_discard {
                     ui.colored_label(self.theme.palette.error, tr("确认丢弃未保存的消息、设置、课堂素材和记忆索引？重启可能恢复旧的安全偏好。"));
-                    if ui.button(tr("确认丢弃并退出")).clicked() {
+                    if neo_ui::Button::new(tr("确认丢弃并退出")).danger().show(ui, &d).clicked() {
                         self.confirm_discard_exit(ctx);
                     }
-                    if ui.button(tr("返回保存选项")).clicked() {
+                    if neo_ui::Button::new(tr("返回保存选项")).ghost().show(ui, &d).clicked() {
                         self.confirm_discard = false;
                     }
                 } else {
-                    if ui.button(tr("重试保存并退出")).clicked() {
+                    if neo_ui::Button::new(tr("重试保存并退出")).elevated().show(ui, &d).clicked() {
                         self.request_exit(ctx);
                     }
-                    if ui.button(tr("保持打开")).clicked() {
+                    if neo_ui::Button::new(tr("保持打开")).ghost().show(ui, &d).clicked() {
                         self.exit_blocked = false;
                     }
-                    if ui.button(tr("退出不保存…")).clicked() {
+                    if neo_ui::Button::new(tr("退出不保存…")).danger().show(ui, &d).clicked() {
                         self.confirm_discard = true;
                     }
                 }
@@ -1197,6 +1215,13 @@ impl NeoApp {
             .is_some_and(|gate| gate.active.load(std::sync::atomic::Ordering::Acquire) != 0);
         if (self.desktop_windows.main_avoided || active) && !self.desktop_show_pending {
             self.state.cancel();
+            // 光秃秃的「已停止」+「（空回复）」看不出原因：说明是唤回
+            // 窗口打断了正在运行的屏幕任务。
+            if let Some(last) = self.state.messages.last_mut() {
+                if last.meta == tr("已停止") {
+                    last.meta = tr("已停止 · 唤回主窗口中断了任务").to_owned();
+                }
+            }
         }
         if active {
             for cancel in &self.desktop_cancels {
@@ -1211,6 +1236,19 @@ impl NeoApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// 用户在整轮暂避期间从任务栏手动唤回了主窗口（无进行中的桌面租约）：
+    /// 恢复窗口、停用本轮后续屏幕操作，但**不取消任务** —— 文字/文件
+    /// 工具继续跑，屏幕操作由 `spawn_ready_tools` 快速失败并告知模型。
+    fn note_manual_restore(&mut self) {
+        self.desktop_windows.restore();
+        self.state.desktop_user_restored = true;
+        self.pending_toasts.push((
+            neo_ui::ToastKind::Warning,
+            tr("窗口已恢复，任务继续运行；本轮的屏幕操作已停用，重新发送任务可恢复").into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(6),
+        ));
     }
 
     /// 关窗转后台：取消关闭，隐藏窗口（同时最小化，wgpu 对隐藏窗仍会
@@ -1371,6 +1409,7 @@ impl NeoApp {
         self.state.classroom_safe = get("classroom_safe").as_deref() != Some("0");
         self.state.silent_startup_errors = get("silent_startup_errors").as_deref() == Some("1");
         self.state.auto_check_updates = get("auto_check_updates").as_deref() != Some("0");
+        self.state.file_logging = get("file_logging").as_deref() != Some("0");
         self.state.floating_enabled = get("floating_enabled").as_deref() == Some("1");
         self.state
             .sync_startup_policy(crate::startup::set_silent_policy);
@@ -1415,6 +1454,11 @@ impl NeoApp {
         let saved_model = get("model");
         self.state
             .restore_models(&saved_list, saved_model.as_deref());
+        // MOD 启用意图读回即生效（reconcile 在扫描收结果时按此表执行）。
+        if let Some(v) = get("mods_enabled") {
+            self.state.mod_grants = crate::mods::decode_grants(&v);
+        }
+        self.saved_mod_grants = crate::mods::encode_grants(&self.state.mod_grants);
     }
 
     /// 刷新侧栏的会话列表。
@@ -1688,23 +1732,29 @@ impl NeoApp {
         state.start_compaction(plan, stream);
     }
 
-    /// 首次发送移交预检后的消息；工具续轮重新构造，两者仍经过 LLM 通用预算。
-    fn start_real_stream_with_messages(state: &mut AppState, msgs: Vec<neo_llm::Msg>) {
-        let cfg = state.llm_config();
-        // 注意：`tool_declarations()` 已经是"每元素一条工具"的扁平列表，
-        // 不要再套一层 Vec —— `tools: [[…]]` 会被服务端 422 掉。
-        //
-        // **思考模式也带工具**：早先这里按"是不是推理模型"把 `tools` 摘掉，
-        // 依据是 R1 时代"推理模型不支持 Function Calling"的说法；官方 Thinking
-        // Mode 文档已经明确"thinking mode supports tool calls"，所以不再摘。
-        // 代价是必须把历史 `reasoning_content` 完整回传（见 `state::api_messages`），
-        // 那条由 `neo_llm::build_wire` 按档位把关。
+    /// 统一的流构造入口：测试通过 `STREAM_START` 钩子替换为内存通道。
+    ///
+    /// 注意：`tool_declarations()` 已经是"每元素一条工具"的扁平列表，
+    /// 不要再套一层 Vec —— `tools: [[…]]` 会被服务端 422 掉。
+    ///
+    /// **思考模式也带工具**：早先这里按"是不是推理模型"把 `tools` 摘掉，
+    /// 依据是 R1 时代"推理模型不支持 Function Calling"的说法；官方 Thinking
+    /// Mode 文档已经明确"thinking mode supports tool calls"，所以不再摘。
+    /// 代价是必须把历史 `reasoning_content` 完整回传（见 `state::api_messages`），
+    /// 那条由 `neo_llm::build_wire` 按档位把关。
+    fn spawn_llm_stream(cfg: neo_llm::Config, msgs: Vec<neo_llm::Msg>) -> neo_llm::Stream {
         let tools = neo_tools::tool_declarations();
         // 通用入口在联网前执行预算及无分配的线协议计数；错误通过 Failed 回到消息。
         #[cfg(not(test))]
         let stream = neo_llm::start_with_tools(cfg, msgs, tools);
         #[cfg(test)]
         let stream = STREAM_START.with(|start| start.get()(cfg, msgs, tools));
+        stream
+    }
+
+    /// 首次发送移交预检后的消息；工具续轮、失败重试都重新构造，共用此入口。
+    fn start_real_stream_with_messages(state: &mut AppState, msgs: Vec<neo_llm::Msg>) {
+        let stream = Self::spawn_llm_stream(state.llm_config(), msgs);
         state.start_generation(StreamSource::Real(Box::new(stream)));
     }
 
@@ -2023,6 +2073,20 @@ impl NeoApp {
             "auto_check_updates",
             if state.auto_check_updates { "1" } else { "0" }
         );
+        save_pref!(
+            state.file_logging,
+            self.saved_file_logging,
+            "file_logging",
+            if state.file_logging { "1" } else { "0" }
+        );
+        let encoded_mods = crate::mods::encode_grants(&state.mod_grants);
+        if encoded_mods != self.saved_mod_grants {
+            if Self::save_setting(self.store.as_ref(), "mods_enabled", &encoded_mods) {
+                self.saved_mod_grants = encoded_mods;
+            } else {
+                saved = false;
+            }
+        }
         if (state.api_base.as_str(), state.api_key.as_str())
             != (self.saved_api.0.as_str(), self.saved_api.1.as_str())
         {
@@ -2061,6 +2125,9 @@ impl NeoApp {
         self.sync_language(ctx);
         self.state
             .sync_startup_policy(crate::startup::set_silent_policy);
+        if crate::filelog::is_enabled() != self.state.file_logging {
+            crate::filelog::set_enabled(self.state.file_logging);
+        }
         if self.applied_classroom_safe == self.state.classroom_safe {
             return;
         }
@@ -2306,10 +2373,15 @@ impl NeoApp {
             }
         }
         if !boards_open && self.desktop_windows.manually_restored() {
-            self.show_window(ctx);
             if active {
-                // 任务栏恢复也算用户打断；旧 UIA 退出前仍保持暂避。
+                // 桌面租约进行中：窗口可见会污染本次采集，仍视为用户打断；
+                // 旧 UIA 退出前保持暂避。
+                self.show_window(ctx);
                 let _ = self.desktop_windows.hide(true);
+            } else {
+                // 没有进行中的桌面工具：任务栏恢复不算打断 —— 整轮暂避
+                // 期间用户点任务栏只是想看看进度，不该把任务杀掉。
+                self.note_manual_restore();
             }
         }
         let blocked = self.desktop_show_pending
@@ -2367,8 +2439,22 @@ impl NeoApp {
             if let Some(handle) = &self.floating {
                 handle.set_visible(false);
             }
-            match self.desktop_windows.hide(!self.hidden_to_tray) {
-                Ok(()) => self.desktop_pending.push(request),
+            let was_avoided = self.desktop_windows.main_avoided;
+            let hide_result = self.desktop_windows.hide(!self.hidden_to_tray);
+            match hide_result {
+                Ok(()) => {
+                    // 首次为屏幕操作最小化主窗时播报，别让用户以为程序
+                    // 自己把窗口吞了；窗口整轮保持最小化属预期行为。
+                    if !self.hidden_to_tray && !was_avoided && self.desktop_windows.main_avoided
+                    {
+                        self.pending_toasts.push((
+                            neo_ui::ToastKind::Info,
+                            tr("已暂时最小化 Neo 窗口以执行屏幕操作；任务仍在后台运行").into(),
+                            std::time::Instant::now() + std::time::Duration::from_secs(6),
+                        ));
+                    }
+                    self.desktop_pending.push(request);
+                }
                 Err(error) => {
                     self.desktop_restore_pending = true;
                     let _ = request.ack.send(Err(error));
@@ -2839,6 +2925,32 @@ impl NeoApp {
                 ));
             }
         }
+        // 日志导出对话框的回执落地（toast）。
+        let log_recv = self.state.log_export_rx.as_ref().map(|rx| rx.try_recv());
+        match log_recv {
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.state.log_export_rx = None;
+            }
+            Some(Ok(crate::state::LogExportMsg::Exported(result))) => {
+                self.state.log_export_rx = None;
+                let (kind, text) = match result {
+                    Ok(count) => (
+                        neo_ui::ToastKind::Success,
+                        tf("已导出 {count} 条日志", &[("count", count.to_string())]),
+                    ),
+                    Err(error) => (
+                        neo_ui::ToastKind::Error,
+                        tf("导出失败：{error}", &[("error", error)]),
+                    ),
+                };
+                self.pending_toasts.push((
+                    kind,
+                    text,
+                    std::time::Instant::now() + std::time::Duration::from_secs(3),
+                ));
+            }
+        }
         // 「打开主界面」工具：执行层只置信号位，这里真正唤窗。
         let show_at =
             neo_tools::tools::open_app::SHOW_WINDOW_AT.load(std::sync::atomic::Ordering::Relaxed);
@@ -2852,8 +2964,67 @@ impl NeoApp {
         if self.state.poll_compaction() {
             ctx.request_repaint();
         }
-        if self.state.generating && self.state.pump() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        if self.state.generating {
+            if self.state.retry.as_ref().is_some_and(|r| !r.fired) {
+                // 等待自动重试：低频醒来等到点即可，不按流式节奏刷帧。
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            } else if self.state.pump() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            }
+        }
+        // 自动重试到点：与首次发送同一预算入口重发，复用仍在流式中的占位消息。
+        // 排程记录保留（只置 fired）：重发再失败时 schedule_retry 靠它递增次数。
+        if self
+            .state
+            .retry
+            .as_ref()
+            .is_some_and(|r| r.due <= std::time::Instant::now() && !r.fired)
+        {
+            if let Some(retry) = &mut self.state.retry {
+                retry.fired = true;
+            }
+            if !self.state.can_call_real() {
+                self.state.abort_generation(
+                    tr("模型接口未配置，自动重试已中止").to_owned(),
+                );
+            } else {
+                let mut messages = self.state.api_messages(usize::MAX);
+                match neo_llm::budget_messages(
+                    &self.state.llm_config(),
+                    &mut messages,
+                    &neo_tools::tool_declarations(),
+                ) {
+                    Ok(()) => {
+                        let stream =
+                            Self::spawn_llm_stream(self.state.llm_config(), messages);
+                        self.state.resume_generation(StreamSource::Real(Box::new(stream)));
+                    }
+                    Err(error) => {
+                        self.state.attachment_error = Some(error.clone());
+                        self.state.abort_generation(error);
+                        self.state
+                            .finish_task_diagnostic(Phase::Rejected, Some(Failure::Budget));
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
+        // 重试排程只播报一次（schedule 发生在 pump 内，tick 在这里统一出 toast）。
+        if let Some(retry) = &mut self.state.retry {
+            if !retry.announced {
+                retry.announced = true;
+                self.pending_toasts.push((
+                    neo_ui::ToastKind::Warning,
+                    tf(
+                        "接口中断，正在自动重试（{attempt}/{max}）",
+                        &[
+                            ("attempt", retry.attempt.to_string()),
+                            ("max", crate::state::MAX_STREAM_RETRIES.to_string()),
+                        ],
+                    ),
+                    std::time::Instant::now() + std::time::Duration::from_secs(4),
+                ));
+            }
         }
         // 模型列表拉取：后台线程在跑，这里只收结果；收到就刷新可选模型。
         if self.state.poll_model_fetch() {
@@ -2867,6 +3038,10 @@ impl NeoApp {
                 );
                 Self::save_setting(self.store.as_ref(), "model", self.state.model_id());
             }
+            ctx.request_repaint();
+        }
+        // MOD 扫描：设置页触发的后台线程，拿到结果就刷新列表并重绘。
+        if self.state.poll_mods_scan() {
             ctx.request_repaint();
         }
         // 工具轮登记：流结束在 `finish_reason = tool_calls` 时把分片聚合成消息块。
@@ -2903,13 +3078,16 @@ impl NeoApp {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         #[allow(clippy::collapsible_if)] // nested if separates the persistence gate from the tool-state check for readability
-        #[allow(clippy::collapsible_if)] // nested if separates the persistence gate from the tool-state check
+        #[allow(clippy::collapsible_if)]
+        // nested if separates the persistence gate from the tool-state check
         if self.state.tool_open && self.persistence_ok {
             if self.state.awaiting_tool().is_none() {
                 if self.state.tools_running() {
                     // 后台在跑：定期回来收结果（也顺带刷新"执行中…"的动画）。
                     ctx.request_repaint_after(std::time::Duration::from_millis(60));
-                } else if self.state.tools_settled() {
+                } else if self.state.tools_settled() && self.state.retry.is_none() {
+                    // retry 非 None = 上一轮流失败后在等自动重试，回灌续轮
+                    // 由重试块负责；这里不能并发再开一条流。
                     self.state.tool_open = false;
                     if self.state.can_call_real() {
                         Self::start_real_stream(&mut self.state);
@@ -2972,12 +3150,13 @@ impl NeoApp {
         {
             return;
         }
-        self.drawing.host_panel(&ctx);
+        self.drawing.host_panel(&ctx, self.theme);
         if self.exit_blocked {
             self.exit_dialog(&ctx);
             return;
         }
         if let Some(status) = self.state.compaction_status.clone() {
+            let d = neo_ui::Design::new(self.theme);
             egui::Window::new(tr("上下文状态"))
                 .collapsible(false)
                 .resizable(false)
@@ -2985,15 +3164,24 @@ impl NeoApp {
                 .show(&ctx, |ui| {
                     ui.label(status);
                     if self.state.compaction.is_some() {
-                        if ui.button(tr("取消压缩")).clicked() {
+                        if neo_ui::Button::new(tr("取消压缩"))
+                            .danger()
+                            .show(ui, &d)
+                            .clicked()
+                        {
                             self.state.cancel();
                         }
-                    } else if ui.button(tr("关闭提示")).clicked() {
+                    } else if neo_ui::Button::new(tr("关闭提示"))
+                        .ghost()
+                        .show(ui, &d)
+                        .clicked()
+                    {
                         self.state.compaction_status = None;
                     }
                 });
         }
         if self.state.preferences_unsaved {
+            let d = neo_ui::Design::new(self.theme);
             egui::Window::new(tr("设置未保存"))
                 .collapsible(false)
                 .resizable(false)
@@ -3003,7 +3191,11 @@ impl NeoApp {
                         self.theme.palette.error,
                         tr("设置尚未保存；安全限制仅对本次运行生效，重启可能恢复旧值。"),
                     );
-                    if ui.button(tr("重试保存设置")).clicked() {
+                    if neo_ui::Button::new(tr("重试保存设置"))
+                        .elevated()
+                        .show(ui, &d)
+                        .clicked()
+                    {
                         self.persist_preferences();
                     }
                 });
@@ -3050,6 +3242,8 @@ impl NeoApp {
         let enter_sends = enter_pressed && !ui::ime_active(&ctx) && !modal_open;
         let escape_pressed =
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        // 上一帧末的状态：日志详情模态打开时，这记 Esc 归模态，不关设置页。
+        let log_detail_open = ui::logs::detail_modal_open(&ctx);
 
         // 缩放按「屏幕」而非「内容区」推导：观看距离对应的是整块屏。
         self.sync_theme(&ctx, screen.size());
@@ -3151,10 +3345,10 @@ impl NeoApp {
                 .min(screen.size() - egui::vec2(m.s(48.0), m.s(48.0)));
             let rise = (1.0 - settings_k) * m.s(10.0);
             let panel_rect = Rect::from_center_size(screen.center() + egui::vec2(0.0, rise), size);
-            if ui::settings::panel(ui, &skin, panel_rect, state, screen.max.y, fonts) {
+            if ui::settings::panel(ui, &skin, panel_rect, state, screen.max.y, fonts, escape_pressed) {
                 state.show_settings = false;
             }
-            if escape_pressed && !sb.escape_consumed {
+            if escape_pressed && !sb.escape_consumed && !log_detail_open {
                 // 侧栏已用这记 Esc 取消重命名/删除确认的话，不再顺手关设置 ——
                 // 与下面「Esc 停止生成」的门同源：一键不一二鸟。
                 state.show_settings = false;
@@ -3378,3 +3572,7 @@ mod snapshot;
 #[cfg(test)]
 #[path = "app_audit_tests.rs"]
 mod audit;
+
+#[cfg(test)]
+#[path = "app_retry_tests.rs"]
+mod retry_tests;

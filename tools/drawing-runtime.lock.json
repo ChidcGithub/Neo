@@ -1,13 +1,13 @@
 {
   "schema": 1,
   "repository": "https://github.com/ChidcGithub/NeoRuntime-drawing",
-  "commit": "8c32db0d2e5aa55dca774cf1c06547710ce8d2c2",
+  "commit": "7697447edba55b895bf959ff4c308422ee7581fc",
   "rust": "1.97.1",
   "target": "x86_64-pc-windows-msvc",
   "protocol": 1,
 
   "source_policy": "Pinned Git tree intersected with exact root files and Rust workspace source paths; local override uses the same allowlist, never recursive directory copying",
-  "source_root_files": ["Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "RELEASING.md", "CHANGELOG.md"],
+  "source_root_files": ["Cargo.toml", "Cargo.lock", "LICENSE", "README.md"],
   "workspace_packages": ["drawing", "blackboard", "crates/board-app", "crates/board-core", "crates/board-hwr", "crates/board-ink", "crates/board-math", "crates/board-protocol", "crates/board-render", "crates/board-session"],
   "legal_files": [
     "LICENSE",
@@ -29,10 +29,10 @@
   "crt_information_url": "https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist",
   "limitations": ["Technical manifest only; no approval assertion", "Eigen notices delivered in main docs/licenses/runtime/native-sources/eigen-1d8b82b-COPYING.*; final package checked by verify_ort_sources", "No model payload", "No GUI/capture/microphone", "Developer-machine checks are not clean-install acceptance"],
   "source_binding": {
-    "source_commit": "8c32db0d2e5aa55dca774cf1c06547710ce8d2c2",
-    "source_tree_sha256": "6910c89f3f7c597ffeb87704039de21c86877dafcc28eb0b057074ef4f4ed773",
-    "cargo_lock_sha256": "108deb894394b36400ba77bdf3d5254d2ddbefb8134c778112856bac1a1523e9",
-    "version": "0.0.1",
+    "source_commit": "7697447edba55b895bf959ff4c308422ee7581fc",
+    "source_tree_sha256": "99dbd928b2f8b6c7744a430ed579a743480c0f17a1bf3ff45ec5314515f54814",
+    "cargo_lock_sha256": "d55c3bbbe7ad504abef620f87d825a26ca057639ffc4d31a75ecd708454acc7c",
+    "version": "0.1.0",
     "legal_files": {
       "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
       "distribution/legal/app/fonts/ATTRIBUTION.md": "9ecf0eff2428cf0ff49db01df487be371c256358456e8abd546f82e8f970cd43",

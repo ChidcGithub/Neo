@@ -99,17 +99,27 @@ pub fn tool_names() -> Vec<&'static str> {
 /// 否则围栏与参数校验都会漏掉。
 pub fn dispatch(scope: &Scope, name: &str, args: &serde_json::Value) -> Outcome {
     let tool = find(name);
-    if scope.is_cancelled() {
-        return Outcome::fail(tool.map_or("unknown", |t| t.name), cancelled_error());
+    let started = std::time::Instant::now();
+    neo_log::info!("tools", "tool invoked"; "tool" => tool.map_or("unknown", |t| t.name));
+    let outcome = if scope.is_cancelled() {
+        Outcome::fail(tool.map_or("unknown", |t| t.name), cancelled_error())
+    } else {
+        match tool {
+            Some(tool) => (tool.run)(scope, &Args::new(tool, args)),
+            None => Outcome::fail(
+                "unknown",
+                ToolError::bad_args(format!("没有名为 `{name}` 的工具"))
+                    .with_hint(format!("可用工具：{}", tool_names().join(", "))),
+            ),
+        }
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if let Some(error) = &outcome.error {
+        neo_log::warn!("tools", "tool failed"; "tool" => outcome.tool, "kind" => error.kind.as_str(), "elapsed_ms" => elapsed_ms);
+    } else {
+        neo_log::info!("tools", "tool finished"; "tool" => outcome.tool, "elapsed_ms" => elapsed_ms);
     }
-    match tool {
-        Some(tool) => (tool.run)(scope, &Args::new(tool, args)),
-        None => Outcome::fail(
-            "unknown",
-            ToolError::bad_args(format!("没有名为 `{name}` 的工具"))
-                .with_hint(format!("可用工具：{}", tool_names().join(", "))),
-        ),
-    }
+    outcome
 }
 
 pub(crate) fn cancelled_error() -> ToolError {

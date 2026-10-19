@@ -181,8 +181,13 @@ impl Drop for FloatingHandle {
 mod native;
 
 const HOLD_MS: u64 = 500;
+const DOUBLE_MS: u64 = 300;
 const SLOP: f32 = 6.0;
-const EXTENT: f32 = 180.0;
+const EXTENT_W: f32 = 252.0;
+const EXTENT_H: f32 = 180.0;
+const MAIN_X: f32 = 90.0;
+const MAIN_Y: f32 = 90.0;
+const MENU_Y: f32 = 90.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Point {
@@ -248,29 +253,35 @@ struct Circle {
 fn circles(menu: bool) -> impl Iterator<Item = Circle> {
     [
         Circle {
-            center: Point { x: 90.0, y: 90.0 },
+            center: Point {
+                x: MAIN_X,
+                y: MAIN_Y,
+            },
             radius: 28.0,
             target: Target::Main,
         },
         Circle {
-            center: Point { x: 90.0, y: 28.0 },
-            radius: 21.0,
+            center: Point {
+                x: 226.0,
+                y: MENU_Y,
+            },
+            radius: 18.0,
             target: Target::Close,
         },
         Circle {
             center: Point {
-                x: 143.694,
-                y: 121.0,
+                x: 142.0,
+                y: MENU_Y,
             },
-            radius: 21.0,
+            radius: 18.0,
             target: Target::Ink,
         },
         Circle {
             center: Point {
-                x: 36.306,
-                y: 121.0,
+                x: 184.0,
+                y: MENU_Y,
             },
-            radius: 21.0,
+            radius: 18.0,
             target: Target::Board,
         },
     ]
@@ -305,10 +316,9 @@ impl MenuAnimation {
 fn animated_circles(amount: f32) -> impl Iterator<Item = Circle> {
     circles(amount > 0.0).map(move |mut circle| {
         if circle.target != Target::Main {
-            let travel = (50.0 + 12.0 * amount) / 62.0;
-            circle.center.x = 90.0 + (circle.center.x - 90.0) * travel;
-            circle.center.y = 90.0 + (circle.center.y - 90.0) * travel;
-            circle.radius *= 0.75 + 0.25 * amount;
+            let travel = 0.75 + 0.25 * amount;
+            circle.center.x = MAIN_X + (circle.center.x - MAIN_X) * travel;
+            circle.radius *= 0.5 + 0.5 * amount;
         }
         circle
     })
@@ -343,14 +353,24 @@ fn hit(point: Point, menu: bool) -> Option<Target> {
 fn fit_scale(dpi: u32, width: i32, height: i32) -> f32 {
     (dpi.max(48) as f32 / 96.0)
         .min(4.0)
-        .min(width.max(1) as f32 / EXTENT)
-        .min(height.max(1) as f32 / EXTENT)
+        .min(width.max(1) as f32 / EXTENT_W)
+        .min(height.max(1) as f32 / EXTENT_H)
 }
 
-fn clamp_origin(point: Point, left: i32, top: i32, right: i32, bottom: i32, size: i32) -> Point {
+fn clamp_origin(
+    point: Point,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    width: i32,
+    height: i32,
+) -> Point {
     Point {
-        x: point.x.clamp(left as f32, (right - size).max(left) as f32),
-        y: point.y.clamp(top as f32, (bottom - size).max(top) as f32),
+        x: point.x.clamp(left as f32, (right - width).max(left) as f32),
+        y: point
+            .y
+            .clamp(top as f32, (bottom - height).max(top) as f32),
     }
 }
 
@@ -361,7 +381,6 @@ enum Phase {
         target: Target,
         origin: Point,
         at: u64,
-        had_menu: bool,
         long: bool,
     },
     Drag {
@@ -383,6 +402,8 @@ enum Effect {
 struct Gesture {
     phase: Phase,
     menu: bool,
+    clicked_at: Option<u64>,
+    pending: bool,
 }
 
 impl Default for Gesture {
@@ -390,6 +411,8 @@ impl Default for Gesture {
         Self {
             phase: Phase::Idle,
             menu: false,
+            clicked_at: None,
+            pending: false,
         }
     }
 }
@@ -405,14 +428,50 @@ impl Gesture {
 
     fn down(&mut self, target: Target, point: Point, now: u64) {
         if !self.active() {
+            self.pending = false;
             self.phase = Phase::Press {
                 target,
                 origin: point,
                 at: now,
-                had_menu: self.menu,
                 long: false,
             };
         }
+    }
+
+    fn waiting(&self) -> bool {
+        self.pending
+    }
+
+    fn tick(&mut self, now: u64) -> Effect {
+        let due = self
+            .clicked_at
+            .is_some_and(|at| now.saturating_sub(at) >= DOUBLE_MS);
+        if self.pending && due {
+            self.pending = false;
+            self.clicked_at = None;
+            self.menu = true;
+            return Effect::MenuChanged;
+        }
+        Effect::None
+    }
+
+    fn click(&mut self, now: u64) -> Effect {
+        let double = self
+            .clicked_at
+            .is_some_and(|at| now.saturating_sub(at) <= DOUBLE_MS);
+        self.clicked_at = Some(now);
+        self.pending = false;
+        if double {
+            self.clicked_at = None;
+            self.menu = false;
+            return Effect::Wake;
+        }
+        if self.menu {
+            self.menu = false;
+            return Effect::MenuChanged;
+        }
+        self.pending = true;
+        Effect::None
     }
 
     /// Points are screen coordinates in DIPs at the press-time scale. Caller
@@ -440,7 +499,6 @@ impl Gesture {
                 target,
                 origin,
                 at,
-                had_menu,
                 long,
             } => {
                 let elapsed = now.saturating_sub(at);
@@ -450,17 +508,15 @@ impl Gesture {
                         return Effect::None;
                     }
                     return match target {
-                        Target::Main if had_menu => {
-                            self.menu = false;
-                            Effect::MenuChanged
-                        }
-                        Target::Main => Effect::Wake,
+                        Target::Main => self.click(now),
                         Target::Close => {
                             self.menu = false;
+                            self.clicked_at = None;
                             Effect::MenuChanged
                         }
                         Target::Ink | Target::Board => {
                             self.menu = false;
+                            self.clicked_at = None;
                             if target == Target::Ink {
                                 Effect::OpenDrawing
                             } else {
@@ -477,6 +533,8 @@ impl Gesture {
                 }
                 if moved {
                     self.menu = false;
+                    self.pending = false;
+                    self.clicked_at = None;
                     self.phase = Phase::Drag { last: point };
                     return Effect::Drag(Point {
                         x: point.x - origin.x,
@@ -488,9 +546,10 @@ impl Gesture {
                         target,
                         origin,
                         at,
-                        had_menu,
                         long: true,
                     };
+                    self.pending = false;
+                    self.clicked_at = None;
                     self.menu = true;
                     return Effect::MenuChanged;
                 }

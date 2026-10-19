@@ -7,7 +7,18 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::thread;
 
 const MAX_WORKERS: usize = 4;
+/// Child log events accepted per second per connection; the rest are dropped.
+pub(super) const LOG_BUDGET: u32 = 64;
+static LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Host-side count of child log events dropped by the per-second budget.
+/// The child keeps its own counter too; neither side re-sends or reconciles them.
+/// Production only increments it; tests read it back.
+#[cfg(test)]
+pub(super) fn dropped_log_events() -> u64 {
+    LOG_DROPPED.load(Ordering::Relaxed)
+}
 
 /// Retained by the supervisor AND every pipe thread, even after child exit.
 /// A broken peer/inherited pipe therefore consumes capacity instead of permitting
@@ -245,6 +256,50 @@ impl Session {
         Ok(())
     }
 
+    /// Rolling one-second budget. Excess is dropped and counted: a noisy child must not
+    /// displace its own RPC traffic. A sustained flood still fills the stdout queue and
+    /// disconnects, exactly like any other protocol flood.
+    fn allow_log(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.log_window).as_secs() >= 1 {
+            self.log_window = now;
+            self.log_count = 0;
+        }
+        if self.log_count >= LOG_BUDGET {
+            LOG_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.log_count += 1;
+        true
+    }
+
+    /// One warning per connection when the budget first drops an event.
+    fn report_log_drop(&mut self, out: &Output) {
+        if self.log_drop_reported {
+            return;
+        }
+        self.log_drop_reported = true;
+        let _ = out.emit(Event::Log(super::LogRecord {
+            level: crate::diagnostics::Level::Warn,
+            message:
+                "runtime log events exceeded the per-second budget; further events are dropped"
+                    .into(),
+            fields: Box::default(),
+        }));
+    }
+
+    /// One warning per connection; later malformed log frames are ignored entirely.
+    fn reject_bad_log(&mut self, out: &Output) {
+        if self.bad_log_reported {
+            return;
+        }
+        self.bad_log_reported = true;
+        let _ = out.emit(Event::Log(super::LogRecord {
+            level: crate::diagnostics::Level::Warn,
+            message: "runtime log event rejected; further bad log frames are ignored".into(),
+            fields: Box::default(),
+        }));
+    }
+
     pub(super) fn frame(
         &mut self,
         frame: &[u8],
@@ -311,6 +366,13 @@ impl Session {
                     return Err(format!("runtime reported protocol_error: {}", data["code"]))
                 }
                 // window.requested is for the runtime's native adapter, never acked here.
+                "log" => match protocol::parse_log(&data) {
+                    Ok(record) if self.allow_log(Instant::now()) => {
+                        out.emit(Event::Log(record))?;
+                    }
+                    Ok(_) => self.report_log_drop(out),
+                    Err(_) => self.reject_bad_log(out),
+                },
                 _ => {}
             },
             Envelope::Response { id, result } => {
@@ -524,6 +586,10 @@ pub(super) fn run(
         configured: false,
         closed: false,
         pending: Default::default(),
+        log_window: Instant::now(),
+        log_count: 0,
+        bad_log_reported: false,
+        log_drop_reported: false,
     };
     let ready_deadline = Instant::now() + READY_TIMEOUT;
     let mut observed_exit = None;

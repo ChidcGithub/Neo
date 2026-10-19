@@ -219,9 +219,9 @@ impl DrawingManager {
     pub(crate) fn consent_pending(&mut self) -> bool {
         self.boards.iter_mut().any(|b| b.host.consent().is_some())
     }
-    pub(crate) fn host_panel(&mut self, ctx: &egui::Context) {
+    pub(crate) fn host_panel(&mut self, ctx: &egui::Context, theme: neo_theme::Theme) {
         for b in &mut self.boards {
-            host::panel(&mut b.host, ctx);
+            host::panel(&mut b.host, ctx, theme);
         }
     }
     /// UI barrier completed on a later native pass, with overlay and floating hidden.
@@ -312,6 +312,19 @@ impl DrawingManager {
                         if board.host.capture_active() {
                             board.show = false;
                         }
+                    }
+                    Event::Log(record) => {
+                        let fields: Vec<(&str, &str)> = record
+                            .fields
+                            .iter()
+                            .map(|(key, value)| (&**key, &**value))
+                            .collect();
+                        crate::diagnostics::record_board(
+                            board.kind.code(),
+                            record.level,
+                            &record.message,
+                            &fields,
+                        );
                     }
                     Event::Exited => {
                         board.host.cancel();

@@ -14,7 +14,7 @@ use egui::{
     Color32, Context, Pos2, Rect, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel,
 };
 use neo_theme::{SquirclePaint, Theme};
-use neo_ui::{Icon, IconButton};
+use neo_ui::{Button, Icon, IconButton};
 
 use crate::brand::WhaleMark;
 use crate::class::{ClassMonitor, SaveState};
@@ -340,7 +340,12 @@ fn paint(
             } else {
                 p.label_tertiary
             }));
-            if retry && ui.button(tr("重试保存 / 索引")).clicked() {
+            if retry
+                && Button::new(tr("重试保存 / 索引"))
+                    .elevated()
+                    .show(ui, &d)
+                    .clicked()
+            {
                 retry_wanted.store(true, Ordering::Relaxed);
                 ui.ctx().request_repaint_of(ViewportId::ROOT);
             }

@@ -23,6 +23,7 @@ pub mod logs;
 pub mod markdown;
 pub mod math;
 pub mod miniwin;
+pub mod mods;
 pub mod settings;
 pub mod sidebar;
 pub mod toastwin;

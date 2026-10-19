@@ -1,11 +1,16 @@
 //! Off-screen GDI only: no HWND, desktop capture, compositor flush or GUI.
 use super::*;
 
+fn dims(scale: f32) -> (i32, i32) {
+    ((EXTENT_W * scale) as i32, (EXTENT_H * scale) as i32)
+}
+
 // Keep the pre-optimization per-pixel geometry and duplicate coverage lookup
 // as an independent reference for the complete premultiplied output.
 fn reference_pixels(
     cache: &RenderCache,
-    size: i32,
+    width: i32,
+    height: i32,
     scale: f32,
     amount: f32,
     glass: Option<&[u32]>,
@@ -16,10 +21,10 @@ fn reference_pixels(
         cache.icon.as_ref().unwrap()
     };
     let icon_size = icon.width() as i32;
-    let icon_left = (90.0 * scale).round() as i32 - icon_size / 2;
-    let mut pixels = vec![0; (size * size) as usize];
-    for y in 0..size {
-        for x in 0..size {
+    let icon_left = (MAIN_X * scale).round() as i32 - icon_size / 2;
+    let mut pixels = vec![0; (width * height) as usize];
+    for y in 0..height {
+        for x in 0..width {
             let p = Point {
                 x: (x as f32 + 0.5) / scale,
                 y: (y as f32 + 0.5) / scale,
@@ -29,7 +34,7 @@ fn reference_pixels(
             else {
                 continue;
             };
-            let index = (y * size + x) as usize;
+            let index = (y * width + x) as usize;
             let distance = p.distance(circle.center);
             let mut color = glass.map_or(0xffc1c1c1, |v| v[index]);
             let rim = (distance - (circle.radius - 1.0)).clamp(0.0, 1.0);
@@ -69,18 +74,18 @@ fn precomputed_geometry_and_reused_coverage_match_original_pixels() {
     unsafe {
         let mut cache = RenderCache::default();
         for scale in [0.5, 1.0, 1.25, 2.0, 4.0] {
-            let size = (EXTENT * scale) as i32;
-            let glass: Vec<_> = (0..size * size)
-                .map(|i| 0xff000000 | ((i as u32 * 7919) & 0x00ffffff))
+            let (width, height) = dims(scale);
+            let glass: Vec<_> = (0..width * height)
+                .map(|i| 0xff000000 | ((i as u32).wrapping_mul(7919) & 0x00ffffff))
                 .collect();
             for language in [crate::i18n::Language::ZhCn, crate::i18n::Language::EnUs] {
                 crate::i18n::with_language(language, || {
                     for amount in [0.0, 0.01, 0.5, 1.0] {
                         for background in [None, Some(glass.as_slice())] {
-                            cache.prepare(size, scale, amount).unwrap();
+                            cache.prepare(width, height, scale, amount).unwrap();
                             let expected =
-                                reference_pixels(&cache, size, scale, amount, background);
-                            paint(&mut cache, size, scale, amount, background).unwrap();
+                                reference_pixels(&cache, width, height, scale, amount, background);
+                            paint(&mut cache, width, height, scale, amount, background).unwrap();
                             assert_eq!(
                                 cache.dib.as_mut().unwrap().pixels(),
                                 expected,
@@ -101,11 +106,11 @@ fn inline_label_key_matches_collected_bounds_and_reuses_mask() {
     unsafe {
         let mut cache = RenderCache::default();
         for scale in [0.5, 1.0, 1.25, 2.0, 4.0] {
-            let size = (EXTENT * scale) as i32;
+            let (width, height) = dims(scale);
             for language in [Language::ZhCn, Language::EnUs] {
                 with_language(language, || {
                     for amount in [0.01, 0.5, 1.0, 1.0 - f32::EPSILON] {
-                        cache.prepare(size, scale, amount).unwrap();
+                        cache.prepare(width, height, scale, amount).unwrap();
                         let expected: Vec<_> = animated_circles(amount)
                             .skip(2)
                             .map(|circle| {
@@ -118,12 +123,12 @@ fn inline_label_key_matches_collected_bounds_and_reuses_mask() {
                         assert_eq!(key.bounds.as_slice(), expected.as_slice());
                         let work = cache.work;
                         let mask = cache.mask.as_ptr();
-                        cache.prepare(size, scale, amount).unwrap();
+                        cache.prepare(width, height, scale, amount).unwrap();
                         assert_eq!(cache.work, work);
                         assert_eq!(cache.mask.as_ptr(), mask);
                         // Closing and reopening must retain the same valid mask.
-                        cache.prepare(size, scale, 0.0).unwrap();
-                        cache.prepare(size, scale, amount).unwrap();
+                        cache.prepare(width, height, scale, 0.0).unwrap();
+                        cache.prepare(width, height, scale, amount).unwrap();
                         assert_eq!(cache.work, work);
                         assert_eq!(cache.mask.as_ptr(), mask);
                     }
@@ -137,12 +142,12 @@ fn inline_label_key_matches_collected_bounds_and_reuses_mask() {
 fn repeated_frames_reuse_dib_artwork_fonts_and_mask() {
     crate::i18n::with_language(crate::i18n::Language::ZhCn, || unsafe {
         let mut cache = RenderCache::default();
-        paint(&mut cache, 180, 1.0, 1.0, None).unwrap();
+        paint(&mut cache, EXTENT_W as i32, EXTENT_H as i32, 1.0, 1.0, None).unwrap();
         let pixels = cache.dib.as_mut().unwrap().pixels().to_vec();
         let bitmap = cache.dib.as_ref().unwrap().bitmap;
         let fonts = cache.fonts.0.clone();
         for _ in 0..20 {
-            paint(&mut cache, 180, 1.0, 1.0, None).unwrap();
+            paint(&mut cache, EXTENT_W as i32, EXTENT_H as i32, 1.0, 1.0, None).unwrap();
             assert_eq!(cache.dib.as_mut().unwrap().pixels(), pixels);
             assert_eq!(cache.dib.as_ref().unwrap().bitmap, bitmap);
             assert_eq!(cache.fonts.0, fonts);
@@ -164,13 +169,13 @@ fn cached_pixels_match_fresh_frames_across_animation_language_and_dpi() {
     unsafe {
         let mut cache = RenderCache::default();
         for scale in [1.0, 1.25, 2.0] {
-            let size = (EXTENT * scale) as i32;
+            let (width, height) = dims(scale);
             for language in [crate::i18n::Language::ZhCn, crate::i18n::Language::EnUs] {
                 crate::i18n::with_language(language, || {
                     for amount in [0.0, 0.01, 0.5, 1.0, 0.5, 0.0] {
                         let mut fresh = RenderCache::default();
-                        paint(&mut fresh, size, scale, amount, None).unwrap();
-                        paint(&mut cache, size, scale, amount, None).unwrap();
+                        paint(&mut fresh, width, height, scale, amount, None).unwrap();
+                        paint(&mut cache, width, height, scale, amount, None).unwrap();
                         assert_eq!(
                             cache.dib.as_mut().unwrap().pixels(),
                             fresh.dib.as_mut().unwrap().pixels()
@@ -187,9 +192,9 @@ fn cache_invalidation_distinguishes_language_dpi_and_animation() {
     use crate::i18n::{with_language, Language};
     with_language(Language::ZhCn, || unsafe {
         let mut cache = RenderCache::default();
-        cache.prepare(180, 1.0, 1.0).unwrap();
+        cache.prepare(EXTENT_W as i32, EXTENT_H as i32, 1.0, 1.0).unwrap();
         with_language(Language::EnUs, || {
-            cache.prepare(180, 1.0, 1.0).unwrap();
+            cache.prepare(EXTENT_W as i32, EXTENT_H as i32, 1.0, 1.0).unwrap();
             assert_eq!(
                 cache.work,
                 CacheWork {
@@ -200,7 +205,7 @@ fn cache_invalidation_distinguishes_language_dpi_and_animation() {
                 }
             );
         });
-        cache.prepare(225, 1.25, 1.0).unwrap();
+        cache.prepare((EXTENT_W * 1.25) as i32, (EXTENT_H * 1.25) as i32, 1.25, 1.0).unwrap();
         assert_eq!(
             cache.work,
             CacheWork {
@@ -211,7 +216,7 @@ fn cache_invalidation_distinguishes_language_dpi_and_animation() {
             }
         );
         let fonts = cache.fonts.0.len();
-        cache.prepare(225, 1.25, 1.0 - f32::EPSILON).unwrap();
+        cache.prepare((EXTENT_W * 1.25) as i32, (EXTENT_H * 1.25) as i32, 1.25, 1.0 - f32::EPSILON).unwrap();
         // Same rounded text bounds, but the exact blur amount still changes.
         assert_eq!(
             cache.work,
@@ -224,7 +229,7 @@ fn cache_invalidation_distinguishes_language_dpi_and_animation() {
         );
         assert_eq!(cache.fonts.0.len(), fonts);
         // A scale change must invalidate even if the rounded DIB size is equal.
-        cache.prepare(225, 1.2501, 1.0).unwrap();
+        cache.prepare((EXTENT_W * 1.2501) as i32, (EXTENT_H * 1.2501) as i32, 1.2501, 1.0).unwrap();
         assert_eq!(
             cache.work,
             CacheWork {
@@ -241,11 +246,11 @@ fn cache_invalidation_distinguishes_language_dpi_and_animation() {
 fn neutral_repaint_removes_all_previous_synthetic_glass_pixels() {
     unsafe {
         let mut cache = RenderCache::default();
-        let glass = vec![0xff123456; 180 * 180];
-        paint(&mut cache, 180, 1.0, 1.0, Some(&glass)).unwrap();
-        paint(&mut cache, 180, 1.0, 0.0, None).unwrap();
+        let glass = vec![0xff123456; EXTENT_W as usize * EXTENT_H as usize];
+        paint(&mut cache, EXTENT_W as i32, EXTENT_H as i32, 1.0, 1.0, Some(&glass)).unwrap();
+        paint(&mut cache, EXTENT_W as i32, EXTENT_H as i32, 1.0, 0.0, None).unwrap();
         let mut fresh = RenderCache::default();
-        paint(&mut fresh, 180, 1.0, 0.0, None).unwrap();
+        paint(&mut fresh, EXTENT_W as i32, EXTENT_H as i32, 1.0, 0.0, None).unwrap();
         assert_eq!(
             cache.dib.as_mut().unwrap().pixels(),
             fresh.dib.as_mut().unwrap().pixels()
@@ -257,14 +262,14 @@ fn neutral_repaint_removes_all_previous_synthetic_glass_pixels() {
 fn win10_gdi_labels_fit_circular_buttons_at_common_dpi_scales() {
     unsafe {
         for scale in [1.0, 1.25, 1.5, 2.0, 3.0, 4.0] {
-            let mut dib = Dib::new((EXTENT * scale) as i32).unwrap();
+            let mut dib = Dib::new((EXTENT_W * scale) as i32, (EXTENT_H * scale) as i32).unwrap();
             let mut fonts = Fonts::default();
             for amount in [0.01, 0.5, 1.0] {
                 for language in [crate::i18n::Language::ZhCn, crate::i18n::Language::EnUs] {
                     crate::i18n::with_language(language, || {
                         dib.pixels().fill(0);
                         let mask = labels(&mut dib, scale, amount, &mut fonts).unwrap();
-                        assert_eq!(mask.len(), (dib.size * dib.size) as usize);
+                        assert_eq!(mask.len(), (dib.width * dib.height) as usize);
                         assert!(mask.iter().any(|alpha| *alpha != 0));
                     });
                 }

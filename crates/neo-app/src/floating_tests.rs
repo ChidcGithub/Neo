@@ -160,7 +160,7 @@ fn pressed() -> Gesture {
 }
 
 #[test]
-fn short_press_wakes_once() {
+fn single_click_opens_the_menu_only_after_the_double_click_window() {
     let mut g = pressed();
     assert_eq!(
         g.update(center(), true, Some(Target::Main), 100),
@@ -168,13 +168,60 @@ fn short_press_wakes_once() {
     );
     assert_eq!(
         g.update(center(), false, Some(Target::Main), 120),
-        Effect::Wake
-    );
-    assert_eq!(
-        g.update(center(), false, Some(Target::Main), 130),
         Effect::None
     );
-    assert!(!g.active());
+    assert!(g.waiting());
+    assert!(!g.menu);
+    assert_eq!(g.tick(120 + DOUBLE_MS - 1), Effect::None);
+    assert!(!g.menu);
+    assert_eq!(g.tick(120 + DOUBLE_MS), Effect::MenuChanged);
+    assert!(g.menu);
+    assert!(!g.waiting());
+    assert_eq!(g.tick(60_000), Effect::None);
+    assert!(g.menu);
+}
+
+#[test]
+fn double_click_wakes_without_ever_opening_the_menu() {
+    let mut g = pressed();
+    assert_eq!(
+        g.update(center(), true, Some(Target::Main), 100),
+        Effect::None
+    );
+    assert_eq!(
+        g.update(center(), false, Some(Target::Main), 120),
+        Effect::None
+    );
+    g.down(Target::Main, center(), 200);
+    assert_eq!(
+        g.update(center(), false, Some(Target::Main), 260),
+        Effect::Wake
+    );
+    assert!(!g.menu);
+    assert!(!g.waiting());
+    assert_eq!(g.tick(60_000), Effect::None);
+    assert!(!g.menu);
+}
+
+#[test]
+fn a_new_press_abandons_the_deferred_open_and_a_slow_second_click_rearms_it() {
+    let mut g = pressed();
+    assert_eq!(
+        g.update(center(), false, Some(Target::Main), 100),
+        Effect::None
+    );
+    assert!(g.waiting());
+    g.down(Target::Main, center(), 200);
+    assert!(!g.waiting());
+    assert_eq!(g.tick(600), Effect::None);
+    assert!(!g.menu);
+    assert_eq!(
+        g.update(center(), false, Some(Target::Main), 500),
+        Effect::None
+    );
+    assert!(g.waiting());
+    assert_eq!(g.tick(500 + DOUBLE_MS), Effect::MenuChanged);
+    assert!(g.menu);
 }
 
 #[test]
@@ -257,10 +304,16 @@ fn small_jitter_is_a_click_but_release_outside_is_not() {
     let mut g = pressed();
     assert_eq!(
         g.update(Point { x: 92.0, y: 92.0 }, false, Some(Target::Main), 100),
-        Effect::Wake
+        Effect::None
     );
+    assert!(g.waiting());
+    assert_eq!(g.tick(100 + DOUBLE_MS), Effect::MenuChanged);
+    assert!(g.menu);
     let mut g = pressed();
     assert_eq!(g.update(center(), false, None, 100), Effect::None);
+    assert!(!g.waiting());
+    assert_eq!(g.tick(60_000), Effect::None);
+    assert!(!g.menu);
 }
 
 #[test]
@@ -325,8 +378,15 @@ fn board_buttons_close_menu_and_emit_distinct_actions_without_wake() {
             g.down(Target::Main, center(), 1200);
             assert_eq!(
                 g.update(center(), false, Some(Target::Main), 1300),
+                Effect::None
+            );
+            assert!(!g.menu);
+            g.down(Target::Main, center(), 1400);
+            assert_eq!(
+                g.update(center(), false, Some(Target::Main), 1450),
                 Effect::Wake
             );
+            assert!(!g.menu);
         }
         let mut g = Gesture {
             menu: true,
@@ -347,30 +407,37 @@ fn board_buttons_close_menu_and_emit_distinct_actions_without_wake() {
 }
 
 #[test]
-fn circle_geometry_is_disjoint_inside_canvas_and_radial() {
+fn circle_geometry_is_disjoint_inside_canvas_and_horizontal_row() {
     let all: Vec<_> = circles(true).collect();
     assert_eq!(all.len(), 4);
     assert_eq!(circles(false).count(), 1);
     for (i, a) in all.iter().enumerate() {
-        assert!(a.center.x - a.radius >= 0.0 && a.center.x + a.radius <= EXTENT);
-        assert!(a.center.y - a.radius >= 0.0 && a.center.y + a.radius <= EXTENT);
+        assert!(a.center.x - a.radius >= 0.0 && a.center.x + a.radius <= EXTENT_W);
+        assert!(a.center.y - a.radius >= 0.0 && a.center.y + a.radius <= EXTENT_H);
         assert_eq!(hit(a.center, true), Some(a.target));
         if i > 0 {
-            assert!((a.center.distance(center()) - 62.0).abs() < 0.01);
+            assert!(a.center.x > MAIN_X, "二级菜单只能展开在主按钮右侧");
+            assert_eq!(a.center.y, MENU_Y, "二级菜单与主按钮同一排");
         }
         for b in &all[i + 1..] {
             assert!(a.center.distance(b.center) > a.radius + b.radius);
         }
     }
+    let mut row: Vec<f32> = all[1..].iter().map(|circle| circle.center.x).collect();
+    row.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(row, vec![142.0, 184.0, 226.0]);
     for point in [
         Point::default(),
-        Point { x: 179.0, y: 179.0 },
+        Point {
+            x: EXTENT_W - 1.0,
+            y: 1.0,
+        },
         Point { x: 90.0, y: 59.0 },
+        Point { x: 113.0, y: 113.0 },
     ] {
         assert_eq!(hit(point, true), None);
     }
     assert_eq!(hit(all[1].center, false), None);
-    assert_eq!(hit(Point { x: 113.0, y: 113.0 }, false), None);
 }
 
 #[test]
@@ -438,7 +505,8 @@ fn circle_edge_has_subpixel_coverage_at_multiple_dpi_scales() {
 fn dpi_and_negative_monitor_work_area_keep_full_menu_inside() {
     for dpi in [48, 96, 120, 144, 192, 384, 768] {
         let scale = fit_scale(dpi, 1920, 1040);
-        let size = (EXTENT * scale).round() as i32;
+        let width = (EXTENT_W * scale).round() as i32;
+        let height = (EXTENT_H * scale).round() as i32;
         let origin = clamp_origin(
             Point {
                 x: -50.0,
@@ -448,12 +516,14 @@ fn dpi_and_negative_monitor_work_area_keep_full_menu_inside() {
             -200,
             0,
             840,
-            size,
+            width,
+            height,
         );
         assert!(origin.x >= -1920.0 && origin.y >= -200.0);
-        assert!(origin.x + size as f32 <= 0.0 && origin.y + size as f32 <= 840.0);
+        assert!(origin.x + width as f32 <= 0.0 && origin.y + height as f32 <= 840.0);
     }
     assert_eq!(fit_scale(144, 1920, 1080), 1.5);
     let scale = fit_scale(192, 80, 60);
-    assert!(EXTENT * scale <= 60.001);
+    assert!(EXTENT_W * scale <= 80.001);
+    assert!(EXTENT_H * scale <= 60.001);
 }

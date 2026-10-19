@@ -144,6 +144,7 @@ impl Store {
                 }
             }
         }
+        neo_log::info!("store", "db opened"; "migrated" => !has_attachments);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -181,17 +182,24 @@ impl Store {
             "INSERT INTO sessions (title, created_ms, updated_ms) VALUES (?1, ?2, ?2)",
             params![title, now],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        neo_log::info!("store", "session created"; "id" => id);
+        Ok(id)
     }
 
     /// 更新会话标题与 `updated_ms`。
     pub fn rename_session(&self, id: i64, title: &str) -> Result<()> {
         let conn = self.conn();
-        conn.execute(
+        match conn.execute(
             "UPDATE sessions SET title = ?1, updated_ms = ?2 WHERE id = ?3",
             params![title, now(), id],
-        )?;
-        Ok(())
+        ) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                neo_log::warn!("store", "db error"; "op" => "rename_session", "category" => error_category(&error));
+                Err(error)
+            }
+        }
     }
 
     /// 仅刷新 `updated_ms`（用于把会话顶到列表最前）。
@@ -212,6 +220,7 @@ impl Store {
         tx.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         tx.commit()?;
+        neo_log::info!("store", "session deleted"; "id" => id);
         Ok(())
     }
 
@@ -299,6 +308,7 @@ impl Store {
             params![timestamp, session_id],
         )?;
         tx.commit()?;
+        neo_log::debug!("store", "message appended"; "session" => session_id, "role" => role);
         Ok(message_id)
     }
 
@@ -355,6 +365,18 @@ fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn error_category(error: &rusqlite::Error) -> &'static str {
+    match error {
+        rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ffi::ErrorCode::ConstraintViolation => {
+            "constraint"
+        }
+        rusqlite::Error::SqliteFailure(_, _) => "sqlite",
+        rusqlite::Error::QueryReturnedNoRows => "no_rows",
+        rusqlite::Error::InvalidParameterName(_) => "param",
+        _ => "other",
+    }
 }
 
 const SCHEMA: &str = "

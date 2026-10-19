@@ -34,6 +34,9 @@ use std::time::{Duration, Instant};
 pub use protocol::{RpcError, State};
 
 const MAX_LINE: usize = 65_536;
+/// Child log events are capped far below the framing limit.
+const MAX_LOG_FIELDS: usize = 16;
+const MAX_LOG_FIELD_KEY: usize = 64;
 const QUEUE: usize = 32;
 const EVENT_QUEUE: usize = 128;
 const HOST_ID_BUDGET: usize = 4096;
@@ -128,6 +131,17 @@ pub enum Event {
     Failed(String),
     /// Emitted only after the child has actually been reaped (or failed to spawn).
     Exited,
+    /// Best-effort child telemetry. Never drives state and never fails the connection.
+    Log(LogRecord),
+}
+
+/// A child log line before host stamping: no component and no timestamps.
+/// The host owns both, so a child cannot impersonate another component or skew time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogRecord {
+    pub level: crate::diagnostics::Level,
+    pub message: String,
+    pub fields: Box<[(Box<str>, Box<str>)]>,
 }
 
 /// Default: exe-parent/apps/{drawing,blackboard}/neo-{drawing,blackboard}.exe.

@@ -36,6 +36,7 @@ mod brand;
 mod class;
 mod diagnostics;
 mod drawing_agent;
+mod filelog;
 mod drawing_capture;
 mod drawing_commands;
 mod drawing_manager;
@@ -45,6 +46,7 @@ mod floating;
 mod graphics;
 mod i18n;
 mod manual_audio;
+mod mods;
 mod notify;
 mod startup;
 mod state;
@@ -145,3 +147,7 @@ fn main() {
 #[cfg(test)]
 #[path = "main_graphics_tests.rs"]
 mod graphics_tests;
+
+#[cfg(test)]
+#[path = "subcrate_log_tests.rs"]
+mod subcrate_log_tests;

@@ -1293,3 +1293,41 @@ fn config_gate() {
     cfg.api_key = "sk-x".to_owned();
     assert!(cfg.is_configured());
 }
+
+#[test]
+fn retryable_failure_matches_transport_and_server_faults_only() {
+    // 可重试：网络/服务端瞬断。
+    for message in [
+        "请求失败：connection reset by peer",
+        "读取流失败：unexpected EOF during chunk",
+        "连接超时：五分钟没有收到任何数据，请重试",
+        "响应流提前结束，未收到正常结束标志",
+        "无法启动读取线程：os error",
+        "接口返回 408 Request Timeout：upstream",
+        "接口返回 429 Too Many Requests：rate limited",
+        "接口返回 500 Internal Server Error：x",
+        "接口返回 503 Service Unavailable：x",
+        "接口返回 520 Web Server Returned an Unknown Error：cf",
+    ] {
+        assert!(crate::retryable_failure(message), "应可重试：{message}");
+    }
+    // 不可重试：配置/预算/鉴权/协议守卫。
+    for message in [
+        "尚未配置模型接口。请在「设置 → 模型」里填写 API 密钥。",
+        "请求超出上下文预算",
+        "无法创建网络客户端：builder",
+        "接口返回 400 Bad Request：invalid model",
+        "接口返回 401 Unauthorized：bad key",
+        "接口返回 404 Not Found：no such model",
+        "接口返回 422 Unprocessable Entity：tools[0][0]",
+        "响应事件过长（疑似畸形流），已中断",
+        "响应正文/推理/工具参数累计超过预算，已中断",
+        "响应未正常完成：length",
+        "工具响应缺少调用内容",
+        "响应解析失败：invalid json",
+        "工具调用 ID 重复，已阻止执行",
+        "工具响应不完整或参数不是 JSON 对象，已阻止执行",
+    ] {
+        assert!(!crate::retryable_failure(message), "不应重试：{message}");
+    }
+}

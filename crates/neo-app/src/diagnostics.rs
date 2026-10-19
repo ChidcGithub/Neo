@@ -1,8 +1,9 @@
-//! 仅供本机界面查看的进程内日志；不落盘、不发送网络、不进入模型上下文。
+//! 仅供本机界面查看的进程内日志；默认同时保留内存有界视图与本地文件日志。
 //!
 //! 调用方只能传固定组件名和安全概括（例如错误类别），不能传工具参数、命令、
 //! 正文、路径、原始错误或密钥。下面的保守脱敏只是纵深防护：它不识别任意编码、
-//! 混淆或没有标记的秘密，不能把任意输入变成安全日志。
+//! 混淆或没有标记的秘密，不能把任意输入变成安全日志。子项目经 neo-log 门面
+//! 转送的记录走 `forward`，同样脱敏后才进内存与文件。
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -14,9 +15,9 @@ use std::time::Instant;
 
 use neo_tools::diagnostic::ErrorTrace;
 
-pub const MAX_ENTRIES: usize = 1_000;
-pub const MAX_BYTES: usize = 256 * 1024;
-pub const MAX_ENTRY_BYTES: usize = 2_048;
+pub const MAX_ENTRIES: usize = 4_000;
+pub const MAX_BYTES: usize = 1024 * 1024;
+pub const MAX_ENTRY_BYTES: usize = 4_096;
 /// Retained UTF-8 budget, separate from summaries; excludes allocator/rendering overhead.
 pub const MAX_TRACE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_TRACE_ENTRY_BYTES: usize = 64 * 1024;
@@ -24,10 +25,13 @@ pub const MAX_TRACE_ENTRY_BYTES: usize = 64 * 1024;
 static DETAIL_GENERATION: AtomicU64 = AtomicU64::new(0);
 const MAX_COMPONENT_BYTES: usize = 64;
 const MAX_INPUT_BYTES: usize = 8 * 1024;
+const MAX_FIELD_BYTES: usize = 1024;
+const MAX_FIELDS: usize = 32;
 const REDACTED: &str = "[已脱敏]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
+    Trace,
     Debug,
     Info,
     Warn,
@@ -35,14 +39,25 @@ pub enum Level {
 }
 
 impl Level {
-    pub const ALL: [Self; 4] = [Self::Debug, Self::Info, Self::Warn, Self::Error];
+    pub const ALL: [Self; 5] = [Self::Trace, Self::Debug, Self::Info, Self::Warn, Self::Error];
 
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Trace => "追踪",
             Self::Debug => "调试",
             Self::Info => "信息",
             Self::Warn => "警告",
             Self::Error => "错误",
+        }
+    }
+
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Trace => "TRACE",
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
         }
     }
 }
@@ -112,13 +127,21 @@ pub struct Entry {
     /// 从本日志初始化开始的毫秒数，不包含系统时间或用户信息。
     pub first_ms: u64,
     pub last_ms: u64,
-    /// Same level, component, safe summary and source; detailed events never merge.
+    /// Wall-clock milliseconds at first occurrence; local display/export only.
+    pub wall_ms: u64,
+    /// 记录该事件的线程名（已截断脱敏），仅用于本地诊断。
+    pub thread: Box<str>,
+    /// 结构化安全字段（已脱敏）；字段值完全相同的重复事件会聚合。
+    pub fields: Box<[(Box<str>, Box<str>)]>,
+    /// Same level, component, safe summary, source and field values; merged repeats
+    /// increment this instead of adding a new entry.
     pub occurrences: u64,
 }
 
 impl Entry {
     fn bytes(&self) -> usize {
-        self.component.len() + self.message.len()
+        self.component.len() + self.message.len() + self.thread.len()
+            + self.fields.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
     }
 }
 
@@ -171,11 +194,14 @@ impl Buffer {
 
     #[cfg(test)]
     fn push(&mut self, level: Level, component: &str, message: &str, now: u64) {
-        self.push_event(level, component, message, now, RecordLocation::default(), None);
+        self.push_event(level, component, message, now, RecordLocation::default(), None,
+            "", 0, &[]);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_event(&mut self, level: Level, component: &str, message: &str, now: u64,
-        source: RecordLocation, trace: Option<(Arc<ErrorTrace>, TraceKind)>) {
+        source: RecordLocation, trace: Option<(Arc<ErrorTrace>, TraceKind)>,
+        thread: &str, wall_ms: u64, fields: &[(&str, &str)]) {
         // 聚合、截断或直接丢弃也会改变计数，所有记录路径都必须失效。
         self.cached_snapshot = None;
         self.stats.received = self.stats.received.saturating_add(1);
@@ -185,21 +211,49 @@ impl Buffer {
             message,
             self.max_entry_bytes.saturating_sub(component.len()),
         );
+        let (thread, thread_cut) = sanitize(thread, MAX_COMPONENT_BYTES.min(self.max_entry_bytes));
+        let _ = thread_cut;
+        let fields: Box<[(Box<str>, Box<str>)]> = fields.iter()
+            .take(MAX_FIELDS)
+            .map(|(key, value)| {
+                let (key, key_cut) = sanitize(key, MAX_FIELD_BYTES);
+                let (value, value_cut) = sanitize(value, MAX_FIELD_BYTES);
+                debug_assert!(!key_cut && !value_cut);
+                (key, value)
+            })
+            .collect();
         if component_cut || message_cut {
             self.stats.truncated = self.stats.truncated.saturating_add(1);
         }
+        // 落盘审计轨迹在聚合之前：内存视图去重，文件保留每次事件的完整时间线。
+        // submit 仅在开关开启且通道已建立（含测试）时才构造拷贝，绝不阻塞调用方。
+        crate::filelog::submit(crate::filelog::Record {
+            wall_ms,
+            mono_ms: now,
+            level: level.code(),
+            component: &component,
+            thread: &thread,
+            message: &message,
+            fields: &fields,
+            source: (source.file, source.line, source.column),
+        });
         // 在整个有界窗口内聚合，交错出现的重复错误也不会把其它条目挤掉。
         // 按脱敏后的概括聚合是刻意的：绝不为了去重保存原文或原文指纹。
-        if let Some(index) = self.entries.iter().position(|entry| {
-            entry.level == level && entry.component == component && entry.message == message
-                && entry.source == source && entry.trace.is_none() && trace.is_none()
-        }) {
-            let mut entry = self.entries.remove(index).expect("已找到日志条目");
-            entry.last_ms = now;
-            entry.occurrences = entry.occurrences.saturating_add(1);
-            self.entries.push_back(entry);
-            self.stats.merged = self.stats.merged.saturating_add(1);
-            return;
+        // 带结构化字段的条目按字段值聚合：字段完全相同的重复事件压成一行 ×N，
+        // 字段不同（如每次各异的 elapsed_ms）则保持独立——只有「输出相同」才去重。
+        if trace.is_none() {
+            if let Some(index) = self.entries.iter().position(|entry| {
+                entry.level == level && entry.component == component && entry.message == message
+                    && entry.source == source && entry.trace.is_none() && entry.thread == thread
+                    && entry.fields == fields
+            }) {
+                let mut entry = self.entries.remove(index).expect("已找到日志条目");
+                entry.last_ms = now;
+                entry.occurrences = entry.occurrences.saturating_add(1);
+                self.entries.push_back(entry);
+                self.stats.merged = self.stats.merged.saturating_add(1);
+                return;
+            }
         }
         static NEXT_ENTRY: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ENTRY.fetch_add(1, Ordering::Relaxed);
@@ -210,6 +264,9 @@ impl Buffer {
             message,
             first_ms: now,
             last_ms: now,
+            wall_ms,
+            thread,
+            fields,
             occurrences: 1,
         };
         let bytes = entry.bytes();
@@ -328,6 +385,26 @@ pub fn record(level: Level, component: &str, message: &str) {
     record_detail(level, component, message, generation, trace);
 }
 
+/// 子进程（黑板/画板）经 `log` 事件上报的记录。
+///
+/// 组件名与时间由宿主补齐：子进程不能伪造别的组件，也不自带时钟。
+/// 不采集宿主栈 —— 记录来自另一个进程，这里的调用栈只会误导排查。
+pub fn record_board(component: &str, level: Level, message: &str, fields: &[(&str, &str)]) {
+    let thread = format!("{component}-child");
+    let wall_ms = wall_now_ms();
+    let push = |buffer: &mut Buffer, now| {
+        buffer.push_event(level, component, message, now, RecordLocation::default(), None,
+            &thread, wall_ms, fields);
+    };
+    #[cfg(test)]
+    if TEST_BUFFER.with(|slot| {
+        if let Some(buffer) = slot.borrow_mut().as_mut() { push(buffer, 0); true } else { false }
+    }) { return; }
+    let logger = logger();
+    let mut buffer = logger.lock();
+    push(&mut buffer, logger.started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+}
+
 /// The borrowed error is formatted only after opt-in; never put it in the safe summary.
 /// This stack is where the error was observed, not where the OS/upstream error arose.
 #[track_caller]
@@ -343,11 +420,13 @@ pub fn record_error(component: &str, safe_summary: &str, error: &(dyn Error + 's
 fn record_detail(level: Level, component: &str, message: &str, generation: u64,
     trace: Option<(Arc<ErrorTrace>, TraceKind)>) {
     let source = RecordLocation::caller(Location::caller());
+    let thread = thread_name();
+    let wall_ms = wall_now_ms();
     let push = |buffer: &mut Buffer, now| {
         let trace = if generation % 2 == 1 && generation == DETAIL_GENERATION.load(Ordering::Acquire) {
             trace.clone()
         } else { None };
-        buffer.push_event(level, component, message, now, source, trace);
+        buffer.push_event(level, component, message, now, source, trace, &thread, wall_ms, &[]);
     };
     #[cfg(test)]
     if TEST_BUFFER.with(|slot| {
@@ -356,6 +435,42 @@ fn record_detail(level: Level, component: &str, message: &str, generation: u64,
     let logger = logger();
     let mut buffer = logger.lock();
     push(&mut buffer, logger.started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+}
+
+/// 接收子项目经 neo-log 门面转送的记录；同样脱敏后进内存与文件。
+pub fn forward(record: &neo_log::Record) {
+    let level = match record.level {
+        neo_log::Level::Trace => Level::Trace,
+        neo_log::Level::Debug => Level::Debug,
+        neo_log::Level::Info => Level::Info,
+        neo_log::Level::Warn => Level::Warn,
+        neo_log::Level::Error => Level::Error,
+    };
+    let fields: Vec<(&str, &str)> = record.fields.iter().map(|f| (&*f.key, &*f.value)).collect();
+    let source = RecordLocation { file: record.location.file, line: record.location.line,
+        column: record.location.column };
+    let push = |buffer: &mut Buffer| {
+        buffer.push_event(level, &record.component, &record.message, record.mono_ms,
+            source, None, &record.thread, record.wall_ms, &fields);
+    };
+    #[cfg(test)]
+    if TEST_BUFFER.with(|slot| {
+        if let Some(buffer) = slot.borrow_mut().as_mut() { push(buffer); true } else { false }
+    }) { return; }
+    let logger = logger();
+    let mut buffer = logger.lock();
+    push(&mut buffer);
+}
+
+fn thread_name() -> Box<str> {
+    std::thread::current().name().unwrap_or("<unnamed>").into()
+}
+
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 pub fn details_enabled() -> bool { DETAIL_GENERATION.load(Ordering::Acquire) % 2 == 1 }
@@ -606,7 +721,7 @@ pub fn clear() {
 /// 常见凭据标记出现时整字段隐藏，避免引号、空白和多行值造成部分泄露。
 /// URL 整体隐藏（含路径、查询、片段和 userinfo），也隐藏带 ? 的相对 URL。
 /// 不声称识别所有秘密；超长输入直接舍弃，避免先复制巨大的原始正文。
-fn sanitize(text: &str, limit: usize) -> (Box<str>, bool) {
+pub(crate) fn sanitize(text: &str, limit: usize) -> (Box<str>, bool) {
     if text.len() > MAX_INPUT_BYTES {
         return (clip("[输入过长，已省略]", limit).into_boxed_str(), true);
     }

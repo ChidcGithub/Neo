@@ -85,6 +85,7 @@ pub fn panel(
     state: &mut AppState,
     viewport_h: f32,
     loaded: &LoadedFonts,
+    escape_pressed: bool,
 ) -> bool {
     let d = skin.d();
     let p = skin.p();
@@ -229,10 +230,15 @@ pub fn panel(
                     SettingsTab::Display => display_tab(ui, skin, w, state, viewport_h),
                     SettingsTab::Model => model_tab(ui, skin, w, state),
                     SettingsTab::Memory => memory_tab(ui, skin, w, state),
-                    SettingsTab::Logs => super::logs::draw(ui, skin, w),
+                    SettingsTab::Mods => super::mods::draw(ui, skin, w, state),
+                    SettingsTab::Logs => super::logs::draw(ui, skin, w, state),
                     SettingsTab::About => about_tab(ui, skin, w, state, loaded),
                 }
             });
+        // 详情模态必须画在滚动区之外：滚动区会裁剪子 Ui，而模态遮罩要盖满整屏。
+        if state.settings_tab == SettingsTab::Logs {
+            super::logs::draw_detail_modal(ui, skin, escape_pressed);
+        }
     });
 
     closed
@@ -277,6 +283,7 @@ fn page_desc(tab: SettingsTab) -> &'static str {
         SettingsTab::Display => "观看距离与缩放",
         SettingsTab::Model => "接口、密钥与模型列表",
         SettingsTab::Memory => "管理与备份记忆",
+        SettingsTab::Mods => "只读发现与启用意图，不启动进程",
         SettingsTab::Logs => "本地诊断，不进入模型上下文",
         SettingsTab::About => "版本、存储与字体",
     })
@@ -290,6 +297,7 @@ fn nav_icon(tab: SettingsTab) -> Icon {
         SettingsTab::Display => Icon::Board,
         SettingsTab::Model => Icon::Sparkle,
         SettingsTab::Memory => Icon::Checklist,
+        SettingsTab::Mods => Icon::Folder,
         SettingsTab::Logs => Icon::Checklist,
         SettingsTab::About => Icon::Info,
     }
@@ -380,7 +388,7 @@ fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         skin,
         width,
         tr("桌面悬浮按钮"),
-        tr("单击听写，拖动移动，长按不动展开菜单。独立于语音唤醒；安全模式下不采集桌面或麦克风"),
+        tr("单击展开菜单，双击唤醒，拖动移动。独立于语音唤醒；安全模式下不采集桌面或麦克风"),
         &mut state.floating_enabled,
         "neo-set-floating",
     );
@@ -1290,7 +1298,7 @@ fn switch_row(
 }
 
 /// 行间细分隔线。
-fn row_divider(ui: &mut Ui, skin: &Skin<'_>, width: f32) {
+pub(super) fn row_divider(ui: &mut Ui, skin: &Skin<'_>, width: f32) {
     let m = skin.m();
     ui.add_space(m.s(2.0));
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, m.s(6.0)), Sense::hover());
@@ -1436,7 +1444,7 @@ fn number_row(
 }
 
 /// 安全与操作提示必须完整换行，不能依赖悬停才能读全。
-fn hint_row(ui: &mut Ui, skin: &Skin<'_>, width: f32, text: &str) {
+pub(super) fn hint_row(ui: &mut Ui, skin: &Skin<'_>, width: f32, text: &str) {
     ui.scope(|ui| {
         ui.set_max_width(width);
         ui.add(
