@@ -4,6 +4,19 @@ mod visual {
     use super::*;
 
     #[test]
+    fn card_corners_stay_compact() {
+        for scale in [1., 1.25, 1.5, 2., 3.] {
+            let card = layout(scale);
+            assert_eq!(card.radius, 12. * scale);
+            assert!(
+                card.radius <= (card.body.bottom - card.body.top) as f32 * 0.15,
+                "corner radius {} too round for body height",
+                card.radius
+            );
+        }
+    }
+
+    #[test]
     fn layout_scales_without_overlap() {
         for scale in [1., 1.25, 1.5, 2., 3.] {
             let card = layout(scale);

@@ -58,10 +58,13 @@ fn format_cost(cost: f64) -> String {
 /// 峰时 = UTC 周一至周五 01:00–04:00 与 06:00–10:00（DeepSeek 官方定义，
 /// 排除中国法定节假日 —— 此处不实现节假日日历，按工作日近似）。
 fn is_peak_utc() -> bool {
-    let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
-        return false;
-    };
-    let secs = d.as_secs();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| is_peak_at(d.as_secs()))
+        .unwrap_or(false)
+}
+
+fn is_peak_at(secs: u64) -> bool {
     let hour = (secs % 86_400) / 3_600;
     // 1970-01-01 是周四；weekday: 0=周日。
     let weekday = (secs / 86_400 + 4) % 7;
@@ -112,13 +115,7 @@ mod tests {
 
     #[test]
     fn peak_window_matches_deepseek_schedule() {
-        let at = |days: u64, hour: u64| {
-            let secs = days * 86_400 + hour * 3_600 + 1_800;
-            let hour = (secs % 86_400) / 3_600;
-            let weekday = ((secs / 86_400) + 4) % 7;
-            let weekday = weekday != 0 && weekday != 6;
-            weekday && (matches!(hour, 1..=3) || matches!(hour, 6..=9))
-        };
+        let at = |days: u64, hour: u64| is_peak_at(days * 86_400 + hour * 3_600 + 1_800);
         // 1970-01-01 是周四（weekday=4）：days=0 周四，days=3 周日，days=4 周一。
         assert!(at(0, 2), "周四 02:00 峰时");
         assert!(at(0, 7), "周四 07:00 峰时");

@@ -2077,3 +2077,18 @@
         assert!(!s.pump());
         assert!(s.messages.last().unwrap().usage.is_empty());
     }
+
+    #[test]
+    fn failed_reply_is_excluded_from_model_context() {
+        use super::*;
+        let mut s = AppState::default();
+        let mut failed = ChatMessage::new(Role::Assistant, "半截回答");
+        failed.error = Some("连接中断".into());
+        s.messages.push(ChatMessage::new(Role::User, "第一个问题"));
+        s.messages.push(failed);
+        s.messages.push(ChatMessage::new(Role::User, "第二个问题"));
+        let messages = s.api_messages(usize::MAX);
+        assert!(messages.iter().all(|m| !m.content.contains("半截回答")));
+        assert!(messages.iter().any(|m| m.content == "第一个问题"));
+        assert!(messages.iter().any(|m| m.content == "第二个问题"));
+    }

@@ -214,7 +214,7 @@ fn record_category(component: &str, category: &str) {
             return;
         }
     }
-    *directory = prepare_log(directory_candidates().into_iter().rev());
+    *directory = prepare_log(directory_candidates());
     if let Some(dir) = directory.as_ref() {
         let _ = append_log(dir, &line);
     }
@@ -612,9 +612,8 @@ mod native {
         }
     }
 
-    mod glass {
-        include!("startup_glass.rs");
-    }
+    #[path = "../../startup_glass.rs"]
+    mod glass;
 
     struct Card {
         duplicate: bool,
@@ -631,6 +630,7 @@ mod native {
     struct Layout {
         width: i32,
         height: i32,
+        scale: f32,
         body: RECT,
         icon: RECT,
         brand: RECT,
@@ -668,12 +668,13 @@ mod native {
         Layout {
             width: px(400.),
             height: px(144.),
+            scale,
             body: rect(8., 6., 392., 134.),
             icon: rect(32., 26., 108., 102.),
             brand: rect(132., 22., 368., 72.),
             caption: rect(134., 77., 368., 99.),
             progress: rect(32., 116., 368., 119.),
-            radius: 22. * scale,
+            radius: 12. * scale,
         }
     }
 
@@ -798,7 +799,9 @@ mod native {
         }
     }
 
-    include!("startup_visual.rs");
+    #[path = "../../startup_visual.rs"]
+    mod visual;
+    use visual::*;
 
     fn text_halo(mask: &[u8], width: usize, index: usize, radius: usize) -> u8 {
         let height = mask.len() / width;
@@ -897,83 +900,127 @@ mod native {
         GdiFlush() != 0 && drawn
     }
 
-    unsafe fn paint(hwnd: HWND, card: &Card) {
-        let mut ps: PAINTSTRUCT = std::mem::zeroed();
-        let target = BeginPaint(hwnd, &mut ps);
-        let geometry = layout(card.scale);
-        let (width, height) = (geometry.width, geometry.height);
-        if width <= 0 || height <= 0 || width as usize * height as usize > MAX_CARD_PIXELS {
-            EndPaint(hwnd, &ps);
-            card.failed.set(true);
-            return;
+    struct PaintScope {
+        hwnd: HWND,
+        paint: PAINTSTRUCT,
+    }
+
+    impl PaintScope {
+        unsafe fn begin(hwnd: HWND) -> Self {
+            let mut paint: PAINTSTRUCT = std::mem::zeroed();
+            BeginPaint(hwnd, &mut paint);
+            Self { hwnd, paint }
         }
-        let dc = CreateCompatibleDC(target);
-        let mut info: BITMAPINFO = std::mem::zeroed();
-        info.bmiHeader = BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            ..std::mem::zeroed()
-        };
-        let mut bits = null_mut();
-        let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-        if target.is_null() || dc.is_null() || bitmap.is_null() || bits.is_null() {
-            if !bitmap.is_null() {
-                DeleteObject(bitmap);
+    }
+
+    impl Drop for PaintScope {
+        fn drop(&mut self) {
+            unsafe {
+                EndPaint(self.hwnd, &self.paint);
             }
-            if !dc.is_null() {
-                DeleteDC(dc);
+        }
+    }
+
+    struct Dib {
+        dc: HDC,
+        bitmap: HBITMAP,
+        previous: HGDIOBJ,
+        bits: *mut u32,
+        width: i32,
+        height: i32,
+    }
+
+    impl Dib {
+        unsafe fn new(target: HDC, width: i32, height: i32) -> Option<Self> {
+            let dc = CreateCompatibleDC(target);
+            if dc.is_null() {
+                return None;
             }
-            EndPaint(hwnd, &ps);
-            card.failed.set(true);
-            return;
-        }
-        let old_bitmap = SelectObject(dc, bitmap);
-        if old_bitmap.is_null() || old_bitmap as isize == GDI_ERROR as isize {
-            DeleteObject(bitmap);
-            DeleteDC(dc);
-            EndPaint(hwnd, &ps);
-            card.failed.set(true);
-            return;
-        }
-        let pixels = std::slice::from_raw_parts_mut(bits.cast::<u32>(), (width * height) as usize);
-        let palette = Palette::for_backdrop(card.backdrop.get());
-        let mut plate = card.plate.borrow_mut();
-        if plate.is_none() {
-            pixels.fill(0);
-            let caption = if card.duplicate {
-                tr("Neo 已经在运行")
-            } else {
-                tr("正在启动")
+            let mut info: BITMAPINFO = std::mem::zeroed();
+            info.bmiHeader = BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..std::mem::zeroed()
             };
-            // Only memory GDI draws glyphs; grayscale coverage ignores GDI's alpha byte.
-            if !draw_glyphs(dc, &geometry, card.scale, caption) {
-                card.failed.set(true);
+            let mut bits = null_mut();
+            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            if bitmap.is_null() || bits.is_null() {
+                if !bitmap.is_null() {
+                    DeleteObject(bitmap);
+                }
+                DeleteDC(dc);
+                return None;
             }
-            let mask: Vec<u8> = pixels.iter().map(|p| (*p & 255) as u8).collect();
-            let size = (geometry.icon.right - geometry.icon.left) as usize;
-            let (icon, _, _) = crate::brand::whale_rgba(size);
-            let glass = card.glass.borrow();
-            *plate = render_plate(&geometry, &mask, &icon, glass.as_deref(), palette);
-            if plate.is_none() {
-                card.failed.set(true);
+            let previous = SelectObject(dc, bitmap);
+            if previous.is_null() || previous as isize == GDI_ERROR as isize {
+                DeleteObject(bitmap);
+                DeleteDC(dc);
+                return None;
+            }
+            Some(Self {
+                dc,
+                bitmap,
+                previous,
+                bits: bits.cast(),
+                width,
+                height,
+            })
+        }
+
+        unsafe fn pixels(&mut self) -> &mut [u32] {
+            std::slice::from_raw_parts_mut(self.bits, (self.width * self.height) as usize)
+        }
+    }
+
+    impl Drop for Dib {
+        fn drop(&mut self) {
+            unsafe {
+                SelectObject(self.dc, self.previous);
+                DeleteObject(self.bitmap);
+                DeleteDC(self.dc);
             }
         }
-        if let Some(plate) = plate.as_ref() {
-            pixels.copy_from_slice(plate);
-            render_progress(
-                pixels,
-                &geometry,
-                animation_phase(card.started.elapsed().as_secs_f32(), card.duplicate),
-                card.duplicate,
-                palette,
-            );
+    }
+
+    unsafe fn glyph_plate(
+        card: &Card,
+        geometry: &Layout,
+        dib: &mut Dib,
+        palette: Palette,
+    ) -> Option<Vec<u32>> {
+        dib.pixels().fill(0);
+        let caption = if card.duplicate {
+            tr("Neo 已经在运行")
         } else {
-            pixels.fill(premultiplied(palette.body, 1.));
+            tr("正在启动")
+        };
+        // Only memory GDI draws glyphs; grayscale coverage ignores GDI's alpha byte.
+        if !draw_glyphs(dib.dc, geometry, card.scale, caption) {
+            card.failed.set(true);
         }
+        let mask: Vec<u8> = dib
+            .pixels()
+            .iter()
+            .map(|pixel| (*pixel & 255) as u8)
+            .collect();
+        let size = (geometry.icon.right - geometry.icon.left) as usize;
+        let (icon, _, _) = crate::brand::whale_rgba(size);
+        let glass = card.glass.borrow();
+        render_plate(geometry, &mask, &icon, glass.as_deref(), palette)
+    }
+
+    unsafe fn present(
+        target: HDC,
+        hwnd: HWND,
+        card: &Card,
+        geometry: &Layout,
+        dib: &mut Dib,
+        palette: Palette,
+    ) {
         if card.layered.get() {
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
@@ -982,8 +1029,8 @@ mod native {
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
             let size = SIZE {
-                cx: width,
-                cy: height,
+                cx: dib.width,
+                cy: dib.height,
             };
             let origin = POINT { x: 0, y: 0 };
             if UpdateLayeredWindow(
@@ -991,7 +1038,7 @@ mod native {
                 null_mut(),
                 null(),
                 &size,
-                dc,
+                dib.dc,
                 &origin,
                 0,
                 &blend,
@@ -999,7 +1046,7 @@ mod native {
             ) == 0
             {
                 // Rounded opaque fallback excludes the translucent shadow.
-                let region = fallback_region(&geometry);
+                let region = fallback_region(geometry);
                 if region.is_null() || SetWindowRgn(hwnd, region, 0) == 0 {
                     if !region.is_null() {
                         DeleteObject(region);
@@ -1017,17 +1064,53 @@ mod native {
             }
         }
         if !card.layered.get() && !card.failed.get() {
-            for pixel in pixels.iter_mut() {
+            for pixel in dib.pixels().iter_mut() {
                 *pixel = opaque_pixel(*pixel, palette.body);
             }
-            if BitBlt(target, 0, 0, width, height, dc, 0, 0, SRCCOPY) == 0 {
+            if BitBlt(target, 0, 0, dib.width, dib.height, dib.dc, 0, 0, SRCCOPY) == 0 {
                 card.failed.set(true);
             }
         }
-        SelectObject(dc, old_bitmap);
-        DeleteObject(bitmap);
-        DeleteDC(dc);
-        EndPaint(hwnd, &ps);
+    }
+
+    unsafe fn paint(hwnd: HWND, card: &Card) {
+        let scope = PaintScope::begin(hwnd);
+        let geometry = layout(card.scale);
+        let (width, height) = (geometry.width, geometry.height);
+        if scope.paint.hdc.is_null()
+            || width <= 0
+            || height <= 0
+            || width as usize * height as usize > MAX_CARD_PIXELS
+        {
+            card.failed.set(true);
+            return;
+        }
+        let Some(mut dib) = Dib::new(scope.paint.hdc, width, height) else {
+            card.failed.set(true);
+            return;
+        };
+        let palette = Palette::for_backdrop(card.backdrop.get());
+        let mut plate = card.plate.borrow_mut();
+        if plate.is_none() {
+            *plate = glyph_plate(card, &geometry, &mut dib, palette);
+            if plate.is_none() {
+                card.failed.set(true);
+            }
+        }
+        match plate.as_ref() {
+            Some(ready) => {
+                dib.pixels().copy_from_slice(ready);
+                render_progress(
+                    dib.pixels(),
+                    &geometry,
+                    animation_phase(card.started.elapsed().as_secs_f32(), card.duplicate),
+                    card.duplicate,
+                    palette,
+                );
+            }
+            None => dib.pixels().fill(premultiplied(palette.body, 1.)),
+        }
+        present(scope.paint.hdc, hwnd, card, &geometry, &mut dib, palette);
     }
 
     unsafe extern "system" fn window_proc(
@@ -1237,9 +1320,8 @@ mod native {
     }
 
     #[cfg(test)]
-    mod tests {
-        include!("startup_native_tests.rs");
-    }
+    #[path = "../../startup_native_tests.rs"]
+    mod tests;
 }
 
 #[cfg(test)]

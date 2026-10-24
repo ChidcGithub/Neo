@@ -954,7 +954,7 @@ fn wake_test_queued_events_never_start_dictation_or_tasks_and_errors_latch() {
     let ctx = egui::Context::default();
     let mut app = wake_test_app(&ctx);
     let (tx, rx) = std::sync::mpsc::channel();
-    let (stt_tx, stt_rx) = std::sync::mpsc::channel();
+    let (stt_tx, stt_rx) = std::sync::mpsc::sync_channel(64);
     app.stt_tx = Some(stt_tx);
     app.wake_rx = Some(rx);
     app.state.draft = "untouched".into();
@@ -1028,7 +1028,7 @@ fn wake_test_delayed_forwarder_rejects_old_detection_and_audio_after_exit() {
         }
     });
     app.wake_rx = Some(ui_rx);
-    let (stt_tx, stt_rx) = mpsc::channel();
+    let (stt_tx, stt_rx) = mpsc::sync_channel(64);
     app.stt_tx = Some(stt_tx);
     app.state.draft = "untouched".into();
     engine_tx
@@ -1215,7 +1215,7 @@ fn safety_hot_switch_invalidates_dictation_without_render() {
     app.applied_classroom_safe = false;
     app.dictating = true;
     app.dictation_epoch = 5;
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(64);
     app.stt_tx = Some(tx);
     let (wake_tx, wake_rx) = std::sync::mpsc::channel();
     app.wake_rx = Some(wake_rx);
@@ -1254,7 +1254,7 @@ fn safety_overlay_failure_summary_never_exposes_system_details() {
 fn safety_overlay_unavailable_stops_audio_and_wake_uses_visible_input() {
     let ctx = egui::Context::default();
     let mut app = NeoApp::install(&ctx);
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(64);
     app.stt_tx = Some(tx);
     app.dictating = true;
     app.dictation_epoch = 7;
@@ -1385,7 +1385,7 @@ fn dictation_wake_never_shows_root_or_cancels_desktop_task() {
         app.hidden_to_tray = tray;
         app.desktop_windows.main_avoided = avoided;
         app.state.generating = true;
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
         app.stt_tx = Some(tx);
         ctx.begin_pass(window_request_input(minimized, occluded));
         app.handle_wake_detected(&ctx, 0.9, true);
@@ -1405,7 +1405,7 @@ fn dictation_wake_never_shows_root_or_cancels_desktop_task() {
 fn fallback_wake_during_dictation_shows_root_only_once() {
     let ctx = egui::Context::default();
     let mut app = NeoApp::install(&ctx);
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(64);
     app.stt_tx = Some(tx);
     app.dictating = true;
     app.hidden_to_tray = true;
@@ -1825,7 +1825,7 @@ fn safety_dictation_rejects_previous_generation() {
 fn safety_cancel_dictation_invalidates_queued_results_and_resets_once() {
     let ctx = egui::Context::default();
     let mut app = NeoApp::install(&ctx);
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(64);
     app.stt_tx = Some(tx);
     app.dictating = true;
     app.dictation_epoch = 7;

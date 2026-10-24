@@ -101,11 +101,6 @@ impl Policy {
         if let Err(e) = a.reject_unknown() {
             return Decision::Deny(format!("参数不合法：{}", e.message));
         }
-        if self.read_only && tool.risk.mutates() {
-            return Decision::Deny(
-                "当前处于「只读」模式：写文件与执行命令已被禁用，请让用户关闭只读后重试".to_owned(),
-            );
-        }
         // 参数级升级（见 PARAM_ESCALATION）：比如 web_search 带 open_browser。
         let risk = PARAM_ESCALATION
             .iter()
@@ -114,6 +109,12 @@ impl Policy {
                     && args.get(*param).and_then(Value::as_bool).unwrap_or(false)
             })
             .map_or(tool.risk, |(_, _, r)| *r);
+        // Open 也有副作用（启动程序、写持久记忆、写每日日志），只读模式一并拒绝。
+        if self.read_only && matches!(risk, Risk::Open | Risk::Write | Risk::Exec) {
+            return Decision::Deny(
+                "当前处于「只读」模式：写文件、执行命令、启动程序与写入记忆已被禁用，请让用户关闭只读后重试".to_owned(),
+            );
+        }
         if self.classroom_safe
             && (risk != Risk::Read
                 || matches!(tool.name, "screenshot" | "screen_elements" | "screen_element_search"))

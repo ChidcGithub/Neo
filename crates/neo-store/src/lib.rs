@@ -44,6 +44,8 @@ pub struct MessageRow {
     pub meta: String,
     /// 用量与费用行（token 数 · ≈金额）；空表示旧消息或未上报。
     pub usage: String,
+    /// 该助手回复因中断/失败未完整生成；恢复时不进入模型上下文。
+    pub failed: bool,
     /// 附件 JSON；图片数据随附件保存，空附件为 `[]`。
     pub attachments: String,
     pub tool_calls: String,
@@ -101,9 +103,13 @@ impl Store {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
+        // 双实例/杀软短暂占用时等一等，而不是立刻 SQLITE_BUSY 丢消息。
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // WAL 让"边聊边写"不阻塞读；synchronous=NORMAL 在 WAL 下是安全的折中。
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // 删除/覆盖的旧页当场清零，减少敏感值残留在空闲页里。
+        conn.pragma_update(None, "secure_delete", "ON")?;
         // SQLite 默认不强制外键（且不持久化、必须逐连接开启）——不开的话
         // schema 里的 REFERENCES ... ON DELETE CASCADE 是死代码，还能写进
         // 不属于任何会话的孤儿消息。
@@ -128,7 +134,12 @@ impl Store {
                 }
             }
         }
-        for (name, default) in [("tool_calls", "[]"), ("tool_call_id", ""), ("usage", "")] {
+        for (name, ty, default) in [
+            ("tool_calls", "TEXT", "'[]'"),
+            ("tool_call_id", "TEXT", "''"),
+            ("usage", "TEXT", "''"),
+            ("failed", "INTEGER", "0"),
+        ] {
             let columns = conn
                 .prepare("PRAGMA table_info(messages)")?
                 .query_map([], |row| row.get::<_, String>(1))?
@@ -136,7 +147,7 @@ impl Store {
             if !columns.iter().any(|column| column == name) {
                 if let Err(error) = conn.execute(
                     &format!(
-                        "ALTER TABLE messages ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'"
+                        "ALTER TABLE messages ADD COLUMN {name} {ty} NOT NULL DEFAULT {default}"
                     ),
                     [],
                 ) {
@@ -158,6 +169,13 @@ impl Store {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// 把 WAL 合并回主库并截断日志文件（加密迁移后擦掉旧明文残留）。
+    pub fn truncate_wal(&self) -> Result<()> {
+        let conn = self.conn();
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        Ok(())
+    }
+
     /// 会话列表，最近更新的在前。
     pub fn sessions(&self) -> Result<Vec<SessionRow>> {
         let conn = self.conn();
@@ -167,9 +185,13 @@ impl Store {
         let rows = stmt
             .query_map([], |r| {
                 Ok(SessionRow {
-                    id: r.get(0)?,
-                    title: r.get(1)?,
-                    updated_ms: r.get(2)?,
+                    id: r.get(0).unwrap_or(0),
+                    title: r
+                        .get::<_, Option<String>>(1)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
+                    updated_ms: r.get(2).unwrap_or(0),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -230,20 +252,27 @@ impl Store {
     pub fn messages(&self, session_id: i64) -> Result<Vec<MessageRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(
-            "SELECT role, content, reasoning, meta, attachments, tool_calls, tool_call_id, usage FROM messages \
+            "SELECT role, content, reasoning, meta, attachments, tool_calls, tool_call_id, usage, failed FROM messages \
              WHERE session_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt
             .query_map(params![session_id], |r| {
+                let text = |index: usize| {
+                    r.get::<_, Option<String>>(index)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                };
                 Ok(MessageRow {
-                    role: r.get(0)?,
-                    content: r.get(1)?,
-                    reasoning: r.get(2)?,
-                    meta: r.get(3)?,
-                    attachments: r.get(4)?,
-                    tool_calls: r.get(5)?,
-                    tool_call_id: r.get(6)?,
-                    usage: r.get(7)?,
+                    role: text(0),
+                    content: text(1),
+                    reasoning: text(2),
+                    meta: text(3),
+                    attachments: text(4),
+                    tool_calls: text(5),
+                    tool_call_id: text(6),
+                    usage: text(7),
+                    failed: r.get::<_, i64>(8).unwrap_or(0) != 0,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -279,6 +308,7 @@ impl Store {
             reasoning,
             meta,
             "",
+            false,
             attachments,
             "[]",
             "",
@@ -295,6 +325,7 @@ impl Store {
         reasoning: &str,
         meta: &str,
         usage: &str,
+        failed: bool,
         attachments: &str,
         tool_calls: &str,
         tool_call_id: &str,
@@ -303,9 +334,9 @@ impl Store {
         let tx = conn.transaction()?;
         let timestamp = now();
         tx.execute(
-            "INSERT INTO messages (session_id, role, content, reasoning, meta, usage, attachments, created_at, tool_calls, tool_call_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![session_id, role, content, reasoning, meta, usage, attachments, timestamp, tool_calls, tool_call_id],
+            "INSERT INTO messages (session_id, role, content, reasoning, meta, usage, failed, attachments, created_at, tool_calls, tool_call_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![session_id, role, content, reasoning, meta, usage, failed, attachments, timestamp, tool_calls, tool_call_id],
         )?;
         let message_id = tx.last_insert_rowid();
         tx.execute(

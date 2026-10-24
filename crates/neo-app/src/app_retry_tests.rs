@@ -129,7 +129,68 @@ fn retry_gives_up_after_three_attempts_with_final_error() {
     tick_once(&mut app, &ctx);
     assert!(app.state.retry.is_none());
     assert!(!app.state.generating);
-    assert!(app.state.messages.last().unwrap().error.is_some());
+    let bubble = app.state.messages.last().unwrap();
+    assert!(bubble.error.is_some());
+    assert!(bubble.meta.is_empty(), "失败收尾应清掉重试文案：{}", bubble.meta);
+}
+
+thread_local! {
+    static USAGE_STEP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[test]
+fn retry_usage_accumulates_across_attempts() {
+    fn scripted(
+        _: neo_llm::Config,
+        _: Vec<neo_llm::Msg>,
+        _: Vec<serde_json::Value>,
+    ) -> neo_llm::Stream {
+        let step = USAGE_STEP.with(|slot| {
+            let step = slot.get();
+            slot.set(step + 1);
+            step
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        if step == 0 {
+            tx.send(neo_llm::Event::Usage(neo_llm::Usage {
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                cached_tokens: 0,
+            }))
+            .unwrap();
+            tx.send(neo_llm::Event::Failed(
+                "请求失败：connection reset".into(),
+            ))
+            .unwrap();
+        } else {
+            tx.send(neo_llm::Event::Usage(neo_llm::Usage {
+                prompt_tokens: 200,
+                completion_tokens: 20,
+                cached_tokens: 0,
+            }))
+            .unwrap();
+            tx.send(neo_llm::Event::Done { tool_calls: false }).unwrap();
+        }
+        neo_llm::Stream::new_for_test(rx)
+    }
+
+    USAGE_STEP.with(|slot| slot.set(0));
+    let previous = STREAM_START.with(|slot| slot.replace(scripted));
+    let ctx = egui::Context::default();
+    let mut app = streaming_app(&ctx);
+    tick_once(&mut app, &ctx);
+    assert!(app.state.retry.is_some());
+    force_due(&mut app.state);
+    tick_once(&mut app, &ctx);
+    tick_once(&mut app, &ctx);
+    STREAM_START.with(|slot| slot.set(previous));
+    assert!(!app.state.generating);
+    let bubble = app.state.messages.last().unwrap();
+    assert!(bubble.error.is_none());
+    let input = tr("输入 {tokens}").replace("{tokens}", "300");
+    let output = tr("输出 {tokens}").replace("{tokens}", "30");
+    assert!(bubble.usage.contains(&input), "{}", bubble.usage);
+    assert!(bubble.usage.contains(&output), "{}", bubble.usage);
 }
 
 #[test]

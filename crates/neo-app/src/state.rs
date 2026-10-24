@@ -1669,8 +1669,8 @@ impl AppState {
             .enumerate()
             .filter(|(i, _)| *i >= start || Some(*i) == keep_user)
         {
-            // 生成中的占位（还没有内容）不参与
-            if m.streaming && m.content.is_empty() {
+            // 生成中的占位（还没有内容）与失败/中断的半截回复都不进入模型上下文。
+            if m.error.is_some() || (m.streaming && m.content.is_empty()) {
                 continue;
             }
             if m.role != Role::Tool {
@@ -2915,7 +2915,18 @@ impl AppState {
                             self.append_delta(&content, &reasoning);
                         }
                         Event::ToolCall(frag) => self.tool_frags.push(frag),
-                        Event::Usage(u) => self.stream_usage = Some(u),
+                        Event::Usage(u) => {
+                            self.stream_usage = Some(match self.stream_usage {
+                                Some(prev) => neo_llm::Usage {
+                                    prompt_tokens: prev.prompt_tokens.saturating_add(u.prompt_tokens),
+                                    completion_tokens: prev
+                                        .completion_tokens
+                                        .saturating_add(u.completion_tokens),
+                                    cached_tokens: prev.cached_tokens.saturating_add(u.cached_tokens),
+                                },
+                                None => u,
+                            });
+                        }
                         Event::Done { tool_calls } => {
                             self.end_stream(None);
                             // 结束原因是 tool_calls：先跑工具，再把结果回灌。
@@ -3043,6 +3054,8 @@ impl AppState {
                         None => model,
                     };
                     last.usage = usage_line;
+                } else {
+                    last.meta.clear();
                 }
             }
         }
@@ -3145,7 +3158,6 @@ impl AppState {
         span.event(Phase::Started, Details::default());
         self.stream_diagnostic = Some(span);
         self.stream_started = Some(std::time::Instant::now());
-        self.stream_usage = None;
         self.stream = Some(source);
     }
 

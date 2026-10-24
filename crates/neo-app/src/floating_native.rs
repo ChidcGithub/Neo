@@ -251,6 +251,7 @@ struct Surface {
     press_scale: f32,
     shown: bool,
     dirty: bool,
+    release_pending: bool,
     recapture: bool,
 }
 #[cfg(not(test))]
@@ -940,6 +941,7 @@ unsafe fn run_inner(
         press_scale: scale,
         shown: false,
         dirty: true,
+        release_pending: false,
         recapture: true,
     };
     let mut cache = RenderCache::default();
@@ -992,11 +994,14 @@ unsafe fn run_inner(
         if input.cancel.replace(false) {
             surface.gesture.cancel();
             input.events.borrow_mut().clear();
+            // 取消时按键可能仍按着：等它真正抬起再接受新的按下，
+            // 否则松手后没有新的 down 边沿可用，悬浮球会像卡住一样。
+            surface.release_pending = GetAsyncKeyState(VK_LBUTTON as i32) < 0;
             surface.dirty = true;
         }
         let events: Vec<_> = input.events.borrow_mut().drain(..).collect();
         for (down, p, time) in events {
-            if !shared.interactive() {
+            if !shared.interactive() || surface.release_pending {
                 break;
             }
             let now = time.duration_since(clock).as_millis() as u64;
@@ -1015,7 +1020,12 @@ unsafe fn run_inner(
         if !shared.visible.load(Ordering::Acquire) {
             continue;
         }
-        if surface.gesture.active() {
+        if surface.release_pending {
+            if GetAsyncKeyState(VK_LBUTTON as i32) >= 0 {
+                surface.release_pending = false;
+                surface.dirty = true;
+            }
+        } else if surface.gesture.active() {
             if GetCursorPos(&mut cursor) == 0 {
                 surface.gesture.cancel();
                 surface.dirty = true;
@@ -1131,6 +1141,7 @@ unsafe fn run_inner(
         std::thread::sleep(Duration::from_millis(
             if surface.gesture.active()
                 || surface.gesture.waiting()
+                || surface.release_pending
                 || surface.menu_animation.active(surface.gesture.menu)
             {
                 16

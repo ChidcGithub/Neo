@@ -86,10 +86,12 @@ fn lmb_down() -> bool {
 }
 
 /// 发给 STT 线程的命令。音频帧直接投喂；`Reset` 在每次唤醒听写前清掉
-/// VAD 缓冲，避免把上一轮的尾巴算进这一轮。
+/// VAD 缓冲，避免把上一轮的尾巴算进这一轮；`Flush` 在结束时把不满一窗的尾音
+/// 补零喂下去并转写，避免最后一个字被吞掉。
 enum SttCmd {
     Audio(u64, Vec<f32>),
     Reset(u64),
+    Flush(u64),
 }
 
 enum SttResult {
@@ -461,11 +463,13 @@ pub struct NeoApp {
     memory_poll: std::time::Instant,
     /// 课堂总结控制器（最大化监听 / 转写 / 打磨 / 弹窗状态机）。
     class: crate::class::ClassMonitor,
-    /// STT 线程的投喂端（音频帧 / 复位命令）。
-    stt_tx: Option<std::sync::mpsc::Sender<SttCmd>>,
+    /// STT 线程的投喂端（音频帧 / 复位 / 收尾命令）。
+    stt_tx: Option<std::sync::mpsc::SyncSender<SttCmd>>,
     /// STT 转写结果的回收端。
     stt_rx: Option<std::sync::mpsc::Receiver<SttResult>>,
     dictation_epoch: u64,
+    /// 已结束听写、等待最后一段尾音转写的代号；收到后仍写入草稿。
+    dictation_tail_epoch: Option<u64>,
     /// 唤醒后的听写进行中：音频帧正经唤醒引擎流向 STT。
     dictating: bool,
     /// 听写起点，用于沉默超时。
@@ -589,6 +593,7 @@ impl NeoApp {
             stt_tx: None,
             stt_rx: None,
             dictation_epoch: 0,
+            dictation_tail_epoch: None,
             dictating: false,
             dictation_since: None,
             dictation_lmb_down: false,
@@ -899,7 +904,7 @@ impl NeoApp {
         if self.stt_tx.is_some() {
             return;
         }
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SttCmd>();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<SttCmd>(64);
         let (out_tx, out_rx) = std::sync::mpsc::channel::<SttResult>();
         let repaint = ctx.clone();
         let spawned = std::thread::Builder::new()
@@ -921,12 +926,31 @@ impl NeoApp {
                             epoch = next;
                             engine.reset();
                         }
-                        SttCmd::Audio(generation, frame) => {
+                        SttCmd::Flush(generation) => {
                             if generation != epoch {
                                 continue;
                             }
+                            engine.flush();
+                            while let Some(seg) = engine.take_segment() {
+                                if out_tx
+                                    .send(SttResult::Transcript(epoch, engine.transcribe(&seg)))
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                repaint.request_repaint();
+                            }
+                        }
+                        SttCmd::Audio(generation, frame) => {
+                            if generation != epoch {
+                                if generation < epoch {
+                                    continue;
+                                }
+                                epoch = generation;
+                                engine.reset();
+                            }
                             engine.accept_waveform(&frame);
-                            if let Some(seg) = engine.take_segment() {
+                            while let Some(seg) = engine.take_segment() {
                                 if out_tx
                                     .send(SttResult::Transcript(epoch, engine.transcribe(&seg)))
                                     .is_err()
@@ -1311,11 +1335,12 @@ impl NeoApp {
         eprintln!("[neo] 唤醒命中（置信度 {score:.2}），进入听写");
         if overlay_alive && self.stt_tx.is_some() {
             self.dictation_epoch = self.dictation_epoch.wrapping_add(1);
+            self.dictation_tail_epoch = None;
             if let Some(overlay) = &self.overlay {
                 overlay.show();
             }
             if let Some(tx) = &self.stt_tx {
-                let _ = tx.send(SttCmd::Reset(self.dictation_epoch));
+                let _ = tx.try_send(SttCmd::Reset(self.dictation_epoch));
             }
             if let Some(wake) = &self.wake {
                 wake.set_dictation(true);
@@ -1353,7 +1378,9 @@ impl NeoApp {
             overlay.set_level((rms * 3.0).clamp(0.0, 1.0));
         }
         if let Some(tx) = &self.stt_tx {
-            if tx.send(SttCmd::Audio(self.dictation_epoch, frame)).is_err() {
+            if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) =
+                tx.try_send(SttCmd::Audio(self.dictation_epoch, frame))
+            {
                 self.stt_tx = None;
                 self.end_dictation();
             }
@@ -1362,6 +1389,17 @@ impl NeoApp {
 
     /// 结束听写：跑马灯淡出，唤醒引擎回到检测模式。
     fn end_dictation(&mut self) {
+        self.stop_dictation(true);
+    }
+
+    /// `flush == true` 时把不满一窗的尾音补转写；取消/强制关闭用 `false`。
+    fn stop_dictation(&mut self, flush: bool) {
+        if self.dictating && flush {
+            if let Some(tx) = &self.stt_tx {
+                let _ = tx.try_send(SttCmd::Flush(self.dictation_epoch));
+            }
+            self.dictation_tail_epoch = Some(self.dictation_epoch);
+        }
         self.dictation_epoch = self.dictation_epoch.wrapping_add(1);
         self.dictating = false;
         self.manual_dictation = false;
@@ -1376,15 +1414,39 @@ impl NeoApp {
         }
     }
 
+    /// 把一段听写文本交给画板或输入框（进入前听写状态已收尾）。
+    fn accept_dictation_text(&mut self, text: &str, ctx: &egui::Context) {
+        if !self.handle_board_dictation(text, ctx)
+            && Self::prepare_dictation_input(
+                &mut self.state,
+                self.store.as_ref(),
+                text,
+                self.last_round_done,
+            )
+        {
+            Self::send_input(&mut self.state, self.store.as_ref());
+        }
+        if !self.state.draft.is_empty() {
+            // 等待确认或发送失败：不重试自动发送，主窗展示保留的两种输入。
+            self.show_window(ctx);
+            self.pending_toasts.push((
+                neo_ui::ToastKind::Warning,
+                tr("语音已保留在草稿，尚未发送；请核对文字和附件后手动发送").into(),
+                std::time::Instant::now() + std::time::Duration::from_secs(6),
+            ));
+        }
+    }
+
     /// 打断听写（点击屏幕）：丢弃本次识别 —— 结束 + 重置 STT 的 VAD 缓冲。
     /// 在途文本由收取处的 `dictating` 守卫天然丢弃（弹出但不发送）。
     fn cancel_dictation(&mut self) {
         if !self.dictating {
             return;
         }
-        self.end_dictation();
+        self.stop_dictation(false);
+        self.dictation_tail_epoch = None;
         if let Some(tx) = &self.stt_tx {
-            let _ = tx.send(SttCmd::Reset(self.dictation_epoch));
+            let _ = tx.try_send(SttCmd::Reset(self.dictation_epoch));
         }
     }
 
@@ -1447,7 +1509,21 @@ impl NeoApp {
             self.state.api_base = v;
         }
         if let Some(v) = get("api_key") {
-            self.state.api_key = v;
+            match crate::secret::open(&v) {
+                Ok(plain) => {
+                    self.state.api_key = plain.clone();
+                    if !v.is_empty() && !crate::secret::is_sealed(&v) {
+                        if let Ok(sealed) = crate::secret::seal(&plain) {
+                            if Self::save_setting(self.store.as_ref(), "api_key", &sealed) {
+                                if let Some(store) = &self.store {
+                                    let _ = store.truncate_wal();
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => record(Level::Warn, "settings", "API Key 解密失败，已按未配置处理"),
+            }
         }
         // 上次拉到的模型列表先读回来，界面立刻有东西可用（不用等网络）。
         let saved_list = get("models").unwrap_or_default();
@@ -1487,6 +1563,9 @@ impl NeoApp {
                 msg.reasoning = r.reasoning;
                 msg.meta = r.meta;
                 msg.usage = r.usage;
+                if r.failed {
+                    msg.error = Some(tr("此回复在中断前未完整生成，已从模型上下文排除").into());
+                }
                 match serde_json::from_str(&r.attachments) {
                     Ok(attachments) => msg.attachments = attachments,
                     Err(_) => {
@@ -1909,6 +1988,7 @@ impl NeoApp {
                             &msg.reasoning,
                             &msg.meta,
                             &msg.usage,
+                            msg.error.is_some(),
                             &json,
                             &calls,
                             msg.tool.as_ref().map_or("", |t| t.call_id.as_str()),
@@ -2093,7 +2173,13 @@ impl NeoApp {
             != (self.saved_api.0.as_str(), self.saved_api.1.as_str())
         {
             let base_saved = Self::save_setting(self.store.as_ref(), "api_base", &state.api_base);
-            let key_saved = Self::save_setting(self.store.as_ref(), "api_key", &state.api_key);
+            let key_saved = match crate::secret::seal(&state.api_key) {
+                Ok(sealed) => Self::save_setting(self.store.as_ref(), "api_key", &sealed),
+                Err(_) => {
+                    record(Level::Error, "settings", "API Key 加密失败，未保存");
+                    false
+                }
+            };
             if base_saved && key_saved {
                 self.saved_api = (state.api_base.clone(), state.api_key.clone());
             } else {
@@ -2138,9 +2224,10 @@ impl NeoApp {
         if self.state.classroom_safe {
             self.state.cancel();
             self.state.auto_approve_tools = false;
-            self.end_dictation();
+            self.stop_dictation(false);
+            self.dictation_tail_epoch = None;
             if let Some(tx) = &self.stt_tx {
-                let _ = tx.send(SttCmd::Reset(self.dictation_epoch));
+                let _ = tx.try_send(SttCmd::Reset(self.dictation_epoch));
             }
             self.wake_rx = None;
             if self.hidden_to_tray {
@@ -2737,6 +2824,15 @@ impl NeoApp {
         // STT 转写结果：只有空编辑器才直接发送；有未提交输入则唤回主窗确认。
         let stt_out = self.stt_rx.as_ref().map(|rx| rx.try_recv());
         match stt_out {
+            Some(Ok(SttResult::Transcript(epoch, Ok(text))))
+                if self.dictation_tail_epoch == Some(epoch) =>
+            {
+                self.dictation_tail_epoch = None;
+                let text = text.trim().to_owned();
+                if !text.is_empty() {
+                    self.accept_dictation_text(&text, &ctx);
+                }
+            }
             Some(Ok(SttResult::Transcript(epoch, _)))
                 if !current_dictation(self.dictating, self.dictation_epoch, epoch) =>
             {
@@ -2746,25 +2842,7 @@ impl NeoApp {
                 let text = text.trim().to_owned();
                 if self.dictating && !text.is_empty() {
                     self.end_dictation();
-                    if !self.handle_board_dictation(&text, &ctx)
-                        && Self::prepare_dictation_input(
-                            &mut self.state,
-                            self.store.as_ref(),
-                            &text,
-                            self.last_round_done,
-                        )
-                    {
-                        Self::send_input(&mut self.state, self.store.as_ref());
-                    }
-                    if !self.state.draft.is_empty() {
-                        // 等待确认或发送失败：不重试自动发送，主窗展示保留的两种输入。
-                        self.show_window(&ctx);
-                        self.pending_toasts.push((
-                            neo_ui::ToastKind::Warning,
-                            tr("语音已保留在草稿，尚未发送；请核对文字和附件后手动发送").into(),
-                            std::time::Instant::now() + std::time::Duration::from_secs(6),
-                        ));
-                    }
+                    self.accept_dictation_text(&text, &ctx);
                 }
             }
             Some(Ok(SttResult::StartupError(msg)))

@@ -49,6 +49,7 @@ mod manual_audio;
 mod mods;
 mod notify;
 mod pricing;
+mod secret;
 mod startup;
 mod state;
 mod ui;

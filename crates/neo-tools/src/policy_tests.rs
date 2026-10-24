@@ -52,6 +52,27 @@
     }
 
     #[test]
+    fn read_only_denies_open_side_effects_including_memory_and_launch() {
+        let p = Policy::read_only();
+        for name in ["open_file", "open_app", "remember", "forget", "note_day"] {
+            let tool = crate::find(name).unwrap();
+            assert!(
+                matches!(p.decide(tool, &json!({})), Decision::Deny(_)),
+                "{name} 在只读模式下必须被拒绝"
+            );
+        }
+        let web = crate::find("web_search").unwrap();
+        assert!(matches!(
+            p.decide(web, &json!({ "query": "x", "open_browser": true })),
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            p.decide(web, &json!({ "query": "x", "open_browser": false })),
+            Decision::Allow
+        );
+    }
+
+    #[test]
     fn unknown_argument_is_denied_before_asking() {
         let p = Policy::default();
         let tool = crate::find("write_file").unwrap();

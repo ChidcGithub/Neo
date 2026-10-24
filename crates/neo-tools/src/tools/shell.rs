@@ -121,10 +121,10 @@ fn resolve_powershell() -> Result<Host, ToolError> {
                 });
             }
         }
-        Ok(Host {
-            executable: PathBuf::from("powershell.exe"),
-            kind: "powershell",
-        })
+        Err(
+            ToolError::new(ErrorKind::Unsupported, "本机没有找到 PowerShell")
+                .with_hint("装 PowerShell 7（pwsh），或用 NEO_SHELL 指定可执行文件绝对路径"),
+        )
     }
     #[cfg(not(target_os = "windows"))]
     Err(

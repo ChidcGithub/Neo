@@ -1,7 +1,11 @@
 // Pure, bounded software composition shared by the window and synthetic preview.
-const MAX_CARD_PIXELS: usize = 4 * 1024 * 1024;
+use super::{
+    premultiplied, progress_segment, readable_text_palette, text_halo, Layout, Palette, RECT,
+};
 
-fn rounded_distance(r: &RECT, radius: f32, x: f32, y: f32) -> f32 {
+pub(super) const MAX_CARD_PIXELS: usize = 4 * 1024 * 1024;
+
+pub(super) fn rounded_distance(r: &RECT, radius: f32, x: f32, y: f32) -> f32 {
     let hx = (r.right - r.left) as f32 * 0.5;
     let hy = (r.bottom - r.top) as f32 * 0.5;
     let radius = radius.min(hx).min(hy);
@@ -10,7 +14,7 @@ fn rounded_distance(r: &RECT, radius: f32, x: f32, y: f32) -> f32 {
     qx.max(0.).hypot(qy.max(0.)) + qx.max(qy).min(0.) - radius
 }
 
-fn over(foreground: u32, background: u32) -> u32 {
+pub(super) fn over(foreground: u32, background: u32) -> u32 {
     let missing = 255 - (foreground >> 24);
     let channel = |shift: u32| -> u32 {
         ((foreground >> shift) & 255) + (((background >> shift) & 255) * missing + 127) / 255
@@ -18,13 +22,13 @@ fn over(foreground: u32, background: u32) -> u32 {
     channel(24) << 24 | channel(16) << 16 | channel(8) << 8 | channel(0)
 }
 
-fn mix(a: [u8; 3], b: [u8; 3], coverage: f32) -> [u8; 3] {
+pub(super) fn mix(a: [u8; 3], b: [u8; 3], coverage: f32) -> [u8; 3] {
     std::array::from_fn(|i| {
         (a[i] as f32 + (b[i] as f32 - a[i] as f32) * coverage.clamp(0., 1.)).round() as u8
     })
 }
 
-fn card_pixel(
+pub(super) fn card_pixel(
     g: &Layout,
     x: i32,
     y: i32,
@@ -36,7 +40,7 @@ fn card_pixel(
     if x < 0 || y < 0 || x >= g.width || y >= g.height {
         return 0;
     }
-    let scale = g.width as f32 / 400.;
+    let scale = g.scale;
     let (xx, yy) = (x as f32 + 0.5, y as f32 + 0.5);
     let distance = rounded_distance(&g.body, g.radius, xx, yy);
     let coverage = (0.5 - distance).clamp(0., 1.);
@@ -83,7 +87,7 @@ fn card_pixel(
     over(premultiplied(color, coverage), shadow)
 }
 
-fn render_plate(
+pub(super) fn render_plate(
     g: &Layout,
     mask: &[u8],
     icon: &[u8],
@@ -102,7 +106,7 @@ fn render_plate(
     {
         return None;
     }
-    let radius = (g.width as f32 / 400.).round().clamp(1., 4.) as usize;
+    let halo = g.scale.round().clamp(1., 4.) as usize;
     let segment = progress_segment(g, 0.);
     Some(
         (0..count)
@@ -116,15 +120,15 @@ fn render_plate(
                     }
                     // A local glyph keyline preserves the frozen backdrop elsewhere.
                     let near_text = [g.brand, g.caption].iter().any(|r| {
-                        x >= r.left - radius as i32
-                            && x < r.right + radius as i32
-                            && y >= r.top - radius as i32
-                            && y < r.bottom + radius as i32
+                        x >= r.left - halo as i32
+                            && x < r.right + halo as i32
+                            && y >= r.top - halo as i32
+                            && y < r.bottom + halo as i32
                     });
                     if near_text {
                         local = readable_text_palette(
                             local,
-                            text_halo(mask, g.width as usize, index, radius),
+                            text_halo(mask, g.width as usize, index, halo),
                         );
                     }
                 }
@@ -142,7 +146,7 @@ fn render_plate(
     )
 }
 
-fn render_progress(pixels: &mut [u32], g: &Layout, phase: f32, duplicate: bool, palette: Palette) {
+pub(super) fn render_progress(pixels: &mut [u32], g: &Layout, phase: f32, duplicate: bool, palette: Palette) {
     if duplicate {
         return;
     }

@@ -8,7 +8,7 @@ fn app() -> (egui::Context, NeoApp, std::sync::mpsc::Receiver<SttCmd>) {
     app.state.classroom_safe = false;
     app.applied_classroom_safe = false;
     app.state.wake_enabled = false;
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(64);
     app.stt_tx = Some(tx);
     (ctx, app, rx)
 }

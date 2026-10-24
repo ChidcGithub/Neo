@@ -7,7 +7,8 @@
 //! egui 跑在主线程，网络不能阻塞它。所以 [`start`] 在**独立线程**里做 HTTP，
 //! 增量通过 [`mpsc::Receiver`] 回报；取消用一个 [`AtomicBool`]，
 //! 读流消费线程每 100ms 检查取消；连接/阻塞读取不能被标志强制打断，
-//! 底层 HTTP 请求受 15 秒连接超时、300 秒总超时约束。
+//! 底层 HTTP 请求受 15 秒连接超时与 30 分钟硬上限约束，
+//! 「长时间没有数据」由 300 秒停顿看门狗判定。
 //!
 //! ```text
 //! 主线程                          neo-llm 线程
@@ -1140,7 +1141,7 @@ fn run(
     if cancel.load(Ordering::Relaxed) {
         return;
     }
-    let client = match http_client(HTTP_TOTAL_TIMEOUT) {
+    let client = match http_client(HTTP_STREAM_TIMEOUT) {
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(Event::Failed(format!("无法创建网络客户端：{e}")));
@@ -1474,7 +1475,7 @@ const MAX_EVENT_BYTES: usize = 1 << 20;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STREAM_EVENTS: usize = 16_384;
-const HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+const HTTP_STREAM_TIMEOUT: Duration = Duration::from_secs(1_800);
 
 fn http_client(total: Duration) -> Result<reqwest::blocking::Client, reqwest::Error> {
     reqwest::blocking::Client::builder()
