@@ -48,6 +48,7 @@ mod i18n;
 mod manual_audio;
 mod mods;
 mod notify;
+mod pricing;
 mod startup;
 mod state;
 mod ui;

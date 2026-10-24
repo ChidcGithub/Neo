@@ -1486,6 +1486,7 @@ impl NeoApp {
                 let mut msg = crate::state::ChatMessage::new(role, r.content);
                 msg.reasoning = r.reasoning;
                 msg.meta = r.meta;
+                msg.usage = r.usage;
                 match serde_json::from_str(&r.attachments) {
                     Ok(attachments) => msg.attachments = attachments,
                     Err(_) => {
@@ -1907,6 +1908,7 @@ impl NeoApp {
                             &msg.content,
                             &msg.reasoning,
                             &msg.meta,
+                            &msg.usage,
                             &json,
                             &calls,
                             msg.tool.as_ref().map_or("", |t| t.call_id.as_str()),

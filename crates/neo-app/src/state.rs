@@ -209,6 +209,8 @@ pub struct ChatMessage {
     pub reasoning: String,
     /// 展示用元信息（模型 · 耗时）。
     pub meta: String,
+    /// 本轮消耗的用量与估算费用（灰色小字行）；空表示不显示。
+    pub usage: String,
     /// 正在流式生成（末尾带光标）。
     pub streaming: bool,
     /// 失败原因 —— 与正文分开渲染，避免错误信息混进 Markdown。
@@ -245,6 +247,7 @@ impl ChatMessage {
             content: content.into(),
             reasoning: String::new(),
             meta: String::new(),
+            usage: String::new(),
             streaming: false,
             error: None,
             tool_calls: Vec::new(),
@@ -261,6 +264,7 @@ impl ChatMessage {
             content,
             reasoning: String::new(),
             meta: format!("{} · {}", meta.name, meta.line()),
+            usage: String::new(),
             streaming: false,
             error: None,
             tool_calls: Vec::new(),
@@ -808,6 +812,8 @@ pub struct AppState {
     pub stream: Option<StreamSource>,
     /// 本轮生成的开始时刻（元信息「模型 · 耗时」的耗时来源）。
     pub stream_started: Option<std::time::Instant>,
+    /// 本轮流收到的用量统计（Done 时写进消息的 usage 行）。
+    stream_usage: Option<neo_llm::Usage>,
     /// 已持久化的消息条数（与 `messages.len()` 的差值即待写消息）。
     pub pending_persist: usize,
     /// submit 后请求一条离线演示回复（未配置密钥时的降级路径）。
@@ -952,6 +958,7 @@ impl Default for AppState {
             generating: false,
             stream: None,
             stream_started: None,
+            stream_usage: None,
             pending_persist: 0,
             wants_demo_reply: false,
             retry: None,
@@ -1975,6 +1982,7 @@ impl AppState {
                         result = Some(Err(tr("摘要接口失败，历史未改变").into()));
                         break;
                     }
+                    Event::Usage(_) => {}
                     Event::Done { .. } | Event::ToolCall(_) => {
                         failure = Some(Failure::ModelOther);
                         result = Some(Err(tr("摘要返回空内容或非法工具调用").into()));
@@ -2867,6 +2875,7 @@ impl AppState {
         self.messages.push(placeholder);
         self.generating = true;
         self.stream_started = Some(std::time::Instant::now());
+        self.stream_usage = None;
         self.stream = Some(source);
     }
 
@@ -2906,6 +2915,7 @@ impl AppState {
                             self.append_delta(&content, &reasoning);
                         }
                         Event::ToolCall(frag) => self.tool_frags.push(frag),
+                        Event::Usage(u) => self.stream_usage = Some(u),
                         Event::Done { tool_calls } => {
                             self.end_stream(None);
                             // 结束原因是 tool_calls：先跑工具，再把结果回灌。
@@ -3010,12 +3020,18 @@ impl AppState {
         }
         self.stream = None;
         self.generating = false;
-        // 元信息在借 messages 之前算好（model_display 也要借 self）。
+        // 元信息在借 messages 之前算好（model_display/model_id 也要借 self）。
         let elapsed = self
             .stream_started
             .take()
             .map(|t| t.elapsed().as_secs_f64());
         let model = self.model_display().to_owned();
+        let pending_usage = self.stream_usage.take();
+        let usage_line = if error.is_none() {
+            self.usage_line(pending_usage)
+        } else {
+            String::new()
+        };
         if let Some(last) = self.messages.last_mut() {
             if last.streaming {
                 last.streaming = false;
@@ -3026,9 +3042,32 @@ impl AppState {
                         Some(s) => format!("{model} · {s:.1}s"),
                         None => model,
                     };
+                    last.usage = usage_line;
                 }
             }
         }
+    }
+
+    /// 把本轮用量格式化成一行灰色小字：`输入 1280 · 缓存命中 512 · 输出 420 · ≈$0.0032`。
+    /// 服务端没报、全零或模型未知价格时返回空串（不显示该行）。
+    fn usage_line(&self, usage: Option<neo_llm::Usage>) -> String {
+        let Some(u) = usage.filter(|u| !u.is_zero()) else {
+            return String::new();
+        };
+        let mut parts = vec![tr("输入 {tokens}").replace("{tokens}", &u.prompt_tokens.to_string())];
+        if u.cached_tokens > 0 {
+            parts.push(
+                tr("缓存命中 {tokens}").replace("{tokens}", &u.cached_tokens.to_string()),
+            );
+        }
+        parts.push(tr("输出 {tokens}").replace("{tokens}", &u.completion_tokens.to_string()));
+        let miss = u.prompt_tokens.saturating_sub(u.cached_tokens);
+        if let Some(cost) =
+            crate::pricing::estimate(self.model_id(), u.cached_tokens, miss, u.completion_tokens)
+        {
+            parts.push(format!("≈{cost}"));
+        }
+        parts.join(" · ")
     }
 
     /// 测试用：直接把当前流标记为失败。
@@ -3106,6 +3145,7 @@ impl AppState {
         span.event(Phase::Started, Details::default());
         self.stream_diagnostic = Some(span);
         self.stream_started = Some(std::time::Instant::now());
+        self.stream_usage = None;
         self.stream = Some(source);
     }
 

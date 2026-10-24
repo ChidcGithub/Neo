@@ -2011,3 +2011,69 @@
         state.begin_task();
         assert!(!state.desktop_user_restored);
     }
+
+    #[test]
+    fn end_stream_writes_usage_line_from_reported_usage() {
+        use super::*;
+        let mut s = AppState {
+            draft: "问题".to_owned(),
+            ..AppState::default()
+        };
+        assert!(s.submit());
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.start_generation(StreamSource::Real(Box::new(neo_llm::Stream::new_for_test(rx))));
+        tx.send(Event::Delta { content: "答".into(), reasoning: String::new() }).unwrap();
+        tx.send(Event::Usage(neo_llm::Usage {
+            prompt_tokens: 1280,
+            completion_tokens: 420,
+            cached_tokens: 512,
+        }))
+        .unwrap();
+        tx.send(Event::Done { tool_calls: false }).unwrap();
+        assert!(!s.pump());
+        let msg = s.messages.last().unwrap();
+        assert!(!msg.streaming);
+        assert!(msg.error.is_none());
+        assert!(msg.usage.starts_with(&tr("输入 {tokens}").replace("{tokens}", "1280")), "{}", msg.usage);
+        assert!(msg.usage.contains(&tr("缓存命中 {tokens}").replace("{tokens}", "512")), "{}", msg.usage);
+        assert!(msg.usage.contains(&tr("输出 {tokens}").replace("{tokens}", "420")), "{}", msg.usage);
+        assert!(msg.usage.contains('·'), "{}", msg.usage);
+    }
+
+    #[test]
+    fn failed_stream_keeps_usage_line_empty() {
+        use super::*;
+        let mut s = AppState {
+            draft: "问题".to_owned(),
+            ..AppState::default()
+        };
+        assert!(s.submit());
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.start_generation(StreamSource::Real(Box::new(neo_llm::Stream::new_for_test(rx))));
+        tx.send(Event::Usage(neo_llm::Usage {
+            prompt_tokens: 10,
+            completion_tokens: 1,
+            cached_tokens: 0,
+        }))
+        .unwrap();
+        tx.send(Event::Failed("鉴权失败".into())).unwrap();
+        assert!(!s.pump());
+        let msg = s.messages.last().unwrap();
+        assert!(msg.error.is_some());
+        assert!(msg.usage.is_empty(), "{}", msg.usage);
+    }
+
+    #[test]
+    fn missing_usage_leaves_usage_line_empty() {
+        use super::*;
+        let mut s = AppState {
+            draft: "问题".to_owned(),
+            ..AppState::default()
+        };
+        assert!(s.submit());
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.start_generation(StreamSource::Real(Box::new(neo_llm::Stream::new_for_test(rx))));
+        tx.send(Event::Done { tool_calls: false }).unwrap();
+        assert!(!s.pump());
+        assert!(s.messages.last().unwrap().usage.is_empty());
+    }

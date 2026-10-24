@@ -123,13 +123,16 @@ fn tool_protocol_survives_reopen() {
     let (store, dir) = temp_store("tool-protocol");
     let id = store.create_session("工具协议").unwrap();
     let calls = r#"[{"id":"call-1","name":"read_file","arguments":"{ \"path\": \"a.txt\" }"}]"#;
-    store.append_message_with_protocol(id, "assistant", "读取", "思考", "", "[]", calls, "").unwrap();
-    store.append_message_with_protocol(id, "tool", r#"{"ok":true,"data":{"content":"原文"}}"#, "", "read_file", "[]", "[]", "call-1").unwrap();
+    let usage = "输入 1280 · 缓存命中 512 · 输出 420 · ≈$0.0032";
+    store.append_message_with_protocol(id, "assistant", "读取", "思考", "", usage, "[]", calls, "").unwrap();
+    store.append_message_with_protocol(id, "tool", r#"{"ok":true,"data":{"content":"原文"}}"#, "", "read_file", "", "[]", "[]", "call-1").unwrap();
     drop(store);
     let store = Store::open(&dir.join("neo.db")).unwrap();
     let rows = store.messages(id).unwrap();
     assert_eq!(rows[0].tool_calls, calls);
+    assert_eq!(rows[0].usage, usage);
     assert_eq!(rows[1].tool_call_id, "call-1");
+    assert_eq!(rows[1].usage, "");
     assert!(rows[1].content.contains("原文"));
     drop(store);
     std::fs::remove_dir_all(dir).unwrap();
@@ -174,6 +177,7 @@ fn old_database_migrates_attachments_once() {
         assert_eq!(messages[0].reasoning, "旧思考");
         assert_eq!(messages[0].meta, "旧元信息");
         assert_eq!(messages[0].attachments, "[]");
+        assert_eq!(messages[0].usage, "");
         assert_eq!(store.sessions().unwrap()[0].title, "旧会话");
         store
             .append_message(1, "user", "旧接口仍可用", "", "")

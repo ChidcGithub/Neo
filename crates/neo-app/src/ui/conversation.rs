@@ -285,6 +285,13 @@ fn draw_one(
                     ui.allocate_exact_size(Vec2::new(content_w, m.s(16.0)), Sense::hover());
                 text_left(ui.painter(), r, &msg.meta, meta_font, p.label_caption);
             }
+            // 用量与费用（token 数 · ≈金额）；比 meta 再灰一档。
+            if !msg.usage.is_empty() {
+                let usage_font = skin.prop(skin.t().caption);
+                let (r, _) =
+                    ui.allocate_exact_size(Vec2::new(content_w, m.s(16.0)), Sense::hover());
+                text_left(ui.painter(), r, &msg.usage, usage_font, p.label_tertiary);
+            }
         }
     }
 }

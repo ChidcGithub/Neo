@@ -727,6 +727,107 @@ fn ignores_usage_only_chunk() {
 }
 
 #[test]
+fn parses_usage_from_finish_and_usage_only_chunks() {
+    let finish = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1280,"completion_tokens":420,"prompt_tokens_details":{"cached_tokens":512}}}"#;
+    let c = parse_chunk(finish).unwrap();
+    assert_eq!(
+        c.usage,
+        Some(Usage {
+            prompt_tokens: 1280,
+            completion_tokens: 420,
+            cached_tokens: 512
+        })
+    );
+    let only = r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}"#;
+    let c = parse_chunk(only).unwrap();
+    assert!(c.content.is_empty() && c.tool_calls.is_empty() && c.finish_reason.is_none());
+    assert_eq!(
+        c.usage,
+        Some(Usage {
+            prompt_tokens: 3,
+            completion_tokens: 5,
+            cached_tokens: 0
+        })
+    );
+    let aliases = parse_chunk(r#"{"usage":{"input_tokens":7,"output_tokens":9}}"#).unwrap();
+    assert_eq!(
+        aliases.usage,
+        Some(Usage {
+            prompt_tokens: 7,
+            completion_tokens: 9,
+            cached_tokens: 0
+        })
+    );
+    let clamped = parse_chunk(
+        r#"{"usage":{"prompt_tokens":3,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":99}}}"#,
+    )
+    .unwrap();
+    assert_eq!(clamped.usage.map(|u| u.cached_tokens), Some(3));
+    assert!(parse_chunk(r#"{"choices":[{"delta":{"content":"x"}}]}"#)
+        .unwrap()
+        .usage
+        .is_none());
+}
+
+#[test]
+fn emits_usage_event_before_done_for_deepseek_style_stream() {
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let events = reader_events(body.as_bytes());
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert!(matches!(&events[0], Event::Delta { content, .. } if content == "hi"));
+    assert!(matches!(events[1], Event::Usage(u)
+        if u.prompt_tokens == 10 && u.completion_tokens == 2 && u.cached_tokens == 4));
+    assert!(matches!(events[2], Event::Done { tool_calls: false }));
+}
+
+#[test]
+fn finish_without_done_still_completes_and_keeps_usage() {
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":6,\"completion_tokens\":1}}\n\n",
+    );
+    let events = reader_events(body.as_bytes());
+    assert!(
+        matches!(events.last(), Some(Event::Done { tool_calls: false })),
+        "{events:?}"
+    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::Usage(u) if u.prompt_tokens == 6)));
+}
+
+#[test]
+fn zero_usage_is_not_reported() {
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let events = reader_events(body.as_bytes());
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Usage(_))),
+        "{events:?}"
+    );
+    assert!(matches!(events.last(), Some(Event::Done { tool_calls: false })));
+}
+
+#[test]
+fn requests_stream_options_include_usage() {
+    let body = request_body(
+        &Config::deepseek("k"),
+        &[Msg::new(Role::User, "hi")],
+        vec![],
+    );
+    assert_eq!(body["stream_options"]["include_usage"], serde_json::json!(true));
+    assert_eq!(body["stream"], serde_json::json!(true));
+}
+
+#[test]
 fn surfaces_server_error() {
     let payload = r#"{"error":{"message":"Authentication Fails"}}"#;
     assert_eq!(

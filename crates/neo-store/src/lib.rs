@@ -42,6 +42,8 @@ pub struct MessageRow {
     pub reasoning: String,
     /// 展示用元信息（模型名 · 耗时）。
     pub meta: String,
+    /// 用量与费用行（token 数 · ≈金额）；空表示旧消息或未上报。
+    pub usage: String,
     /// 附件 JSON；图片数据随附件保存，空附件为 `[]`。
     pub attachments: String,
     pub tool_calls: String,
@@ -126,7 +128,7 @@ impl Store {
                 }
             }
         }
-        for (name, default) in [("tool_calls", "[]"), ("tool_call_id", "")] {
+        for (name, default) in [("tool_calls", "[]"), ("tool_call_id", ""), ("usage", "")] {
             let columns = conn
                 .prepare("PRAGMA table_info(messages)")?
                 .query_map([], |row| row.get::<_, String>(1))?
@@ -228,7 +230,7 @@ impl Store {
     pub fn messages(&self, session_id: i64) -> Result<Vec<MessageRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(
-            "SELECT role, content, reasoning, meta, attachments, tool_calls, tool_call_id FROM messages \
+            "SELECT role, content, reasoning, meta, attachments, tool_calls, tool_call_id, usage FROM messages \
              WHERE session_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt
@@ -241,6 +243,7 @@ impl Store {
                     attachments: r.get(4)?,
                     tool_calls: r.get(5)?,
                     tool_call_id: r.get(6)?,
+                    usage: r.get(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -275,13 +278,14 @@ impl Store {
             content,
             reasoning,
             meta,
+            "",
             attachments,
             "[]",
             "",
         )
     }
 
-    /// 原文与工具协议同事务保存，避免重开后丢失配对结果。
+    /// 原文、工具协议与用量同事务保存，避免重开后丢失配对结果。
     #[allow(clippy::too_many_arguments)]
     pub fn append_message_with_protocol(
         &self,
@@ -290,6 +294,7 @@ impl Store {
         content: &str,
         reasoning: &str,
         meta: &str,
+        usage: &str,
         attachments: &str,
         tool_calls: &str,
         tool_call_id: &str,
@@ -298,9 +303,9 @@ impl Store {
         let tx = conn.transaction()?;
         let timestamp = now();
         tx.execute(
-            "INSERT INTO messages (session_id, role, content, reasoning, meta, attachments, created_at, tool_calls, tool_call_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![session_id, role, content, reasoning, meta, attachments, timestamp, tool_calls, tool_call_id],
+            "INSERT INTO messages (session_id, role, content, reasoning, meta, usage, attachments, created_at, tool_calls, tool_call_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![session_id, role, content, reasoning, meta, usage, attachments, timestamp, tool_calls, tool_call_id],
         )?;
         let message_id = tx.last_insert_rowid();
         tx.execute(

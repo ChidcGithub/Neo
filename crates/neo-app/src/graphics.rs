@@ -3,6 +3,7 @@
 //! 两者均失败可在 Neo 退出后运行 `neo --reset-renderer`，单实例检查后清缓存重探测。
 use std::{
     ffi::OsString,
+    fs::OpenOptions,
     fs,
     io::{self, Write},
     path::PathBuf,
@@ -49,6 +50,22 @@ fn parse_probe(args: &[OsString]) -> Option<Result<Backend, ()>> {
         [flag, backend] if flag == PROBE_ARG && backend == "glow" => Ok(Backend::Glow),
         _ => Err(()),
     })
+}
+
+/// `--renderer dx12|glow`：跳过探测强制使用指定后端（探测子进程被拦截时的逃生口）。
+fn forced_renderer(args: impl Iterator<Item = OsString>) -> Option<Result<Backend, ()>> {
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        if arg != "--renderer" {
+            continue;
+        }
+        return Some(match args.next().as_deref() {
+            Some(value) if value == "dx12" => Ok(Backend::Dx12),
+            Some(value) if value == "glow" => Ok(Backend::Glow),
+            _ => Err(()),
+        });
+    }
+    None
 }
 
 /// Some 表示内部命令（含非法参数），调用方必须立即退出，不进入 startup。
@@ -109,7 +126,11 @@ impl FirstFrame {
     }
 }
 
-struct ProbeApp { frame: FirstFrame, rendered: Arc<AtomicBool> }
+struct ProbeApp {
+    frame: FirstFrame,
+    rendered: Arc<AtomicBool>,
+    timed_out: Arc<AtomicBool>,
+}
 
 impl eframe::App for ProbeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
@@ -119,6 +140,7 @@ impl eframe::App for ProbeApp {
             self.rendered.store(true, Ordering::Relaxed);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         } else if self.frame.timed_out {
+            self.timed_out.store(true, Ordering::Relaxed);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         } else {
             self.frame.request(ui.ctx());
@@ -126,9 +148,33 @@ impl eframe::App for ProbeApp {
     }
 }
 
+/// 探测子进程把失败原因写进父进程指定的报告文件；正常启动不生成文件。
+struct ProbeLog(Option<std::fs::File>);
+
+impl ProbeLog {
+    fn open() -> Self {
+        let file = std::env::var_os("NEO_PROBE_REPORT")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok());
+        Self(file)
+    }
+
+    fn line(&mut self, text: &str) {
+        if let Some(file) = &mut self.0 {
+            let _ = writeln!(file, "{text}");
+            let _ = file.flush();
+        }
+    }
+}
+
 fn run_probe(backend: Backend) -> bool {
+    let mut log = ProbeLog::open();
+    log.line(&format!("backend={}", backend.name()));
+    log.line(&format!("version={}", env!("CARGO_PKG_VERSION")));
+    log.line("stage=run_native");
     let rendered = Arc::new(AtomicBool::new(false));
-    let result = rendered.clone();
+    let timed_out = Arc::new(AtomicBool::new(false));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([96.0, 64.0])
@@ -142,31 +188,80 @@ fn run_probe(backend: Backend) -> bool {
         persist_window: false,
         ..options(backend)
     };
-    eframe::run_native("Neo renderer probe", options, Box::new(move |_| {
-        Ok(Box::new(ProbeApp { frame: FirstFrame::default(), rendered }))
-    })).is_ok() && result.load(Ordering::Relaxed)
+    let result = eframe::run_native("Neo renderer probe", options, {
+        let rendered = rendered.clone();
+        let timed_out = timed_out.clone();
+        Box::new(move |_| {
+            Ok(Box::new(ProbeApp { frame: FirstFrame::default(), rendered, timed_out }))
+        })
+    });
+    match &result {
+        Ok(()) => log.line("run_native=ok"),
+        Err(error) => log.line(&format!("run_native=error: {error:?}")),
+    }
+    log.line(&format!("rendered={}", rendered.load(Ordering::Relaxed)));
+    log.line(&format!("frame_timeout={}", timed_out.load(Ordering::Relaxed)));
+    result.is_ok() && rendered.load(Ordering::Relaxed)
+}
+
+fn probe_report_path(backend: Backend) -> Option<PathBuf> {
+    crate::startup::log_dir().map(|dir| dir.join(format!("probe-{}.txt", backend.name())))
+}
+
+fn write_probe_line(report: Option<&PathBuf>, text: &str) {
+    if let Some(path) = report {
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{text}");
+        }
+    }
 }
 
 fn probe(backend: Backend) -> bool {
-    let Ok(exe) = std::env::current_exe() else { return false; };
+    let report = probe_report_path(backend);
+    if let Some(path) = &report {
+        let _ = fs::remove_file(path);
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        write_probe_line(report.as_ref(), "parent=error: current_exe unavailable");
+        return false;
+    };
     let mut command = Command::new(exe);
     command.args([PROBE_ARG, backend.name()])
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    if let Some(path) = &report {
+        command.env("NEO_PROBE_REPORT", path);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW：debug 构建也不闪控制台。
     }
-    let Ok(mut child) = command.spawn() else { return false; };
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            write_probe_line(report.as_ref(), &format!("parent=error: spawn failed: {error}"));
+            return false;
+        }
+    };
     let deadline = Instant::now() + PROBE_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) if status.success() => {
+                if let Some(path) = &report {
+                    let _ = fs::remove_file(path);
+                }
+                return true;
+            }
+            Ok(Some(status)) => {
+                write_probe_line(report.as_ref(), &format!("parent=child exited: {status}"));
+                return false;
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
             _ => {
                 // 无论超时还是 wait 错误，都终止并回收；不可遗留卡住的驱动进程。
                 let _ = child.kill();
                 let _ = child.wait();
+                write_probe_line(report.as_ref(), "parent=timeout or wait error; killed");
                 return false;
             }
         }
@@ -262,6 +357,17 @@ pub fn select(_startup: &crate::startup::Startup) -> io::Result<Selection> {
         Err(error) => return Err(error),
     };
     let mut cache = Cache::decode(&text);
+    let forced = match forced_renderer(std::env::args_os().skip(1)) {
+        Some(Ok(backend)) => Some(backend),
+        Some(Err(())) => return Err(io::Error::other("--renderer expects dx12 or glow")),
+        None => None,
+    };
+    if let Some(backend) = forced {
+        cache.pending = Some(backend);
+        save(&path, &cache)?;
+        eprintln!("[neo] renderer forced: {}", backend.name());
+        return Ok(Selection { backend, path, cache });
+    }
     let backend = select_with(&mut cache, |backend| {
         let ok = probe(backend);
         if !ok {
@@ -280,8 +386,12 @@ pub fn startup_failed(reason: &str) {
     const HELP: &str = "Neo 渲染初始化失败。\n\
 若主窗口首帧前失败，请重新启动一次，Neo 会跳过该后端并尝试后备。\n\
 若两个后端均失败，更新显卡驱动后退出 Neo，运行 neo.exe --reset-renderer 重新探测。\n\
+若探测子进程被安全策略拦截但确认显卡可用，可运行 neo.exe --renderer dx12（或 glow）跳过探测强制使用该后端。\n\
+若显示适配器是「Microsoft Basic Display Adapter」，说明系统没装显卡驱动：\n\
+  请先安装厂商驱动；Neo 需要可用的 DX12 或 OpenGL，Basic Display 两者都不提供。\n\
 若 graphics.json 无法读写，为避免重复进入故障驱动，Neo 本次停止启动。\n\
 请确保 NEO_HOME（若设置）或 %APPDATA%/Neo 可写，或将 NEO_HOME 设置到可写的绝对路径。\n\
+诊断文件：日志目录下的 probe-dx12.txt / probe-glow.txt（记录每个后端的失败原因）。\n\
 缓存位置：NEO_HOME/graphics.json，否则 %APPDATA%/Neo/graphics.json。\n";
     eprintln!("[neo] graphics: {reason}\n{HELP}");
     if let Some(dir) = crate::startup::log_dir() {

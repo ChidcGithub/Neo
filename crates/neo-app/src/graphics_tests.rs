@@ -13,6 +13,17 @@
     }
 
     #[test]
+    fn forced_renderer_is_strict_and_opt_in() {
+        let parse = |args: &[&str]| forced_renderer(args.iter().map(OsString::from));
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&["--reset-renderer"]), None);
+        assert_eq!(parse(&["--renderer", "dx12"]), Some(Ok(Backend::Dx12)));
+        assert_eq!(parse(&["--renderer", "glow"]), Some(Ok(Backend::Glow)));
+        assert_eq!(parse(&["--renderer"]), Some(Err(())));
+        assert_eq!(parse(&["--renderer", "vulkan"]), Some(Err(())));
+    }
+
+    #[test]
     fn invalid_cache_probes_dx12_then_glow_and_stays_pending() {
         for text in ["", "broken", "{}", r#"{"version":"old","ready":"dx12","pending":null,"failed":[]}"#] {
             let mut cache = Cache::decode(text);

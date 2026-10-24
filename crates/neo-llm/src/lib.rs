@@ -643,6 +643,23 @@ pub fn context_usage(config: &Config, messages: &[Msg], tools: &[serde_json::Val
     })
 }
 
+/// 一次请求的用量统计（来自响应里的 `usage` 字段）。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Usage {
+    /// 计费输入 token 总数（含缓存命中部分）。
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// 输入里缓存命中的部分，是 `prompt_tokens` 的子集。
+    pub cached_tokens: u64,
+}
+
+impl Usage {
+    /// 全零视为未上报（有的服务端会发 `usage` 但都是 0）。
+    pub fn is_zero(&self) -> bool {
+        self.prompt_tokens == 0 && self.completion_tokens == 0
+    }
+}
+
 /// 流式过程中回报的事件。
 #[derive(Debug)]
 pub enum Event {
@@ -650,6 +667,10 @@ pub enum Event {
     Delta { content: String, reasoning: String },
     /// 工具调用分片。聚合用 [`assemble`]。
     ToolCall(ToolCallFrag),
+    /// 用量统计。需请求 `stream_options.include_usage`；服务端在
+    /// finish_reason 之后、[`Event::Done`] 之前以独立分片（`choices` 为空
+    /// 数组）下发，随后紧跟 Done。
+    Usage(Usage),
     /// 正常结束。
     ///
     /// `tool_calls == true` 表示模型停下来是为了等你执行工具：
@@ -964,10 +985,17 @@ struct WireThinking {
 }
 
 #[derive(Serialize)]
+struct WireStreamOptions {
+    include_usage: bool,
+}
+
+#[derive(Serialize)]
 struct WireRequest<'a> {
     model: &'a str,
     messages: Vec<WireMessage<'a>>,
     stream: bool,
+    /// 请求在收尾分片回报用量统计（`choices` 为空数组的独立分片）。
+    stream_options: WireStreamOptions,
     max_tokens: usize,
     /// 空数组时整个字段不出现 —— 不支持 function calling 的服务端不会因为
     /// 一个空 `tools` 而报错。
@@ -1070,6 +1098,9 @@ fn build_wire<'a>(
             })
             .collect(),
         stream: true,
+        stream_options: WireStreamOptions {
+            include_usage: true,
+        },
         max_tokens,
         tools,
         thinking: config.thinking.toggle().map(|kind| WireThinking { kind }),
@@ -1240,6 +1271,8 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
     let mut event_data = String::new();
     let mut has_data = false;
     let mut first_line = true;
+    let mut usage: Option<Usage> = None;
+    let mut finish_at: Option<Instant> = None;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -1248,6 +1281,16 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
         let msg = match line_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(m) => m,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                // finish_reason 之后服务端可能只补一个 usage 分片就静默保持
+                // 连接；给短宽限收尾，而不是像旧实现那样立刻判完成
+                // （那样永远收不到 finish 之后的 usage 分片）。
+                if let Some(at) = finish_at {
+                    if at.elapsed() > FINISH_GRACE {
+                        completed = true;
+                        break;
+                    }
+                    continue;
+                }
                 // 思考型模型可以静默很久，但「五分钟一个字节都没有」基本等于
                 // 连接死透了（正常服务端至少会发 keepalive 注释行）。
                 if last_data.elapsed() > STALL_TIMEOUT {
@@ -1327,6 +1370,9 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
                     ));
                     return;
                 }
+                if chunk.usage.is_some() {
+                    usage = chunk.usage;
+                }
                 let has_text = !chunk.content.is_empty() || !chunk.reasoning.is_empty();
                 let sent = if has_text {
                     tx.send(Event::Delta {
@@ -1355,9 +1401,11 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
                         let _ = tx.send(Event::Failed("工具响应缺少调用内容".to_owned()));
                         return;
                     }
-                    // 有些兼容服务只发送 finish_reason，不发送 [DONE]。
-                    completed = true;
-                    break;
+                    // 旧实现在这里直接 completed+break —— 那样收不到 finish 之后
+                    // 的 usage-only 分片（OpenAI/DeepSeek 在 finish 与 [DONE]
+                    // 之间发）。改为记时间戳：宽限内继续收 [DONE]/usage/EOF，
+                    // 超时按正常完成收尾（兼容只发 finish 不发 [DONE] 的服务）。
+                    finish_at = Some(Instant::now());
                 }
             }
             Err(e) => {
@@ -1372,6 +1420,10 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
         }
     }
 
+    // finish_reason 已到但 [DONE]/EOF/通道断开没置 completed：视为正常完成。
+    if !completed && finish_at.is_some() {
+        completed = true;
+    }
     if !completed {
         let _ = tx.send(Event::Failed(
             "响应流提前结束，未收到正常结束标志".to_owned(),
@@ -1397,6 +1449,11 @@ fn consume_lines(line_rx: Receiver<LineEvent>, tx: &Sender<Event>, cancel: &Atom
             "工具响应不完整或参数不是 JSON 对象，已阻止执行".to_owned(),
         ));
         return;
+    }
+    if let Some(u) = usage.filter(|u| !u.is_zero()) {
+        if tx.send(Event::Usage(u)).is_err() {
+            return;
+        }
     }
     let _ = tx.send(Event::Done {
         tool_calls: !calls.is_empty(),
@@ -1429,6 +1486,10 @@ fn http_client(total: Duration) -> Result<reqwest::blocking::Client, reqwest::Er
 /// 流式读取的静默看门狗：超过它一个字节都没收到就判定连接已死。
 const STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// finish_reason 之后等待 usage/[DONE] 的短宽限。多数服务端毫秒级发完
+/// 剩余分片；超时按正常完成收尾（兼容只发 finish 不发 [DONE] 的旧服务）。
+const FINISH_GRACE: Duration = Duration::from_millis(500);
+
 /// 一次响应里允许的最大工具调用数。服务端故障/恶意响应给出天文序号时，
 /// `assemble` 会按序号无上限扩容槽位 —— 在解析入口就拒掉（远程 DoS）。
 const MAX_TOOL_CALLS: usize = 128;
@@ -1440,6 +1501,30 @@ struct Chunk {
     reasoning: String,
     tool_calls: Vec<ToolCallFrag>,
     finish_reason: Option<String>,
+    usage: Option<Usage>,
+}
+
+fn parse_usage(v: &serde_json::Value) -> Option<Usage> {
+    let u = v.get("usage")?;
+    if !u.is_object() {
+        return None;
+    }
+    let prompt = u["prompt_tokens"]
+        .as_u64()
+        .or_else(|| u["input_tokens"].as_u64())
+        .unwrap_or(0);
+    let completion = u["completion_tokens"]
+        .as_u64()
+        .or_else(|| u["output_tokens"].as_u64())
+        .unwrap_or(0);
+    let cached = u["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    Some(Usage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        cached_tokens: cached.min(prompt),
+    })
 }
 
 fn parse_chunk(payload: &str) -> Result<Chunk, String> {
@@ -1462,6 +1547,7 @@ fn parse_chunk(payload: &str) -> Result<Chunk, String> {
             .as_str()
             .filter(|reason| !reason.trim().is_empty())
             .map(str::to_owned),
+        usage: parse_usage(&v),
         ..Default::default()
     };
 

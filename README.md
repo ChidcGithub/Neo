@@ -139,11 +139,13 @@ existing auxiliary-window fallback without the DX12 refraction overlay.
 
 After updating a faulty graphics driver, close Neo and run `neo.exe --reset-renderer`
 to probe again. The cache directory must be writable; initialization guidance is
-written to `graphics-help.txt` in the startup log directory on failure.
+written to `graphics-help.txt` in the startup log directory on failure. If the probe
+subprocess is blocked by security policy while the GPU is known to work, run
+`neo.exe --renderer dx12` (or `glow`) to bypass probing and use that backend directly.
 
 ## Download & Install
 
-The workspace is preparing **`0.1.1`**; this is not an announcement of a published
+The workspace is preparing **`0.1.11`**; this is not an announcement of a published
 stable release. The workflow builds and publishes binaries after technical checks;
 see Releases for available packages.
 The earlier [pre10 source prerelease](https://github.com/ChidcGithub/Neo/releases/tag/v0.1.0-pre10)

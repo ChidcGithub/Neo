@@ -1134,6 +1134,7 @@ fn drain_limited(stream: &neo_llm::Stream, deadline: Instant, cancelled: &Atomic
                     return Ok(out);
                 }
             }
+            Ok(neo_llm::Event::Usage(_)) => {}
             Ok(neo_llm::Event::Done { .. }) => return Ok(out),
             Ok(neo_llm::Event::Failed(_)) => return Err("模型请求失败".into()),
             Ok(neo_llm::Event::ToolCall(_)) => {

@@ -376,6 +376,7 @@ impl Output {
                     self.answer.push_str(&content);
                 }
             }
+            Event::Usage(_) => {}
             Event::Done { tool_calls: false } => self.done = true,
             Event::Done { tool_calls: true } | Event::ToolCall(_) => {
                 self.fail("画板 Agent 不允许工具调用；未执行工具或写入回答");
