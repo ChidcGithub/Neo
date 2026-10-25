@@ -145,7 +145,7 @@ subprocess is blocked by security policy while the GPU is known to work, run
 
 ## Download & Install
 
-The workspace is preparing **`0.1.11`**; this is not an announcement of a published
+The workspace is preparing **`0.1.12`**; this is not an announcement of a published
 stable release. The workflow builds and publishes binaries after technical checks;
 see Releases for available packages.
 The earlier [pre10 source prerelease](https://github.com/ChidcGithub/Neo/releases/tag/v0.1.0-pre10)
