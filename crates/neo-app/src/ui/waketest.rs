@@ -12,9 +12,9 @@ pub fn draw(ui: &mut egui::Ui, skin: &Skin<'_>, width: f32, state: &mut AppState
     ui.spacing_mut().item_spacing.y = skin.m().s(8.0);
     let test = &state.wake_test;
     let blocked = if state.classroom_safe {
-        Some(tr("安全模式下无法测试；可在「通用」中关闭。"))
+        Some(tr("安全模式下不可用"))
     } else if !state.wake_enabled {
-        Some(tr("请先在「通用」中开启语音唤醒。"))
+        Some(tr("请先开启语音唤醒"))
     } else if test.busy
         || state.generating
         || state.tool_open
@@ -23,11 +23,9 @@ pub fn draw(ui: &mut egui::Ui, skin: &Skin<'_>, width: f32, state: &mut AppState
         || state.compaction_resume
         || state.wants_demo_reply
     {
-        Some(tr("任务或听写进行中，请结束后测试。"))
+        Some(tr("请结束后再测试"))
     } else if test.broken {
-        Some(tr(
-            "唤醒引擎故障，不自动重试。修复后在「通用」关闭语音唤醒，待界面更新后重新开启。",
-        ))
+        Some(tr("唤醒引擎故障，请重启语音唤醒"))
     } else {
         None
     };
@@ -59,11 +57,11 @@ pub fn draw(ui: &mut egui::Ui, skin: &Skin<'_>, width: f32, state: &mut AppState
     }
     let test = &state.wake_test;
     let status = if test.running {
-        tr("测试中 · 仅计数，不听写、不发送")
+        tr("测试中")
     } else if test.requested {
-        tr("等待现有唤醒引擎就绪")
+        tr("等待开始")
     } else {
-        tr("已停止 · 下方为上次快照")
+        tr("已停止")
     };
     ui.add(egui::Label::new(egui::RichText::new(status).strong()).wrap());
     let number = |value: Option<f32>| {
@@ -113,7 +111,7 @@ pub fn draw(ui: &mut egui::Ui, skin: &Skin<'_>, width: f32, state: &mut AppState
         kv_row(ui, skin, width, "dBFS", &number(s.dbfs));
         kv_row(ui, skin, width, tr("音频峰值"), &number(s.peak));
         if let Some(dbfs) = s.dbfs.filter(|v| v.is_finite()) {
-            // 仅绘制现有快照，无动画、无额外采集或刷新定时器。
+            // 仅绘制快照，不额外采集。
             let level = ((dbfs + 60.0) / 60.0).clamp(0.0, 1.0);
             let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(width, skin.m().s(6.0)), egui::Sense::hover());
@@ -125,14 +123,6 @@ pub fn draw(ui: &mut egui::Ui, skin: &Skin<'_>, width: f32, state: &mut AppState
             );
             ui.painter()
                 .rect_filled(filled, skin.m().s(3.0), skin.p().label_secondary);
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(tr("电平刻度 −60 至 0 dBFS · 停止后保留快照"))
-                        .font(skin.prop(skin.t().caption))
-                        .color(skin.p().label_caption),
-                )
-                .wrap(),
-            );
         }
         ui.separator();
         section_label_row(ui, skin, width, tr("唤醒识别"));
@@ -143,10 +133,7 @@ pub fn draw(ui: &mut egui::Ui, skin: &Skin<'_>, width: f32, state: &mut AppState
             skin,
             width,
             tr("实际阈值"),
-            &tf(
-                "{value}（只读）",
-                &[("value", format!("{:.4}", s.threshold))],
-            ),
+            &format!("{:.4}", s.threshold),
         );
         kv_row(
             ui,
@@ -167,7 +154,7 @@ pub fn draw(ui: &mut egui::Ui, skin: &Skin<'_>, width: f32, state: &mut AppState
             width,
             tr("引擎累计确认命中"),
             &tf(
-                "{count} 次（含正常监听）",
+                "{count} 次",
                 &[("count", s.hit_count.to_string())],
             ),
         );
@@ -177,24 +164,13 @@ pub fn draw(ui: &mut egui::Ui, skin: &Skin<'_>, width: f32, state: &mut AppState
     if let Some(error) = &test.error {
         ui.add(
             egui::Label::new(
-                egui::RichText::new(tf("最近错误（保留）：{error}", &[("error", error.clone())]))
+                egui::RichText::new(tf("最近错误：{error}", &[("error", error.clone())]))
                     .color(skin.p().error),
             )
             .wrap(),
         );
     } else {
         ui.add(egui::Label::new(tr("最近错误：无")).wrap());
-    }
-    ui.separator();
-    section_label_row(ui, skin, width, tr("隐私与排查指引"));
-    for text in [
-        tr("复用当前模型和麦克风；诊断仅存内存，不上传、不写入日志或对话。"),
-        tr("离页、关闭设置、隐藏主窗或切换安全模式会停止测试；正常语音唤醒不随测试关闭，恢复监听前会重新预热。"),
-        tr("麦克风：Windows 设置 → 系统 → 声音 → 输入；请检查应用权限。此处显示启动时设备，变更后重启语音唤醒。"),
-        tr("模型或 ONNX Runtime 缺失时，请联系管理员检查资源与权限。"),
-        tr("预热后先近距安静测试，再远距对比。识别不佳时检查麦克风位置、增益和噪声，勿擅调阈值。"),
-    ] {
-        ui.add(egui::Label::new(text).wrap());
     }
 }
 

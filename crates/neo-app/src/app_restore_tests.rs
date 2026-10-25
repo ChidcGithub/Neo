@@ -892,7 +892,7 @@ fn wake_test_app(ctx: &egui::Context) -> NeoApp {
     app.state.classroom_safe = false;
     app.applied_classroom_safe = false;
     app.state.show_settings = true;
-    app.state.settings_tab = crate::state::SettingsTab::WakeTest;
+    app.state.settings_tab = crate::state::SettingsTab::Voice;
     app.state.wake_enabled = true;
     app.state.wake_test.requested = true;
     app
@@ -942,7 +942,7 @@ fn wake_test_leaving_stops_and_keeps_errors_without_resuming() {
             Some("resource unavailable")
         );
         app.state.show_settings = true;
-        app.state.settings_tab = crate::state::SettingsTab::WakeTest;
+        app.state.settings_tab = crate::state::SettingsTab::Voice;
         app.state.classroom_safe = false;
         app.hidden_to_tray = false;
         assert!(!app.sync_wake_test(true));

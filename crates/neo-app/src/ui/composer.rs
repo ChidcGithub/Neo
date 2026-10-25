@@ -38,6 +38,7 @@ pub struct Outcome {
     pub stop: bool,
     pub toggle_plan: bool,
     pub toggle_read_only: bool,
+    pub toggle_wake: bool,
     pub next_model: bool,
 }
 
@@ -570,10 +571,10 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
         ),
     );
     let model_budget = (controls.width()
-        - m.s(28.0)
+        - m.s(56.0)
         - Chip::width(ui.painter(), &d, tr("计划"), false)
         - Chip::width(ui.painter(), &d, tr("只读"), false)
-        - 4.0 * m.toolbar_gap())
+        - 5.0 * m.toolbar_gap())
     .max(0.0);
     let model = state.model_display();
     let model_w = Chip::width(ui.painter(), &d, model, true).min(model_budget);
@@ -586,7 +587,7 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
             .w_full()
             .h_full()
             .show(ui, |flex| {
-                // 左侧：+ / Plan / 只读。
+                // 左侧：附件 / 语音唤醒 / Plan / 只读。
                 let add = flex.add_ui(item(), |ui| {
                     IconButton::new(Icon::Plus)
                         .subtle()
@@ -597,6 +598,25 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, rect: Rect, state: &mut AppState, hero
                 });
                 if add.inner.clicked() {
                     out.attach = true;
+                }
+                let wake = flex.add_ui(item(), |ui| {
+                    let button = if state.effective_wake_enabled() {
+                        IconButton::new(Icon::Mic).elevated()
+                    } else {
+                        IconButton::new(Icon::Mic).subtle()
+                    };
+                    button
+                        .enabled(!state.classroom_safe)
+                        .id_salt("neo-composer-wake")
+                        .show(ui, &d)
+                        .on_hover_text(if state.wake_enabled {
+                            tr("语音唤醒：开（点击关闭）")
+                        } else {
+                            tr("语音唤醒：关（点击开启）")
+                        })
+                });
+                if wake.inner.clicked() {
+                    out.toggle_wake = true;
                 }
                 let plan = flex.add_ui(item(), |ui| {
                     Chip::new(tr("计划"))

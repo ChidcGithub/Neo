@@ -1386,7 +1386,7 @@ fn display_panel_1080p() {
         app.state.theme_mode = ThemeMode::Dark;
         app.state.distance = Distance::Classroom;
         app.state.show_settings = true;
-        app.state.settings_tab = crate::state::SettingsTab::Display;
+        app.state.settings_tab = crate::state::SettingsTab::Appearance;
     });
     assert!(p.is_file());
 }

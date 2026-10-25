@@ -34,7 +34,7 @@ pub fn draw(ui: &mut egui::Ui, skin: &Skin<'_>, width: f32, state: &mut AppState
         ui,
         skin,
         width,
-        tr("程序同级的 mods 文件夹，或用 NEO_MODS_DIR 环境变量指定；只读扫描，不创建目录。"),
+        tr("将 MOD 放入 mods 目录"),
     );
     ui.add_space(m.s(16.0));
 
@@ -178,7 +178,7 @@ fn mod_row(
     );
 
     if matches!(row.status, ModStatus::NeedsReconfirm) {
-        hint_row(ui, skin, width, tr("清单修订或能力已变化，重新打开以重新确认"));
+        hint_row(ui, skin, width, tr("需重新确认"));
     }
 
     let summary = tf(
@@ -219,9 +219,9 @@ fn mod_row(
     }
     ui.add_space(m.s(4.0));
     let status_desc = match row.status {
-        ModStatus::Off => tr("记录允许加载该 MOD；当前版本不会启动进程"),
-        ModStatus::On => tr("已记录允许加载；当前版本不会启动进程"),
-        ModStatus::NeedsReconfirm => tr("清单修订或能力已变化，重新打开以重新确认"),
+        ModStatus::Off => tr("未启用"),
+        ModStatus::On => tr("已启用"),
+        ModStatus::NeedsReconfirm => tr("需重新确认"),
     };
     hint_row(ui, skin, width, status_desc);
     ui.add_space(m.s(4.0));

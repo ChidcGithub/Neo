@@ -403,15 +403,17 @@ pub struct NeoApp {
     prev_stage: Stage,
     /// 设置面板弹出淡入的基准：上一帧画出去时的开关。
     prev_show_settings: bool,
-    /// 语音唤醒引擎（"Hi, Neo"）。模型未训练或麦克风不可用时为 `None`，
-    /// 界面照常工作，只是没有唤醒。
+    /// 语音唤醒引擎（"Hi, Neo"）。模型缺失/加载失败时收尾为 `None`；
+    /// 麦克风断开由引擎自行重连，不会清空此项。
     wake: Option<neo_wake::WakeEngine>,
     /// 唤醒事件的接收端（由转发线程喂入，事件到达即唤起一帧）。
     wake_rx: Option<std::sync::mpsc::Receiver<neo_wake::WakeEvent>>,
     /// 当前接收端允许的测试代次；进出测试后持续拒收旧事件，不依赖转发时机。
     wake_epoch: u64,
-    /// 引擎线程已报错退出：本次运行不再自动重启（否则帧帧重试）。
+    /// 引擎因不可恢复错误（模型/推理）退出后置位，避免逐帧重启；关闭唤醒开关可清除。
     wake_broken: bool,
+    wake_sensitivity_applied: u8,
+    saved_wake_sensitivity: u8,
     /// 系统托盘图标。只在真实客户端装配（`start_tray`），离屏测试没有托盘。
     tray: Option<tray_icon::TrayIcon>,
     tray_labels: Option<(tray_icon::menu::MenuItem, tray_icon::menu::MenuItem)>,
@@ -559,6 +561,8 @@ impl NeoApp {
             wake_rx: None,
             wake_epoch: 0,
             wake_broken: false,
+            wake_sensitivity_applied: 255,
+            saved_wake_sensitivity: 255,
             tray: None,
             tray_labels: None,
             tray_show_id: tray_icon::menu::MenuId::new("neo-tray-show"),
@@ -634,6 +638,7 @@ impl NeoApp {
             app.state.start_in_tray,
             app.state.class_enabled,
         );
+        app.saved_wake_sensitivity = app.state.wake_sensitivity;
         if let Some(store) = app.store.as_ref() {
             Self::refresh_sessions(&mut app.state, store);
             // 恢复上次使用的会话。
@@ -847,7 +852,11 @@ impl NeoApp {
         if !self.state.effective_wake_enabled() || self.wake.is_some() || self.wake_broken {
             return;
         }
-        let (engine, rx) = neo_wake::WakeEngine::start(neo_wake::WakeConfig::default());
+        let wake_config = neo_wake::WakeConfig {
+            threshold: self.state.wake_threshold(),
+            ..Default::default()
+        };
+        let (engine, rx) = neo_wake::WakeEngine::start(wake_config);
         // 引擎线程 → UI 之间加一段转发：事件到达时主动唤起一帧，
         // 主循环不用为了它空转轮询。
         let (tx, ui_rx) = std::sync::mpsc::channel();
@@ -864,6 +873,7 @@ impl NeoApp {
             }) {
             Ok(_) => {
                 self.wake_epoch = engine.event_epoch();
+                self.wake_sensitivity_applied = self.state.wake_sensitivity;
                 self.wake = Some(engine);
                 self.wake_rx = Some(ui_rx);
             }
@@ -1496,6 +1506,11 @@ impl NeoApp {
         if let Some(v) = get("wake_enabled") {
             self.state.wake_enabled = v == "1";
         }
+        let fallback = neo_wake::sensitivity_for_threshold(neo_wake::WakeConfig::default().threshold);
+        self.state.wake_sensitivity = get("wake_sensitivity")
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .map(|v| v.min(100))
+            .unwrap_or(fallback);
         if let Some(v) = get("start_in_tray") {
             self.state.start_in_tray = v == "1";
         }
@@ -2115,6 +2130,17 @@ impl NeoApp {
             "wake_enabled",
             if state.wake_enabled { "1" } else { "0" }
         );
+        if state.wake_sensitivity != self.saved_wake_sensitivity {
+            if Self::save_setting(
+                self.store.as_ref(),
+                "wake_sensitivity",
+                &state.wake_sensitivity.to_string(),
+            ) {
+                self.saved_wake_sensitivity = state.wake_sensitivity;
+            } else {
+                saved = false;
+            }
+        }
         save_pref!(
             state.floating_enabled,
             self.saved_floating_enabled,
@@ -2259,6 +2285,28 @@ impl NeoApp {
                         self.on_dictation_audio(ctx, frame);
                     }
                 }
+                Some(Ok(neo_wake::WakeEvent::Device(device))) => {
+                    match device {
+                        Some(name) => {
+                            self.state.wake_test.error = None;
+                            self.pending_toasts.push((
+                                neo_ui::ToastKind::Info,
+                                tf("麦克风已切换：{name}", &[("name", name)]),
+                                std::time::Instant::now() + std::time::Duration::from_secs(4),
+                            ));
+                        }
+                        None => {
+                            self.state.wake_test.error =
+                                Some(tr("麦克风已断开，正在等待重新连接").into());
+                            self.pending_toasts.push((
+                                neo_ui::ToastKind::Warning,
+                                tr("麦克风已断开，正在等待重新连接").into(),
+                                std::time::Instant::now() + std::time::Duration::from_secs(4),
+                            ));
+                        }
+                    }
+                    ctx.request_repaint();
+                }
                 Some(Ok(neo_wake::WakeEvent::Error(msg))) => {
                     self.fail_wake(msg);
                     break;
@@ -2327,7 +2375,7 @@ impl NeoApp {
             || self.state.wants_demo_reply;
         self.state.wake_test.broken = self.wake_broken;
         let allowed = self.state.show_settings
-            && self.state.settings_tab == crate::state::SettingsTab::WakeTest
+            && self.state.settings_tab == crate::state::SettingsTab::Voice
             && self.state.effective_wake_enabled()
             && !self.state.wake_test.busy
             && !self.wake_broken
@@ -2793,6 +2841,12 @@ impl NeoApp {
             // 开关拨回「关」即解锁故障锁存：重新打开视为一次手动重试。
             // 风暴防护仍在——引擎再次报错会重新置位 wake_broken。
             self.wake_broken = false;
+        }
+        if let Some(wake) = &self.wake {
+            if self.wake_sensitivity_applied != self.state.wake_sensitivity {
+                wake.set_threshold(self.state.wake_threshold());
+                self.wake_sensitivity_applied = self.state.wake_sensitivity;
+            }
         }
         self.state.poll_attachments();
         if self.state.attachment_busy() {
@@ -3529,6 +3583,9 @@ impl NeoApp {
 
         if composer_out.toggle_plan {
             state.plan_mode = !state.plan_mode;
+        }
+        if composer_out.toggle_wake {
+            state.wake_enabled = !state.wake_enabled;
         }
         if composer_out.toggle_read_only {
             state.read_only = !state.read_only;

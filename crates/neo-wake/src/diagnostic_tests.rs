@@ -5,7 +5,7 @@ fn fake_engine() -> WakeEngine {
         stop: Arc::new(AtomicBool::new(false)),
         mode: Arc::new(AtomicU8::new(MODE_DETECT)),
         monitor: Arc::new(WakeMonitor::new(0.25)),
-        thread: None,
+        threshold: Arc::new(AtomicU32::new(0.25f32.to_bits())), thread: None,
     }
 }
 
@@ -147,6 +147,23 @@ fn event_epoch_survives_forwarding_and_normal_dictation_switches() {
     engine.set_dictation(true);
     assert!(WakeEvent::Audio { epoch: 2, frame: vec![0.2] }.is_current(engine.event_epoch()));
     assert!(WakeEvent::Error("synthetic failure".into()).is_current(engine.event_epoch()));
+}
+
+#[test]
+fn sensitivity_maps_between_threshold_bounds() {
+    assert!((threshold_for_sensitivity(0) - THRESHOLD_MAX).abs() < 1e-6);
+    assert!((threshold_for_sensitivity(100) - THRESHOLD_MIN).abs() < 1e-6);
+    assert_eq!(sensitivity_for_threshold(threshold_for_sensitivity(65)), 65);
+    assert!((threshold_for_sensitivity(65) - 0.249).abs() < 0.01);
+}
+
+#[test]
+fn runtime_threshold_updates_monitor_and_clamps() {
+    let engine = fake_engine();
+    engine.set_threshold(0.9);
+    assert!((engine.diagnostics().threshold - THRESHOLD_MAX).abs() < 1e-6);
+    engine.set_threshold(0.25);
+    assert_eq!(engine.diagnostics().threshold, 0.25);
 }
 
 #[test]

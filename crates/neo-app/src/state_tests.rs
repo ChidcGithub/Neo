@@ -2079,6 +2079,17 @@
     }
 
     #[test]
+    fn wake_sensitivity_maps_to_threshold_bounds() {
+        use super::*;
+        let mut s = AppState::default();
+        assert_eq!(s.wake_sensitivity, 65);
+        s.wake_sensitivity = 100;
+        assert!((s.wake_threshold() - neo_wake::THRESHOLD_MIN).abs() < 1e-6);
+        s.wake_sensitivity = 0;
+        assert!((s.wake_threshold() - neo_wake::THRESHOLD_MAX).abs() < 1e-6);
+    }
+
+    #[test]
     fn failed_reply_is_excluded_from_model_context() {
         use super::*;
         let mut s = AppState::default();

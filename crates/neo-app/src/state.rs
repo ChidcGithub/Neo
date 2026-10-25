@@ -298,9 +298,8 @@ pub struct WakeTestState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsTab {
     General,
-    WakeTest,
     Appearance,
-    Display,
+    Voice,
     Model,
     Memory,
     Mods,
@@ -311,9 +310,8 @@ pub enum SettingsTab {
 impl SettingsTab {
     pub const ALL: &'static [(Self, &'static str)] = &[
         (Self::General, "通用"),
-        (Self::WakeTest, "麦克风测试"),
         (Self::Appearance, "外观"),
-        (Self::Display, "显示"),
+        (Self::Voice, "语音"),
         (Self::Model, "模型"),
         (Self::Memory, "记忆"),
         (Self::Mods, "MOD"),
@@ -769,6 +767,8 @@ pub struct AppState {
     pub minimize_to_tray: bool,
     /// "Hi, Neo" 语音唤醒开关。
     pub wake_enabled: bool,
+    /// 唤醒灵敏度（0–100，越大越容易触发）。
+    pub wake_sensitivity: u8,
     /// 桌面悬浮按钮（默认关闭）；手动听写不依赖唤醒词开关。
     pub floating_enabled: bool,
     pub wake_test: WakeTestState,
@@ -935,6 +935,7 @@ impl Default for AppState {
             log_export_rx: None,
             minimize_to_tray: true,
             wake_enabled: true,
+            wake_sensitivity: 65,
             floating_enabled: false,
             wake_test: WakeTestState::default(),
             start_in_tray: true,
@@ -1010,6 +1011,11 @@ impl AppState {
 
     pub fn effective_wake_enabled(&self) -> bool {
         self.wake_enabled && !self.classroom_safe
+    }
+
+    /// 当前灵敏度对应的判定阈值（交给唤醒引擎）。
+    pub fn wake_threshold(&self) -> f32 {
+        neo_wake::threshold_for_sensitivity(self.wake_sensitivity)
     }
 
     pub fn effective_class_enabled(&self) -> bool {

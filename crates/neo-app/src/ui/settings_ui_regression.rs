@@ -77,7 +77,7 @@ fn settings_i18n_english_pages_wrap_at_narrow_widths() {
                 for tab in [
                     SettingsTab::General,
                     SettingsTab::Appearance,
-                    SettingsTab::Display,
+                    SettingsTab::Voice,
                     SettingsTab::Model,
                     SettingsTab::Memory,
                     SettingsTab::Mods,
@@ -109,10 +109,8 @@ fn settings_i18n_english_pages_wrap_at_narrow_widths() {
                             page_intro(ui, &skin, &state);
                             match tab {
                                 SettingsTab::General => general_tab(ui, &skin, w, &mut state),
-                                SettingsTab::Appearance => appearance_tab(ui, &skin, w, &mut state),
-                                SettingsTab::Display => {
-                                    display_tab(ui, &skin, w, &mut state, 720.0)
-                                }
+                                SettingsTab::Appearance => appearance_tab(ui, &skin, w, &mut state, 720.0),
+                                SettingsTab::Voice => voice_tab(ui, &skin, w, &mut state),
                                 SettingsTab::Model => model_tab(ui, &skin, w, &mut state),
                                 SettingsTab::Memory => memory_tab_with_actions(
                                     ui,
@@ -361,7 +359,7 @@ fn ui_safety_narrow_settings_log_navigation_is_reachable() {
 }
 
 #[test]
-fn narrow_scaled_settings_keep_warnings_and_scrolled_safety_text_readable() {
+fn narrow_scaled_settings_keep_warnings_readable() {
     for width in [240.0, 320.0, 460.0] {
         for scale in [0.85, 1.0, 1.75, 2.8] {
             for dpi in [0.85, 1.0, 2.8] {
@@ -376,10 +374,8 @@ fn narrow_scaled_settings_keep_warnings_and_scrolled_safety_text_readable() {
                 let size = egui::vec2(width, 720.0);
                 let mut state = AppState::default();
                 state.preferences_unsaved = true;
-                let mut seen = std::collections::BTreeSet::new();
-                let mut expected = 0;
-                let mut warning_seen = std::collections::BTreeSet::new();
                 let mut warning_rows = 0;
+                let mut warning_seen = std::collections::BTreeSet::new();
                 for step in 0..65 {
                     let mut input = egui::RawInput {
                         screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
@@ -431,32 +427,7 @@ fn narrow_scaled_settings_keep_warnings_and_scrolled_safety_text_readable() {
                                         warning_seen.insert(index);
                                     }
                                 }
-                            }
-                            if text.galley.job.text.starts_with("非离线模式") {
-                                for boundary in [
-                                    "问答和文件内容仍可发送给模型",
-                                    "仍可联网读取",
-                                    "暂停语音唤醒、课堂采集和桌面观察",
-                                    "禁止打开、写入、执行",
-                                ] {
-                                    assert!(
-                                        text.galley.job.text.contains(boundary),
-                                        "missing safety boundary: {boundary}"
-                                    );
-                                }
-                                expected = text.galley.rows.len();
-                                for (index, row) in text.galley.rows.iter().enumerate() {
-                                    let rect = row.rect().translate(text.pos.to_vec2());
-                                    assert!(
-                                        rect.left() >= 0.0 && rect.right() <= width,
-                                        "safety overflow {width}/{scale}/{dpi}"
-                                    );
-                                    if clipped.clip_rect.expand(1.0).contains_rect(rect) {
-                                        seen.insert(index);
-                                    }
-                                }
-                            }
-                        }
+                            }                        }
                     }
                 }
                 assert!(warning_rows > 0);
@@ -464,12 +435,6 @@ fn narrow_scaled_settings_keep_warnings_and_scrolled_safety_text_readable() {
                     warning_seen.len(),
                     warning_rows,
                     "all warning lines reachable {width}/{scale}/{dpi}"
-                );
-                assert!(expected > 0);
-                assert_eq!(
-                    seen.len(),
-                    expected,
-                    "all safety lines reachable {width}/{scale}/{dpi}"
                 );
             }
         }
@@ -512,9 +477,8 @@ fn model_credentials_hint_wraps_without_painting_the_key() {
             for clipped in &output.shapes {
                 if let egui::Shape::Text(text) = &clipped.shape {
                     assert!(!text.galley.job.text.contains(&state.api_key));
-                    if text.galley.job.text.starts_with("密钥仅本机保存") {
-                        assert!(text.galley.job.text.contains("认证时发送至所填接口"));
-                        assert!(text.galley.job.text.contains("刷新前请核对地址"));
+                    if text.galley.job.text.starts_with("仅保存在本机") {
+                        assert_eq!(text.galley.job.text, "仅保存在本机");
                         found = true;
                         assert!(!text.galley.elided);
                         assert!(clipped
@@ -705,7 +669,7 @@ fn long_page_title_reserves_clickable_close_target() {
             let skin = Skin::new(theme, &whale);
             let size = egui::vec2(width, 420.0);
             let mut state = AppState::default();
-            state.settings_tab = SettingsTab::WakeTest;
+            state.settings_tab = SettingsTab::Voice;
             state.preferences_unsaved = true;
             let mut closed = false;
             let mut render = |events| {
@@ -744,7 +708,7 @@ fn long_page_title_reserves_clickable_close_target() {
             for clipped in &output.shapes {
                 if let egui::Shape::Text(text) = &clipped.shape {
                     let rect = Rect::from_min_size(text.pos, text.galley.size());
-                    if text.galley.text() == "麦克风测试" && rect.intersects(title) {
+                    if text.galley.text() == "语音" && rect.intersects(title) {
                         assert!(rect.right() < close.left());
                         assert!(title.expand(1.0).contains_rect(rect));
                         found = true;

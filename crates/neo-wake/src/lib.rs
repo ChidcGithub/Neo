@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -27,21 +27,44 @@ const MIN_EMBEDDINGS: usize = 16;
 const MEL_BINS: usize = 32;
 const EMB_DIM: usize = 96;
 
-/// 连续确认帧数：滑窗每 80ms 预测一次，要求**连续 2 帧**过线才触发。
-/// 「随便说几个字」的误触发几乎都是单帧尖峰；「嗨，Neo」持续约 0.6s，
-/// 覆盖 5~7 个连续窗口，稳稳两连。阈值卡在真唤醒得分下缘（≈0.2）时，
-/// 这个比硬提阈值更能保住唤醒率。
+/// 连续确认帧数：每 80ms 预测一次，连续 2 帧过线才触发，压掉单帧尖峰。
 const CONFIRM_FRAMES: usize = 2;
 
-/// 采集回调 → 引擎线程的缓冲块数。回调线程绝不能阻塞（实时音频线程），
-/// 满了就丢**新**块：积压说明推理跟不上实时，丢新块让引擎追当前
-/// （唤醒只看最近 2s 滑窗，丢一块等于一个几十毫秒的洞，比越落越远强）。
+/// 灵敏度 100% 对应最宽松（最容易唤醒）的阈值。
+pub const THRESHOLD_MIN: f32 = 0.06;
+/// 灵敏度 0% 对应最严格（最不容易误唤醒）的阈值。
+pub const THRESHOLD_MAX: f32 = 0.60;
+
+/// 0–100 的灵敏度映射到判定阈值：越大越灵敏。
+pub fn threshold_for_sensitivity(percent: u8) -> f32 {
+    let ratio = percent.min(100) as f32 / 100.0;
+    THRESHOLD_MAX - ratio * (THRESHOLD_MAX - THRESHOLD_MIN)
+}
+
+/// 阈值反推灵敏度百分比（用于旧配置/环境变量迁移）。
+pub fn sensitivity_for_threshold(threshold: f32) -> u8 {
+    let clamped = threshold.clamp(THRESHOLD_MIN, THRESHOLD_MAX);
+    (((THRESHOLD_MAX - clamped) / (THRESHOLD_MAX - THRESHOLD_MIN) * 100.0).round() as u8).min(100)
+}
+
+/// 采集回调 → 引擎线程的缓冲块数；满了丢新块，避免推理落后时越积越远。
 const SAMPLE_CHUNKS: usize = 8;
 
-/// 麦克风静默看门狗：流活着时数据回调按设备周期持续到达（静音也是零
-/// 数据帧，不是没回调）。超过它一个样本都没到 = 流实质已死（拔出且无
-/// 后继设备等），必须上报而不是永远空转装没事。
+/// 麦克风静默看门狗：静音也会有零数据帧回调；超过它一个样本都没到，
+/// 判定流已死并触发重连。
 const MIC_SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 默认输入设备轮询间隔（只比较名称，不重建流）。
+const DEVICE_POLL: Duration = Duration::from_secs(2);
+/// 设备断开后的重试间隔。
+const REOPEN_DELAY: Duration = Duration::from_millis(800);
+
+fn default_input_name() -> Option<String> {
+    cpal::default_host()
+        .default_input_device()
+        .and_then(|device| device.description().ok())
+        .map(|description| description.name().to_string())
+}
 
 /// Unix 毫秒（0 表示「还没有」）。
 fn now_ms() -> u64 {
@@ -67,11 +90,7 @@ impl Default for WakeConfig {
             // > exe 同级 resources/models/wake/
             // > 源码内 assets/（cargo run 开发布局）
             model_dir: default_model_dir(),
-            // 默认 0.25：混入机主真人录音重训后，实测真唤醒 0.34~0.83，
-            // 日常说话/环境噪声峰值 ≤0.01 —— 两侧都是几十倍距离；
-            // 再叠加连续 2 帧确认（CONFIRM_FRAMES），误触发基本没有空间。
-            // 调试期可用 NEO_WAKE_THRESHOLD=0.3 之类临时压阈值试灵敏度，
-            // 不必改代码重新构建。
+            // 默认 0.25；设置页灵敏度优先，环境变量仅作无设置时的兜底。
             threshold: std::env::var("NEO_WAKE_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -132,7 +151,10 @@ pub enum WakeEvent {
     Detected { epoch: u64, score: f32 },
     /// 听写模式下转发的 16kHz 单声道 f32 音频块（每块 80ms / 1280 样本）
     Audio { epoch: u64, frame: Vec<f32> },
-    /// 引擎线程遇到无法恢复的错误后退出（模型缺失 / 无麦克风 / 推理失败）
+    /// 采集设备变化：`Some(name)` 表示正在使用该设备（切换/恢复），
+    /// `None` 表示设备已断开、正在等待重新接入。
+    Device(Option<String>),
+    /// 引擎线程遇到无法恢复的错误后退出（模型缺失 / 推理失败）
     Error(String),
 }
 
@@ -144,7 +166,7 @@ impl WakeEvent {
             Self::Detected { epoch, .. } | Self::Audio { epoch, .. } => {
                 current_epoch & 1 == 0 && *epoch == current_epoch
             }
-            Self::Error(_) => true,
+            Self::Device(_) | Self::Error(_) => true,
         }
     }
 }
@@ -153,7 +175,7 @@ impl WakeEvent {
 const MODE_DETECT: u8 = 0; // 常规：只跑唤醒词检测
 const MODE_DICTATE: u8 = 1; // 唤醒后听写：转发音频帧，暂停唤醒检测（省 CPU、防复读）
 
-/// 生命周期状态；Ready 表示流已启动，是否填满推理窗口看 warmup_frames。
+/// 生命周期状态；Ready 表示流已启动，Loading 也包括等待麦克风重连。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakePhase {
     Loading,
@@ -168,7 +190,7 @@ pub struct WakeDiagnostics {
     pub enabled: bool,
     pub test_mode: bool,
     pub phase: WakePhase,
-    /// 启动时选中的默认输入设备；设备自动切换后名称可能已过时。
+    /// 当前输入设备；每次重连后更新。
     pub device_name: Option<String>,
     pub sample_rate: Option<u32>,
     /// 归一化单声道输入电平；None 表示未启用或尚无样本，静音为 -120 dBFS。
@@ -186,7 +208,7 @@ pub struct WakeDiagnostics {
     pub last_hit_ms: u64,
     pub updated_at_ms: u64,
     pub last_audio_ms: u64,
-    /// 最后一次错误保持到实例销毁，不写日志；最多 512 个字符。
+    /// 最近一次可展示的错误；成功重连后清空，最多 512 个字符。
     pub error: Option<String>,
 }
 
@@ -222,6 +244,14 @@ impl WakeMonitor {
         self.update(|s| {
             s.phase = WakePhase::Error;
             s.error = Some(error.chars().take(512).collect());
+        });
+    }
+
+    /// 可恢复故障：保持引擎存活，界面显示正在等待设备恢复。
+    fn recoverable(&self, reason: &str) {
+        self.update(|s| {
+            s.phase = WakePhase::Loading;
+            s.error = Some(reason.chars().take(512).collect());
         });
     }
 
@@ -322,12 +352,13 @@ pub struct WakeEngine {
     stop: Arc<AtomicBool>,
     mode: Arc<AtomicU8>,
     monitor: Arc<WakeMonitor>,
+    threshold: Arc<AtomicU32>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl WakeEngine {
     /// 启动后台采集 + 推理线程，返回事件接收端。
-    /// 安装资源缺失时也会正常返回，错误通过 WakeEvent::Error 上报。
+    /// 模型/资源错误通过 [`WakeEvent::Error`] 上报；麦克风故障自动重连并发送 [`WakeEvent::Device`]。
     pub fn start(config: WakeConfig) -> (Self, mpsc::Receiver<WakeEvent>) {
         neo_log::info!("wake", "detector started"; "threshold" => config.threshold, "debounce_ms" => config.debounce.as_millis() as u64);
         let (tx, rx) = mpsc::channel();
@@ -337,13 +368,15 @@ impl WakeEngine {
         let mode2 = mode.clone();
         let monitor = Arc::new(WakeMonitor::new(config.threshold));
         let monitor2 = monitor.clone();
+        let threshold = Arc::new(AtomicU32::new(config.threshold.to_bits()));
+        let threshold2 = threshold.clone();
         let failed = tx.clone();
         let thread = std::thread::Builder::new()
             .name("neo-wake".into())
             .spawn(move || {
                 let failed = tx.clone();
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    engine_main(config, tx, stop2, mode2, monitor2.clone());
+                    engine_main(config, tx, stop2, mode2, monitor2.clone(), threshold2);
                 })).is_err() {
                     monitor2.fail("唤醒线程异常中断");
                     let _ = failed.send(WakeEvent::Error("唤醒线程异常中断".into()));
@@ -366,10 +399,18 @@ impl WakeEngine {
                 stop,
                 mode,
                 monitor,
+                threshold,
                 thread,
             },
             rx,
         )
+    }
+
+    /// 运行中调整唤醒灵敏度对应的判定阈值（0.06–0.60，越小越严格）。
+    pub fn set_threshold(&self, threshold: f32) {
+        let value = threshold.clamp(THRESHOLD_MIN, THRESHOLD_MAX);
+        self.threshold.store(value.to_bits(), Ordering::Relaxed);
+        self.monitor.update(|s| s.threshold = value);
     }
 
     /// 仅开关额外电平/得分遥测；不启停麦克风、不重载模型、不改变工作模式。
@@ -441,6 +482,7 @@ fn engine_main(
     stop: Arc<AtomicBool>,
     mode: Arc<AtomicU8>,
     monitor: Arc<WakeMonitor>,
+    threshold: Arc<AtomicU32>,
 ) {
     let _lease = loop {
         if stop.load(Ordering::Relaxed) {
@@ -468,170 +510,237 @@ fn engine_main(
     };
     neo_log::info!("wake", "models loaded");
 
-    if stop.load(Ordering::Relaxed) {
-        return;
-    }
-    let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<i16>>(SAMPLE_CHUNKS);
-    let err_tx = tx.clone();
-    let err_monitor = monitor.clone();
-    let stream = match build_stream(sample_tx, move |msg| {
-        err_monitor.fail(&msg);
-        let _ = err_tx.send(WakeEvent::Error(msg));
-    }) {
-        Ok(s) => s,
-        Err(e) => {
-            monitor.fail(&e);
-            let _ = tx.send(WakeEvent::Error(e));
+    let mut announced: Option<String> = None;
+    let mut reported_loss = false;
+    loop {
+        if stop.load(Ordering::Relaxed) {
             return;
         }
-    };
-    if stop.load(Ordering::Relaxed) {
-        return;
-    }
-    monitor.update(|s| {
-        s.device_name = Some(stream.device_name.chars().take(256).collect());
-        s.sample_rate = Some(stream.sample_rate);
-    });
-    if let Err(e) = stream.stream.play() {
-        let error = format!("start mic stream: {e}");
-        monitor.fail(&error);
-        let _ = tx.send(WakeEvent::Error(error));
-        return;
-    }
-    monitor.update(|s| {
-        if s.phase != WakePhase::Error { s.phase = WakePhase::Ready; }
-    });
-
-    let mut resampler = Resampler::new(stream.sample_rate, SAMPLE_RATE);
-    let mut pending: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
-    let mut frames: VecDeque<Vec<f32>> = VecDeque::with_capacity(CHUNK_FRAMES);
-    let mut last_fire = Instant::now() - config.debounce * 2;
-    let mut chunk = vec![0f32; FRAME_SAMPLES * CHUNK_FRAMES];
-
-    let mut meter = DiagnosticMeter::new(Instant::now());
-    let mut test_seen = 0;
-    let mut mode_seen = MODE_DETECT;
-    // 连续过线帧数（见 CONFIRM_FRAMES）：单帧尖峰不算数。
-    let mut streak = 0usize;
-
-    while !stop.load(Ordering::Relaxed) {
-        // 模式切换：清缓冲 + 重置防抖。
-        // 回到检测模式时，滑窗需要约 2s 重新填满，期间不会误触发；
-        // 听写残留的唤醒词尾音也不会在切回后立刻再烧一次。
-        let test = monitor.test_epoch.load(Ordering::Acquire);
-        let m = if test & 1 != 0 { MODE_DETECT } else { mode.load(Ordering::Relaxed) };
-        if m != mode_seen || test != test_seen {
-            mode_seen = m;
-            frames.clear();
-            pending.clear();
-            streak = 0;
-            last_fire = Instant::now();
-            if test != test_seen {
-                reset_test_audio(&sample_rx, &mut resampler, stream.sample_rate, &mut chunk);
-                test_seen = test;
-            }
-            meter = DiagnosticMeter::new(Instant::now());
-            monitor.update(|s| {
-                s.warmup_frames = 0;
-                s.dictating = m == MODE_DICTATE;
-                s.score = None;
-                s.score_peak_2s = None;
-            });
-        }
-        let now = Instant::now();
-        meter.enable(monitor.enabled.load(Ordering::Acquire), now);
-        meter.publish(&monitor, now, frames.len(), mode_seen == MODE_DICTATE);
-        let raw = match sample_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(v) => v,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // 流活着就有持续的采样回调（静音也是零帧，不是没帧）。
-                // 一个样本都没有超过看门狗时间 = 流实质已死（设备拔出且
-                // 无后继等）—— DeviceChanged 错误回调分不出真假死，
-                // 只能靠数据兜底。上报后退出，别永远空转装没事。
-                let silent = now_ms().saturating_sub(stream.last_sample.load(Ordering::Relaxed));
-                if silent > MIC_SILENCE_TIMEOUT.as_millis() as u64 {
-                    let error = "麦克风已断开（5 秒没有采到任何声音）".to_owned();
-                    monitor.fail(&error);
-                    let _ = tx.send(WakeEvent::Error(error));
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<i16>>(SAMPLE_CHUNKS);
+        let reopen = Arc::new(AtomicBool::new(false));
+        let reopen_err = reopen.clone();
+        let reopen_change = reopen.clone();
+        let stream = match build_stream(
+            sample_tx,
+            move |_| {
+                neo_log::warn!("wake", "mic stream error"; "category" => "device");
+                reopen_err.store(true, Ordering::Release);
+            },
+            move || reopen_change.store(true, Ordering::Release),
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                if stop.load(Ordering::Relaxed) {
                     return;
                 }
+                neo_log::warn!("wake", "microphone unavailable"; "category" => "device");
+                monitor.recoverable(&error);
+                if announced.take().is_some() && !reported_loss {
+                    reported_loss = true;
+                    let _ = tx.send(WakeEvent::Device(None));
+                }
+                std::thread::sleep(REOPEN_DELAY);
                 continue;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        meter.enable(monitor.enabled.load(Ordering::Acquire), Instant::now());
-        meter.audio(&raw);
-        resampler.process(&raw, &mut pending);
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(error) = stream.stream.play() {
+            monitor.recoverable(&format!("start mic stream: {error}"));
+            std::thread::sleep(REOPEN_DELAY);
+            continue;
+        }
+        let name = stream.device_name.clone();
+        monitor.update(|s| {
+            s.phase = WakePhase::Ready;
+            s.error = None;
+            s.device_name = Some(name.chars().take(256).collect());
+            s.sample_rate = Some(stream.sample_rate);
+        });
+        if reported_loss {
+            reported_loss = false;
+            announced = Some(name.clone());
+            let _ = tx.send(WakeEvent::Device(Some(name)));
+        } else if announced
+            .as_deref()
+            .is_some_and(|previous| previous != name.as_str())
+        {
+            announced = Some(name.clone());
+            let _ = tx.send(WakeEvent::Device(Some(name)));
+        } else {
+            announced = Some(name);
+        }
 
-        while pending.len() >= FRAME_SAMPLES {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            if monitor.test_epoch.load(Ordering::Acquire) != test_seen {
-                break; // 外层统一重置，不能用测试退出前的帧继续推理。
-            }
-            let frame: Vec<f32> = pending
-                .drain(..FRAME_SAMPLES)
-                .map(|s| s as f32 / 32768.0)
-                .collect();
+        let mut resampler = Resampler::new(stream.sample_rate, SAMPLE_RATE);
+        let mut pending: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
+        let mut frames: VecDeque<Vec<f32>> = VecDeque::with_capacity(CHUNK_FRAMES);
+        let mut last_fire = Instant::now() - config.debounce * 2;
+        let mut chunk = vec![0f32; FRAME_SAMPLES * CHUNK_FRAMES];
 
-            // 听写模式：帧直接转发给上层（VAD/STT），不跑唤醒推理
-            if mode_seen == MODE_DICTATE {
-                let state = monitor.snapshot.lock().unwrap_or_else(|p| p.into_inner());
-                if monitor.test_epoch.load(Ordering::Acquire) != test_seen { break; }
-                if !state.test_mode && tx.send(WakeEvent::Audio { epoch: test_seen, frame }).is_err() {
+        let mut meter = DiagnosticMeter::new(Instant::now());
+        let mut test_seen = 0;
+        let mut mode_seen = MODE_DETECT;
+        let mut streak = 0usize;
+        let mut device_check = Instant::now();
+        let mut reopen_reason: Option<String> = None;
+
+        while !stop.load(Ordering::Relaxed) {
+            if reopen.load(Ordering::Acquire) {
+                reopen_reason = Some("麦克风连接中断".to_owned());
+                break;
+            }
+            if device_check.elapsed() >= DEVICE_POLL {
+                device_check = Instant::now();
+                if default_input_name().as_deref() != Some(stream.device_name.as_str()) {
+                    reopen_reason = Some("默认麦克风已变化".to_owned());
+                    break;
+                }
+            }
+            let test = monitor.test_epoch.load(Ordering::Acquire);
+            let m = if test & 1 != 0 {
+                MODE_DETECT
+            } else {
+                mode.load(Ordering::Relaxed)
+            };
+            if m != mode_seen || test != test_seen {
+                mode_seen = m;
+                frames.clear();
+                pending.clear();
+                streak = 0;
+                last_fire = Instant::now();
+                if test != test_seen {
+                    reset_test_audio(&sample_rx, &mut resampler, stream.sample_rate, &mut chunk);
+                    test_seen = test;
+                }
+                meter = DiagnosticMeter::new(Instant::now());
+                monitor.update(|s| {
+                    s.warmup_frames = 0;
+                    s.dictating = m == MODE_DICTATE;
+                    s.score = None;
+                    s.score_peak_2s = None;
+                });
+            }
+            let now = Instant::now();
+            meter.enable(monitor.enabled.load(Ordering::Acquire), now);
+            meter.publish(&monitor, now, frames.len(), mode_seen == MODE_DICTATE);
+            let raw = match sample_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(v) => v,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if reopen.load(Ordering::Acquire) {
+                        reopen_reason = Some("麦克风连接中断".to_owned());
+                        break;
+                    }
+                    let silent =
+                        now_ms().saturating_sub(stream.last_sample.load(Ordering::Relaxed));
+                    if silent > MIC_SILENCE_TIMEOUT.as_millis() as u64 {
+                        reopen_reason = Some("麦克风已断开（长时间没有数据）".to_owned());
+                        break;
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    reopen_reason = Some("麦克风采集已停止".to_owned());
+                    break;
+                }
+            };
+            meter.enable(monitor.enabled.load(Ordering::Acquire), Instant::now());
+            meter.audio(&raw);
+            resampler.process(&raw, &mut pending);
+
+            while pending.len() >= FRAME_SAMPLES {
+                if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                continue;
-            }
+                if monitor.test_epoch.load(Ordering::Acquire) != test_seen {
+                    break;
+                }
+                let frame: Vec<f32> = pending
+                    .drain(..FRAME_SAMPLES)
+                    .map(|s| s as f32 / 32768.0)
+                    .collect();
 
-            if frames.len() == CHUNK_FRAMES {
-                frames.pop_front();
-            }
-            frames.push_back(frame);
-
-            if frames.len() < CHUNK_FRAMES {
-                continue;
-            }
-            // 每 80ms 对最近 2s 音频做一次完整预测（与 Python listener 一致）
-            for (dst, src) in chunk.chunks_exact_mut(FRAME_SAMPLES).zip(frames.iter()) {
-                dst.copy_from_slice(src);
-            }
-            match predict(&mut models, &chunk) {
-                Ok(score) => {
-                    if stop.load(Ordering::Relaxed) {
+                if mode_seen == MODE_DICTATE {
+                    let state = monitor.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+                    if monitor.test_epoch.load(Ordering::Acquire) != test_seen {
+                        break;
+                    }
+                    if !state.test_mode
+                        && tx
+                            .send(WakeEvent::Audio {
+                                epoch: test_seen,
+                                frame,
+                            })
+                            .is_err()
+                    {
                         return;
                     }
-                    if monitor.test_epoch.load(Ordering::Acquire) != test_seen { break; }
-                    meter.enable(monitor.enabled.load(Ordering::Acquire), Instant::now());
-                    meter.score(Instant::now(), score);
-                    if score >= config.threshold {
-                        streak += 1;
-                    } else {
-                        streak = 0;
-                    }
-                    if streak >= CONFIRM_FRAMES && last_fire.elapsed() >= config.debounce {
-                        neo_log::info!("wake", "wake fired"; "streak" => streak, "debounce_ms" => config.debounce.as_millis() as u64);
-                        streak = 0;
-                        last_fire = Instant::now();
-                        // 检测后清空缓冲，与 Python listener 的 pause 行为一致
-                        frames.clear();
-                        pending.clear();
-                        if !monitor.detected(test_seen, score, &tx) {
+                    continue;
+                }
+
+                if frames.len() == CHUNK_FRAMES {
+                    frames.pop_front();
+                }
+                frames.push_back(frame);
+
+                if frames.len() < CHUNK_FRAMES {
+                    continue;
+                }
+                for (dst, src) in chunk.chunks_exact_mut(FRAME_SAMPLES).zip(frames.iter()) {
+                    dst.copy_from_slice(src);
+                }
+                match predict(&mut models, &chunk) {
+                    Ok(score) => {
+                        if stop.load(Ordering::Relaxed) {
                             return;
                         }
+                        if monitor.test_epoch.load(Ordering::Acquire) != test_seen {
+                            break;
+                        }
+                        meter.enable(monitor.enabled.load(Ordering::Acquire), Instant::now());
+                        meter.score(Instant::now(), score);
+                        let active_threshold = f32::from_bits(threshold.load(Ordering::Relaxed));
+                        if score >= active_threshold {
+                            streak += 1;
+                        } else {
+                            streak = 0;
+                        }
+                        if streak >= CONFIRM_FRAMES && last_fire.elapsed() >= config.debounce {
+                            neo_log::info!("wake", "wake fired"; "streak" => streak, "debounce_ms" => config.debounce.as_millis() as u64);
+                            streak = 0;
+                            last_fire = Instant::now();
+                            frames.clear();
+                            pending.clear();
+                            if !monitor.detected(test_seen, score, &tx) {
+                                return;
+                            }
+                        }
                     }
-                }
-                Err(e) => {
-                    let error = format!("inference: {e}");
-                    monitor.fail(&error);
-                    let _ = tx.send(WakeEvent::Error(error));
-                    return;
+                    Err(e) => {
+                        let error = format!("inference: {e}");
+                        monitor.fail(&error);
+                        let _ = tx.send(WakeEvent::Error(error));
+                        return;
+                    }
                 }
             }
         }
+
+        drop(stream);
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(reason) = reopen_reason else {
+            return;
+        };
+        neo_log::warn!("wake", "microphone lost; reconnecting"; "category" => "device");
+        monitor.recoverable(&reason);
+        if announced.take().is_some() && !reported_loss {
+            reported_loss = true;
+            let _ = tx.send(WakeEvent::Device(None));
+        }
+        std::thread::sleep(REOPEN_DELAY);
     }
-    // stream 随作用域结束而 drop，采集回调停止
 }
 
 fn reset_test_audio(
@@ -792,10 +901,11 @@ fn push_samples(tx: &mpsc::SyncSender<Vec<i16>>, last: &AtomicU64, buf: Vec<i16>
     let _ = tx.try_send(buf); // Full / Disconnected 都丢：回调线程不能阻塞
 }
 
-/// `on_err` 只在致命错误时调用；Xrun / 设备切换这类瞬态事件内部消化。
+/// `on_err` 用于不可恢复/一般错误；设备切换单独回调，便于采集侧重开而不退出。
 fn build_stream(
     tx: mpsc::SyncSender<Vec<i16>>,
     on_err: impl Fn(String) + Send + Clone + 'static,
+    on_change: impl Fn() + Send + Clone + 'static,
 ) -> Result<AudioStream, String> {
     let host = cpal::default_host();
     let device = host
@@ -810,15 +920,14 @@ fn build_stream(
     // 看门狗起始值给「现在」：流刚建好、首个回调还没到之前不算死亡。
     let last_sample = Arc::new(AtomicU64::new(now_ms()));
 
-    let err_cb = move |e: cpal::Error| {
-        match e.kind() {
-            // Xrun（缓冲区欠载/过载）与 DeviceChanged（默认设备切换、流自动跟随）
-            // 都是瞬态事件，流仍在继续采集——启动期 CPU 尖峰很容易触发一次 Xrun，
-            // 误当致命错误会让唤醒整局失效，这里只记录不上报。
-            // （设备拔出且无后继的「假 DeviceChanged、真死流」由数据看门狗兜住。）
-            cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged => {
-                eprintln!("[neo-wake] mic stream 瞬态事件（流仍存活，忽略）");
+    let err_cb = {
+        let on_err = on_err.clone();
+        let on_change = on_change.clone();
+        move |e: cpal::Error| match e.kind() {
+            cpal::ErrorKind::Xrun => {
+                eprintln!("[neo-wake] mic stream xrun（忽略）");
             }
+            cpal::ErrorKind::DeviceChanged => on_change(),
             _ => on_err(format!("mic stream: {e}")),
         }
     };
@@ -1062,7 +1171,7 @@ pub struct AudioTap {
     stop: Arc<AtomicBool>,
     missing: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    device: String,
+    device: Arc<Mutex<String>>,
 }
 
 impl AudioTap {
@@ -1085,6 +1194,8 @@ impl AudioTap {
         let missing = Arc::new(AtomicBool::new(false));
         let missing2 = missing.clone();
         let (hello_tx, hello_rx) = mpsc::channel::<Result<String, String>>();
+        let device = Arc::new(Mutex::new(String::new()));
+        let device2 = device.clone();
         // 握手失败只停止本次采集，不能伪装成调用方主动下课。
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
@@ -1092,21 +1203,33 @@ impl AudioTap {
         let session_stop2 = session_stop.clone();
         let thread = std::thread::Builder::new()
             .name("neo-audio-tap".into())
-            .spawn(move || tap_main(frame_tx, hello_tx, stop2, session_stop2, cancelled2, missing2))
+            .spawn(move || {
+                tap_main(
+                    frame_tx,
+                    hello_tx,
+                    stop2,
+                    session_stop2,
+                    cancelled2,
+                    missing2,
+                    device2,
+                )
+            })
             .map_err(|e| format!("spawn audio tap: {e}"))?;
         // 等采集线程握手：设备名或启动错误。流活着时线程不会主动退出。
         // 必须有超时：坏驱动/杀软钩住音频栈时建流可能永久卡住 —— 无超时
         // 会把调用方线程一起 wedge 掉。超时后不能 join（同样会卡死），
         // 置 stop 并分离线程：它若将来醒来会自己看到 stop 退出。
-        let device = match wait_tap_hello(&hello_rx, &session_stop, &cancelled, Instant::now() + Duration::from_secs(10)) {
-            Ok(name) => name,
+        match wait_tap_hello(&hello_rx, &session_stop, &cancelled, Instant::now() + Duration::from_secs(10)) {
+            Ok(name) => {
+                *device.lock().unwrap_or_else(|p| p.into_inner()) = name;
+            }
             Err(e) => {
                 stop.store(true, Ordering::Relaxed);
                 // 错误事件可能先于驱动析构返回；错误路径也不能无限 join。
                 drop(thread);
                 return Err(e);
             }
-        };
+        }
         Ok(Self {
             rx: frame_rx,
             stop,
@@ -1116,14 +1239,16 @@ impl AudioTap {
         })
     }
 
-    /// 采集设备名（遥测用）。
-    pub fn device(&self) -> &str {
-        &self.device
+    /// 采集设备名（遥测用；设备热插拔后返回当前设备）。
+    pub fn device(&self) -> String {
+        self.device
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
-    /// 取下一帧（80ms / 1280 样本 f32）。超时返回 `None`；
-    /// 流死亡（线程退出）后持续返回 `None` —— 用 [`AudioTap::is_alive`]
-    /// 区分「安静的教室」与「死流」。
+    /// 取下一帧（80ms / 1280 样本 f32），超时返回 `None`。
+    /// 设备断开期间线程仍在重连，持续无帧时用 [`AudioTap::is_alive`] 判断线程是否还在。
     pub fn next_frame(&self, timeout: Duration) -> Option<Vec<f32>> {
         self.rx.recv_timeout(timeout).ok()
     }
@@ -1156,8 +1281,7 @@ impl AudioTap {
         self.missing.load(Ordering::Relaxed)
     }
 
-    /// 采集线程是否还活着。`next_frame` 持续返回 `None` 时用它区分
-    /// 「没声音」与「流死了」。
+    /// 采集线程是否还在运行（停止或 panic 后为 false）。
     pub fn is_alive(&self) -> bool {
         self.thread.as_ref().is_some_and(|t| !t.is_finished())
     }
@@ -1200,87 +1324,155 @@ fn tap_main(
     session_stop: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     missing: Arc<AtomicBool>,
+    device: Arc<Mutex<String>>,
 ) {
-    if stop.load(Ordering::Relaxed) || session_stop.load(Ordering::Relaxed) || cancelled.load(Ordering::Acquire) {
+    if stop.load(Ordering::Relaxed)
+        || session_stop.load(Ordering::Relaxed)
+        || cancelled.load(Ordering::Acquire)
+    {
         return;
     }
-    let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<i16>>(SAMPLE_CHUNKS);
-    // 致命流错误：置死标志，主循环见到即退出 —— 线程退出后帧通道断开，
-    // 对端经 is_alive() 得知流死（只 eprintln 的话对端永远分不清
-    // 「安静的教室」与「死流」）。
-    let dead = Arc::new(AtomicBool::new(false));
-    let dead2 = dead.clone();
-    let stream = match build_stream(sample_tx, move |msg| {
-        eprintln!("[neo-audio-tap] {msg}");
-        dead2.store(true, Ordering::Relaxed);
-    }) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = hello.send(Err(e));
+    let mut started = false;
+    loop {
+        if stop.load(Ordering::Relaxed)
+            || session_stop.load(Ordering::Relaxed)
+            || cancelled.load(Ordering::Acquire)
+        {
             return;
         }
-    };
-    if stop.load(Ordering::Relaxed) || session_stop.load(Ordering::Relaxed) || cancelled.load(Ordering::Acquire) {
-        return;
-    }
-    if let Err(e) = stream.stream.play() {
-        let _ = hello.send(Err(format!("start mic stream: {e}")));
-        return;
-    }
-    if hello.send(Ok(stream.device_name.clone())).is_err() {
-        return; // 启动方已放弃
-    }
-
-    // 收样本 → 重采样 → 组帧 → 转发，直到 stop、流报错或看门狗判定死流。
-    let mut resampler = Resampler::new(stream.sample_rate, SAMPLE_RATE);
-    let mut pending: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
-    while !stop.load(Ordering::Relaxed) && !session_stop.load(Ordering::Relaxed) && !cancelled.load(Ordering::Acquire) {
-        let raw = match sample_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(v) => v,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if dead.load(Ordering::Relaxed) {
-                    break; // 停流后统一排空已有样本
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<i16>>(SAMPLE_CHUNKS);
+        let reopen = Arc::new(AtomicBool::new(false));
+        let reopen_err = reopen.clone();
+        let reopen_change = reopen.clone();
+        let stream = match build_stream(
+            sample_tx,
+            move |msg| {
+                eprintln!("[neo-audio-tap] {msg}");
+                reopen_err.store(true, Ordering::Release);
+            },
+            move || reopen_change.store(true, Ordering::Release),
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                if !started {
+                    let _ = hello.send(Err(error));
+                    return;
                 }
-                // 同唤醒引擎的数据看门狗：持续无样本 = 流实质已死。
-                let silent = now_ms().saturating_sub(stream.last_sample.load(Ordering::Relaxed));
-                if silent > MIC_SILENCE_TIMEOUT.as_millis() as u64 {
-                    eprintln!("[neo-audio-tap] 麦克风 {MIC_SILENCE_TIMEOUT:?} 无数据，判定死流退出");
-                    break;
-                }
+                eprintln!("[neo-audio-tap] 等待麦克风：{error}");
+                missing.store(true, Ordering::Relaxed);
+                std::thread::sleep(REOPEN_DELAY);
                 continue;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        if cancelled.load(Ordering::Acquire) {
+        if stop.load(Ordering::Relaxed)
+            || session_stop.load(Ordering::Relaxed)
+            || cancelled.load(Ordering::Acquire)
+        {
             return;
         }
-        resampler.process(&raw, &mut pending);
-        while pending.len() >= FRAME_SAMPLES {
+        if let Err(error) = stream.stream.play() {
+            if !started {
+                let _ = hello.send(Err(format!("start mic stream: {error}")));
+                return;
+            }
+            eprintln!("[neo-audio-tap] 启动麦克风失败：{error}");
+            missing.store(true, Ordering::Relaxed);
+            std::thread::sleep(REOPEN_DELAY);
+            continue;
+        }
+        *device.lock().unwrap_or_else(|p| p.into_inner()) = stream.device_name.clone();
+        if !started {
+            if hello.send(Ok(stream.device_name.clone())).is_err() {
+                return;
+            }
+            started = true;
+        }
+
+        let mut resampler = Resampler::new(stream.sample_rate, SAMPLE_RATE);
+        let mut pending: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
+        let mut device_check = Instant::now();
+        let mut reopen_reason: Option<String> = None;
+        while !stop.load(Ordering::Relaxed)
+            && !session_stop.load(Ordering::Relaxed)
+            && !cancelled.load(Ordering::Acquire)
+        {
+            if reopen.load(Ordering::Acquire) {
+                reopen_reason = Some("麦克风连接中断".to_owned());
+                break;
+            }
+            if device_check.elapsed() >= DEVICE_POLL {
+                device_check = Instant::now();
+                if default_input_name().as_deref() != Some(stream.device_name.as_str()) {
+                    reopen_reason = Some("默认麦克风已变化".to_owned());
+                    break;
+                }
+            }
+            let raw = match sample_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(v) => v,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if reopen.load(Ordering::Acquire) {
+                        reopen_reason = Some("麦克风连接中断".to_owned());
+                        break;
+                    }
+                    let silent =
+                        now_ms().saturating_sub(stream.last_sample.load(Ordering::Relaxed));
+                    if silent > MIC_SILENCE_TIMEOUT.as_millis() as u64 {
+                        reopen_reason = Some("麦克风已断开（长时间没有数据）".to_owned());
+                        break;
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    reopen_reason = Some("麦克风采集已停止".to_owned());
+                    break;
+                }
+            };
             if cancelled.load(Ordering::Acquire) {
                 return;
             }
-            let frame: Vec<f32> = pending
-                .drain(..FRAME_SAMPLES)
-                .map(|s| s as f32 / 32768.0)
-                .collect();
-            if !push_tap_frame(&tx, &missing, frame) {
-                return; // 消费端走了
+            resampler.process(&raw, &mut pending);
+            while pending.len() >= FRAME_SAMPLES {
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                let frame: Vec<f32> = pending
+                    .drain(..FRAME_SAMPLES)
+                    .map(|s| s as f32 / 32768.0)
+                    .collect();
+                if !push_tap_frame(&tx, &missing, frame) {
+                    return;
+                }
             }
         }
-    }
-    // drop 流使回调停止后，原始队列才是封闭的。不能先等通道断开，
-    // 因为发送端由仍活着的 stream 持有。
-    drop(stream);
-    if cancelled.load(Ordering::Acquire) {
-        return;
-    }
-    for raw in sample_rx.try_iter() {
-        resampler.process(&raw, &mut pending);
-    }
-    for chunk in pending.chunks(FRAME_SAMPLES) {
-        if cancelled.load(Ordering::Acquire)
-            || !push_tap_frame(&tx, &missing, chunk.iter().map(|&s| s as f32 / 32768.0).collect()) {
-            break;
+
+        let stopping = stop.load(Ordering::Relaxed)
+            || session_stop.load(Ordering::Relaxed)
+            || cancelled.load(Ordering::Acquire);
+        drop(stream);
+        if stopping {
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            for raw in sample_rx.try_iter() {
+                resampler.process(&raw, &mut pending);
+            }
+            for chunk in pending.chunks(FRAME_SAMPLES) {
+                if cancelled.load(Ordering::Acquire)
+                    || !push_tap_frame(
+                        &tx,
+                        &missing,
+                        chunk.iter().map(|&s| s as f32 / 32768.0).collect(),
+                    )
+                {
+                    break;
+                }
+            }
+            return;
+        }
+        if let Some(reason) = reopen_reason {
+            eprintln!("[neo-audio-tap] {reason}，正在等待重新连接");
+            missing.store(true, Ordering::Relaxed);
+            std::thread::sleep(REOPEN_DELAY);
         }
     }
 }

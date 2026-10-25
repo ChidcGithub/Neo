@@ -5,7 +5,7 @@ fn cancelled_tap_never_starts_device_handshake() {
     assert!(AudioTap::start_cancellable(Arc::new(AtomicBool::new(true))).is_err());
     let (tx, rx) = mpsc::sync_channel(TAP_FRAMES);
     let (hello, ready) = mpsc::channel();
-    tap_main(tx, hello, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+    tap_main(tx, hello, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(String::new())));
     assert!(rx.try_recv().is_err());
     assert!(ready.try_recv().is_err());
 }
@@ -25,7 +25,7 @@ fn handshake_uses_absolute_deadline_and_cancel_before_queued_success() {
 fn cancelled_wake_skips_models_and_microphone() {
     let (tx, rx) = mpsc::channel();
     let _lease = WAKE_LEASE.lock().unwrap_or_else(|p| p.into_inner());
-    engine_main(WakeConfig::default(), tx, Arc::new(AtomicBool::new(true)), Arc::new(AtomicU8::new(MODE_DETECT)), Arc::new(WakeMonitor::new(0.25)));
+    engine_main(WakeConfig::default(), tx, Arc::new(AtomicBool::new(true)), Arc::new(AtomicU8::new(MODE_DETECT)), Arc::new(WakeMonitor::new(0.25)), Arc::new(AtomicU32::new(0.25f32.to_bits())));
     assert!(rx.try_recv().is_err());
 }
 
@@ -34,7 +34,7 @@ fn dropping_wake_does_not_join_a_busy_worker() {
     let (release, wait) = mpsc::channel();
     let thread = std::thread::spawn(move || { let _ = wait.recv(); });
     let stop = Arc::new(AtomicBool::new(false));
-    let engine = WakeEngine { stop: stop.clone(), mode: Arc::new(AtomicU8::new(MODE_DETECT)), monitor: Arc::new(WakeMonitor::new(0.25)), thread: Some(thread) };
+    let engine = WakeEngine { stop: stop.clone(), mode: Arc::new(AtomicU8::new(MODE_DETECT)), monitor: Arc::new(WakeMonitor::new(0.25)), threshold: Arc::new(AtomicU32::new(0.25f32.to_bits())), thread: Some(thread) };
     let (done, finished) = mpsc::channel();
     let dropper = std::thread::spawn(move || { drop(engine); let _ = done.send(()); });
     let result = finished.recv_timeout(Duration::from_secs(1));
@@ -50,7 +50,7 @@ fn dropping_tap_does_not_join_a_busy_worker() {
     let thread = std::thread::spawn(move || { let _ = wait.recv(); });
     let (_tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
-    let tap = AudioTap { rx, stop: stop.clone(), missing: Arc::new(AtomicBool::new(false)), thread: Some(thread), device: "synthetic".into() };
+    let tap = AudioTap { rx, stop: stop.clone(), missing: Arc::new(AtomicBool::new(false)), thread: Some(thread), device: Arc::new(Mutex::new("synthetic".to_owned())) };
     let (done, finished) = mpsc::channel();
     let dropper = std::thread::spawn(move || { drop(tap); let _ = done.send(()); });
     let result = finished.recv_timeout(Duration::from_secs(1));
@@ -91,7 +91,7 @@ fn stop_joins_producer_without_losing_queued_tail() {
         }
         assert!(push_tap_frame(&tx, &worker_missing, vec![2.0; 17]));
     });
-    let mut tap = AudioTap { rx, stop, missing, thread: Some(thread), device: "synthetic".into() };
+    let mut tap = AudioTap { rx, stop, missing, thread: Some(thread), device: Arc::new(Mutex::new("synthetic".to_owned())) };
     assert!(tap.stop_capture());
     assert!(!tap.is_alive());
     assert!(!tap.has_missing_audio());
@@ -117,7 +117,7 @@ fn slow_consumer_has_bounded_fifo_and_full_queue_does_not_block_stop() {
         while !stopped.load(Ordering::Relaxed) { std::thread::yield_now(); }
         assert!(push_tap_frame(&tx, &worker_missing, vec![-1.0; 17]));
     });
-    let mut tap = AudioTap { rx, stop, missing, thread: Some(thread), device: "synthetic".into() };
+    let mut tap = AudioTap { rx, stop, missing, thread: Some(thread), device: Arc::new(Mutex::new("synthetic".to_owned())) };
     let full = filled.recv_timeout(Duration::from_secs(2));
     let stopped = tap.stop_capture();
     assert!(full.is_ok());
@@ -138,7 +138,7 @@ fn explicit_stop_times_out_without_claiming_busy_worker_is_dead() {
     let (_tx, rx) = mpsc::sync_channel(TAP_FRAMES);
     let stop = Arc::new(AtomicBool::new(false));
     let thread = std::thread::spawn(move || { let _ = wait.recv(); });
-    let mut tap = AudioTap { rx, stop: stop.clone(), missing: Arc::new(AtomicBool::new(false)), thread: Some(thread), device: "synthetic".into() };
+    let mut tap = AudioTap { rx, stop: stop.clone(), missing: Arc::new(AtomicBool::new(false)), thread: Some(thread), device: Arc::new(Mutex::new("synthetic".to_owned())) };
     let (done, finished) = mpsc::channel();
     let stopper = std::thread::spawn(move || {
         let start = Instant::now();

@@ -138,20 +138,10 @@ impl LogViewState {
         ui.push_id("neo-diagnostics-page", |ui| {
             ui.set_max_width(width);
             ui.spacing_mut().item_spacing = egui::vec2(m.s(8.0), m.s(8.0));
-            ui.add(egui::Label::new(
-                RichText::new(tr("诊断同时保留内存视图与本地文件日志；均不上传、不发送给模型。启动故障另记本地概括日志，不受此处清空影响。"))
-                    .font(skin.prop(skin.t().caption)).color(p.label_secondary),
-            ).wrap());
-            ui.add(egui::Label::new(RichText::new(
-                tr("id：操作编号；parent：关联任务；elapsed_ms 含等待确认时间。cancel_requested ≠ 已终止；background=true 不跟踪进程退出。")
-            ).font(skin.prop(skin.t().caption)).color(p.label_secondary)).wrap());
             let mut enabled = diagnostics::details_enabled();
             let toggle = ui.checkbox(&mut enabled, tr("详细错误诊断（仅本次运行）"));
             #[cfg(test)]
             ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neo-logs-details-toggle"), toggle.rect));
-            ui.add(egui::Label::new(RichText::new(
-                tr("详情可能含密钥等秘密，仅记录开启后的新错误。关闭后清除已保留详情，但不能撤回复制内容或擦除在途错误；不上传、不发送给模型。")
-            ).font(skin.prop(skin.t().caption)).color(p.warn)).wrap());
             if toggle.changed() {
                 diagnostics::set_details_enabled(enabled);
                 self.reset_details();

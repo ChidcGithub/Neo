@@ -1,11 +1,12 @@
 //! # neo-store
 //!
-//! Neo 的本地持久化。三张表：
+//! Neo 的本地持久化。四张表：
 //!
 //! | 表 | 存什么 |
 //! |---|---|
 //! | `sessions` | 会话（标题 + 时间戳） |
 //! | `messages` | 消息（含思考过程 `reasoning`） |
+//! | `context_checkpoints` | 历史压缩摘要与覆盖位置 |
 //! | `settings` | 键值设置（主题 / 观看距离 / API 配置） |
 //!
 //! 设计取舍：
@@ -315,7 +316,7 @@ impl Store {
         )
     }
 
-    /// 原文、工具协议与用量同事务保存，避免重开后丢失配对结果。
+    /// 原文、工具协议、用量与失败标记同事务保存，避免重开后丢失配对结果。
     #[allow(clippy::too_many_arguments)]
     pub fn append_message_with_protocol(
         &self,

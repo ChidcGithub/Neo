@@ -431,6 +431,105 @@ impl Switch {
 }
 
 /// 「标签 —— 键 —— 值」一行（设置面板里的只读信息行）。
+/// 单值滑杆。`neo_ui` 自绘，避免设置页散落裸 egui 控件。
+pub struct Slider<'a> {
+    value: &'a mut u8,
+    min: u8,
+    max: u8,
+    enabled: bool,
+    id_salt: Option<egui::Id>,
+}
+
+impl<'a> Slider<'a> {
+    pub fn new(value: &'a mut u8) -> Self {
+        Self {
+            value,
+            min: 0,
+            max: 100,
+            enabled: true,
+            id_salt: None,
+        }
+    }
+
+    pub fn range(mut self, range: std::ops::RangeInclusive<u8>) -> Self {
+        self.min = *range.start();
+        self.max = (*range.end()).max(self.min);
+        self
+    }
+
+    pub fn enabled(mut self, on: bool) -> Self {
+        self.enabled = on;
+        self
+    }
+
+    pub fn id_salt(mut self, s: impl std::hash::Hash) -> Self {
+        self.id_salt = Some(crate::base::hash_id(s));
+        self
+    }
+
+    pub fn height(d: &Design) -> f32 {
+        d.m().hit_target(d.m().s(22.0))
+    }
+
+    pub fn show(self, ui: &mut Ui, d: &Design, width: f32) -> egui::Response {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, Self::height(d)), Sense::hover());
+        self.show_at(ui, d, rect)
+    }
+
+    pub fn show_at(self, ui: &Ui, d: &Design, rect: Rect) -> egui::Response {
+        let m = d.m();
+        let p = d.p();
+        let c = d.c();
+        let id = self.id_salt.unwrap_or_else(|| {
+            ui.id()
+                .with(("slider", rect.left() as i32, rect.top() as i32))
+        });
+        let resp = if self.enabled {
+            ui.interact(rect, id, Sense::click_and_drag())
+        } else {
+            crate::base::hover_area(ui, rect, id)
+        };
+        let track_h = m.s(6.0);
+        let track = Rect::from_center_size(
+            rect.center(),
+            Vec2::new((rect.width() - m.s(12.0)).max(1.0), track_h),
+        );
+        if self.enabled && (resp.dragged() || resp.clicked()) {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let t = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+                let raw = self.min as f32 + t * (self.max - self.min) as f32;
+                *self.value = raw.round().clamp(self.min as f32, self.max as f32) as u8;
+            }
+        }
+        let span = (self.max - self.min).max(1);
+        let t = ((*self.value).clamp(self.min, self.max) - self.min) as f32 / span as f32;
+        ui.painter().squircle_filled(
+            track,
+            track_h * 0.5,
+            crate::base::translucent(p.border_l2, 0.6),
+        );
+        let filled = Rect::from_min_max(
+            track.min,
+            egui::pos2(track.left() + track.width() * t, track.bottom()),
+        );
+        if filled.width() > 0.0 {
+            ui.painter()
+                .squircle_filled(filled, track_h * 0.5, c.business);
+        }
+        let knob = egui::pos2(track.left() + track.width() * t, track.center().y);
+        ui.painter().circle_filled(
+            knob,
+            m.s(8.0),
+            if self.enabled {
+                c.business
+            } else {
+                crate::base::translucent(c.business, 0.5)
+            },
+        );
+        resp
+    }
+}
+
 pub struct FieldRow<'a> {
     key: &'a str,
     value: &'a str,

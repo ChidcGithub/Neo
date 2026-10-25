@@ -1,8 +1,7 @@
 //! 设置面板（全屏遮罩 + 居中卡片，正式版布局）。
 //!
-//! 左列：「设置」标题 + 竖排导航（通用 / 外观 / 显示 / 模型 / 关于）；
-//! 右列：页标题 + 页描述 + 可滚动内容区。内容超出时滚动，面板尺寸固定，
-//! 不再像原型期那样按内容精确预算高度。
+//! 左列：「设置」标题 + 竖排导航（通用 / 外观 / 语音 / 模型 / 记忆 / MOD / 日志 / 关于）；
+//! 右列：页标题 + 页描述 + 可滚动内容区；面板尺寸固定，内容超出时滚动。
 //!
 //! # 组件归口
 //!
@@ -225,9 +224,8 @@ pub fn panel(
                 ui.add_space(m.s(8.0));
                 match state.settings_tab {
                     SettingsTab::General => general_tab(ui, skin, w, state),
-                    SettingsTab::WakeTest => super::waketest::draw(ui, skin, w, state),
-                    SettingsTab::Appearance => appearance_tab(ui, skin, w, state),
-                    SettingsTab::Display => display_tab(ui, skin, w, state, viewport_h),
+                    SettingsTab::Appearance => appearance_tab(ui, skin, w, state, viewport_h),
+                    SettingsTab::Voice => voice_tab(ui, skin, w, state),
                     SettingsTab::Model => model_tab(ui, skin, w, state),
                     SettingsTab::Memory => memory_tab(ui, skin, w, state),
                     SettingsTab::Mods => super::mods::draw(ui, skin, w, state),
@@ -277,10 +275,9 @@ fn page_name(tab: SettingsTab) -> &'static str {
 
 fn page_desc(tab: SettingsTab) -> &'static str {
     tr(match tab {
-        SettingsTab::General => "安全、后台与语音",
-        SettingsTab::WakeTest => "本机测试麦克风与唤醒词，不听写、不发送",
-        SettingsTab::Appearance => "主题与回复展示",
-        SettingsTab::Display => "观看距离与缩放",
+        SettingsTab::General => "语言、安全与后台行为",
+        SettingsTab::Appearance => "主题、回复展示与观看距离",
+        SettingsTab::Voice => "唤醒灵敏度、课堂总结与麦克风",
         SettingsTab::Model => "接口、密钥与模型列表",
         SettingsTab::Memory => "管理与备份记忆",
         SettingsTab::Mods => "只读发现与启用意图，不启动进程",
@@ -292,9 +289,8 @@ fn page_desc(tab: SettingsTab) -> &'static str {
 fn nav_icon(tab: SettingsTab) -> Icon {
     match tab {
         SettingsTab::General => Icon::Cog,
-        SettingsTab::WakeTest => Icon::Info,
         SettingsTab::Appearance => Icon::Sun,
-        SettingsTab::Display => Icon::Board,
+        SettingsTab::Voice => Icon::Mic,
         SettingsTab::Model => Icon::Sparkle,
         SettingsTab::Memory => Icon::Checklist,
         SettingsTab::Mods => Icon::Folder,
@@ -307,7 +303,7 @@ fn nav_icon(tab: SettingsTab) -> Icon {
 // 各页
 // ---------------------------------------------------------------------------
 
-/// 通用页：安全策略、后台运行、悬浮按钮与音频功能。
+/// 通用页：语言、安全策略、后台与悬浮按钮。
 fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     section_label_row(ui, skin, width, tr("语言"));
     let selected = match state.language {
@@ -339,27 +335,20 @@ fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         skin,
         width,
         tr("课堂安全模式"),
-        tr("默认开启，限制后台采集和工具权限"),
+        tr("写入、执行与桌面观察"),
         &mut safe,
         "neo-set-safe",
     );
     state.set_classroom_safe(safe);
-    ui.add(egui::Label::new(tr("非离线模式：问答和文件内容仍可发送给模型，仍可联网读取。开启后暂停语音唤醒、课堂采集和桌面观察，禁止打开、写入、执行。")).wrap());
     row_divider(ui, skin, width);
     switch_row(
         ui,
         skin,
         width,
         tr("致命启动错误静默退出"),
-        tr("仅安全模式下生效，默认关闭"),
+        tr("仅记入本地日志"),
         &mut state.silent_startup_errors,
         "neo-set-silent-startup",
-    );
-    hint_row(
-        ui,
-        skin,
-        width,
-        tr("仍记本地日志；普通工具/网络故障不自动退出。关闭此项则弹窗报告致命错误。"),
     );
     row_divider(ui, skin, width);
     section_label_row(ui, skin, width, tr("窗口与后台"));
@@ -368,7 +357,7 @@ fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         skin,
         width,
         tr("关闭时最小化到托盘"),
-        tr("从托盘菜单重新打开；安全模式下不监听唤醒词"),
+        tr("关闭窗口后驻留托盘"),
         &mut state.minimize_to_tray,
         "neo-set-tray",
     );
@@ -378,7 +367,7 @@ fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         skin,
         width,
         tr("启动时最小化到托盘"),
-        tr("需关闭安全模式并启用语音唤醒"),
+        tr("启动后直接进托盘"),
         &mut state.start_in_tray,
         "neo-set-start-tray",
     );
@@ -388,38 +377,19 @@ fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         skin,
         width,
         tr("桌面悬浮按钮"),
-        tr("单击展开菜单，双击唤醒，拖动移动。独立于语音唤醒；安全模式下不采集桌面或麦克风"),
+        tr("桌面悬浮快捷面板"),
         &mut state.floating_enabled,
         "neo-set-floating",
     );
-    row_divider(ui, skin, width);
-    section_label_row(ui, skin, width, tr("语音与课堂"));
-    switch_row(
-        ui,
-        skin,
-        width,
-        tr("语音唤醒「Hi, Neo」"),
-        tr("开启后监听唤醒词；安全模式下暂停"),
-        &mut state.wake_enabled,
-        "neo-set-wake",
-    );
-    row_divider(ui, skin, width);
-    switch_row(
-        ui,
-        skin,
-        width,
-        tr("课堂总结"),
-        tr("应用全屏/最大化时后台截屏分析、录音转写；退出后闲置两分钟弹出总结。记录保存到记忆目录 class/；安全模式下暂停"),
-        &mut state.class_enabled,
-        "neo-set-class",
-    );
-    if let Some(status) = &state.class_status {
-        ui.add_space(skin.m().s(4.0));
-        hint_row(ui, skin, width, status);
-    }
 }
 
-fn appearance_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
+fn appearance_tab(
+    ui: &mut Ui,
+    skin: &Skin<'_>,
+    width: f32,
+    state: &mut AppState,
+    viewport_h: f32,
+) {
     let m = skin.m();
     section_label_row(ui, skin, width, tr("主题"));
     let idx = match state.theme_mode {
@@ -447,14 +417,12 @@ fn appearance_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState
         skin,
         width,
         tr("显示思考过程"),
-        tr("适用于推理模型"),
+        tr("推理模型专用"),
         &mut state.show_reasoning,
         "neo-set-reasoning",
     );
-}
-
-fn display_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState, viewport_h: f32) {
-    let m = skin.m();
+    ui.add_space(m.s(16.0));
+    row_divider(ui, skin, width);
     section_label_row(ui, skin, width, tr("观看距离"));
     let idx = match state.distance {
         neo_theme::Distance::Standard => 0,
@@ -477,7 +445,6 @@ fn display_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState, v
     }
     ui.add_space(m.s(16.0));
 
-    // ---- 缩放链路 ----
     section_label_row(ui, skin, width, tr("缩放详情"));
     let rows: [(&str, String); 5] = [
         (tr("视口高"), format!("{viewport_h:.0} pt")),
@@ -491,6 +458,66 @@ fn display_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState, v
     }
 }
 
+fn voice_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
+    let m = skin.m();
+    section_label_row(ui, skin, width, tr("语音唤醒"));
+    switch_row(
+        ui,
+        skin,
+        width,
+        tr("语音唤醒「Hi, Neo」"),
+        tr("监听「Hi, Neo」唤醒词"),
+        &mut state.wake_enabled,
+        "neo-set-wake",
+    );
+    row_divider(ui, skin, width);
+    sensitivity_row(ui, skin, width, state);
+    ui.add_space(m.s(16.0));
+
+    section_label_row(ui, skin, width, tr("课堂总结"));
+    switch_row(
+        ui,
+        skin,
+        width,
+        tr("课堂总结"),
+        tr("全屏时后台记录课堂"),
+        &mut state.class_enabled,
+        "neo-set-class",
+    );
+    if let Some(status) = &state.class_status {
+        ui.add_space(m.s(4.0));
+        hint_row(ui, skin, width, status);
+    }
+    ui.add_space(m.s(16.0));
+
+    section_label_row(ui, skin, width, tr("麦克风测试"));
+    super::waketest::draw(ui, skin, width, state);
+}
+
+fn sensitivity_row(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
+    let p = skin.p();
+    let m = skin.m();
+    ui.set_max_width(width);
+    ui.label(
+        egui::RichText::new(format!("{} {}%", tr("唤醒灵敏度"), state.wake_sensitivity))
+            .font(skin.bold(skin.t().label))
+            .color(p.label_primary),
+    );
+    neo_ui::Slider::new(&mut state.wake_sensitivity)
+        .id_salt("neo-wake-sensitivity")
+        .show(ui, &skin.d(), width);
+    ui.add_space(m.s(4.0));
+    hint_row(
+        ui,
+        skin,
+        width,
+        &tf(
+            "当前阈值 {threshold}",
+            &[("threshold", format!("{:.2}", state.wake_threshold()))],
+        ),
+    );
+}
+
 fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     let m = skin.m();
     section_label_row(ui, skin, width, tr("接口地址"));
@@ -500,7 +527,7 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         ui,
         skin,
         width,
-        tr("OpenAI 兼容接口，如 https://api.deepseek.com"),
+        tr("OpenAI 兼容接口地址"),
     );
     ui.add_space(m.s(16.0));
 
@@ -511,7 +538,7 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         ui,
         skin,
         width,
-        tr("密钥仅本机保存；认证时发送至所填接口，刷新前请核对地址"),
+        tr("仅保存在本机"),
     );
     ui.add_space(m.s(16.0));
 
@@ -530,12 +557,6 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     };
     kv_row(ui, skin, width, tr("当前模型"), &name);
     ui.add_space(m.s(6.0));
-    let switch_hint = if state.model_def().is_some_and(|m| m.reasoning) {
-        tr("点击输入卡的模型名循环切换；当前模型默认开启思考")
-    } else {
-        tr("点击输入卡的模型名循环切换")
-    };
-    hint_row(ui, skin, width, switch_hint);
     ui.add_space(m.s(16.0));
 
     section_label_row(ui, skin, width, tr("上下文预算（估算 token）"));
@@ -548,13 +569,7 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         1024,
         "neo-context-tokens",
     );
-    hint_row(ui, skin, width, tr("默认 1,000,000，按接口与模型能力调整，含输出和工具预留。接近预算时后台摘要，保留原记录；失败不丢弃历史。"));
-    hint_row(
-        ui,
-        skin,
-        width,
-        tr("每任务最多 500 次工具调用（含错误、拒绝、询问）；续轮与历史压缩不重置计数。"),
-    );
+    hint_row(ui, skin, width, tr("默认 1,000,000 token"));
     ui.add_space(m.s(16.0));
 
     // ---- 思考强度：对应请求体顶层的 thinking / reasoning_effort ----
@@ -570,8 +585,6 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     if let Some(i) = choice_row(ui, skin, width, &labels, sel, "settings-thinking") {
         state.thinking = neo_llm::Thinking::ALL[i];
     }
-    ui.add_space(m.s(6.0));
-    hint_row(ui, skin, width, tr(state.thinking.hint()));
     ui.add_space(m.s(16.0));
 
     // ---- 可选模型：来自模型商的 /models，内置表只是兜底 ----
@@ -617,19 +630,16 @@ fn model_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
     });
     ui.add_space(m.s(6.0));
     let hint = match (&state.model_fetch, &state.model_fetch_error) {
-        (Some(_), _) => tr("正在刷新…").to_owned(),
-        (None, Some(e)) if !state.has_models() => tf(
-            "刷新失败：{error} · 核对接口与密钥后重试",
-            &[("error", e.clone())],
-        ),
-        (None, Some(e)) => tf("刷新失败：{error}（保留原列表）", &[("error", e.clone())]),
+        (Some(_), _) => tr("刷新中…").to_owned(),
+        (None, Some(e)) if !state.has_models() => tf("刷新失败：{error}", &[("error", e.clone())]),
+        (None, Some(e)) => tf("刷新失败：{error}", &[("error", e.clone())]),
         (None, None) if state.has_models() => {
-            tr("模型商列表仅手动刷新；启动（含安全模式）或修改配置不会自动刷新").to_owned()
+            tr("已是最新列表").to_owned()
         }
         (None, None) if state.api_key.trim().is_empty() => {
-            tr("填写 API 密钥后，点击「从模型商刷新」").to_owned()
+            tr("请先填写 API 密钥").to_owned()
         }
-        (None, None) => tr("点击「从模型商刷新」获取列表").to_owned(),
+        (None, None) => tr("刷新以加载模型").to_owned(),
     };
     hint_row(ui, skin, width, &hint);
 }
@@ -661,7 +671,7 @@ fn about_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState, loa
         skin,
         width,
         tr("自动检查更新"),
-        tr("启动后联网 GitHub 检查一次；不自动下载或安装"),
+        tr("检查 GitHub 新版本"),
         &mut state.auto_check_updates,
         "neo-set-auto-updates",
     );
@@ -677,17 +687,17 @@ fn about_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState, loa
     ui.add_space(m.s(8.0));
     match &state.update_status {
         crate::updates::Status::Idle => {
-            hint_row(ui, skin, width, tr("尚未检查；手动检查间隔至少 10 秒"))
+            hint_row(ui, skin, width, tr("未检查"))
         }
-        crate::updates::Status::Checking => hint_row(ui, skin, width, tr("正在检查 GitHub 更新…")),
-        crate::updates::Status::UpToDate => hint_row(ui, skin, width, tr("已是最新发布版本")),
+        crate::updates::Status::Checking => hint_row(ui, skin, width, tr("检查中…")),
+        crate::updates::Status::UpToDate => hint_row(ui, skin, width, tr("已是最新版本")),
         crate::updates::Status::Available { version, url } => {
             hint_row(
                 ui,
                 skin,
                 width,
                 &tf(
-                    "新版本 {version}，请查看发布说明并手动下载",
+                    "新版本 {version}",
                     &[("version", version.clone())],
                 ),
             );
@@ -697,7 +707,7 @@ fn about_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState, loa
             ui,
             skin,
             width,
-            tr("检查失败，请检查网络后重试；不影响使用"),
+            tr("检查失败"),
         ),
     }
     ui.add_space(m.s(16.0));
@@ -954,7 +964,7 @@ fn memory_tab_with_actions(
             ui,
             skin,
             width,
-            tr("暂无记忆。对 Neo 说「记住……」，或在下方添加"),
+            tr("暂无记忆"),
         );
     }
 

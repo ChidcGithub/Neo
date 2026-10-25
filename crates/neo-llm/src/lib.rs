@@ -695,8 +695,8 @@ impl Stream {
     ///
     /// 返回空 `Vec` 只代表「此刻没有新事件」，**不代表流已结束** ——
     /// 请求刚发出、首个增量未到达时同样是空。以收到 [`Event::Done`] /
-    /// [`Event::Failed`] 为结束标志；若两者都没等到而 [`Stream::is_finished`]
-    /// 已成立，说明线程异常退出（panic），调用方应自行按失败收尾。
+    /// [`Event::Failed`] 为结束标志；取消不会发送事件，调用方需结合自身取消状态判断，
+    /// 其余没等到终止事件而 [`Stream::is_finished`] 已成立的情况按线程异常收尾。
     pub fn poll(&self) -> Vec<Event> {
         let mut out = Vec::new();
         loop {

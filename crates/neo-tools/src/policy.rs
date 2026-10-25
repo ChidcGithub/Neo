@@ -54,7 +54,7 @@ pub enum Decision {
 pub struct Policy {
     /// 课堂安全模式：禁止桌面观察和所有有副作用的工具。
     pub classroom_safe: bool,
-    /// 输入卡的「只读」开关：打开后写与执行一律拒绝。
+    /// 输入卡的「只读」开关：打开后写、执行与启动程序一律拒绝。
     pub read_only: bool,
     /// 用户显式信任本会话（"全部允许"）。默认关。
     pub auto_approve: bool,
