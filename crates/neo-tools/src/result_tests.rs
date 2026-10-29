@@ -1,6 +1,9 @@
 
     use super::*;
 
+    use std::error::Error;
+    use std::sync::Arc;
+
     use crate::diagnostic::{with_enabled_for_test, ErrorTrace, SourceLocation};
 
     #[test]

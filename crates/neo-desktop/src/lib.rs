@@ -5,11 +5,23 @@
 
 pub mod app;
 pub mod clipboard;
+pub mod diagnostic;
 pub mod display;
 pub mod error;
 pub mod input;
+pub mod screen;
+pub mod screen_uia;
+mod scope;
+mod tool_error;
 #[cfg(windows)]
 pub mod uia;
 pub mod window;
 
 pub use error::{DesktopError, Result};
+pub use scope::{normalize, Scope};
+pub use tool_error::{ErrorKind, ToolError};
+
+#[track_caller]
+pub fn cancelled_error() -> ToolError {
+    ToolError::not_allowed("工具调用已取消；已发生的操作不会回滚")
+}

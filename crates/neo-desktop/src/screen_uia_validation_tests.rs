@@ -1,6 +1,6 @@
 //! Pure regression tests: no COM, desktop enumeration, window activation or input.
 use super::*;
-use crate::result::ErrorKind;
+use crate::ErrorKind;
 
 fn target() -> ScreenElement {
     ScreenElement {

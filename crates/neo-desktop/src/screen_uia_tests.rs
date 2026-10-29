@@ -1,6 +1,6 @@
 
     use super::*;
-    use crate::tools::screen::Rect;
+    use crate::screen::Rect;
 
     fn vs() -> Rect {
         Rect {

@@ -122,9 +122,7 @@ pub fn dispatch(scope: &Scope, name: &str, args: &serde_json::Value) -> Outcome 
     outcome
 }
 
-pub(crate) fn cancelled_error() -> ToolError {
-    ToolError::not_allowed("工具调用已取消；已发生的操作不会回滚")
-}
+pub(crate) use neo_desktop::cancelled_error;
 
 #[cfg(test)]
 #[path = "lib_cancellation_tests.rs"]

@@ -255,7 +255,7 @@ fn raw_chain(uia: &IUIAutomation, raw: &IUIAutomationTreeWalker, start: &IUIAuto
 }
 
 fn run_probe() -> Result<(), String> {
-    let _dpi = crate::tools::screen::physical_pixels().map_err(|_| "physical pixel DPI guard failed")?;
+    let _dpi = crate::screen::physical_pixels().map_err(|_| "physical pixel DPI guard failed")?;
     let _com = read("CoInitializeEx", ComGuard::new())?;
     let started = Instant::now();
     unsafe {
@@ -269,7 +269,7 @@ fn run_probe() -> Result<(), String> {
             "chromium_class_family": chromium_class, "class_query_ok": n > 0,
             "names_or_content_read": false, "input_injected": false, "window_activated": false,
             "coordinate_space": "physical_pixels", "metadata_only_collect": true}));
-        let uia: IUIAutomation = read("CoCreateInstance", neo_desktop::uia::create_uia())?;
+        let uia: IUIAutomation = read("CoCreateInstance", crate::uia::create_uia())?;
         let raw = read("RawViewWalker", uia.RawViewWalker())?;
         let top = read("initial.ElementFromHandle", uia.ElementFromHandle(HWND(hwnd)))?;
         let top_identity = read("initial.identity", identity(&top, hwnd as isize, read("initial.GetRuntimeId", runtime_id(&top))?))?;

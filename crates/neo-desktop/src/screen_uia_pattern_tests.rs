@@ -194,7 +194,7 @@ fn explicit_unsupported_pattern_errors_remain_absent() {
 
 #[test]
 fn real_pattern_errors_keep_hresult_and_specific_stage_and_fail_closed() {
-    use crate::result::ErrorKind;
+    use crate::ErrorKind;
     for (hr, kind) in [(0x80004003, ErrorKind::Io), (0x80070005, ErrorKind::NotAllowed),
         (0x80131505, ErrorKind::Timeout), (0x800705B4, ErrorKind::Timeout),
         (0x80040201, ErrorKind::NotFound), (0x80004005, ErrorKind::Io)] {

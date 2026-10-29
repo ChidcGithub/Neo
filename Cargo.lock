@@ -3247,6 +3247,9 @@ dependencies = [
 name = "neo-desktop"
 version = "0.1.12"
 dependencies = [
+ "image",
+ "serde",
+ "serde_json",
  "strsim",
  "windows",
  "windows-sys 0.61.2",

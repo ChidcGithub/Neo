@@ -1,3 +1,7 @@
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 
     use super::*;
 
@@ -65,10 +69,7 @@
                 .kind,
             crate::ErrorKind::NotAllowed
         );
-        let unc = Scope {
-            root: normalize(Path::new(r"\\server\share\workspace")),
-            cancel: None,
-        };
+        let unc = Scope::from_parts(normalize(Path::new(r"\\server\share\workspace")), None);
         assert_eq!(
             unc.display(&unc.resolve(r"\\server\share\workspace\a.txt").unwrap()),
             "a.txt"
