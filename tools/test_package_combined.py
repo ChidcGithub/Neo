@@ -44,7 +44,7 @@ class PackageTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
 
     def test_lock_exact_commit_and_policy(self):
-        self.assertEqual(self.lock["commit"], "b046fad1390e560b2eb8b72b55e2c7f733b20290")
+        self.assertEqual(self.lock["commit"], "536f9c410f71a6620d312df2cd8fa7d7cea83de0")
         self.assertEqual(self.lock["rust"], "1.97.1")
         self.assertEqual(self.lock["protocol"], 1)
         self.assertNotIn("public_approved", self.lock)

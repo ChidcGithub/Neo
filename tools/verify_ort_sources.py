@@ -41,7 +41,7 @@ RECORD = "docs/licenses/runtime/ort-eigen-correspondence.json"
 LOCK = "tools/source-companions.lock.json"
 DRAWING_LOCK = "tools/drawing-runtime.lock.json"
 DRAWING_SOURCE = "docs/licenses/NeoRuntime-drawing/SOURCE.json"
-DRAWING_COMMIT = "b046fad1390e560b2eb8b72b55e2c7f733b20290"
+DRAWING_COMMIT = "536f9c410f71a6620d312df2cd8fa7d7cea83de0"
 # Fixed distribution identified in the existing public native-source README.
 # Package mode also compares the assembler's pinned dist.txt provenance.
 DRAWING_ORT_SHA256 = "540d19b3379fda6fb8f7280d8c15efde20ed225a67a357a6dae38c4300fe190d"

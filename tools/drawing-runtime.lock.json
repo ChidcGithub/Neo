@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "repository": "https://github.com/ChidcGithub/NeoRuntime-drawing",
-  "commit": "b046fad1390e560b2eb8b72b55e2c7f733b20290",
+  "commit": "536f9c410f71a6620d312df2cd8fa7d7cea83de0",
   "rust": "1.97.1",
   "target": "x86_64-pc-windows-msvc",
   "protocol": 1,
@@ -29,10 +29,10 @@
   "crt_information_url": "https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist",
   "limitations": ["Technical manifest only; no approval assertion", "Eigen notices delivered in main docs/licenses/runtime/native-sources/eigen-1d8b82b-COPYING.*; final package checked by verify_ort_sources", "No model payload", "No GUI/capture/microphone", "Developer-machine checks are not clean-install acceptance"],
   "source_binding": {
-    "source_commit": "b046fad1390e560b2eb8b72b55e2c7f733b20290",
-    "source_tree_sha256": "aad2468721d34011ff048d33071f3fb031312da302031e1c3335aa99c4c4ee4f",
-    "cargo_lock_sha256": "72f3596940834eaec088eba722fe2f66cc6276589fd651aba02fb3b660fc30e0",
-    "version": "0.1.8",
+    "source_commit": "536f9c410f71a6620d312df2cd8fa7d7cea83de0",
+    "source_tree_sha256": "983f7d6fadc39a06cbba1c91a06f681fc5382185605b99b0ac7d0a7357b14035",
+    "cargo_lock_sha256": "8b5664a6f9fb69feaed675c63b219e83f71da530e232240b51713bf50df6b108",
+    "version": "0.1.13",
     "legal_files": {
       "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
       "distribution/legal/app/fonts/ATTRIBUTION.md": "9ecf0eff2428cf0ff49db01df487be371c256358456e8abd546f82e8f970cd43",

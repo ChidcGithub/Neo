@@ -40,7 +40,7 @@
       "eigen_archive": "eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33.zip",
       "eigen_sha256": "6a60d76351f97132669daeeb721d6bf14b008101883ad2d687a3201c5c461eb0",
       "patches": [],
-      "drawing_commit": "b046fad1390e560b2eb8b72b55e2c7f733b20290"
+      "drawing_commit": "536f9c410f71a6620d312df2cd8fa7d7cea83de0"
     }
   ],
   "source_delivery": {

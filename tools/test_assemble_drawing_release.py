@@ -65,7 +65,7 @@ class LockTests(unittest.TestCase):
 
     def test_real_lock_stays_pinned_without_approval_fields(self):
         lock = a.load_lock()
-        self.assertEqual(lock["commit"], "b046fad1390e560b2eb8b72b55e2c7f733b20290")
+        self.assertEqual(lock["commit"], "536f9c410f71a6620d312df2cd8fa7d7cea83de0")
         self.assertEqual(lock["rust"], "1.97.1")
         for key in ("public_approved", "distribution_review", "review"):
             self.assertNotIn(key, lock)
@@ -95,7 +95,7 @@ class LockTests(unittest.TestCase):
             with patch.dict(os.environ, GITHUB_OUTPUT=str(output)):
                 self.assertEqual(a.main(["lock-outputs", "--lock", str(lock_path)]), 0)
             self.assertEqual(output.read_text().splitlines(), [
-                "commit=b046fad1390e560b2eb8b72b55e2c7f733b20290",
+                "commit=536f9c410f71a6620d312df2cd8fa7d7cea83de0",
                 "repository=ChidcGithub/NeoRuntime-drawing", "rust=1.97.1"])
 
     def test_duplicate_json_keys_rejected(self):

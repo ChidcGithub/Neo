@@ -440,7 +440,7 @@ class TrackedAndCliTests(unittest.TestCase):
         drawing = ort.read_json(ort.ROOT / ort.DRAWING_LOCK)
         record = ort.read_json(ort.ROOT / ort.RECORD)
         lock = ort.read_json(ort.ROOT / ort.LOCK)
-        self.assertEqual(ort.DRAWING_COMMIT, "b046fad1390e560b2eb8b72b55e2c7f733b20290")
+        self.assertEqual(ort.DRAWING_COMMIT, "536f9c410f71a6620d312df2cd8fa7d7cea83de0")
         self.assertEqual(drawing["commit"], ort.DRAWING_COMMIT)
         self.assertEqual(drawing["source_binding"]["source_commit"], ort.DRAWING_COMMIT)
         self.assertEqual(ort.file_record(ort.ROOT / ort.RECORD)["sha256"],
