@@ -340,12 +340,14 @@ pub(crate) fn needs_desktop(name: &str, args: &serde_json::Value) -> bool {
         name,
         "screenshot"
             | "screen_elements"
+            | "desktop_snapshot"
             | "click"
             | "drag"
             | "type_text"
             | "scroll"
             | "shortcut"
             | "move_mouse"
+            | "app_control"
     ) || (name == "screen_element_search"
         && args.get("refresh").and_then(|v| v.as_bool()) == Some(true))
 }

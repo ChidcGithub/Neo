@@ -334,10 +334,12 @@
             "screenshot",
             "screen_elements",
             "screen_element_search",
+            "desktop_snapshot",
             "type_text",
             "scroll",
             "shortcut",
             "move_mouse",
+            "app_control",
             "web_search",
         ] {
             let mut meta = ToolMeta::restored(name);
@@ -487,10 +489,12 @@
             "drag",
             "screenshot",
             "screen_elements",
+            "desktop_snapshot",
             "type_text",
             "scroll",
             "shortcut",
             "move_mouse",
+            "app_control",
         ] {
             assert!(needs_desktop(name, &serde_json::json!({})));
             assert!(neo_tools::find(name).is_some());

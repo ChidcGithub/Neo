@@ -605,6 +605,7 @@ fn uia_failure(tool: &str, error: &neo_tools::ToolError) -> Option<UiaFailure> {
             | "type_text"
             | "scroll"
             | "move_mouse"
+            | "desktop_snapshot"
     ) || error.message.len() > MAX_INPUT_BYTES
         || !error.message.starts_with("UIA 即时核验拒绝输入：")
     { return None; }

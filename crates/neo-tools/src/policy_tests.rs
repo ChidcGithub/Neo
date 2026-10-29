@@ -8,7 +8,12 @@
         let policy = Policy { classroom_safe: true, auto_approve: true, ..Policy::default() };
         for tool in crate::tools::REGISTRY {
             let decision = policy.decide(tool, &json!({}));
-            if tool.risk != Risk::Read || matches!(tool.name, "screenshot" | "screen_elements" | "screen_element_search") {
+            if tool.risk != Risk::Read
+                || matches!(
+                    tool.name,
+                    "screenshot" | "screen_elements" | "screen_element_search" | "desktop_snapshot"
+                )
+            {
                 assert!(matches!(decision, Decision::Deny(_)), "{}", tool.name);
             } else {
                 assert_eq!(decision, Decision::Allow, "{}", tool.name);

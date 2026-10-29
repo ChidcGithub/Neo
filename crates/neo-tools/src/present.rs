@@ -50,8 +50,9 @@ impl Variant {
             "write_file" => Variant::Write,
             "edit_file" => Variant::Edit,
             "powershell" => Variant::Bash,
-            "screenshot" | "screen_elements" | "screen_element_search" | "click" | "drag"
-            | "type_text" | "scroll" | "shortcut" | "move_mouse" | "wait" => Variant::Screen,
+            "screenshot" | "screen_elements" | "screen_element_search" | "desktop_snapshot"
+            | "click" | "drag" | "type_text" | "scroll" | "shortcut" | "move_mouse"
+            | "app_control" | "wait" => Variant::Screen,
             _ => Variant::Others,
         }
     }

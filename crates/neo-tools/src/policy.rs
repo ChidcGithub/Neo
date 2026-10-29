@@ -117,7 +117,10 @@ impl Policy {
         }
         if self.classroom_safe
             && (risk != Risk::Read
-                || matches!(tool.name, "screenshot" | "screen_elements" | "screen_element_search"))
+                || matches!(
+                    tool.name,
+                    "screenshot" | "screen_elements" | "screen_element_search" | "desktop_snapshot"
+                ))
         {
             return Decision::Deny("课堂安全模式禁止桌面观察、打开程序、写入和执行；请用户明确关闭安全模式后重试".to_owned());
         }

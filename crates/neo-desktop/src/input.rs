@@ -479,7 +479,7 @@ mod imp {
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(18));
+            std::thread::sleep(Duration::from_millis(35));
         }
         Ok(())
     }

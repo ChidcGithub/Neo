@@ -206,7 +206,6 @@ fn store_locked(cell: &mut Option<Cached>, els: &[ScreenElement]) -> String {
     id
 }
 
-#[cfg(test)]
 pub fn cache_store(els: &[ScreenElement]) -> String {
     store_locked(&mut CACHE.lock().unwrap(), els)
 }

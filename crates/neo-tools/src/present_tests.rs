@@ -11,12 +11,14 @@
             "screenshot",
             "screen_elements",
             "screen_element_search",
+            "desktop_snapshot",
             "click",
             "drag",
             "type_text",
             "scroll",
             "shortcut",
             "move_mouse",
+            "app_control",
             "wait",
         ] {
             assert_eq!(Variant::of(name), Variant::Screen, "{name}");

@@ -7,10 +7,12 @@
 //! 两个 shell 工具只差方言和宿主，执行骨架共用 [`shell`]。
 
 pub(crate) mod base64_lite;
+pub mod app_control;
 pub mod ask_user;
 pub mod bash;
 pub mod click;
 pub mod daily;
+pub mod desktop_snapshot;
 pub mod drag;
 pub mod edit_file;
 pub mod memory;
@@ -217,6 +219,15 @@ pub static REGISTRY: &[Tool] = &[
         run: screen_element_search::run,
     },
     Tool {
+        name: "desktop_snapshot",
+        title: "桌面快照",
+        purpose: "一次拿到窗口列表、焦点窗口、可交互元素（带 snapshot_id + element_id）和可选截图。先看全局再用 click/type_text。",
+        risk: Risk::Read,
+        params: desktop_snapshot::PARAMS,
+        preview: desktop_snapshot::preview,
+        run: desktop_snapshot::run,
+    },
+    Tool {
         name: "click",
         title: "点击鼠标",
         purpose: "点击鼠标（左/右键、双击）。优先 UIA 的 snapshot_id + element_id；视觉定位可传 screenshot_id + 图内 x/y，由程序映射，无引用时 x/y 是桌面物理坐标。截图引用不验证身份；陈旧引用拒绝，不猜坐标、不自动重试，操作后按需要重新观察。",
@@ -269,6 +280,15 @@ pub static REGISTRY: &[Tool] = &[
         params: move_mouse::PARAMS,
         preview: move_mouse::preview,
         run: move_mouse::run,
+    },
+    Tool {
+        name: "app_control",
+        title: "应用控制",
+        purpose: "启动 Start Menu 应用或可执行文件，切换/缩放窗口。先用 desktop_snapshot 拿 window_id。",
+        risk: Risk::Exec,
+        params: app_control::PARAMS,
+        preview: app_control::preview,
+        run: app_control::run,
     },
     Tool {
         name: "wait",

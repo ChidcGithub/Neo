@@ -2584,6 +2584,7 @@ fn task_tool_limit_500th_completes_and_persists_but_never_continues() {
         let _mock = MockStream::install();
         let store = temp_store(&format!("task-tool-limit-{batch}"));
         let mut state = synthetic_send_state(false);
+        state.context_tokens = 48 * 1024;
         assert!(state.submit());
         state.task_tool_calls = 499;
         state
