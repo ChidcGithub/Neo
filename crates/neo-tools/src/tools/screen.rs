@@ -37,15 +37,12 @@ use crate::result::{ErrorKind, ToolError};
 /// 是因为 `capture()` 是 `screenshot` / `screen_elements` 的唯一入口，一处全覆盖。
 pub static SCREENSHOT_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 最近一次**合成输入**（`SendInput` 注入的鼠标事件）完成的墙钟毫秒
-/// （Unix epoch；0 = 还没注入过）。
+/// 最近一次**合成输入**完成的墙钟毫秒（Unix epoch；0 = 还没注入过）。
 ///
-/// `GetAsyncKeyState` 分不清真人点击与 AI 用 click/drag 注入的点击；
-/// 上层的「用户点了屏幕 = 打断 AI」判定（neo-app 的 miniwin）读这个戳，
-/// 把按下沿落在注入窗口期内的当作 AI 自己的动作忽略 ——
-/// 否则 AI 操作鼠标时会自己把自己打断。
-pub static SYNTHETIC_INPUT_AT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+/// 由 `neo-desktop::input` 统一维护；`click` / `drag` 与新的键盘工具共用。
+/// 上层的「用户点了屏幕 = 打断 AI」判定读它，把注入窗口期内的按下沿
+/// 当作 AI 自己的动作忽略。
+pub use neo_desktop::input::SYNTHETIC_INPUT_AT;
 
 /// 当前墙钟毫秒（Unix epoch）。
 pub(crate) fn epoch_millis() -> u64 {

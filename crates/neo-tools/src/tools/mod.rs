@@ -14,6 +14,7 @@ pub mod daily;
 pub mod drag;
 pub mod edit_file;
 pub mod memory;
+pub mod move_mouse;
 pub mod open_app;
 pub mod open_file;
 pub mod powershell;
@@ -25,8 +26,13 @@ pub mod screen_elements;
 pub mod screen_uia;
 pub mod screenshot;
 pub mod screenshot_space;
+pub mod scroll;
 pub mod shell;
+pub mod shortcut;
+pub mod target;
+pub mod type_text;
 pub mod view_image;
+pub mod wait;
 pub mod web_search;
 pub mod write_file;
 
@@ -227,6 +233,51 @@ pub static REGISTRY: &[Tool] = &[
         params: drag::PARAMS,
         preview: drag::preview,
         run: drag::run,
+    },
+    Tool {
+        name: "type_text",
+        title: "输入文字",
+        purpose: "点击输入框后输入文字；可先清空、定位光标、回车提交。优先用 screen_elements 的 snapshot_id + element_id 定位。",
+        risk: Risk::Exec,
+        params: type_text::PARAMS,
+        preview: type_text::preview,
+        run: type_text::run,
+    },
+    Tool {
+        name: "scroll",
+        title: "滚动屏幕",
+        purpose: "在目标元素或坐标处滚动鼠标滚轮，支持上下左右。滚动后旧元素快照失效。",
+        risk: Risk::Exec,
+        params: scroll::PARAMS,
+        preview: scroll::preview,
+        run: scroll::run,
+    },
+    Tool {
+        name: "shortcut",
+        title: "按键",
+        purpose: "向当前焦点窗口发送组合键（ctrl+c、alt+tab、win+r 等）。按键前先用 click/type_text 确认焦点。",
+        risk: Risk::Exec,
+        params: shortcut::PARAMS,
+        preview: shortcut::preview,
+        run: shortcut::run,
+    },
+    Tool {
+        name: "move_mouse",
+        title: "移动鼠标",
+        purpose: "把鼠标指针移到元素中心或坐标，可选分步耗时；只移动不点击。",
+        risk: Risk::Exec,
+        params: move_mouse::PARAMS,
+        preview: move_mouse::preview,
+        run: move_mouse::run,
+    },
+    Tool {
+        name: "wait",
+        title: "等待",
+        purpose: "等待一段时间（0–120 秒），用于应用启动、页面加载或动画结束；可被用户取消。",
+        risk: Risk::Read,
+        params: wait::PARAMS,
+        preview: wait::preview,
+        run: wait::run,
     },
 ];
 

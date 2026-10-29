@@ -6,6 +6,7 @@ members = [
     "crates/neo-store",
     "crates/neo-llm",
     "crates/neo-tools",
+    "crates/neo-desktop",
     "crates/neo-wake",
     "crates/neo-stt",
     "crates/neo-overlay",
@@ -26,6 +27,7 @@ neo-ui = { path = "crates/neo-ui" }
 neo-store = { path = "crates/neo-store" }
 neo-llm = { path = "crates/neo-llm" }
 neo-tools = { path = "crates/neo-tools" }
+neo-desktop = { path = "crates/neo-desktop" }
 neo-wake = { path = "crates/neo-wake" }
 neo-stt = { path = "crates/neo-stt" }
 neo-overlay = { path = "crates/neo-overlay" }

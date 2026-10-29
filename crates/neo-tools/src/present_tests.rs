@@ -7,7 +7,18 @@
         // 上游原表的抽样
         assert_eq!(Variant::of("bash"), Variant::Bash);
         // 屏幕交互自成一类：它不是"读文件"，也不是"跑命令"。
-        for name in ["screenshot", "click", "drag"] {
+        for name in [
+            "screenshot",
+            "screen_elements",
+            "screen_element_search",
+            "click",
+            "drag",
+            "type_text",
+            "scroll",
+            "shortcut",
+            "move_mouse",
+            "wait",
+        ] {
             assert_eq!(Variant::of(name), Variant::Screen, "{name}");
             assert_eq!(Variant::of(name).title(), "屏幕", "{name} 的中文标题");
         }
@@ -17,7 +28,7 @@
         assert_eq!(Variant::of("grep"), Variant::Search);
         assert_eq!(Variant::of("glob"), Variant::Search);
         assert_eq!(Variant::of("cordis_inspect"), Variant::Read);
-        // Neo 自己的六个工具
+        // Neo 自己的工具
         assert_eq!(Variant::of("read_file"), Variant::Read);
         assert_eq!(Variant::of("read_document"), Variant::Read);
         assert_eq!(Variant::of("view_image"), Variant::Read);

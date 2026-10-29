@@ -597,8 +597,15 @@ pub struct UiaFailure {
 /// 只读受控 UIA 错误封套中的第一个已知 stage/HRESULT 对；不保留 hint/窗口名。
 /// 未知格式降级为 ErrorKind，不尝试泛化解析 Windows Display 文本。
 fn uia_failure(tool: &str, error: &neo_tools::ToolError) -> Option<UiaFailure> {
-    if !matches!(tool, "click" | "screen_elements" | "screen_element_search")
-        || error.message.len() > MAX_INPUT_BYTES
+    if !matches!(
+        tool,
+        "click"
+            | "screen_elements"
+            | "screen_element_search"
+            | "type_text"
+            | "scroll"
+            | "move_mouse"
+    ) || error.message.len() > MAX_INPUT_BYTES
         || !error.message.starts_with("UIA 即时核验拒绝输入：")
     { return None; }
     const STAGES: &[&str] = &[

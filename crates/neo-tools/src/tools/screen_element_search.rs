@@ -8,7 +8,7 @@ use super::screen::Rect;
 
 pub static PARAMS: &[Param] = &[
     Param::opt_text("query", "按钮或控件名称中的关键词；不填则返回全部候选。"),
-    Param::opt_text("role", "控件类型过滤，例如 Button、Edit、MenuItem。"),
+    Param::opt_text("role", "控件类型过滤，例如 Button、Edit、Document、MenuItem。"),
     Param::opt_text("position", "位置过滤：top/bottom 为上/下排，left/right 为左/右列，middle 为中间整排，center 为中央格；也支持四个角。"),
     Param::opt_text("window", "窗口标题包含过滤；refresh=true 时在遍历控件前过滤窗口。"),
     Param::opt_text("window_id", "overview 返回的精确窗口标识。"),

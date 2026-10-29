@@ -276,6 +276,7 @@
         }
         let valid = neo_tools::ToolError::io("UIA 即时核验拒绝输入：provider_error (stage=ElementFromPoint, HRESULT=0x80070005)");
         assert!(uia_failure("read_file", &valid).is_none());
+        assert!(uia_failure("type_text", &valid).is_some());
         assert!(uia_failure("PRIVATE_TOOL", &valid).is_none());
         assert!(uia_failure("click", &neo_tools::ToolError::io("stage=ElementFromPoint, HRESULT=0x80070005)")).is_none());
         assert!(uia_failure("click", &neo_tools::ToolError::io(format!("{}{}", valid.message, "X".repeat(MAX_INPUT_BYTES)))).is_none());

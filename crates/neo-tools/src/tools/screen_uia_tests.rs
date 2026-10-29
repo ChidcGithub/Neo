@@ -451,3 +451,9 @@
             assert_eq!(e.id, i + 1);
         }
     }
+
+    #[test]
+    fn document_role_is_queryable() {
+        assert_eq!(super::parse_role("document").unwrap(), Some("Document"));
+        assert_eq!(super::parse_role("Document").unwrap(), Some("Document"));
+    }

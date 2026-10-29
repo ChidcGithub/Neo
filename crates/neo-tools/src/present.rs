@@ -50,7 +50,8 @@ impl Variant {
             "write_file" => Variant::Write,
             "edit_file" => Variant::Edit,
             "powershell" => Variant::Bash,
-            "screenshot" | "click" | "drag" => Variant::Screen,
+            "screenshot" | "screen_elements" | "screen_element_search" | "click" | "drag"
+            | "type_text" | "scroll" | "shortcut" | "move_mouse" | "wait" => Variant::Screen,
             _ => Variant::Others,
         }
     }
@@ -67,7 +68,7 @@ impl Variant {
             // 屏幕工具的参数大多是坐标（整数），没有合适的字符串键 ——
             // 摘要会退到"原始参数那一行"，那正好就是 `{"x":100,"y":200}` 这种，
             // 对"点了哪儿"来说反而是最清楚的说法。
-            Variant::Screen => &["description", "path"],
+            Variant::Screen => &["description", "text", "keys", "path"],
             Variant::Others => &[],
         }
     }

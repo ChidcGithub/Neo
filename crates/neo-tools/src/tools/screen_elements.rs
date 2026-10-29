@@ -199,7 +199,7 @@ fn intent_hint(role: &str) -> &'static str {
         "CheckBox" => "切换选项",
         "RadioButton" => "选择选项",
         "ComboBox" => "展开并选择",
-        "Edit" => "输入或编辑",
+        "Edit" | "Document" => "输入或编辑",
         "Slider" | "Spinner" => "调整",
         "Calendar" => "选择日期",
         _ => "用途未知",

@@ -68,7 +68,7 @@ not upstream ports.
 | 🌊 **Liquid-glass marquee** | Fullscreen transparent overlay on DX12 + DirectComposition: live desktop capture drives real-time **refraction with chromatic dispersion, Fresnel rim light, and roughness blur**, wrapped in a theme-blue band that hugs the screen edges — corners included. Breathes with the mic level. |
 | 🪟 **Separate visual and input layers** | Passive status cards and effects share a persistent, click-through overlay. Confirmation, question and classroom dialogs use independent opaque windows that receive input; the visual overlay never takes focus. |
 | 💬 **Streaming conversation** | OpenAI-compatible `/chat/completions` client (DeepSeek by default) with CommonMark + KaTeX rendering (a Rust port of KaTeX's layout). Cancellable at any moment — even mid-tool-execution. |
-| 🛠️ **Gated local tools** | 20 tools: files, documents, shell (PowerShell + bundled Git Bash), screenshots, UIA automation, web search, memory. Write/exec actions require on-screen confirmation first. |
+| 🛠️ **Gated local tools** | 25 tools: files, documents, shell (PowerShell + bundled Git Bash), screenshots, UIA automation, keyboard/scroll/shortcut input, web search, memory. Write/exec actions require on-screen confirmation first. |
 | ❓ **Ask-the-user tool** | When the model is unsure, `ask_user` pops a question card with tappable options instead of guessing. |
 | 🧠 **Three-tier memory** | Long-term profile (`remember`/`forget`, injected into every prompt) · **daily notes** with a gist index (`note_day`/`recall_day`, index-first lookup) · per-day **class notes** written by the classroom monitor. |
 | 🖥️ **Classroom mode** | Detects when a presentation goes fullscreen → silently captures + transcribes the lesson → polishes a summary when the class ends → slides in a summary card. A tiny red dot in the corner marks summary start/finish. |
@@ -378,7 +378,8 @@ flowchart LR
     App[neo-app<br/>eframe UI · state machine · tray]
     Overlay[neo-overlay<br/>unified render layer<br/>wgpu/DX12]
     LLM[neo-llm<br/>streaming client]
-    Tools[neo-tools<br/>20 gated tools]
+    Tools[neo-tools<br/>25 gated tools]
+    Desktop[neo-desktop<br/>UIA · input · clipboard]
     Store[(neo-store<br/>SQLite)]
     FS[(memories.json<br/>daily/ · class/)]
 
@@ -386,7 +387,7 @@ flowchart LR
     Mic --> STT -->|transcript| App
     App -->|show / level| Overlay
     Screen -->|20 fps capture| Overlay
-    App --> LLM --> Tools
+    App --> LLM --> Tools --> Desktop
     Tools -->|confirmation / question cards| Overlay
     App <--> Store
     Tools <--> FS
@@ -452,11 +453,11 @@ the confirmation policy, and the docs are derived from that single declaration.
 
 | Risk | Tools | Policy |
 |---|---|---|
-| `read` | read_file · read_document · view_image · web_search · recall_day · screenshot · screen_elements · screen_element_search | run immediately |
+| `read` | read_file · read_document · view_image · web_search · recall_day · screenshot · screen_elements · screen_element_search · wait | run immediately |
 | `open` | open_file · open_app · remember · forget · note_day | run immediately (machine state untouched) |
 | `ask` | ask_user | the popup *is* the answer path — replies flow back as the tool result |
 | `write` | write_file · edit_file | on-screen confirmation |
-| `exec` | powershell · bash · click · drag | on-screen confirmation |
+| `exec` | powershell · bash · click · drag · type_text · scroll · shortcut · move_mouse | on-screen confirmation |
 
 > [!WARNING]
 > While any Agent task is running — including text generation and non-mouse tools —

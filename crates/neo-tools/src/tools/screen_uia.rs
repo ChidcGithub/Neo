@@ -482,7 +482,8 @@ fn candidate_points(rect: [i32; 4], preferred: Option<(i32, i32)>, monitors: &[[
 
 pub fn parse_role(value: &str) -> Result<Option<&'static str>, ToolError> {
     const ROLES: &[&str] = &["Button", "Hyperlink", "MenuItem", "TabItem", "ListItem", "CheckBox",
-        "RadioButton", "ComboBox", "Edit", "Slider", "TreeItem", "DataItem", "Calendar", "Spinner", "SplitButton", "Custom"];
+        "RadioButton", "ComboBox", "Edit", "Document", "Slider", "TreeItem", "DataItem",
+        "Calendar", "Spinner", "SplitButton", "Custom"];
     if value.trim().is_empty() { return Ok(None); }
     ROLES.iter().copied().find(|r| r.eq_ignore_ascii_case(value.trim())).map(Some)
         .ok_or_else(|| ToolError::bad_args(format!("未知 role；支持 {}", ROLES.join("、"))))
@@ -551,7 +552,7 @@ fn window_matches(title: &str, filter: Option<&str>) -> bool {
 
 #[cfg(windows)]
 mod imp {
-    //! COM 侧：CoInitialize → CoCreateInstance(CUIAutomation) → ControlViewWalker DFS。
+    //! COM 侧：CoInitialize → create_uia(CUIAutomation8) → ControlViewWalker DFS。
     //!
     //! 用 **Current** 属性而不是 Cached：DFS 是即时树，Cached 需要额外建请求对象，
     //! 收益在这个预算规模（≤800 元素）下不值得。实测 Python 同款遍历 540ms，
@@ -563,14 +564,14 @@ mod imp {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_MULTITHREADED,
+        CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED,
     };
     use windows::Win32::UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
+        IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
         UIA_ButtonControlTypeId, UIA_CalendarControlTypeId, UIA_CheckBoxControlTypeId,
-        UIA_ComboBoxControlTypeId, UIA_DataItemControlTypeId, UIA_EditControlTypeId,
-        UIA_HyperlinkControlTypeId, UIA_ListItemControlTypeId, UIA_MenuItemControlTypeId,
+        UIA_ComboBoxControlTypeId, UIA_DataItemControlTypeId, UIA_DocumentControlTypeId,
+        UIA_EditControlTypeId, UIA_HyperlinkControlTypeId, UIA_ListItemControlTypeId,
+        UIA_MenuItemControlTypeId,
         UIA_RadioButtonControlTypeId, UIA_SliderControlTypeId, UIA_SpinnerControlTypeId,
         UIA_SplitButtonControlTypeId, UIA_TabItemControlTypeId, UIA_TreeItemControlTypeId,
     };
@@ -751,8 +752,8 @@ mod imp {
                     }
                 }
             }
-            // 输入控件不向内部取文本；从不读取 Value/TextPattern。
-            if el.CurrentControlType().map(|t| t.0 == 50004).unwrap_or(true) {
+            // 输入控件/文档不向内部取文本；从不读取 Value/TextPattern。
+            if el.CurrentControlType().map(|t| matches!(t.0, 50004 | 50030)).unwrap_or(true) {
                 return (String::new(), "unlabeled");
             }
             let mut stack = Vec::new();
@@ -823,7 +824,11 @@ mod imp {
                 let offscreen = probe("CurrentIsOffscreen", el.CurrentIsOffscreen())?.as_bool();
                 let Some(mismatch) = super::target_mismatch(expected, &current, enabled, offscreen) else {
                     if action_pattern_result(&el)? { return Ok(el); }
-                    if current.role == "Edit" && probe("CurrentIsKeyboardFocusable", el.CurrentIsKeyboardFocusable())?.as_bool() { return Ok(el); }
+                    if matches!(current.role, "Edit" | "Document")
+                        && probe("CurrentIsKeyboardFocusable", el.CurrentIsKeyboardFocusable())?.as_bool()
+                    {
+                        return Ok(el);
+                    }
                     return Err(ValidationFailure::rejected("no_click_action"));
                 };
                 if !super::may_ascend_hit(expected, &current, passive(&el)?, depth, enabled, offscreen) {
@@ -845,7 +850,9 @@ mod imp {
     }
 
     fn actionable(el: &IUIAutomationElement, role: &str) -> bool {
-        action_pattern(el) || (role == "Edit" && unsafe { el.CurrentIsKeyboardFocusable().map(|v| v.as_bool()).unwrap_or(false) })
+        action_pattern(el)
+            || (matches!(role, "Edit" | "Document")
+                && unsafe { el.CurrentIsKeyboardFocusable().map(|v| v.as_bool()).unwrap_or(false) })
     }
 
     pub fn validate(expected: &ScreenElement) -> Result<(i32, i32), ToolError> {
@@ -853,7 +860,7 @@ mod imp {
         let started = Instant::now();
         let _com = probe("CoInitializeEx", ComGuard::new()).map_err(one)?;
         let setup = || -> Result<_, ValidationFailure> { unsafe {
-            let uia: IUIAutomation = probe("CoCreateInstance", CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER))?;
+            let uia = probe("CoCreateInstance", neo_desktop::uia::create_uia())?;
             let walker = probe("RawViewWalker", uia.RawViewWalker())?;
             let hwnd = expected.identity.hwnd as windows_sys::Win32::Foundation::HWND;
             if hwnd.is_null() { return Err(ValidationFailure::rejected("invalid_window")); }
@@ -934,6 +941,7 @@ mod imp {
             id if id == UIA_RadioButtonControlTypeId.0 => "RadioButton",
             id if id == UIA_ComboBoxControlTypeId.0 => "ComboBox",
             id if id == UIA_EditControlTypeId.0 => "Edit",
+            id if id == UIA_DocumentControlTypeId.0 => "Document",
             id if id == UIA_SliderControlTypeId.0 => "Slider",
             id if id == UIA_TreeItemControlTypeId.0 => "TreeItem",
             id if id == UIA_DataItemControlTypeId.0 => "DataItem",
@@ -971,7 +979,7 @@ mod imp {
         query: &Query<'_>,
     ) -> WinResult<Vec<RawElement>> {
         unsafe {
-            let uia: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+            let uia = neo_desktop::uia::create_uia()?;
             let walker: IUIAutomationTreeWalker = uia.ControlViewWalker()?;
             let root = uia.GetRootElement()?;
             let monitors = monitors()?;

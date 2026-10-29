@@ -269,7 +269,7 @@ fn run_probe() -> Result<(), String> {
             "chromium_class_family": chromium_class, "class_query_ok": n > 0,
             "names_or_content_read": false, "input_injected": false, "window_activated": false,
             "coordinate_space": "physical_pixels", "metadata_only_collect": true}));
-        let uia: IUIAutomation = read("CoCreateInstance", CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER))?;
+        let uia: IUIAutomation = read("CoCreateInstance", neo_desktop::uia::create_uia())?;
         let raw = read("RawViewWalker", uia.RawViewWalker())?;
         let top = read("initial.ElementFromHandle", uia.ElementFromHandle(HWND(hwnd)))?;
         let top_identity = read("initial.identity", identity(&top, hwnd as isize, read("initial.GetRuntimeId", runtime_id(&top))?))?;

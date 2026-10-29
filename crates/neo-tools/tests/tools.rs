@@ -47,7 +47,12 @@ fn registry_is_well_formed() {
             "screen_elements",
             "screen_element_search",
             "click",
-            "drag"
+            "drag",
+            "type_text",
+            "scroll",
+            "shortcut",
+            "move_mouse",
+            "wait"
         ]
     );
     // 每个工具的 schema 必须自洽：required 与 default 不冲突、参数名唯一。

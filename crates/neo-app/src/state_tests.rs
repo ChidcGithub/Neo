@@ -334,6 +334,10 @@
             "screenshot",
             "screen_elements",
             "screen_element_search",
+            "type_text",
+            "scroll",
+            "shortcut",
+            "move_mouse",
             "web_search",
         ] {
             let mut meta = ToolMeta::restored(name);
@@ -478,10 +482,20 @@
 
     #[test]
     fn desktop_barrier_scope_and_missing_gate_fail_closed() {
-        for name in ["click", "drag", "screenshot", "screen_elements"] {
+        for name in [
+            "click",
+            "drag",
+            "screenshot",
+            "screen_elements",
+            "type_text",
+            "scroll",
+            "shortcut",
+            "move_mouse",
+        ] {
             assert!(needs_desktop(name, &serde_json::json!({})));
             assert!(neo_tools::find(name).is_some());
         }
+        assert!(!needs_desktop("wait", &serde_json::json!({})));
         assert!(needs_desktop("screen_element_search", &serde_json::json!({"refresh": true})));
         assert!(!needs_desktop("screen_element_search", &serde_json::json!({})));
         assert!(!needs_desktop("screen_element_search", &serde_json::json!({"refresh": false})));

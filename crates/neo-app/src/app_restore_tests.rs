@@ -2859,6 +2859,8 @@ fn send_reuse_save_barriers_preserve_draft_and_attachments() {
     for before_submit in [true, false] {
         let _mock = MockStream::install();
         let mut state = synthetic_send_state(true);
+        // 25 个工具的 schema 已占约 25 KB；32 KB 上下文再加图片会先触发预算错误。
+        state.context_tokens = 48 * 1024;
         state.messages.clear();
         state.active_session = Some(id);
         if before_submit {
@@ -2932,6 +2934,8 @@ fn send_reuse_tool_round_still_checks_budget_and_pairing() {
     for over_budget in [false, true] {
         let _mock = MockStream::install();
         let mut state = synthetic_send_state(false);
+        // 工具 schema 约 25 KB；给消息留出预算，同时保留 over_budget 分支的压力。
+        state.context_tokens = 48 * 1024;
         assert!(state.submit());
         let mut assistant = ChatMessage::new(Role::Assistant, "");
         assistant.reasoning = if over_budget {

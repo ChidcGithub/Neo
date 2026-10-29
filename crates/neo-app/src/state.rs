@@ -336,9 +336,18 @@ pub enum LogExportMsg {
 
 /// 只有这些工具读取或操作实时桌面；纯缓存搜索不需要隐藏审批界面。
 pub(crate) fn needs_desktop(name: &str, args: &serde_json::Value) -> bool {
-    matches!(name, "screenshot" | "screen_elements" | "click" | "drag")
-        || (name == "screen_element_search"
-            && args.get("refresh").and_then(|v| v.as_bool()) == Some(true))
+    matches!(
+        name,
+        "screenshot"
+            | "screen_elements"
+            | "click"
+            | "drag"
+            | "type_text"
+            | "scroll"
+            | "shortcut"
+            | "move_mouse"
+    ) || (name == "screen_element_search"
+        && args.get("refresh").and_then(|v| v.as_bool()) == Some(true))
 }
 
 pub(crate) struct DesktopRequest {
