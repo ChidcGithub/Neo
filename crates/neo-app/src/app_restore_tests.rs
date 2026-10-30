@@ -2181,7 +2181,7 @@ fn send_reuse_synthetic_build_count() {
                 assert_eq!(requests.len(), 1);
                 let messages = &requests[0];
                 assert_eq!(messages.len(), 4, "image={image}; first={}", messages[0].content);
-                assert!(messages[0].content.contains("课堂安全模式限制"));
+                assert!(messages[0].content.contains("Classroom-safe mode restriction"));
                 assert!(messages[3].content.contains("课堂资料正文"));
                 let image_bytes: usize = messages.iter().flat_map(|m| &m.images).map(String::len).sum();
                 assert_eq!(image_bytes, if image { 1024 * 1024 + 22 } else { 0 });

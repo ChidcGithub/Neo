@@ -25,6 +25,14 @@ impl Language {
             Self::ZhCn
         }
     }
+
+    /// English language name used in the model-facing system prompt.
+    pub fn prompt_name(self) -> &'static str {
+        match self {
+            Self::ZhCn => "Simplified Chinese",
+            Self::EnUs => "English",
+        }
+    }
 }
 
 #[cfg(not(test))]

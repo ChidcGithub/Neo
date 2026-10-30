@@ -38,9 +38,13 @@ fn localized_stop_and_cancel_keep_prompts_and_tool_feedback_identical() {
                 .content
                 .contains("用户取消了这次调用；已请求停止，已发生的副作用不会自动回滚"));
             let unchanged = (
-                state.system_prompt(),
+                // Only the answer-language clause follows the UI language.
+                state
+                    .system_prompt()
+                    .replace(language.prompt_name(), "<answer-language>"),
                 state.messages[2].content.clone(),
-                format!("{:?}", state.api_messages(usize::MAX)),
+                format!("{:?}", state.api_messages(usize::MAX))
+                    .replace(language.prompt_name(), "<answer-language>"),
             );
             if let Some(expected) = &baseline {
                 assert_eq!(&unchanged, expected);
@@ -178,7 +182,8 @@ fn localized_disconnected_stream_error_is_not_added_to_model_history() {
                 state.messages.last().unwrap().error.as_deref(),
                 Some(tr("连接异常中断（流线程退出），请重试"))
             );
-            let wire = format!("{:?}", state.api_messages(usize::MAX));
+            let wire = format!("{:?}", state.api_messages(usize::MAX))
+                .replace(language.prompt_name(), "<answer-language>");
             if let Some(expected) = &baseline {
                 assert_eq!(&wire, expected);
             } else {
@@ -302,7 +307,7 @@ fn startup_missing_settings_table_uses_safe_defaults_without_writing() {
 }
 
 #[test]
-fn state_default_follows_language_without_translating_user_titles_or_prompts() {
+fn state_default_follows_language_without_translating_user_titles() {
     for language in [Language::ZhCn, Language::EnUs] {
         with_language(language, || {
             let mut state = AppState::default();
@@ -321,7 +326,29 @@ fn state_default_follows_language_without_translating_user_titles_or_prompts() {
                 "用户内容 stays unchanged",
             ));
             assert_eq!(state.current_title(), "用户内容 stays unchanged");
-            assert!(state.system_prompt().contains("默认简体中文"));
+            let prompt = state.system_prompt();
+            assert!(prompt.contains("the language selected in Settings"));
+            assert!(prompt.contains(language.prompt_name()));
+        });
+    }
+}
+
+#[test]
+fn system_prompt_is_english_and_names_the_configured_answer_language() {
+    for language in [Language::ZhCn, Language::EnUs] {
+        with_language(language, || {
+            let prompt = AppState::default().system_prompt();
+            assert!(
+                prompt.contains(language.prompt_name()),
+                "{language:?} prompt is missing its answer language"
+            );
+            assert!(prompt.contains("the language selected in Settings"));
+            assert!(
+                !prompt
+                    .chars()
+                    .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)),
+                "model-facing system prompt must stay English: {prompt}"
+            );
         });
     }
 }

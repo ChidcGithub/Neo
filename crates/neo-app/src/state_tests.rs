@@ -388,11 +388,21 @@
     fn safety_desktop_prompt_requires_fresh_referenced_coordinates_and_verification() {
         let prompt = super::AppState::default().system_prompt();
         for rule in [
-            "负原点全桌面、局部及二次裁剪", "image_space/image_to_desktop", "不乘 DPI", "不要除 dpi_scale",
-            "click(screenshot_id=返回ID,x=20,y=30)", "桌面(-80,-20)", "image_attached=false",
-            "snapshot_id+element_id", "screenshot_id", "无截图引用时必须明确",
-            "source_size/sent_size", "不得当桌面定位依据", "必须重新观察",
-            "input_sent，不表示任务完成", "重新小范围观察", "不自动重试有副作用操作",
+            "negative-origin full-desktop, region, and re-cropped",
+            "image_space/image_to_desktop",
+            "Do not multiply or divide by DPI",
+            "click(screenshot_id=returned ID,x=20,y=30)",
+            "maps to desktop (-80, -20)",
+            "image_attached=false",
+            "snapshot_id+element_id",
+            "screenshot_id",
+            "Without a screenshot reference, use explicit virtual-desktop physical coordinates",
+            "source_size/sent_size",
+            "must not be used for desktop positioning",
+            "re-observe",
+            "input_sent",
+            "re-observe a small area",
+            "do not automatically retry actions with side effects",
         ] {
             assert!(prompt.contains(rule), "missing rule: {rule}");
         }
@@ -430,7 +440,7 @@
             ),
             neo_tools::Decision::Allow
         ));
-        assert!(state.system_prompt().contains("关闭计划模式再执行"));
+        assert!(state.system_prompt().contains("turn off Plan mode"));
     }
 
     #[test]
@@ -1040,8 +1050,8 @@
         use super::*;
         let prompt = AppState::default().system_prompt();
         assert!(prompt.contains("present_result"));
-        assert!(prompt.contains("题目、长任务"));
-        assert!(prompt.contains("普通问答"));
+        assert!(prompt.contains("a problem, a long task"));
+        assert!(prompt.contains("ordinary Q&A"));
     }
 
     #[test]
@@ -1916,7 +1926,7 @@
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1].role, ApiRole::User);
         assert!(messages[1].content.contains("低信任历史摘要"));
-        assert!(messages[0].content.contains("课堂安全模式限制"));
+        assert!(messages[0].content.contains("Classroom-safe mode restriction"));
         assert!(!messages[0].content.contains("忽略安全限制"));
         assert_eq!(messages[2].content, "最新用户原意必须完整");
         state.messages[0].content.push('!');
