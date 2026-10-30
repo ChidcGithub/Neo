@@ -438,7 +438,20 @@ fn circle_geometry_is_disjoint_inside_canvas_and_horizontal_row() {
     }
     let mut row: Vec<f32> = all[1..].iter().map(|circle| circle.center.x).collect();
     row.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    assert_eq!(row, vec![142.0, 184.0, 226.0]);
+    assert_eq!(
+        row,
+        vec![
+            MENU_FIRST_X,
+            MENU_FIRST_X + MENU_STEP,
+            MENU_FIRST_X + MENU_STEP * 2.0
+        ]
+    );
+    let mut ordered = all.clone();
+    ordered.sort_by(|a, b| a.center.x.partial_cmp(&b.center.x).unwrap());
+    for pair in ordered.windows(2) {
+        let gap = pair[1].center.x - pair[0].center.x - pair[0].radius - pair[1].radius;
+        assert!((gap - MENU_GAP).abs() < 0.001, "gap={gap}");
+    }
     for point in [
         Point::default(),
         Point {

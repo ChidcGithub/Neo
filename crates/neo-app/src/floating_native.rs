@@ -161,7 +161,7 @@ struct Dib {
 }
 impl Dib {
     unsafe fn new(width: i32, height: i32) -> Result<Self, String> {
-        if !(1..=1024).contains(&width) || !(1..=1024).contains(&height) {
+        if !(1..=2048).contains(&width) || !(1..=2048).contains(&height) {
             return Err("floating invalid surface size".into());
         }
         let dc = CreateCompatibleDC(null_mut());

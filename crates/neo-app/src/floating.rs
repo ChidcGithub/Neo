@@ -211,11 +211,16 @@ mod native;
 const HOLD_MS: u64 = 500;
 const DOUBLE_MS: u64 = 300;
 const SLOP: f32 = 6.0;
-const EXTENT_W: f32 = 252.0;
+const EXTENT_W: f32 = 300.0;
 const EXTENT_H: f32 = 180.0;
 const MAIN_X: f32 = 90.0;
 const MAIN_Y: f32 = 90.0;
 const MENU_Y: f32 = 90.0;
+/// Edge-to-edge gap between adjacent menu buttons at 100% scale.
+const MENU_GAP: f32 = 15.0;
+const MENU_RADIUS: f32 = 20.0;
+const MENU_STEP: f32 = MENU_RADIUS * 2.0 + MENU_GAP;
+const MENU_FIRST_X: f32 = MAIN_X + 28.0 + MENU_GAP + MENU_RADIUS;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Point {
@@ -290,26 +295,26 @@ fn circles(menu: bool) -> impl Iterator<Item = Circle> {
         },
         Circle {
             center: Point {
-                x: 226.0,
+                x: MENU_FIRST_X + MENU_STEP * 2.0,
                 y: MENU_Y,
             },
-            radius: 20.0,
+            radius: MENU_RADIUS,
             target: Target::Close,
         },
         Circle {
             center: Point {
-                x: 142.0,
+                x: MENU_FIRST_X,
                 y: MENU_Y,
             },
-            radius: 20.0,
+            radius: MENU_RADIUS,
             target: Target::Ink,
         },
         Circle {
             center: Point {
-                x: 184.0,
+                x: MENU_FIRST_X + MENU_STEP,
                 y: MENU_Y,
             },
-            radius: 20.0,
+            radius: MENU_RADIUS,
             target: Target::Board,
         },
     ]
