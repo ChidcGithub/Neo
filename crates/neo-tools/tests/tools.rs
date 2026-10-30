@@ -60,6 +60,13 @@ fn registry_is_well_formed() {
     );
     // 每个工具的 schema 必须自洽：required 与 default 不冲突、参数名唯一。
     for t in neo_tools::registry() {
+        assert!(!t.purpose.trim().is_empty(), "{} 缺少一句话说明", t.name);
+        assert!(!t.purpose.contains('\n'), "{} 的工具说明必须是单行", t.name);
+        assert!(
+            t.purpose.chars().count() <= 120,
+            "{} 的工具说明过长",
+            t.name
+        );
         let schema = t.schema();
         let required: Vec<&str> = schema["required"]
             .as_array()
@@ -101,6 +108,19 @@ fn registry_is_well_formed() {
             }
         }
         assert_eq!(schema["additionalProperties"], false);
+    }
+}
+
+#[test]
+fn prompt_catalog_is_one_line_per_tool_with_signature() {
+    let catalog = neo_tools::prompt_catalog();
+    let lines: Vec<&str> = catalog.lines().collect();
+    assert_eq!(lines.len(), neo_tools::registry().len());
+    assert!(lines[0].starts_with("- read_file -> "));
+    for line in lines {
+        assert!(line.starts_with("- "), "{line}");
+        assert!(line.contains(" -> "), "{line}");
+        assert!(!line.contains('\n'), "{line}");
     }
 }
 

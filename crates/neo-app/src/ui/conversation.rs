@@ -358,12 +358,12 @@ pub fn header_height(skin: &Skin<'_>) -> f32 {
 /// 工具调用行：一次调用只占一行。
 ///
 /// ```text
-/// [图标/状态点] Search(query="…") · 联网搜索 ………… 执行成功
+/// [图标/状态点] Search(query="…") -> 联网搜索 ………… 执行成功
 /// ```
 ///
 /// - **调用形式**用英文变体名 + 声明顺序的前三个参数，例如
 ///   `Read(path="src/a.rs", offset=3)`；认不出来的工具用真实工具名；
-/// - **短说明**取工具注册表里的中文短名（≤15 字），用三级色；
+/// - **短说明**用 `->` 接在调用形式后面，取工具注册表里的中文短名（≤15 字）；
 /// - **状态**靠右对齐，失败时变红；非零退出码显示为 `exit N`；
 /// - **行首**平时是变体图标，失败时换成红点、待确认时换成强调色点；
 /// - 执行中只转圈并显示状态文字，不再额外占一行。
@@ -424,7 +424,6 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     let lh = t.label_lh.max(t.label * 1.5);
     let pad_x = m.s(6.0);
     let lead = m.s(16.0);
-    let sep = m.s(2.0);
     let gap = m.s(8.0);
 
     let h = lh + m.s(6.0) * 2.0;
@@ -498,14 +497,20 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     );
     let avail_end = (right - gap).max(x);
 
-    // 先给短说明留出空间，剩下的给调用签名。
+    // 先给箭头和短说明留出空间，剩下的给调用签名。
+    let arrow = "->";
+    let arrow_font = purpose_font.clone();
+    let arrow_w = painter
+        .layout_no_wrap(arrow.to_owned(), arrow_font.clone(), p.label_caption)
+        .size()
+        .x;
     let purpose_w = painter
         .layout_no_wrap(purpose.to_owned(), purpose_font.clone(), p.label_tertiary)
         .size()
         .x;
-    let show_purpose = purpose_w + gap * 2.0 + m.s(48.0) <= avail_end - x;
+    let show_purpose = purpose_w + gap * 2.0 + arrow_w + m.s(48.0) <= avail_end - x;
     let call_budget = if show_purpose {
-        (avail_end - x - purpose_w - gap * 2.0).max(0.0)
+        (avail_end - x - purpose_w - gap * 2.0 - arrow_w).max(0.0)
     } else {
         (avail_end - x).max(0.0)
     };
@@ -524,10 +529,15 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     x += call_w;
 
     if show_purpose {
-        // 2pt 圆点分隔符（上游 `.sep`：2px 圆点，左右各 8px，label-caption 色）
-        if x + gap * 2.0 + m.s(12.0) < avail_end {
-            painter.circle_filled(egui::pos2(x + gap, cy), sep * 0.5, p.label_caption);
-            x += gap * 2.0;
+        if x + gap * 2.0 + arrow_w < avail_end {
+            painter.text(
+                egui::pos2(x + gap, cy),
+                egui::Align2::LEFT_CENTER,
+                arrow,
+                arrow_font,
+                p.label_caption,
+            );
+            x += gap * 2.0 + arrow_w;
         }
         if x < avail_end {
             let shown = super::elide(painter, purpose, &purpose_font, avail_end - x);

@@ -86,7 +86,9 @@ pub(crate) static NEO_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 pub use policy::{Decision, Policy, Risk};
 pub use result::{Args, ErrorKind, Outcome, ToolError};
 pub use scope::Scope;
-pub use spec::{find, openai_tools, registry, tool_declarations, Param, Tool, Ty};
+pub use spec::{
+    find, openai_tools, prompt_catalog, registry, tool_declarations, Param, Tool, Ty,
+};
 
 /// 所有工具名（顺序即 registry 顺序），UI 与测试共用。
 pub fn tool_names() -> Vec<&'static str> {

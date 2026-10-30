@@ -221,11 +221,13 @@ pub fn openai_tools() -> Value {
     Value::Array(tool_declarations())
 }
 
-/// 全部工具的一句话清单（拼进系统提示词）。
+/// 全部工具的一句话清单（拼进系统提示词）：一个工具一行。
+///
+/// 参数形式由 JSON schema / 实际调用行负责，这里只保留工具名和一行说明。
 pub fn prompt_catalog() -> String {
     registry()
         .iter()
-        .map(|t| format!("- `{}`（{}）：{}", t.name, t.title, t.purpose))
+        .map(|t| format!("- {} -> {}", t.name, t.purpose))
         .collect::<Vec<_>>()
         .join("\n")
 }

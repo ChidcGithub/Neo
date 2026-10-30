@@ -200,6 +200,10 @@ fn tool_card_is_one_line_with_call_signature_and_short_purpose() {
         .iter()
         .find(|text| text.galley.text() == "Search(query=\"rust\")")
         .expect("调用签名");
+    let arrow = texts
+        .iter()
+        .find(|text| text.galley.text() == "->")
+        .expect("箭头");
     let purpose = texts
         .iter()
         .find(|text| text.galley.text() == "联网搜索")
@@ -211,6 +215,7 @@ fn tool_card_is_one_line_with_call_signature_and_short_purpose() {
     let center_y = |text: &egui::epaint::TextShape| {
         text.galley.rect.translate(text.pos.to_vec2()).center().y
     };
+    assert!((center_y(call) - center_y(arrow)).abs() < 1.0);
     assert!((center_y(call) - center_y(purpose)).abs() < 1.0);
     assert!((center_y(call) - center_y(status)).abs() < 1.0);
 }

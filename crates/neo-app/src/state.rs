@@ -2092,7 +2092,8 @@ impl AppState {
              regardless of the language of the question, unless the user explicitly asks to switch. \
              Be concise, well structured, and readable on a projector.\n\
              Use the simplest method that completes the request; if you can answer directly, do not call \
-             tools or perform unnecessary reconnaissance. Tool names and parameters are in the tools declarations.\n\
+             tools or perform unnecessary reconnaissance.\n\
+             Tool catalog (one tool per line; full parameter schemas follow):\n{catalog}\n\
              When the user sends a problem, a long task, or needs a deliverable presented, show the final \
              explanation/result with present_result in a centered card (Markdown, until the user closes it). \
              Do not pop a card for ordinary Q&A or short replies.\n\
@@ -2132,6 +2133,7 @@ impl AppState {
              re-observe a small area to verify; do not automatically retry actions with side effects. \
              screen_element_search(refresh=false) reads only the cache; refresh=true enumerates. Take \
              screenshots only for necessary visual information; use double for double-click.",
+            catalog = neo_tools::prompt_catalog(),
             memory = self.memory_block(),
             today = neo_tools::classlog::today_key(),
         )

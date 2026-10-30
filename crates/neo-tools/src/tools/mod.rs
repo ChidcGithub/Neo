@@ -48,7 +48,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "read_file",
         title: "查看文件",
-        purpose: "读取工作区内文本文件的内容（可分段）。改文件之前先用它确认原文。",
+        purpose: "Read a text file; use offset/limit to continue paging.",
         risk: Risk::Read,
         params: read_file::PARAMS,
         preview: read_file::preview,
@@ -57,7 +57,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "read_document",
         title: "读取文档",
-        purpose: "解析工作区内 DOC/DOCX Word 文档、PPT/PPTX PowerPoint 演示文稿和文本，按字符分页返回正文。默认 4000、最多 8000 字符；用 next_offset 续读。文件限 32 MiB，最多提取 80,000 字符，截断或格式局限见 warning；图片请用 view_image。",
+        purpose: "Extract text from DOC/DOCX/PPT/PPTX files; continue with next_offset.",
         risk: Risk::Read,
         params: read_document::PARAMS,
         preview: read_document::preview,
@@ -66,7 +66,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "view_image",
         title: "查看图片",
-        purpose: "查看工作区内图片的基本信息（格式 / 尺寸 / 体积），必要时取回原始数据。",
+        purpose: "Inspect an image; optionally return its encoded data.",
         risk: Risk::Read,
         params: view_image::PARAMS,
         preview: view_image::preview,
@@ -76,9 +76,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "web_search",
         title: "联网搜索",
-        purpose: "用 Bing 搜索互联网：解析结果页，把标题 / 链接 / 摘要回给你（不需要任何 key）。\
-                 \n时效或课外事实（新闻、近况、没把握的知识）用它核实，不要凭记忆硬答；\
-                 用户想自己看网页时设 open_browser=true，在其浏览器里打开搜索页。",
+        purpose: "Search the web for current or more detailed information.",
         risk: Risk::Read,
         params: web_search::PARAMS,
         preview: web_search::preview,
@@ -87,7 +85,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "open_file",
         title: "打开文件",
-        purpose: "在用户机器上用默认程序打开某个文件，或在文件管理器里定位它，让用户亲眼看。",
+        purpose: "Open a file with its default app or reveal it in Explorer.",
         risk: Risk::Open,
         params: open_file::PARAMS,
         preview: open_file::preview,
@@ -96,7 +94,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "open_app",
         title: "打开主界面",
-        purpose: "把 Neo 的主窗口唤回到屏幕上（后台静默处理时用户说「打开主界面 / 让我看看」就用它）。",
+        purpose: "Bring the Neo main window back to the screen.",
         risk: Risk::Open,
         params: &[],
         preview: open_app::preview,
@@ -106,9 +104,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "ask_user",
         title: "向用户提问",
-        purpose: "拿不准用户意图时弹窗提问：给问题 + 2~4 个候选答案，用户点选后答案回给你。\
-                 \n题没拍全、要求有歧义、下一步有多种合理做法时用它确认，不要自己猜；\
-                 能合理假设的琐事不要打扰用户。",
+        purpose: "Ask the user a question with 2–4 tappable options.",
         risk: Risk::Read,
         params: ask_user::PARAMS,
         preview: ask_user::preview,
@@ -117,7 +113,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "present_result",
         title: "展示结果",
-        purpose: "用户发来题目、长任务或需要成果展示时，把最终讲解/成果写成 Markdown 卡片显示在屏幕中央，直到用户关闭；普通问答和简短回复不要弹卡。",
+        purpose: "Show a Markdown result card until the user closes it.",
         risk: Risk::Read,
         params: present_result::PARAMS,
         preview: present_result::preview,
@@ -126,7 +122,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "write_file",
         title: "写入文件",
-        purpose: "写入或整体覆盖一个文件。新建文件、整篇重写时用它；只改一小段请用 edit_file。",
+        purpose: "Create or overwrite a file with complete content.",
         risk: Risk::Write,
         params: write_file::PARAMS,
         preview: write_file::preview,
@@ -135,7 +131,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "edit_file",
         title: "修改文件",
-        purpose: "把文件里一段确定的原文替换成新文本。比 write_file 安全：不重写整个文件。",
+        purpose: "Replace one exact text block in an existing file.",
         risk: Risk::Write,
         params: edit_file::PARAMS,
         preview: edit_file::preview,
@@ -144,7 +140,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "powershell",
         title: "执行命令",
-        purpose: "在工作区内执行 PowerShell 命令（编译、测试、搜索、批量处理）。专用文件、文档或图像工具能做的事不要用它。",
+        purpose: "Run PowerShell commands inside the workspace.",
         risk: Risk::Exec,
         params: powershell::PARAMS,
         preview: powershell::preview,
@@ -153,9 +149,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "bash",
         title: "执行命令",
-        purpose: "在工作区内的类 Unix 环境（随包的 Git Bash）里执行命令：\
-                 \\nls / grep / sed / find / git 等文本与版本控制工具。\
-                 \\n专用文件、文档或图像工具能做的事不要用它；要写另一种 shell 的语法请换用姊妹工具。",
+        purpose: "Run Bash commands in the bundled Unix environment.",
         risk: Risk::Exec,
         params: bash::PARAMS,
         preview: bash::preview,
@@ -165,7 +159,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "remember",
         title: "记住",
-        purpose: "把值得长期记住的事（用户偏好、身份、常用设定）写进长期记忆，以后的对话都带在身上。一次性的任务指令不要记。",
+        purpose: "Store a durable user preference or fact.",
         risk: Risk::Open,
         params: memory::REMEMBER_PARAMS,
         preview: memory::remember_preview,
@@ -174,7 +168,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "forget",
         title: "忘掉",
-        purpose: "删除一条长期记忆（#id 或内容关键词）。记忆过期、记错、或用户要求忘掉时用。",
+        purpose: "Delete one long-term memory by id or keyword.",
         risk: Risk::Open,
         params: memory::FORGET_PARAMS,
         preview: memory::forget_preview,
@@ -184,8 +178,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "recall_day",
         title: "回想某天",
-        purpose: "读取每日记忆。不给日期 = 返回「哪天有什么」的一句话索引（先查它）；\
-                 \n给 date = 读那天的全部速记和当天课堂总结。用户问「今天/某天发生了什么」时用它。",
+        purpose: "Read daily notes; omit date to list the index.",
         risk: Risk::Read,
         params: daily::RECALL_PARAMS,
         preview: daily::recall_preview,
@@ -194,7 +187,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "note_day",
         title: "记当天",
-        purpose: "仅在用户明确要求记录时，往今天的每日记忆追加速记（时间自动盖章）。不得静默观察或记录学生行为；长期偏好用 remember。",
+        purpose: "Append a timestamped note to today's daily log.",
         risk: Risk::Open,
         params: daily::NOTE_PARAMS,
         preview: daily::note_preview,
@@ -204,7 +197,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "screenshot",
         title: "截取屏幕",
-        purpose: "仅在用户请求且需要视觉信息时截屏，不要求每次操作前后截图。PNG 原点为图内 (0,0)，不等于桌面原点；返回 image_space、image_to_desktop 与短期 screenshot_id。click 或再次 screenshot 可传此引用和图内坐标，由程序累加偏移。width/height 是正宽高，不是 right/bottom。引用裁图重新读取当前桌面，不验证目标身份、不自动处理旧图内容变化。",
+        purpose: "Capture the screen or a region for visual inspection.",
         risk: Risk::Read,
         params: screenshot::PARAMS,
         preview: screenshot::preview,
@@ -213,7 +206,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "screen_elements",
         title: "屏幕元素",
-        purpose: "用户请求桌面操作时先 mode=overview 获取窗口概览，再用 window_id 或 query 局部枚举。返回 snapshot_id + element_id，点击时必须一起传入，操作后刷新局部元素。不要默认扫描整桌面。",
+        purpose: "List interactive UI elements with stable element IDs.",
         risk: Risk::Read,
         params: screen_elements::PARAMS,
         preview: screen_elements::preview,
@@ -222,7 +215,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "screen_element_search",
         title: "搜索屏幕元素",
-        purpose: "在最近一次屏幕元素清单中按名称、控件类型或屏幕位置搜索按钮和控件，并返回 element_id、精确矩形、中心点与保守用途提示。找不到按钮时先用它，不要凭截图猜坐标。refresh=false 只查缓存，无缓存时拒绝；只有 refresh=true 才重新枚举。点击时同时传返回的 snapshot_id 和 element_id。",
+        purpose: "Search the latest UI element list by name, type, or position.",
         risk: Risk::Read,
         params: screen_element_search::PARAMS,
         preview: screen_element_search::preview,
@@ -231,7 +224,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "desktop_snapshot",
         title: "桌面快照",
-        purpose: "一次拿到窗口列表、焦点窗口、可交互元素（带 snapshot_id + element_id）和可选截图。先看全局再用 click/type_text。",
+        purpose: "Get windows, focus, UI elements, and an optional screenshot.",
         risk: Risk::Read,
         params: desktop_snapshot::PARAMS,
         preview: desktop_snapshot::preview,
@@ -240,7 +233,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "click",
         title: "点击鼠标",
-        purpose: "点击鼠标（左/右键、双击）。优先 UIA 的 snapshot_id + element_id；视觉定位可传 screenshot_id + 图内 x/y，由程序映射，无引用时 x/y 是桌面物理坐标。截图引用不验证身份；陈旧引用拒绝，不猜坐标、不自动重试，操作后按需要重新观察。",
+        purpose: "Click a UI element or a screen coordinate.",
         risk: Risk::Exec,
         params: click::PARAMS,
         preview: click::preview,
@@ -249,7 +242,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "drag",
         title: "拖动鼠标",
-        purpose: "按住鼠标从一处拖到另一处（选中文字、拖滑块、框选）。先用局部元素确定目标，仅在必要时请求截图。",
+        purpose: "Drag the mouse from one point to another.",
         risk: Risk::Exec,
         params: drag::PARAMS,
         preview: drag::preview,
@@ -258,7 +251,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "type_text",
         title: "输入文字",
-        purpose: "点击输入框后输入文字；可先清空、定位光标、回车提交。优先用 screen_elements 的 snapshot_id + element_id 定位。",
+        purpose: "Type text into the focused input; optionally submit.",
         risk: Risk::Exec,
         params: type_text::PARAMS,
         preview: type_text::preview,
@@ -267,7 +260,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "scroll",
         title: "滚动屏幕",
-        purpose: "在目标元素或坐标处滚动鼠标滚轮，支持上下左右。滚动后旧元素快照失效。",
+        purpose: "Scroll the mouse wheel at an element or coordinate.",
         risk: Risk::Exec,
         params: scroll::PARAMS,
         preview: scroll::preview,
@@ -276,7 +269,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "shortcut",
         title: "按键",
-        purpose: "向当前焦点窗口发送组合键（ctrl+c、alt+tab、win+r 等）。按键前先用 click/type_text 确认焦点。",
+        purpose: "Send a keyboard shortcut to the focused window.",
         risk: Risk::Exec,
         params: shortcut::PARAMS,
         preview: shortcut::preview,
@@ -285,7 +278,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "move_mouse",
         title: "移动鼠标",
-        purpose: "把鼠标指针移到元素中心或坐标，可选分步耗时；只移动不点击。",
+        purpose: "Move the pointer to an element or coordinate.",
         risk: Risk::Exec,
         params: move_mouse::PARAMS,
         preview: move_mouse::preview,
@@ -294,7 +287,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "app_control",
         title: "应用控制",
-        purpose: "启动 Start Menu 应用或可执行文件，切换/缩放窗口。先用 desktop_snapshot 拿 window_id。",
+        purpose: "Launch an app or switch/resize a window.",
         risk: Risk::Exec,
         params: app_control::PARAMS,
         preview: app_control::preview,
@@ -303,7 +296,7 @@ pub static REGISTRY: &[Tool] = &[
     Tool {
         name: "wait",
         title: "等待",
-        purpose: "等待一段时间（0–120 秒），用于应用启动、页面加载或动画结束；可被用户取消。",
+        purpose: "Wait up to 120 seconds; cancellable by the user.",
         risk: Risk::Read,
         params: wait::PARAMS,
         preview: wait::preview,
