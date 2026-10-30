@@ -2,7 +2,7 @@
 //!
 //! 规则照搬上游 Harness 的 `tool-call-model`（`dsh-client-ui-tool`）：
 //!
-//! 1. **工具名 → 变体**（`search / read / bash / write / edit / code / others`）。
+//! 1. **工具名 → 变体**（`search / read / bash / write / edit / code / screen / present / others`）。
 //!    行标题就是变体名，而不是工具自己起的名字 —— 一行工具调用的信息密度
 //!    靠"我读了一个文件 + 哪个文件"这两件事就够，工具名反倒没人看。
 //! 2. **摘要从参数里按变体取键**（见 [`Variant::summary_keys`]），
@@ -30,6 +30,8 @@ pub enum Variant {
     /// 单独一类才好认——`screenshot` 在题述里是"看屏幕"，
     /// 与"读一个文件"并不是一回事。
     Screen,
+    /// 结果展示（屏幕中央的结果卡）。
+    Present,
     /// 认不出来的工具 —— 标题退回工具名本身。
     Others,
 }
@@ -53,6 +55,7 @@ impl Variant {
             "screenshot" | "screen_elements" | "screen_element_search" | "desktop_snapshot"
             | "click" | "drag" | "type_text" | "scroll" | "shortcut" | "move_mouse"
             | "app_control" | "wait" => Variant::Screen,
+            "present_result" => Variant::Present,
             _ => Variant::Others,
         }
     }
@@ -70,6 +73,7 @@ impl Variant {
             // 摘要会退到"原始参数那一行"，那正好就是 `{"x":100,"y":200}` 这种，
             // 对"点了哪儿"来说反而是最清楚的说法。
             Variant::Screen => &["description", "text", "keys", "path"],
+            Variant::Present => &["title"],
             Variant::Others => &[],
         }
     }
@@ -92,6 +96,7 @@ impl Variant {
             Variant::Write => "写入",
             Variant::Edit => "修改",
             Variant::Screen => "屏幕",
+            Variant::Present => "展示",
             Variant::Code => "运行代码",
             Variant::Others => "工具",
         }

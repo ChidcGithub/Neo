@@ -20,6 +20,7 @@ pub mod move_mouse;
 pub mod open_app;
 pub mod open_file;
 pub mod powershell;
+pub mod present_result;
 pub mod read_document;
 pub mod read_file;
 pub mod screen;
@@ -112,6 +113,15 @@ pub static REGISTRY: &[Tool] = &[
         params: ask_user::PARAMS,
         preview: ask_user::preview,
         run: ask_user::run,
+    },
+    Tool {
+        name: "present_result",
+        title: "展示结果",
+        purpose: "用户发来题目、长任务或需要成果展示时，把最终讲解/成果写成 Markdown 卡片显示在屏幕中央，直到用户关闭；普通问答和简短回复不要弹卡。",
+        risk: Risk::Read,
+        params: present_result::PARAMS,
+        preview: present_result::preview,
+        run: present_result::run,
     },
     Tool {
         name: "write_file",

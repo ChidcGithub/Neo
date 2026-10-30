@@ -35,6 +35,7 @@ fn registry_is_well_formed() {
             "open_file",
             "open_app",
             "ask_user",
+            "present_result",
             "write_file",
             "edit_file",
             "powershell",

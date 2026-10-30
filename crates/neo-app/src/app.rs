@@ -459,6 +459,8 @@ pub struct NeoApp {
     confirmwin: ui::confirmwin::ConfirmWin,
     /// 课堂总结的顶部弹窗（打磨完成后从屏幕上方滑入）。
     classwin: ui::classwin::ClassWin,
+    /// AI 结果卡：屏幕中央显示，直到用户关闭。
+    resultwin: ui::resultwin::ResultWin,
     /// 已见到的「唤回主窗」信号（`open_app` 工具置位；变了 = AI 要开主界面）。
     show_window_seen: u64,
     /// 记忆文件 mtime 轮询节拍（2s）。
@@ -591,6 +593,7 @@ impl NeoApp {
             class_pings_seen: 0,
             confirmwin: Default::default(),
             classwin: Default::default(),
+            resultwin: Default::default(),
             show_window_seen: 0,
             memory_poll: std::time::Instant::now(),
             class: Default::default(),
@@ -2944,8 +2947,11 @@ impl NeoApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         // 迷你窗：主窗藏起 + AI 在忙时贴屏幕角落（对话速览 / 截屏回避 / 打断确认）。
-        // 打断判定要排除课堂总结弹窗的矩形：点它的「关闭」不是「打断 AI」。
-        let classwin_rect = self.classwin.visible_rect_physical(&ctx);
+        // 打断判定要排除课堂总结和结果卡的矩形：点它们的「关闭」不是「打断 AI」。
+        let mut card_rect = self.classwin.visible_rect_physical(&ctx);
+        if let Some(rect) = self.resultwin.visible_rect_physical(&ctx) {
+            card_rect = Some(card_rect.map_or(rect, |current| current.union(rect)));
+        }
         // 只有纯视觉内容进入 overlay；确认与课堂弹窗始终使用独立交互视口。
         let overlay = self.overlay.as_ref();
         self.miniwin.tick(
@@ -2953,13 +2959,16 @@ impl NeoApp {
             &mut self.state,
             self.theme,
             self.hidden_to_tray || self.desktop_windows.main_avoided,
-            classwin_rect,
+            card_rect,
             overlay,
         );
         // 截屏闪光：抓帧完成后在被抓区域边缘闪一道白框。
         self.shotflash.tick(&ctx, overlay);
         // 工具确认/提问使用不透明客户区，不把留白处点击漏给桌面。
         self.confirmwin
+            .tick(&ctx, &mut self.state, self.theme, overlay);
+        // AI 结果卡：屏幕中央显示，直到用户关闭。
+        self.resultwin
             .tick(&ctx, &mut self.state, self.theme, overlay);
         // 课堂总结：最大化监听 / 转写 / 打磨状态机（默认关，设置里开）。
         self.class

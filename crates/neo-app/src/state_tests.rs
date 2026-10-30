@@ -1007,6 +1007,44 @@
     }
 
     #[test]
+    fn present_result_shows_card_and_settles_without_a_worker() {
+        use super::*;
+        let mut state = AppState::default();
+        state.messages.push(ChatMessage::new(Role::Assistant, ""));
+        state.tool_frags.push(neo_llm::ToolCallFrag {
+            index: 0,
+            id: Some("present-1".into()),
+            name: Some("present_result".into()),
+            args: serde_json::json!({
+                "title": "勾股定理证明",
+                "content": "## 结论\n\n$a^2+b^2=c^2$"
+            })
+            .to_string(),
+        });
+
+        assert_eq!(state.begin_tool_round(), 1);
+        let card = state.presented.as_ref().expect("结果卡应已写入状态");
+        assert_eq!(card.title, "勾股定理证明");
+        let tool = state.messages.last().unwrap().tool.as_ref().unwrap();
+        assert_eq!(tool.state, ToolState::Done);
+        assert!(tool.outcome.as_ref().unwrap().is_ok());
+        assert_eq!(
+            state.spawn_ready_tools(&neo_tools::Scope::new(std::env::temp_dir())),
+            0,
+            "展示工具不应再启动后台线程"
+        );
+    }
+
+    #[test]
+    fn prompt_tells_the_model_when_to_present_results() {
+        use super::*;
+        let prompt = AppState::default().system_prompt();
+        assert!(prompt.contains("present_result"));
+        assert!(prompt.contains("题目、长任务"));
+        assert!(prompt.contains("普通问答"));
+    }
+
+    #[test]
     fn task_epoch_compaction_and_resume_keep_identity() {
         let mut state = compaction_fixture();
         state.begin_task();
@@ -1845,7 +1883,8 @@
     }
 
     fn compaction_fixture() -> AppState {
-        let mut state = AppState { context_tokens: 32 * 1024, ..AppState::default() };
+        // 给 system + 工具声明留出固定预算，历史仍超过 80% 阈值。
+        let mut state = AppState { context_tokens: 48 * 1024, ..AppState::default() };
         state.messages.push(ChatMessage::new(Role::User, "旧目标"));
         state.messages.push(ChatMessage::new(Role::Assistant, "a".repeat(20_000)));
         state.messages.push(ChatMessage::new(Role::User, "最新用户原意必须完整"));
@@ -1914,7 +1953,7 @@
 
     #[test]
     fn compaction_tool_blocks_keep_latest_pair_and_original_intent() {
-        let mut state = AppState { context_tokens: 32 * 1024, ..AppState::default() };
+        let mut state = AppState { context_tokens: 48 * 1024, ..AppState::default() };
         state.messages.push(ChatMessage::new(Role::User, "完整原意"));
         for i in 0..3 {
             append_context_result(&mut state, &format!("pair-{i}"), neo_tools::Outcome::ok(

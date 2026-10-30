@@ -24,6 +24,7 @@ pub mod markdown;
 pub mod math;
 pub mod miniwin;
 pub mod mods;
+pub mod resultwin;
 pub mod settings;
 pub mod sidebar;
 pub mod toastwin;

@@ -38,8 +38,19 @@
         assert_eq!(Variant::of("edit_file"), Variant::Edit);
         assert_eq!(Variant::of("powershell"), Variant::Bash);
         assert_eq!(Variant::of("open_file"), Variant::Others);
+        assert_eq!(Variant::of("present_result"), Variant::Present);
+        assert_eq!(Variant::of("present_result").title(), "展示");
         // 不认识的不能猜
         assert_eq!(Variant::of("天外飞仙"), Variant::Others);
+    }
+
+    #[test]
+    fn present_uses_title_not_body_for_summary() {
+        let args = json!({
+            "content": "# 很长的正文\n\n正文第一行",
+            "title": "勾股定理证明"
+        });
+        assert_eq!(summary(Variant::Present, &args), "勾股定理证明");
     }
 
     #[test]

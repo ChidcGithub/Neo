@@ -568,6 +568,7 @@ fn icon_for(variant: neo_tools::present::Variant) -> Icon {
         // 屏幕交互：拿「面板」这个矩形图标表示一块屏幕。上游图标集里
         // 没有指针/鼠标，硬造一个反而会和整套几何不搭（见 icons.rs 的说明）。
         Variant::Screen => Icon::Board,
+        Variant::Present => Icon::Checklist,
         Variant::Others => Icon::Dots,
     }
 }

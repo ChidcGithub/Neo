@@ -1058,15 +1058,15 @@ impl MiniWin {
     /// 主窗隐藏时渲染循环走 logic-only 路径，两者都经过 `tick()`。
     ///
     /// `hidden_to_tray` 也包含桌面工具导致的主窗自动暂避。
-    /// `classwin_rect`：`ClassWin::visible_rect_physical(ctx)` 返回的全局物理
-    /// 客户区；不可传布局目标矩形或 ROOT 的逻辑坐标。
+    /// `card_rect`：课堂总结或结果卡的全局物理客户区（两者取并集）；
+    /// 不可传布局目标矩形或 ROOT 的逻辑坐标。
     pub fn tick(
         &mut self,
         ctx: &Context,
         state: &mut AppState,
         theme: Theme,
         hidden_to_tray: bool,
-        classwin_rect: Option<Rect>,
+        card_rect: Option<Rect>,
         overlay: Option<&neo_overlay::OverlayHandle>,
     ) {
         let overlay = overlay.filter(|layer| layer.is_alive());
@@ -1155,10 +1155,8 @@ impl MiniWin {
         //    确认/提问等待态与已打开的打断弹窗由 request_interrupt 排除。
         if lmb_edge {
             // hook 留存的是按下时的物理坐标；矩形是最新视口采样，非点击时归属。
-            let on_classwin = cursor
-                .zip(classwin_rect)
-                .is_some_and(|(c, r)| r.contains(c));
-            self.request_interrupt(state, true, on_classwin, synthetic);
+            let on_card = cursor.zip(card_rect).is_some_and(|(c, r)| r.contains(c));
+            self.request_interrupt(state, true, on_card, synthetic);
         }
         // 截屏/桌面屏障期间仍可记住真实桌面点击请求，但不接受新的弹窗回答。
         if busy {

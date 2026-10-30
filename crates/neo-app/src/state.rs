@@ -843,6 +843,8 @@ pub struct AppState {
     pub auto_approve_tools: bool,
     /// 本轮是用户主动停止的（完成通知不该把「打断」报成「任务完成」）。
     pub round_cancelled: bool,
+    /// 屏幕中央展示的结果卡；用户关闭前一直保留，新展示替换旧的。
+    pub presented: Option<std::sync::Arc<neo_tools::tools::present_result::Card>>,
 
     /// 思考强度档位（对应请求体的 `thinking` / `reasoning_effort`）。
     pub thinking: neo_llm::Thinking,
@@ -980,6 +982,7 @@ impl Default for AppState {
             tool_open: false,
             auto_approve_tools: false,
             round_cancelled: false,
+            presented: None,
             thinking: neo_llm::Thinking::Model,
             context_tokens: neo_llm::CONTEXT_TOKENS,
             task_tool_calls: 0,
@@ -2083,6 +2086,7 @@ impl AppState {
         format!(
             "{safety}{restrictions}你是 Neo，中学课堂 AI 助教。默认简体中文，简洁、结构清晰、适合投屏。\
              用最简单的方法完成请求，能直接回答就不调工具，不做多余勘察。工具与参数见 tools 声明。\n\
+             用户发来题目、长任务或需要成果展示时，把最终讲解/成果用 present_result 显示在屏幕中央（Markdown，直到用户关闭）；普通问答和简短回复不要弹卡。\n\
              长期记忆：\n{}\n今天是 {}（本地时区）。\
              用户长期偏好用 remember，纠错或要求忘掉用 forget；不记一次性任务。\
              recall_day 先查索引再读日期。note_day 仅在明确要求时记录，不得静默观察或记录学生。\n\
@@ -2358,24 +2362,39 @@ impl AppState {
                         None,
                         (t.preview)(&neo_tools::Args::new(t, &args)),
                     ),
-                    (Some(t), Ok(args)) => match policy.decide(t, &args) {
-                        neo_tools::Decision::Allow => (
-                            ToolState::Running,
-                            None,
-                            (t.preview)(&neo_tools::Args::new(t, &args)),
-                        ),
-                        neo_tools::Decision::Confirm(why) => {
-                            (ToolState::AwaitingConfirm, None, why)
+                    (Some(t), Ok(args)) => {
+                        let parsed = neo_tools::Args::new(t, &args);
+                        let preview = (t.preview)(&parsed);
+                        match policy.decide(t, &args) {
+                            neo_tools::Decision::Allow if t.name == "present_result" => {
+                                match neo_tools::tools::present_result::card(&parsed) {
+                                    Ok(card) => {
+                                        let outcome =
+                                            neo_tools::tools::present_result::presented(&card);
+                                        self.presented = Some(std::sync::Arc::new(card));
+                                        (ToolState::Done, Some(outcome), preview)
+                                    }
+                                    Err(error) => (
+                                        ToolState::Done,
+                                        Some(neo_tools::Outcome::fail(t.name, error)),
+                                        preview,
+                                    ),
+                                }
+                            }
+                            neo_tools::Decision::Allow => (ToolState::Running, None, preview),
+                            neo_tools::Decision::Confirm(why) => {
+                                (ToolState::AwaitingConfirm, None, why)
+                            }
+                            neo_tools::Decision::Deny(why) => (
+                                ToolState::Denied,
+                                Some(neo_tools::Outcome::fail(
+                                    t.name,
+                                    neo_tools::ToolError::not_allowed(why),
+                                )),
+                                preview,
+                            ),
                         }
-                        neo_tools::Decision::Deny(why) => (
-                            ToolState::Denied,
-                            Some(neo_tools::Outcome::fail(
-                                t.name,
-                                neo_tools::ToolError::not_allowed(why),
-                            )),
-                            (t.preview)(&neo_tools::Args::new(t, &args)),
-                        ),
-                    },
+                    }
                     (Some(t), Err(why)) => (
                         ToolState::Done,
                         Some(neo_tools::Outcome::fail(
@@ -2417,6 +2436,10 @@ impl AppState {
                 ToolState::AwaitingConfirm => Phase::AwaitingConfirm,
                 ToolState::Running => Phase::Ready,
                 ToolState::Denied => Phase::Denied,
+                // 前端直接落卡的展示工具：没有后台任务，但结果已经成功交付。
+                ToolState::Done if meta.outcome.as_ref().is_some_and(|o| o.is_ok()) => {
+                    Phase::Completed
+                }
                 _ => Phase::Rejected,
             };
             span.event(

@@ -2139,7 +2139,8 @@ impl Drop for MockStream {
 fn synthetic_send_state(image: bool) -> AppState {
     use crate::state::{ChatMessage, Role};
     let mut state = AppState::default();
-    state.context_tokens = 32 * 1024;
+    // 工具声明随工具数量增长；历史摘要测试须留出 system + schema 的固定预算。
+    state.context_tokens = 48 * 1024;
     state.api_key = "synthetic-test".into();
     state.restore_models("deepseek-chat", Some("deepseek-chat"));
     state
