@@ -538,5 +538,6 @@
   "默认开启，限制后台采集和工具权限": "On by default; limits background capture and tool permissions",
   "默认输入设备": "Default input device",
   "（空回复）": "(Empty reply)",
-  "；已保留卡片，未关闭": "; card kept open"
+  "；已保留卡片，未关闭": "; card kept open",
+  "悬浮按钮大小": "Floating button size"
 }

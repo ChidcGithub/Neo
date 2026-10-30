@@ -33,6 +33,32 @@ fn floating_setting_defaults_off_and_roundtrips() {
 }
 
 #[test]
+fn floating_size_defaults_roundtrips_and_clamps() {
+    let ctx = egui::Context::default();
+    let mut app = NeoApp::install(&ctx);
+    assert_eq!(app.state.floating_size, crate::floating::SIZE_DEFAULT);
+    app.state.floating_size = 125;
+    assert!(app.persist_preferences());
+    assert_eq!(app.saved_floating_size, 125);
+    app.state.floating_size = crate::floating::SIZE_DEFAULT;
+    app.load_settings();
+    assert_eq!(app.state.floating_size, 125);
+    for (value, expected) in [
+        ("50", crate::floating::SIZE_MIN),
+        ("200", crate::floating::SIZE_MAX),
+        ("broken", crate::floating::SIZE_DEFAULT),
+    ] {
+        app.store
+            .as_ref()
+            .unwrap()
+            .set_setting("floating_size", value)
+            .unwrap();
+        app.load_settings();
+        assert_eq!(app.state.floating_size, expected, "value={value}");
+    }
+}
+
+#[test]
 fn floating_wake_reuses_dictation_without_enabling_voice_wake() {
     let (ctx, mut app, rx) = app();
     app.handle_floating_wake(&ctx, true);

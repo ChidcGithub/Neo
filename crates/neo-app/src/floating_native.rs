@@ -242,6 +242,7 @@ unsafe fn monitor(point: POINT) -> Result<(RECT, u32), String> {
 struct Surface {
     origin: Point,
     scale: f32,
+    size_percent: u32,
     width: i32,
     height: i32,
     work: RECT,
@@ -292,7 +293,12 @@ impl Surface {
     unsafe fn relayout(&mut self, point: POINT) -> Result<(), String> {
         let (work, dpi) = monitor(point)?;
         let old_scale = self.scale;
-        self.scale = fit_scale(dpi, work.right - work.left, work.bottom - work.top);
+        self.scale = fit_scale(
+            dpi,
+            work.right - work.left,
+            work.bottom - work.top,
+            self.size_percent,
+        );
         self.width = (EXTENT_W * self.scale).round().max(1.0) as i32;
         self.height = (EXTENT_H * self.scale).round().max(1.0) as i32;
         self.origin.x += MAIN_X * (old_scale - self.scale);
@@ -548,7 +554,6 @@ struct RenderCache {
     dib: Option<Dib>,
     scale: Option<f32>,
     icon: Option<image::RgbaImage>,
-    blurred: Option<(f32, image::RgbaImage)>,
     fonts: Fonts,
     label_key: Option<LabelKey>,
     mask: Vec<u8>,
@@ -561,7 +566,6 @@ struct RenderCache {
 struct CacheWork {
     dibs: usize,
     rasterizations: usize,
-    blurs: usize,
     masks: usize,
 }
 
@@ -605,26 +609,11 @@ impl RenderCache {
                 image::RgbaImage::from_raw(width, height, rgba)
                     .ok_or("floating invalid whale bitmap")?,
             );
-            self.blurred = None;
             self.fonts = Fonts::default();
             self.label_key = None;
             self.scale = Some(scale);
         }
         if amount > 0.0 {
-            if self
-                .blurred
-                .as_ref()
-                .is_none_or(|(previous, _)| *previous != amount)
-            {
-                self.blurred = Some((
-                    amount,
-                    image::imageops::blur(self.icon.as_ref().unwrap(), 0.8 * scale * amount),
-                ));
-                #[cfg(test)]
-                {
-                    self.work.blurs += 1;
-                }
-            }
             // Use exact integer GDI bounds, not quantized animation progress.
             // An open menu always has two labels; cache hits need no heap key.
             let mut label_circles = animated_circles(amount).skip(2);
@@ -666,11 +655,7 @@ unsafe fn paint(
     glass: Option<&[u32]>,
 ) -> Result<(), String> {
     cache.prepare(width, height, scale, amount)?;
-    let icon = if amount > 0.0 {
-        &cache.blurred.as_ref().unwrap().1
-    } else {
-        cache.icon.as_ref().unwrap()
-    };
+    let icon = cache.icon.as_ref().unwrap();
     let icon_size = icon.width() as i32;
     let icon_left = (MAIN_X * scale).round() as i32 - icon_size / 2;
     let frame_circles: Vec<_> = animated_circles(amount).collect(); // At most four.
@@ -923,7 +908,13 @@ unsafe fn run_inner(
     let mut cursor = POINT { x: 0, y: 0 };
     GetCursorPos(&mut cursor);
     let (work, dpi) = monitor(cursor)?;
-    let scale = fit_scale(dpi, work.right - work.left, work.bottom - work.top);
+    let size_percent = shared.size_percent();
+    let scale = fit_scale(
+        dpi,
+        work.right - work.left,
+        work.bottom - work.top,
+        size_percent,
+    );
     let width = (EXTENT_W * scale).round().max(1.0) as i32;
     let height = (EXTENT_H * scale).round().max(1.0) as i32;
     let mut surface = Surface {
@@ -932,6 +923,7 @@ unsafe fn run_inner(
             y: (work.top + (work.bottom - work.top - height) / 2) as f32,
         },
         scale,
+        size_percent,
         width,
         height,
         work,
@@ -954,6 +946,17 @@ unsafe fn run_inner(
     loop {
         if shared.stop.load(Ordering::Acquire) {
             break;
+        }
+        let requested_size = shared.size_percent();
+        if surface.size_percent != requested_size {
+            surface.size_percent = requested_size;
+            surface.dirty = true;
+            surface.recapture = true;
+            let center = POINT {
+                x: (surface.origin.x + MAIN_X * surface.scale) as i32,
+                y: (surface.origin.y + MAIN_Y * surface.scale) as i32,
+            };
+            surface.relayout(center)?;
         }
         if refresh_capture(shared, &mut capture_revision, &mut surface.glass) {
             surface.dirty = true;

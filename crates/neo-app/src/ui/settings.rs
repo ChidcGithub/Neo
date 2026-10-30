@@ -381,6 +381,24 @@ fn general_tab(ui: &mut Ui, skin: &Skin<'_>, width: f32, state: &mut AppState) {
         &mut state.floating_enabled,
         "neo-set-floating",
     );
+    if state.floating_enabled {
+        let m = skin.m();
+        ui.add_space(m.s(10.0));
+        ui.label(
+            egui::RichText::new(format!(
+                "{} {}%",
+                tr("悬浮按钮大小"),
+                state.floating_size
+            ))
+            .font(skin.bold(skin.t().label))
+            .color(skin.p().label_primary),
+        );
+        neo_ui::Slider::new(&mut state.floating_size)
+            .range(crate::floating::SIZE_MIN..=crate::floating::SIZE_MAX)
+            .id_salt("neo-floating-size")
+            .show(ui, &skin.d(), width);
+        ui.add_space(m.s(4.0));
+    }
 }
 
 fn appearance_tab(

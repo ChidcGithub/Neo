@@ -3,7 +3,7 @@
 #[cfg(all(windows, not(test)))]
 use std::sync::mpsc;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     mpsc::Receiver,
     Arc,
 };
@@ -26,25 +26,42 @@ pub struct FloatingHandle {
     unavailable_reported: AtomicBool,
 }
 
+/// User-selectable size range for the floating control, in percent.
+pub const SIZE_MIN: u8 = 75;
+pub const SIZE_MAX: u8 = 150;
+pub const SIZE_DEFAULT: u8 = 100;
+
+pub fn clamp_size(percent: u8) -> u8 {
+    percent.clamp(SIZE_MIN, SIZE_MAX)
+}
+
 struct Shared {
     stop: AtomicBool,
     visible: AtomicBool,
     hidden: AtomicBool,
     capture_allowed: AtomicBool,
     capture_revision: AtomicU64,
+    size_percent: AtomicU32,
     dead: AtomicBool,
 }
 
 impl Shared {
-    fn new(capture_allowed: bool) -> Self {
+    fn new(capture_allowed: bool, size_percent: u8) -> Self {
         Self {
             stop: AtomicBool::new(false),
             visible: AtomicBool::new(true),
             hidden: AtomicBool::new(false),
             capture_allowed: AtomicBool::new(capture_allowed),
             capture_revision: AtomicU64::new(0),
+            size_percent: AtomicU32::new(clamp_size(size_percent) as u32),
             dead: AtomicBool::new(false),
         }
+    }
+
+    fn size_percent(&self) -> u32 {
+        self.size_percent
+            .load(Ordering::Acquire)
+            .clamp(SIZE_MIN as u32, SIZE_MAX as u32)
     }
 
     fn interactive(&self) -> bool {
@@ -90,10 +107,14 @@ impl FloatingHandle {
     /// Starts visible. Only call from real app assembly, never a state constructor.
     /// Windows 10 2004+ is the supported native platform.
     /// Pass false in safe mode: no desktop sampling or compositor flush.
-    pub fn start(ctx: egui::Context, capture_allowed: bool) -> Result<Self, String> {
+    pub fn start(
+        ctx: egui::Context,
+        capture_allowed: bool,
+        size_percent: u8,
+    ) -> Result<Self, String> {
         #[cfg(all(windows, not(test)))]
         {
-            let shared = Arc::new(Shared::new(capture_allowed));
+            let shared = Arc::new(Shared::new(capture_allowed, size_percent));
             let (send, actions) = mpsc::sync_channel(8);
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let worker_shared = shared.clone();
@@ -124,7 +145,7 @@ impl FloatingHandle {
         }
         #[cfg(any(not(windows), test))]
         {
-            let _ = (ctx, capture_allowed);
+            let _ = (ctx, capture_allowed, size_percent);
             Err("native floating control is disabled on this platform or in tests".into())
         }
     }
@@ -150,6 +171,13 @@ impl FloatingHandle {
         if self.shared.capture_allowed.swap(allowed, Ordering::AcqRel) != allowed {
             self.shared.capture_revision.fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    /// Change the floating control size; the native worker relayouts on its next tick.
+    pub fn set_size(&self, size_percent: u8) {
+        self.shared
+            .size_percent
+            .store(clamp_size(size_percent) as u32, Ordering::Release);
     }
 
     pub fn try_recv(&self) -> Option<Action> {
@@ -265,7 +293,7 @@ fn circles(menu: bool) -> impl Iterator<Item = Circle> {
                 x: 226.0,
                 y: MENU_Y,
             },
-            radius: 18.0,
+            radius: 20.0,
             target: Target::Close,
         },
         Circle {
@@ -273,7 +301,7 @@ fn circles(menu: bool) -> impl Iterator<Item = Circle> {
                 x: 142.0,
                 y: MENU_Y,
             },
-            radius: 18.0,
+            radius: 20.0,
             target: Target::Ink,
         },
         Circle {
@@ -281,7 +309,7 @@ fn circles(menu: bool) -> impl Iterator<Item = Circle> {
                 x: 184.0,
                 y: MENU_Y,
             },
-            radius: 18.0,
+            radius: 20.0,
             target: Target::Board,
         },
     ]
@@ -350,8 +378,9 @@ fn hit(point: Point, menu: bool) -> Option<Target> {
 
 /// Full menu footprint stays inside the monitor work area, including negative
 /// virtual-desktop coordinates. Tiny work areas shrink rather than overflow.
-fn fit_scale(dpi: u32, width: i32, height: i32) -> f32 {
-    (dpi.max(48) as f32 / 96.0)
+fn fit_scale(dpi: u32, width: i32, height: i32, size_percent: u32) -> f32 {
+    let user_scale = size_percent.clamp(SIZE_MIN as u32, SIZE_MAX as u32) as f32 / 100.0;
+    ((dpi.max(48) as f32 / 96.0) * user_scale)
         .min(4.0)
         .min(width.max(1) as f32 / EXTENT_W)
         .min(height.max(1) as f32 / EXTENT_H)

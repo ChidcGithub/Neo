@@ -15,11 +15,7 @@ fn reference_pixels(
     amount: f32,
     glass: Option<&[u32]>,
 ) -> Vec<u32> {
-    let icon = if amount > 0.0 {
-        &cache.blurred.as_ref().unwrap().1
-    } else {
-        cache.icon.as_ref().unwrap()
-    };
+    let icon = cache.icon.as_ref().unwrap();
     let icon_size = icon.width() as i32;
     let icon_left = (MAIN_X * scale).round() as i32 - icon_size / 2;
     let mut pixels = vec![0; (width * height) as usize];
@@ -157,7 +153,6 @@ fn repeated_frames_reuse_dib_artwork_fonts_and_mask() {
             CacheWork {
                 dibs: 1,
                 rasterizations: 1,
-                blurs: 1,
                 masks: 1
             }
         );
@@ -200,7 +195,6 @@ fn cache_invalidation_distinguishes_language_dpi_and_animation() {
                 CacheWork {
                     dibs: 1,
                     rasterizations: 1,
-                    blurs: 1,
                     masks: 2
                 }
             );
@@ -211,19 +205,17 @@ fn cache_invalidation_distinguishes_language_dpi_and_animation() {
             CacheWork {
                 dibs: 2,
                 rasterizations: 2,
-                blurs: 2,
                 masks: 3
             }
         );
         let fonts = cache.fonts.0.len();
         cache.prepare((EXTENT_W * 1.25) as i32, (EXTENT_H * 1.25) as i32, 1.25, 1.0 - f32::EPSILON).unwrap();
-        // Same rounded text bounds, but the exact blur amount still changes.
+        // Same rounded text bounds: the mask remains reusable.
         assert_eq!(
             cache.work,
             CacheWork {
                 dibs: 2,
                 rasterizations: 2,
-                blurs: 3,
                 masks: 3
             }
         );
@@ -235,7 +227,6 @@ fn cache_invalidation_distinguishes_language_dpi_and_animation() {
             CacheWork {
                 dibs: 2,
                 rasterizations: 3,
-                blurs: 4,
                 masks: 4
             }
         );

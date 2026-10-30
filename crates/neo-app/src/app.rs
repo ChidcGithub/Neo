@@ -370,6 +370,7 @@ pub struct NeoApp {
     saved_silent_startup_errors: bool,
     saved_auto_check_updates: bool,
     saved_floating_enabled: bool,
+    saved_floating_size: u8,
     /// 上次落库的 MOD 启用意图（编码串，变化才写）。
     saved_mod_grants: String,
     /// 上次落库的文件日志开关。
@@ -543,6 +544,7 @@ impl NeoApp {
             saved_silent_startup_errors: false,
             saved_auto_check_updates: true,
             saved_floating_enabled: false,
+            saved_floating_size: crate::floating::SIZE_DEFAULT,
             saved_mod_grants: String::new(),
             saved_file_logging: true,
             floating: None,
@@ -626,6 +628,7 @@ impl NeoApp {
         app.saved_silent_startup_errors = app.state.silent_startup_errors;
         app.saved_auto_check_updates = app.state.auto_check_updates;
         app.saved_floating_enabled = app.state.floating_enabled;
+        app.saved_floating_size = app.state.floating_size;
         app.state
             .sync_startup_policy(crate::startup::set_silent_policy);
         app.applied_classroom_safe = app.state.classroom_safe;
@@ -676,7 +679,11 @@ impl NeoApp {
             return;
         }
         self.floating_attempted = true;
-        match crate::floating::FloatingHandle::start(ctx.clone(), !self.state.classroom_safe) {
+        match crate::floating::FloatingHandle::start(
+            ctx.clone(),
+            !self.state.classroom_safe,
+            self.state.floating_size,
+        ) {
             Ok(handle) => self.floating = Some(handle),
             Err(error) => {
                 record(Level::Warn, "floating", &error);
@@ -800,6 +807,7 @@ impl NeoApp {
         }
         if let Some(handle) = &self.floating {
             handle.set_capture_allowed(!self.state.classroom_safe);
+            handle.set_size(self.state.floating_size);
             handle.set_visible(
                 self.state.floating_enabled
                     && !self.quitting
@@ -1486,6 +1494,10 @@ impl NeoApp {
         self.state.auto_check_updates = get("auto_check_updates").as_deref() != Some("0");
         self.state.file_logging = get("file_logging").as_deref() != Some("0");
         self.state.floating_enabled = get("floating_enabled").as_deref() == Some("1");
+        self.state.floating_size = get("floating_size")
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .map(crate::floating::clamp_size)
+            .unwrap_or(crate::floating::SIZE_DEFAULT);
         self.state
             .sync_startup_policy(crate::startup::set_silent_policy);
         if let Some(v) = get("theme") {
@@ -2150,6 +2162,17 @@ impl NeoApp {
             "floating_enabled",
             if state.floating_enabled { "1" } else { "0" }
         );
+        if state.floating_size != self.saved_floating_size {
+            if Self::save_setting(
+                self.store.as_ref(),
+                "floating_size",
+                &state.floating_size.to_string(),
+            ) {
+                self.saved_floating_size = state.floating_size;
+            } else {
+                saved = false;
+            }
+        }
         save_pref!(
             state.start_in_tray,
             self.saved_prefs.6,

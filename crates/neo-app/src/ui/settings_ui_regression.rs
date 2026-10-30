@@ -323,6 +323,30 @@ fn floating_setting_can_be_toggled_without_enabling_voice_wake() {
 }
 
 #[test]
+fn floating_size_control_appears_only_when_floating_is_enabled() {
+    with_language(Language::ZhCn, || {
+        let ctx = context();
+        let mut state = AppState::default();
+        let size = egui::vec2(720.0, 2400.0);
+        {
+            let mut render = |ui: &mut Ui, skin: &Skin<'_>| {
+                general_tab(ui, skin, 704.0, &mut state);
+            };
+            let output = frame(&ctx, size, vec![], &mut render);
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text().starts_with(tr("悬浮按钮大小")))));
+        }
+        state.floating_enabled = true;
+        let mut render = |ui: &mut Ui, skin: &Skin<'_>| {
+            general_tab(ui, skin, 704.0, &mut state);
+        };
+        let output = frame(&ctx, size, vec![], &mut render);
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text().starts_with(tr("悬浮按钮大小")))));
+    });
+}
+
+#[test]
 fn ui_safety_narrow_settings_log_navigation_is_reachable() {
     for width in [320.0, 460.0] {
         let ctx = context();

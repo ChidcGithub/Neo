@@ -53,13 +53,25 @@ fn test_handle(capture_allowed: bool) -> (FloatingHandle, std::sync::mpsc::SyncS
     let (send, actions) = std::sync::mpsc::sync_channel(8);
     (
         FloatingHandle {
-            shared: Arc::new(Shared::new(capture_allowed)),
+            shared: Arc::new(Shared::new(capture_allowed, SIZE_DEFAULT)),
             actions,
             thread: None,
             unavailable_reported: AtomicBool::new(false),
         },
         send,
     )
+}
+
+#[test]
+fn size_setting_is_shared_and_clamped() {
+    let (handle, _) = test_handle(true);
+    assert_eq!(handle.shared.size_percent(), SIZE_DEFAULT as u32);
+    handle.set_size(125);
+    assert_eq!(handle.shared.size_percent(), 125);
+    handle.set_size(1);
+    assert_eq!(handle.shared.size_percent(), SIZE_MIN as u32);
+    handle.set_size(u8::MAX);
+    assert_eq!(handle.shared.size_percent(), SIZE_MAX as u32);
 }
 
 #[test]
@@ -411,6 +423,7 @@ fn circle_geometry_is_disjoint_inside_canvas_and_horizontal_row() {
     let all: Vec<_> = circles(true).collect();
     assert_eq!(all.len(), 4);
     assert_eq!(circles(false).count(), 1);
+    assert!(all[1..].iter().all(|circle| circle.radius == 20.0));
     for (i, a) in all.iter().enumerate() {
         assert!(a.center.x - a.radius >= 0.0 && a.center.x + a.radius <= EXTENT_W);
         assert!(a.center.y - a.radius >= 0.0 && a.center.y + a.radius <= EXTENT_H);
@@ -504,7 +517,7 @@ fn circle_edge_has_subpixel_coverage_at_multiple_dpi_scales() {
 #[test]
 fn dpi_and_negative_monitor_work_area_keep_full_menu_inside() {
     for dpi in [48, 96, 120, 144, 192, 384, 768] {
-        let scale = fit_scale(dpi, 1920, 1040);
+        let scale = fit_scale(dpi, 1920, 1040, SIZE_DEFAULT as u32);
         let width = (EXTENT_W * scale).round() as i32;
         let height = (EXTENT_H * scale).round() as i32;
         let origin = clamp_origin(
@@ -522,8 +535,13 @@ fn dpi_and_negative_monitor_work_area_keep_full_menu_inside() {
         assert!(origin.x >= -1920.0 && origin.y >= -200.0);
         assert!(origin.x + width as f32 <= 0.0 && origin.y + height as f32 <= 840.0);
     }
-    assert_eq!(fit_scale(144, 1920, 1080), 1.5);
-    let scale = fit_scale(192, 80, 60);
+    assert_eq!(fit_scale(144, 1920, 1080, SIZE_DEFAULT as u32), 1.5);
+    let scale = fit_scale(192, 80, 60, SIZE_DEFAULT as u32);
     assert!(EXTENT_W * scale <= 80.001);
     assert!(EXTENT_H * scale <= 60.001);
+    assert_eq!(fit_scale(96, 1920, 1080, 125), 1.25);
+    // The work area cap still wins over a larger user preference.
+    assert!(EXTENT_W * fit_scale(96, 80, 60, SIZE_MAX as u32) <= 80.001);
+    assert_eq!(clamp_size(1), SIZE_MIN);
+    assert_eq!(clamp_size(u8::MAX), SIZE_MAX);
 }

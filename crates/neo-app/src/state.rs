@@ -782,6 +782,8 @@ pub struct AppState {
     pub wake_sensitivity: u8,
     /// 桌面悬浮按钮（默认关闭）；手动听写不依赖唤醒词开关。
     pub floating_enabled: bool,
+    /// 悬浮按钮大小（百分比，75–150，默认 100）。
+    pub floating_size: u8,
     pub wake_test: WakeTestState,
     /// 启动后直接进入系统托盘后台运行，等待语音唤醒，不显示主界面。
     pub start_in_tray: bool,
@@ -950,6 +952,7 @@ impl Default for AppState {
             wake_enabled: true,
             wake_sensitivity: 65,
             floating_enabled: false,
+            floating_size: crate::floating::SIZE_DEFAULT,
             wake_test: WakeTestState::default(),
             start_in_tray: true,
             class_enabled: false,
