@@ -355,23 +355,18 @@ pub fn header_height(skin: &Skin<'_>) -> f32 {
     pad[0] + skin.m().s(40.0)
 }
 
-/// 工具调用行。
-///
-/// 结构照搬上游 Harness（`dsh-client-ui-tool`，从它的内联 CSS 与 `tool-call-model`
-/// 抽出来的）：
+/// 工具调用行：一次调用只占一行。
 ///
 /// ```text
-/// [图标/状态点] 标题 · 摘要…………………………  [退出码]
+/// [图标/状态点] Search(query="…") · 联网搜索 ………… 执行成功
 /// ```
 ///
-/// - **标题是"变体名"**（读取 / 写入 / 修改 / 执行 / 搜索 / 工具），不是工具自己的名字 ——
-///   一行工具调用的信息密度靠"读了什么、跑没跑通"就够（上游也是这么做的，
-///   它把变体名写成设计字面量；Neo 换了中文词，结构不变）；
-/// - **摘要与标题同一行**，中间隔一个 2pt 圆点，摘要用三级色 + 省略号；
-/// - **行首**平时是变体图标，失败时换成红点、待确认时换成强调色点
-///   （上游 `leadingFor`：error → 红点、stopped → warning 点）；
-/// - **执行中**显示独立状态文字与转圈，不与已完成摘要混淆；
-/// - 命令**非零退出**时摘要后跟一个红色退出码胶囊（上游 `terminalFailed` 的红 pill）。
+/// - **调用形式**用英文变体名 + 声明顺序的前三个参数，例如
+///   `Read(path="src/a.rs", offset=3)`；认不出来的工具用真实工具名；
+/// - **短说明**取工具注册表里的中文短名（≤15 字），用三级色；
+/// - **状态**靠右对齐，失败时变红；非零退出码显示为 `exit N`；
+/// - **行首**平时是变体图标，失败时换成红点、待确认时换成强调色点；
+/// - 执行中只转圈并显示状态文字，不再额外占一行。
 ///
 /// 失败时下面补一行原因 —— 卡片本身就是给老师看的"为什么没成"。
 fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage, content_w: f32) {
@@ -393,26 +388,14 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     let denied = tool.state == ToolState::Denied;
     let cancelled = tool.state == ToolState::Cancelled;
 
-    // 标题：变体名；认不出来的工具退回自己的名字（上游：`工具名 · 摘要`）。
-    let title = if variant == Variant::Others {
-        present::others_title(&tool.name)
-    } else {
-        tr(variant.title()).to_owned()
-    };
-    // 摘要：待确认时说的是"将要做什么"（工具自己写的 preview），
-    // 其余用参数派生（上游的 `deriveSummary`：模型写的一句话 > 命令本身）。
-    let summary = if awaiting {
-        tool.preview.clone()
-    } else {
-        let s = present::summary(variant, &tool.args);
-        if s.is_empty() {
-            tool.line()
-        } else {
-            s
-        }
-    };
+    // 一行只放一次调用：`Search(query="...") · 联网搜索`。
+    // 参数按工具声明顺序取前三个，值做单行截断；认不出来的工具用原名。
+    let call = present::call_signature(variant, &tool.name, &tool.args);
+    let purpose = neo_tools::find(&tool.name)
+        .map(|t| tr(t.title))
+        .unwrap_or_else(|| tr("工具"));
 
-    // 命令的退出码（非零才显示胶囊）。
+    // 命令的退出码（非零才显示）。
     let exit_code = tool
         .outcome
         .as_ref()
@@ -437,9 +420,6 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
     } else {
         None
     };
-    ui.add(egui::Label::new(egui::RichText::new(status)
-        .font(skin.prop(t.caption)).color(if failed { p.error } else { p.label_secondary })).wrap());
-
     // 上游：一行 14px/24px；leading 16px，右侧 6px。
     let lh = t.label_lh.max(t.label * 1.5);
     let pad_x = m.s(6.0);
@@ -479,55 +459,88 @@ fn draw_tool_card(ui: &mut Ui, skin: &Skin<'_>, msg: &crate::state::ChatMessage,
         icon_for(variant).paint(painter, lead_rect, p.label_tertiary);
     }
 
-    // ---- 标题 · 摘要 ----
-    let title_font = skin.prop(t.label);
-    let summary_font = skin.prop(t.label);
+    // ---- 一行：调用形式 · 短说明 ………… 状态 ----
+    let call_font = skin.prop(t.label);
+    let purpose_font = skin.prop(t.caption);
+    let status_font = skin.prop(t.caption);
     let mut x = lead_rect.right() + m.s(6.0);
 
-    let avail_end = row.right() - pad_x;
-    // 标题也要 elide：模型给的异常长工具名不该画出内容列右缘。
-    let shown_title = super::elide(painter, &title, &title_font, (avail_end - x).max(0.0));
-    let title_w = painter
-        .layout_no_wrap(shown_title.clone(), title_font.clone(), p.label_primary)
+    // 右侧先放退出码与状态，调用说明只使用剩余宽度。
+    let mut right = row.right() - pad_x;
+    if let Some(code) = exit_code.filter(|c| *c != 0 && tool.state == ToolState::Done) {
+        let text = format!("exit {code}");
+        let font = skin.mono(t.caption);
+        let width = painter
+            .layout_no_wrap(text.clone(), font.clone(), p.error)
+            .size()
+            .x;
+        right -= width;
+        painter.text(
+            egui::pos2(right, cy),
+            egui::Align2::LEFT_CENTER,
+            text,
+            font,
+            p.error,
+        );
+        right -= gap;
+    }
+    let status_w = painter
+        .layout_no_wrap(status.to_owned(), status_font.clone(), p.label_secondary)
         .size()
         .x;
+    right -= status_w;
+    painter.text(
+        egui::pos2(right, cy),
+        egui::Align2::LEFT_CENTER,
+        status,
+        status_font,
+        if failed { p.error } else { p.label_secondary },
+    );
+    let avail_end = (right - gap).max(x);
 
+    // 先给短说明留出空间，剩下的给调用签名。
+    let purpose_w = painter
+        .layout_no_wrap(purpose.to_owned(), purpose_font.clone(), p.label_tertiary)
+        .size()
+        .x;
+    let show_purpose = purpose_w + gap * 2.0 + m.s(48.0) <= avail_end - x;
+    let call_budget = if show_purpose {
+        (avail_end - x - purpose_w - gap * 2.0).max(0.0)
+    } else {
+        (avail_end - x).max(0.0)
+    };
+    let shown_call = super::elide(painter, &call, &call_font, call_budget);
+    let call_w = painter
+        .layout_no_wrap(shown_call.clone(), call_font.clone(), p.label_primary)
+        .size()
+        .x;
     painter.text(
         egui::pos2(x, cy),
         egui::Align2::LEFT_CENTER,
-        shown_title,
-        title_font,
+        shown_call,
+        call_font,
         p.label_primary,
     );
-    x += title_w;
+    x += call_w;
 
-    // 2pt 圆点分隔符（上游 `.sep`：2px 圆点，左右各 8px，label-caption 色）
-    if x + gap * 2.0 + m.s(12.0) < avail_end {
-        painter.circle_filled(egui::pos2(x + gap, cy), sep * 0.5, p.label_caption);
-        x += gap * 2.0;
-    }
-
-    if x < avail_end {
-        let shown = super::elide(painter, &summary, &summary_font, avail_end - x);
-        painter.text(
-            egui::pos2(x, cy),
-            egui::Align2::LEFT_CENTER,
-            shown,
-            summary_font,
-            p.label_tertiary,
-        );
-    }
-
-    // 退出码另占布局；极窄列放不下徽标时保留完整换行文本。
-    if let Some(code) = exit_code.filter(|c| *c != 0 && tool.state == ToolState::Done) {
-        let text = code.to_string();
-        let badge = neo_ui::Badge::new(&text).tone(neo_ui::BadgeTone::Danger);
-        if badge.width(ui, &skin.d()) <= content_w {
-            badge.show(ui, &skin.d());
-        } else {
-            ui.add(egui::Label::new(egui::RichText::new(text).font(skin.mono(t.caption)).color(p.error)).wrap());
+    if show_purpose {
+        // 2pt 圆点分隔符（上游 `.sep`：2px 圆点，左右各 8px，label-caption 色）
+        if x + gap * 2.0 + m.s(12.0) < avail_end {
+            painter.circle_filled(egui::pos2(x + gap, cy), sep * 0.5, p.label_caption);
+            x += gap * 2.0;
+        }
+        if x < avail_end {
+            let shown = super::elide(painter, purpose, &purpose_font, avail_end - x);
+            painter.text(
+                egui::pos2(x, cy),
+                egui::Align2::LEFT_CENTER,
+                shown,
+                purpose_font,
+                p.label_tertiary,
+            );
         }
     }
+
     if let Some(text) = err_text.filter(|_| failed) {
         neo_ui::InlineNotice::new(("tool-error", &tool.call_id), &text)
             .tone(tone).show(ui, &skin.d());

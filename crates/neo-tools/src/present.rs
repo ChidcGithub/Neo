@@ -83,6 +83,21 @@ impl Variant {
         matches!(self, Variant::Read | Variant::Write | Variant::Edit)
     }
 
+    /// 英文函数式名称，用于工具调用行（`Search(...)`）。
+    pub fn call_name(self) -> &'static str {
+        match self {
+            Variant::Search => "Search",
+            Variant::Read => "Read",
+            Variant::Bash => "Bash",
+            Variant::Write => "Write",
+            Variant::Edit => "Edit",
+            Variant::Screen => "Screen",
+            Variant::Present => "Present",
+            Variant::Code => "Code",
+            Variant::Others => "Tool",
+        }
+    }
+
     /// 中文行标题。
     ///
     /// 上游用 `Search` / `Read` / `Bash` … 这批字面量，并在源码里注明
@@ -127,6 +142,66 @@ pub fn summary(variant: Variant, args: &Value) -> String {
         return first_line(args.as_str().unwrap_or_default());
     }
     String::new()
+}
+
+/// 一行调用形式：`Search(query="…", open_browser=false)`。
+///
+/// 参数按工具声明顺序排列（模型最常写的在前），最多三个；字符串只留首行
+/// 和前 28 个字符，数组/对象折叠成 `[…]` / `{…}`，保证整行可读。
+pub fn call_signature(variant: Variant, tool_name: &str, args: &Value) -> String {
+    let name = if variant == Variant::Others {
+        tool_name
+    } else {
+        variant.call_name()
+    };
+    let Some(obj) = args.as_object() else {
+        return format!("{name}()");
+    };
+    let mut keys: Vec<&str> = Vec::new();
+    if let Some(tool) = crate::find(tool_name) {
+        for param in tool.params {
+            if obj.get(param.name).is_some_and(|value| !value.is_null()) {
+                keys.push(param.name);
+            }
+        }
+    }
+    for key in obj.keys() {
+        if !keys.contains(&key.as_str()) && !obj[key].is_null() {
+            keys.push(key);
+        }
+    }
+    const MAX_ARGS: usize = 3;
+    let total = keys.len();
+    let shown: Vec<String> = keys
+        .into_iter()
+        .take(MAX_ARGS)
+        .map(|key| format!("{key}={}", compact_value(&obj[key])))
+        .collect();
+    if shown.is_empty() {
+        format!("{name}()")
+    } else {
+        let more = if total > shown.len() { "…" } else { "" };
+        format!("{name}({}{more})", shown.join(", "))
+    }
+}
+
+fn compact_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => {
+            let line = first_line(text).replace('"', "'");
+            let count = line.chars().count();
+            let mut shown: String = line.chars().take(28).collect();
+            if count > 28 {
+                shown.push('…');
+            }
+            format!("\"{shown}\"")
+        }
+        Value::Number(number) => number.to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Null => "null".to_owned(),
+        Value::Array(_) => "[…]".to_owned(),
+        Value::Object(_) => "{…}".to_owned(),
+    }
 }
 
 /// 文件类变体的目标路径（用于"点开文件"）。

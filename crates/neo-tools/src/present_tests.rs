@@ -54,6 +54,36 @@
     }
 
     #[test]
+    fn call_signature_is_one_line_with_compact_values() {
+        let args = json!({"query": "rust", "open_browser": false});
+        assert_eq!(
+            call_signature(Variant::Search, "web_search", &args),
+            "Search(query=\"rust\", open_browser=false)"
+        );
+        let args = json!({"path": "src/a.rs", "offset": 3});
+        assert_eq!(
+            call_signature(Variant::Read, "read_file", &args),
+            "Read(path=\"src/a.rs\", offset=3)"
+        );
+        let args = json!({
+            "title": "T",
+            "content": "line1\nline2".repeat(50)
+        });
+        let sig = call_signature(Variant::Present, "present_result", &args);
+        assert!(sig.starts_with("Present(title=\"T\", content=\"line1"));
+        assert!(!sig.contains('\n'));
+        assert!(sig.chars().count() < 80);
+        assert_eq!(
+            call_signature(Variant::Others, "remember", &json!({"content": "x"})),
+            "remember(content=\"x\")"
+        );
+        assert_eq!(
+            call_signature(Variant::Search, "web_search", &serde_json::Value::Null),
+            "Search()"
+        );
+    }
+
+    #[test]
     fn bash_prefers_description_over_command() {
         let args = json!({ "command": "cargo test", "description": "跑单元测试" });
         assert_eq!(summary(Variant::Bash, &args), "跑单元测试");

@@ -163,6 +163,59 @@ fn tool_states_are_exclusive_and_errors_remain_accessible() {
 }
 
 #[test]
+fn tool_card_is_one_line_with_call_signature_and_short_purpose() {
+    use crate::state::{ChatMessage, Role, ToolMeta, ToolState};
+    let ctx = context();
+    let mut msg = ChatMessage::new(Role::Tool, String::new());
+    msg.tool = Some(ToolMeta {
+        call_id: "one-line".into(),
+        name: "web_search".into(),
+        title: "联网搜索",
+        risk: "read",
+        preview: "搜索：rust".into(),
+        args: serde_json::json!({"query": "rust"}),
+        state: ToolState::Done,
+        outcome: Some(neo_tools::Outcome::ok(
+            "web_search",
+            "ok",
+            serde_json::Value::Null,
+        )),
+    });
+    let output = frame_themed(
+        &ctx,
+        Vec2::new(520.0, 200.0),
+        vec![],
+        neo_theme::ThemeMode::Dark,
+        |ui, skin| draw_tool_card(ui, skin, &msg, 480.0),
+    );
+    let texts: Vec<_> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    let call = texts
+        .iter()
+        .find(|text| text.galley.text() == "Search(query=\"rust\")")
+        .expect("调用签名");
+    let purpose = texts
+        .iter()
+        .find(|text| text.galley.text() == "联网搜索")
+        .expect("短说明");
+    let status = texts
+        .iter()
+        .find(|text| text.galley.text() == tr("执行成功"))
+        .expect("状态");
+    let center_y = |text: &egui::epaint::TextShape| {
+        text.galley.rect.translate(text.pos.to_vec2()).center().y
+    };
+    assert!((center_y(call) - center_y(purpose)).abs() < 1.0);
+    assert!((center_y(call) - center_y(status)).abs() < 1.0);
+}
+
+#[test]
 fn long_code_and_wide_table_stay_readable_inside_message_column() {
     for mode in [neo_theme::ThemeMode::Light, neo_theme::ThemeMode::Dark] {
         for width in [320.0, 768.0, 1920.0] {
