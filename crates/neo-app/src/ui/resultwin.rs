@@ -174,9 +174,6 @@ fn paint(
         .id_salt("neo-resultwin-close")
         .show_at(ui, &d, close_center)
         .on_hover_text(crate::i18n::tr("关闭"));
-    #[cfg(test)]
-    ui.ctx()
-        .data_mut(|data| data.insert_temp(egui::Id::new("neo-resultwin-close-probe"), close.rect));
     let close = close.clicked();
 
     let title_font = d.font_bold(d.t().label + m.s(4.0));

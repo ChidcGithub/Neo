@@ -128,10 +128,16 @@ fn callback_renders_markdown_and_close_button() {
         .collect();
     assert!(texts.iter().any(|text| text.contains("勾股定理证明")));
     assert!(texts.iter().any(|text| text.contains("第一步")));
-    let close: Rect = ctx.data(|data| {
-        data.get_temp(egui::Id::new("neo-resultwin-close-probe"))
-            .expect("close button probe")
-    });
+    let close = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == neo_ui::Icon::Close.glyph() => {
+                Some(text.galley.rect.translate(text.pos.to_vec2()))
+            }
+            _ => None,
+        })
+        .expect("close button glyph");
     assert!(Rect::from_min_size(Pos2::ZERO, size).contains_rect(close));
 }
 
