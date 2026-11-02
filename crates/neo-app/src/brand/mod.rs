@@ -124,6 +124,11 @@ pub fn tray_rgba(size: usize, white: bool) -> (Vec<u8>, u32, u32) {
     )
 }
 
+/// Tray's alternate style (`neo` + spark), same color as [`tray_rgba`].
+pub fn tray_spark_rgba(size: usize, white: bool) -> (Vec<u8>, u32, u32) {
+    window_rgba(size, white)
+}
+
 /// Square window/taskbar icon (`neo` + spark). `white = true` selects the
 /// dark-background variant.
 pub fn window_rgba(size: usize, white: bool) -> (Vec<u8>, u32, u32) {

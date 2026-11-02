@@ -13,6 +13,8 @@
         for (name, (rgba, w, h)) in [
             ("tray black", tray_rgba(64, false)),
             ("tray white", tray_rgba(64, true)),
+            ("tray spark black", tray_spark_rgba(64, false)),
+            ("tray spark white", tray_spark_rgba(64, true)),
             ("window black", window_rgba(64, false)),
             ("window white", window_rgba(64, true)),
             ("app black", app_rgba(96, false)),

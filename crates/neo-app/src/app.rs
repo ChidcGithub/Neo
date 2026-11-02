@@ -424,6 +424,8 @@ pub struct NeoApp {
     tray_quit_id: tray_icon::menu::MenuId,
     /// 托盘图标当前是否使用白色（深色背景）版本。
     tray_icon_white: bool,
+    /// 托盘当前是否使用 `neo + spark` 样式。
+    tray_icon_spark: bool,
     /// 上一次轮换托盘图标的时间。
     tray_icon_at: std::time::Instant,
     /// 已应用的窗口图标颜色；`None` 表示等首次主题同步。
@@ -578,6 +580,7 @@ impl NeoApp {
             tray_show_id: tray_icon::menu::MenuId::new("neo-tray-show"),
             tray_quit_id: tray_icon::menu::MenuId::new("neo-tray-quit"),
             tray_icon_white: true,
+            tray_icon_spark: false,
             tray_icon_at: std::time::Instant::now(),
             window_icon_white: None,
             hidden_to_tray: false,
@@ -1022,6 +1025,7 @@ impl NeoApp {
             return;
         }
         self.tray_icon_white = self.state.theme_mode == ThemeMode::Dark;
+        self.tray_icon_spark = false;
         self.tray_icon_at = std::time::Instant::now();
         let (rgba, w, h) = crate::brand::tray_rgba(64, self.tray_icon_white);
         let icon = match tray_icon::Icon::from_rgba(rgba, w, h) {
@@ -1050,7 +1054,11 @@ impl NeoApp {
     /// 托盘没有 winit 唤醒源，隐藏期间靠 `request_repaint_after` 保持低频轮询。
     fn apply_tray_icon(&self) {
         let Some(tray) = &self.tray else { return };
-        let (rgba, w, h) = crate::brand::tray_rgba(64, self.tray_icon_white);
+        let (rgba, w, h) = if self.tray_icon_spark {
+            crate::brand::tray_spark_rgba(64, self.tray_icon_white)
+        } else {
+            crate::brand::tray_rgba(64, self.tray_icon_white)
+        };
         if let Ok(icon) = tray_icon::Icon::from_rgba(rgba, w, h) {
             let _ = tray.set_icon(Some(icon));
         }
@@ -1060,10 +1068,10 @@ impl NeoApp {
         if self.tray.is_none() {
             return;
         }
-        // 黑白两版轮换，避免固定单色在深浅任务栏上长期失去辨识度。
+        // 同一种颜色下轮换字标样式：纯 `neo` ↔ `neo + spark`。
         const ROTATE: std::time::Duration = std::time::Duration::from_secs(3);
         if self.tray_icon_at.elapsed() >= ROTATE {
-            self.tray_icon_white = !self.tray_icon_white;
+            self.tray_icon_spark = !self.tray_icon_spark;
             self.tray_icon_at = std::time::Instant::now();
             self.apply_tray_icon();
             ctx.request_repaint_after(ROTATE);
@@ -2465,6 +2473,10 @@ impl NeoApp {
         self.theme = Theme::new(self.state.theme_mode, viewport.y, self.state.distance);
         self.theme.apply(ctx);
         let white = self.state.theme_mode == ThemeMode::Dark;
+        if self.tray_icon_white != white {
+            self.tray_icon_white = white;
+            self.apply_tray_icon();
+        }
         if self.window_icon_white != Some(white) {
             let (rgba, width, height) = crate::brand::window_rgba(64, white);
             ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(

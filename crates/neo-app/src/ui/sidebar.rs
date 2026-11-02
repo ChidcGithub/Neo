@@ -64,7 +64,7 @@ pub fn draw(
         egui::pos2(content.left() + m.s(4.0), y),
         Vec2::new(content.width() - m.s(8.0), brand_h),
     );
-    let mascot_w = m.s(24.0);
+    let mascot_w = m.s(30.0);
     skin.mascot.paint(
         ui.painter(),
         Rect::from_min_size(
