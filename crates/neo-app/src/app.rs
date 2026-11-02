@@ -1027,7 +1027,8 @@ impl NeoApp {
         self.tray_icon_white = self.state.theme_mode == ThemeMode::Dark;
         self.tray_icon_spark = false;
         self.tray_icon_at = std::time::Instant::now();
-        let (rgba, w, h) = crate::brand::tray_rgba(64, self.tray_icon_white);
+        let (rgba, w, h) =
+            crate::brand::tray_rgba(crate::brand::tray_size(), self.tray_icon_white);
         let icon = match tray_icon::Icon::from_rgba(rgba, w, h) {
             Ok(icon) => icon,
             Err(_) => {
@@ -1049,21 +1050,23 @@ impl NeoApp {
         }
     }
 
-    /// 轮询托盘事件：图标点击 / 菜单点击。
-    ///
-    /// 托盘没有 winit 唤醒源，隐藏期间靠 `request_repaint_after` 保持低频轮询。
+    /// 按系统小图标尺寸重画托盘图标，避免 Windows 二次缩放把字标糊掉。
     fn apply_tray_icon(&self) {
         let Some(tray) = &self.tray else { return };
+        let size = crate::brand::tray_size();
         let (rgba, w, h) = if self.tray_icon_spark {
-            crate::brand::tray_spark_rgba(64, self.tray_icon_white)
+            crate::brand::tray_spark_rgba(size, self.tray_icon_white)
         } else {
-            crate::brand::tray_rgba(64, self.tray_icon_white)
+            crate::brand::tray_rgba(size, self.tray_icon_white)
         };
         if let Ok(icon) = tray_icon::Icon::from_rgba(rgba, w, h) {
             let _ = tray.set_icon(Some(icon));
         }
     }
 
+    /// 轮询托盘事件：图标点击 / 菜单点击。
+    ///
+    /// 托盘没有 winit 唤醒源，隐藏期间靠 `request_repaint_after` 保持低频轮询。
     fn poll_tray(&mut self, ctx: &egui::Context) {
         if self.tray.is_none() {
             return;

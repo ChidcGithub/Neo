@@ -112,7 +112,28 @@ fn rgba_from_png(bytes: &[u8], size: usize) -> (Vec<u8>, u32, u32) {
     (resized.into_raw(), size as u32, size as u32)
 }
 
-/// Square tray icon. `white = true` selects the dark-background variant.
+/// Physical pixel size of a notification-area icon.
+///
+/// Rendering the wordmark at exactly this size keeps Windows from resampling
+/// the thin glyphs into a blur.
+pub fn tray_size() -> usize {
+    #[cfg(windows)]
+    let size = {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+        unsafe { GetSystemMetrics(SM_CXSMICON) }
+    };
+    #[cfg(not(windows))]
+    let size = 32;
+    usize::try_from(size)
+        .ok()
+        .filter(|size| *size > 0)
+        .unwrap_or(32)
+}
+
+/// Square tray wordmark. `white = true` selects the dark-background variant.
+///
+/// The embedded PNG has no horizontal padding, so the wordmark fills the
+/// notification-area slot instead of floating inside a mostly empty square.
 pub fn tray_rgba(size: usize, white: bool) -> (Vec<u8>, u32, u32) {
     rgba_from_png(
         if white {

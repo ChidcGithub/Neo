@@ -30,6 +30,33 @@
     }
 
     #[test]
+    fn tray_wordmark_fills_the_icon_width() {
+        for white in [false, true] {
+            let (rgba, w, _) = tray_rgba(64, white);
+            let mut min_x = w;
+            let mut max_x = 0;
+            for (i, pixel) in rgba.chunks_exact(4).enumerate() {
+                if pixel[3] > 0 {
+                    let x = (i as u32) % w;
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                }
+            }
+            assert!(
+                max_x - min_x + 1 >= w - 2,
+                "tray wordmark leaves {min_x} px on the left and {} px on the right",
+                w - 1 - max_x
+            );
+        }
+    }
+
+    #[test]
+    fn tray_size_is_a_plausible_system_icon_size() {
+        let size = tray_size();
+        assert!((16..=128).contains(&size), "unexpected tray size {size}");
+    }
+
+    #[test]
     fn parses_four_subpaths() {
         // 上游路径由 4 条子路径组成：身体 + 鳍挖空 + 眼睛 + 鳍/嘴挖空。
         // 数量由 `d` 字符串里的 M/Z 对决定，与 SVG 源一一对应。
