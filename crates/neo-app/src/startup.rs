@@ -1008,7 +1008,11 @@ mod native {
             .map(|pixel| (*pixel & 255) as u8)
             .collect();
         let size = (geometry.icon.right - geometry.icon.left) as usize;
-        let (icon, _, _) = crate::brand::whale_rgba(size);
+        let luminance = (palette.body[0] as u32 * 299
+            + palette.body[1] as u32 * 587
+            + palette.body[2] as u32 * 114)
+            / 1000;
+        let (icon, _, _) = crate::brand::app_rgba(size, luminance < 128);
         let glass = card.glass.borrow();
         render_plate(geometry, &mask, &icon, glass.as_deref(), palette)
     }

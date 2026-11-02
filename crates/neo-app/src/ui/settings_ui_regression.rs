@@ -89,7 +89,7 @@ fn settings_i18n_english_pages_wrap_at_narrow_widths() {
                         neo_theme::Metrics::from_scale(scale),
                     );
                     theme.apply(&ctx);
-                    let whale = crate::brand::WhaleMark::cached(&ctx);
+                    let whale = crate::brand::MascotMark::cached(&ctx);
                     let skin = Skin::new(theme, &whale);
                     let mut state = AppState::default();
                     state.language = Language::EnUs;
@@ -393,7 +393,7 @@ fn narrow_scaled_settings_keep_warnings_readable() {
                     neo_theme::Metrics::from_scale(scale),
                 );
                 theme.apply(&ctx);
-                let whale = crate::brand::WhaleMark::cached(&ctx);
+                let whale = crate::brand::MascotMark::cached(&ctx);
                 let skin = Skin::new(theme, &whale);
                 let size = egui::vec2(width, 720.0);
                 let mut state = AppState::default();
@@ -475,7 +475,7 @@ fn model_credentials_hint_wraps_without_painting_the_key() {
                 neo_theme::Metrics::from_scale(scale),
             );
             theme.apply(&ctx);
-            let whale = crate::brand::WhaleMark::cached(&ctx);
+            let whale = crate::brand::MascotMark::cached(&ctx);
             let skin = Skin::new(theme, &whale);
             let mut state = AppState::default();
             state.api_key = "PRIVATE-KEY-NOT-FOR-DISPLAY".into();
@@ -529,7 +529,7 @@ fn five_thinking_choices_wrap_without_overlap_and_all_click() {
                 neo_theme::Metrics::from_scale(scale),
             );
             theme.apply(&ctx);
-            let whale = crate::brand::WhaleMark::cached(&ctx);
+            let whale = crate::brand::MascotMark::cached(&ctx);
             let skin = Skin::new(theme, &whale);
             let labels: Vec<&str> = neo_llm::Thinking::ALL.iter().map(|t| t.label()).collect();
             let mut selected = 0;
@@ -632,7 +632,7 @@ fn long_values_and_section_titles_use_real_wrapped_height() {
                 neo_theme::Metrics::from_scale(scale),
             );
             theme.apply(&ctx);
-            let whale = crate::brand::WhaleMark::cached(&ctx);
+            let whale = crate::brand::MascotMark::cached(&ctx);
             let skin = Skin::new(theme, &whale);
             let values = [
                 "provider/model-long-name-".repeat(8),
@@ -689,7 +689,7 @@ fn long_page_title_reserves_clickable_close_target() {
                 neo_theme::Metrics::from_scale(scale),
             );
             theme.apply(&ctx);
-            let whale = crate::brand::WhaleMark::cached(&ctx);
+            let whale = crate::brand::MascotMark::cached(&ctx);
             let skin = Skin::new(theme, &whale);
             let size = egui::vec2(width, 420.0);
             let mut state = AppState::default();
@@ -761,7 +761,7 @@ fn low_height_large_scale_keeps_body_scrollable_and_close_clear() {
             neo_theme::Metrics::from_scale(scale),
         );
         theme.apply(&ctx);
-        let whale = crate::brand::WhaleMark::cached(&ctx);
+        let whale = crate::brand::MascotMark::cached(&ctx);
         let skin = Skin::new(theme, &whale);
         let size = egui::vec2(width, height);
         let mut state = AppState::default();
@@ -882,7 +882,7 @@ fn memory_list_long_text_wraps_with_aligned_compact_actions() {
             neo_theme::fonts::install(&ctx);
             let theme = neo_theme::Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
             theme.apply(&ctx);
-            let whale = crate::brand::WhaleMark::cached(&ctx);
+            let whale = crate::brand::MascotMark::cached(&ctx);
             let skin = Skin::new(theme, &whale);
             let mut state = AppState::default();
             state.memories = [
@@ -1040,7 +1040,7 @@ fn memory_delete_requires_confirmation_and_targets_do_not_overlap() {
                     let theme =
                         neo_theme::Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
                     theme.apply(&ctx);
-                    let whale = crate::brand::WhaleMark::cached(&ctx);
+                    let whale = crate::brand::MascotMark::cached(&ctx);
                     let skin = Skin::new(theme, &whale);
                     let mut state = AppState::default();
                     state.memories = (1..=3)
@@ -1134,7 +1134,7 @@ fn long_memory_list_scrolls_back_to_error_owner_and_preserves_draft() {
         neo_theme::Metrics::from_scale(1.0),
     );
     theme.apply(&ctx);
-    let whale = crate::brand::WhaleMark::cached(&ctx);
+    let whale = crate::brand::MascotMark::cached(&ctx);
     let skin = Skin::new(theme, &whale);
     let mut state = AppState::default();
     state.memories = (1..=80)
@@ -1313,7 +1313,7 @@ fn context_budget_uses_number_field_with_chinese_label_and_clamped_steps() {
         let size = egui::vec2(width, 6000.0);
         // 固定同一个 scale 的 Skin 渲染，探针矩形与组件高度才能逐字节对账。
         let mut run = |events: Vec<egui::Event>| {
-            let whale = crate::brand::WhaleMark::cached(&ctx);
+            let whale = crate::brand::MascotMark::cached(&ctx);
             let skin = Skin::new(theme, &whale);
             let mut output = ctx.run_ui(
                 egui::RawInput {

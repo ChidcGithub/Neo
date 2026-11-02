@@ -15,7 +15,7 @@ use egui::{Id, Rect, Vec2};
 use neo_store::Store;
 use neo_theme::{fonts::LoadedFonts, Distance, Theme, ThemeMode};
 
-use crate::brand::WhaleMark;
+use crate::brand::MascotMark;
 use crate::diagnostics::{record, Failure, Level, Phase};
 use crate::i18n::{self, tf, tr, Language};
 use crate::state::{AppState, Role, Stage, StreamSource};
@@ -353,7 +353,7 @@ struct DrawingDesktop {
 
 pub struct NeoApp {
     state: AppState,
-    whale: WhaleMark,
+    mascot: MascotMark,
     fonts: LoadedFonts,
     theme: Theme,
     fingerprint: Option<Fingerprint>,
@@ -422,6 +422,12 @@ pub struct NeoApp {
     tray_show_id: tray_icon::menu::MenuId,
     /// 托盘菜单「退出」的 id。
     tray_quit_id: tray_icon::menu::MenuId,
+    /// 托盘图标当前是否使用白色（深色背景）版本。
+    tray_icon_white: bool,
+    /// 上一次轮换托盘图标的时间。
+    tray_icon_at: std::time::Instant,
+    /// 已应用的窗口图标颜色；`None` 表示等首次主题同步。
+    window_icon_white: Option<bool>,
     /// 当前是否处于「关窗转后台」的隐藏态。
     hidden_to_tray: bool,
     /// 保存屏障通过或用户确认丢弃后，放行下一次关闭且不再启动任务。
@@ -499,7 +505,7 @@ impl NeoApp {
     /// 在帧内装配会直接 panic。`eframe` 的 `app_creator` 满足这一约束。
     pub fn install(ctx: &egui::Context) -> Self {
         let fonts = neo_theme::fonts::install(ctx);
-        let whale = WhaleMark::load(ctx);
+        let mascot = MascotMark::load(ctx);
 
         // 持久化：打不开就降级为纯内存模式，不挡启动。
         #[cfg(not(test))]
@@ -530,7 +536,7 @@ impl NeoApp {
 
         let mut app = Self {
             state,
-            whale,
+            mascot,
             fonts,
             theme: Theme::new(ThemeMode::Dark, 1080.0, Distance::default()),
             fingerprint: None,
@@ -571,6 +577,9 @@ impl NeoApp {
             tray_labels: None,
             tray_show_id: tray_icon::menu::MenuId::new("neo-tray-show"),
             tray_quit_id: tray_icon::menu::MenuId::new("neo-tray-quit"),
+            tray_icon_white: true,
+            tray_icon_at: std::time::Instant::now(),
+            window_icon_white: None,
             hidden_to_tray: false,
             quitting: false,
             exit_blocked: false,
@@ -1012,7 +1021,9 @@ impl NeoApp {
             record(Level::Error, "tray", "托盘菜单创建失败");
             return;
         }
-        let (rgba, w, h) = crate::brand::whale_rgba(64);
+        self.tray_icon_white = self.state.theme_mode == ThemeMode::Dark;
+        self.tray_icon_at = std::time::Instant::now();
+        let (rgba, w, h) = crate::brand::tray_rgba(64, self.tray_icon_white);
         let icon = match tray_icon::Icon::from_rgba(rgba, w, h) {
             Ok(icon) => icon,
             Err(_) => {
@@ -1037,9 +1048,25 @@ impl NeoApp {
     /// 轮询托盘事件：图标点击 / 菜单点击。
     ///
     /// 托盘没有 winit 唤醒源，隐藏期间靠 `request_repaint_after` 保持低频轮询。
+    fn apply_tray_icon(&self) {
+        let Some(tray) = &self.tray else { return };
+        let (rgba, w, h) = crate::brand::tray_rgba(64, self.tray_icon_white);
+        if let Ok(icon) = tray_icon::Icon::from_rgba(rgba, w, h) {
+            let _ = tray.set_icon(Some(icon));
+        }
+    }
+
     fn poll_tray(&mut self, ctx: &egui::Context) {
         if self.tray.is_none() {
             return;
+        }
+        // 黑白两版轮换，避免固定单色在深浅任务栏上长期失去辨识度。
+        const ROTATE: std::time::Duration = std::time::Duration::from_secs(3);
+        if self.tray_icon_at.elapsed() >= ROTATE {
+            self.tray_icon_white = !self.tray_icon_white;
+            self.tray_icon_at = std::time::Instant::now();
+            self.apply_tray_icon();
+            ctx.request_repaint_after(ROTATE);
         }
         while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
             // 左键按下即唤回（比双击省一步，教室里少一次操作）。
@@ -2437,6 +2464,18 @@ impl NeoApp {
         }
         self.theme = Theme::new(self.state.theme_mode, viewport.y, self.state.distance);
         self.theme.apply(ctx);
+        let white = self.state.theme_mode == ThemeMode::Dark;
+        if self.window_icon_white != Some(white) {
+            let (rgba, width, height) = crate::brand::window_rgba(64, white);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(
+                egui::IconData {
+                    rgba,
+                    width,
+                    height,
+                },
+            ))));
+            self.window_icon_white = Some(white);
+        }
         self.fingerprint = Some(key);
     }
 
@@ -3417,12 +3456,12 @@ impl NeoApp {
         // ---- 2. 绘制 ----
         let NeoApp {
             state,
-            whale,
+            mascot,
             fonts,
             theme,
             ..
         } = self;
-        let skin = Skin::new(*theme, whale);
+        let skin = Skin::new(*theme, mascot);
         let m = skin.m();
         let p = skin.p();
 

@@ -2,6 +2,32 @@
     use super::*;
 
     #[test]
+    fn embedded_mascot_textures_load_with_the_expected_aspect() {
+        let ctx = egui::Context::default();
+        let mark = MascotMark::load(&ctx);
+        assert!((mark.aspect() - 1024.0 / 523.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn tray_window_and_app_icons_are_square_and_have_alpha() {
+        for (name, (rgba, w, h)) in [
+            ("tray black", tray_rgba(64, false)),
+            ("tray white", tray_rgba(64, true)),
+            ("window black", window_rgba(64, false)),
+            ("window white", window_rgba(64, true)),
+            ("app black", app_rgba(96, false)),
+            ("app white", app_rgba(96, true)),
+        ] {
+            assert_eq!(w, h, "{name}");
+            assert_eq!(rgba.len(), (w * h * 4) as usize, "{name}");
+            assert!(
+                rgba.chunks_exact(4).any(|p| p[3] > 0),
+                "{name} has no opaque pixels"
+            );
+        }
+    }
+
+    #[test]
     fn parses_four_subpaths() {
         // 上游路径由 4 条子路径组成：身体 + 鳍挖空 + 眼睛 + 鳍/嘴挖空。
         // 数量由 `d` 字符串里的 M/Z 对决定，与 SVG 源一一对应。

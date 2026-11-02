@@ -50,7 +50,7 @@ fn frame_themed(
 ) -> egui::FullOutput {
     let theme = neo_theme::Theme::new(mode, 1080.0, neo_theme::Distance::Standard);
     theme.apply(ctx);
-    let whale = crate::brand::WhaleMark::cached(ctx);
+    let whale = crate::brand::MascotMark::cached(ctx);
     let mut output = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),

@@ -384,7 +384,7 @@ fn virtual_rows_pause_and_resume_without_laying_out_the_entire_buffer() {
         neo_theme::Distance::Standard,
     );
     theme.apply(&ctx);
-    let whale = crate::brand::WhaleMark::cached(&ctx);
+    let whale = crate::brand::MascotMark::cached(&ctx);
     let skin = Skin::new(theme, &whale);
     let mut entries = vec![sample().entries[0].clone(); MAX_ENTRIES];
     for entry in entries.iter_mut().take(120) {
@@ -558,7 +558,7 @@ fn page_draws_headlessly_in_both_themes_and_narrow_widths() {
                 let theme =
                     neo_theme::Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
                 theme.apply(&ctx);
-                let whale = crate::brand::WhaleMark::cached(&ctx);
+                let whale = crate::brand::MascotMark::cached(&ctx);
                 let skin = Skin::new(theme, &whale);
                 let mut state = LogViewState {
                     follow: false,

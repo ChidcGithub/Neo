@@ -64,20 +64,20 @@ pub fn draw(
         egui::pos2(content.left() + m.s(4.0), y),
         Vec2::new(content.width() - m.s(8.0), brand_h),
     );
-    let whale_w = m.s(24.0);
-    skin.whale.paint(
+    let mascot_w = m.s(24.0);
+    skin.mascot.paint(
         ui.painter(),
         Rect::from_min_size(
             egui::pos2(
                 brand.left(),
-                brand.center().y - whale_w * 0.5 / skin.whale.aspect(),
+                brand.center().y - mascot_w * 0.5 / skin.mascot.aspect(),
             ),
-            Vec2::new(whale_w, whale_w / skin.whale.aspect()),
+            Vec2::new(mascot_w, mascot_w / skin.mascot.aspect()),
         ),
         p.label_primary,
     );
     let wordmark = Rect::from_min_max(
-        egui::pos2(brand.left() + whale_w + m.s(9.0), brand.top()),
+        egui::pos2(brand.left() + mascot_w + m.s(9.0), brand.top()),
         egui::pos2(brand.right(), brand.bottom()),
     );
     text_left(

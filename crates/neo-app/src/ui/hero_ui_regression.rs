@@ -26,7 +26,7 @@
                 let theme =
                     neo_theme::Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
                 theme.apply(&ctx);
-                let whale = crate::brand::WhaleMark::cached(&ctx);
+                let whale = crate::brand::MascotMark::cached(&ctx);
                 let skin = Skin::new(theme, &whale);
                 let area = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, height));
                 let mut state = AppState::default();

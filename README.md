@@ -504,7 +504,7 @@ flowchart LR
     Tag([git tag v*]) --> Build[ cargo build --release ]
     Build --> Assets[STT models + MinGit runtime]
     Assets --> Zip[[portable-x64.zip]]
-    Assets --> Art[make_installer_art.py<br/>whale icon · wizard bitmaps]
+    Assets --> Art[make_installer_art.py<br/>brand icon · wizard bitmaps]
     Art --> NSIS[[installer-x64.exe]]
     Zip --> Release([GitHub Release<br/>auto changelog])
     NSIS --> Release

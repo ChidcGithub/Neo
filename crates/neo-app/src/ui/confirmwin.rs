@@ -8,7 +8,7 @@ use egui::{Context, Pos2, Vec2, ViewportBuilder, ViewportCommand, ViewportId, Wi
 use neo_theme::Theme;
 
 use super::miniwin::OFFSCREEN;
-use crate::brand::WhaleMark;
+use crate::brand::MascotMark;
 use crate::state::AppState;
 use crate::ui::{tools, Skin};
 
@@ -119,7 +119,7 @@ impl ConfirmWin {
         let draw = move |ui: &mut egui::Ui| {
             theme.apply(ui.ctx());
             let Some(meta) = &snapshot else { return };
-            let whale = WhaleMark::cached(ui.ctx());
+            let whale = MascotMark::cached(ui.ctx());
             let skin = Skin::new(theme, &whale);
             let clicked = ui
                 .add_enabled_ui(answer.load(Ordering::Acquire) == 0, |ui| {

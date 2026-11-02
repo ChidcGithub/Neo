@@ -16,7 +16,7 @@ use egui::{
 use neo_theme::{SquirclePaint, Theme};
 use neo_ui::{Button, Icon, IconButton};
 
-use crate::brand::WhaleMark;
+use crate::brand::MascotMark;
 use crate::class::{ClassMonitor, SaveState};
 use crate::ui::{markdown, text_left, Skin};
 
@@ -214,7 +214,7 @@ impl ClassWin {
                 }
                 drop(since);
 
-                let whale = WhaleMark::cached(ui.ctx());
+                let whale = MascotMark::cached(ui.ctx());
                 let skin = Skin::new(theme, &whale);
                 if paint(
                     ui,

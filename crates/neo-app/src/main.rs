@@ -102,8 +102,9 @@ fn main() {
         }
     };
     let backend = selection.backend;
-    // 窗口图标与托盘图标共用同一张鲸鱼位图（品牌蓝、方形内接居中）。
-    let (rgba, width, height) = brand::whale_rgba(64);
+    // Start with the dark-surface window mark; the first theme sync swaps it
+    // to the black variant when the persisted theme is light.
+    let (rgba, width, height) = brand::window_rgba(64, true);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(i18n::tr("Neo — 教室大屏 AI 助手"))

@@ -10,7 +10,7 @@ use egui::{Context, Pos2, Rect, Vec2, ViewportBuilder, ViewportCommand, Viewport
 use neo_theme::{SquirclePaint, Theme};
 use neo_ui::{Icon, IconButton};
 
-use crate::brand::WhaleMark;
+use crate::brand::MascotMark;
 use crate::state::AppState;
 use crate::ui::{Skin, markdown, text_left};
 
@@ -134,7 +134,7 @@ impl ResultWin {
                     ui.ctx().request_repaint_of(ViewportId::ROOT);
                 }
                 let Some(card) = &card else { return };
-                let whale = WhaleMark::cached(ui.ctx());
+                let whale = MascotMark::cached(ui.ctx());
                 let skin = Skin::new(theme, &whale);
                 if paint(ui, &skin, card) {
                     close_wanted.store(true, Ordering::Release);

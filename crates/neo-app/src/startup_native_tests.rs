@@ -377,7 +377,7 @@ fn cached_plate_preserves_glass_brand_and_animation_bounds() {
     let g = layout(1.);
     let mask = unsafe { memory_glyphs(&g, 1., "正在启动") };
     assert!(mask.contains(&255));
-    let (icon, _, _) = crate::brand::whale_rgba(76);
+    let (icon, _, _) = crate::brand::app_rgba(76, false);
     let glass = vec![0xffbbc9d8; (g.width * g.height) as usize];
     let palette = Palette::light();
     let plate = render_plate(&g, &mask, &icon, Some(&glass), palette).unwrap();
@@ -408,7 +408,7 @@ fn cached_plate_preserves_glass_brand_and_animation_bounds() {
 fn high_contrast_ignores_glass_and_has_no_decorative_shadow() {
     let g = layout(1.);
     let mask = vec![0; (g.width * g.height) as usize];
-    let (icon, _, _) = crate::brand::whale_rgba(76);
+    let (icon, _, _) = crate::brand::app_rgba(76, false);
     for (body, ink) in [([0, 0, 0], [255, 255, 255]), ([255, 255, 255], [0, 0, 0])] {
         let palette = Palette {
             body,
@@ -470,7 +470,7 @@ fn high_contrast_ignores_glass_and_has_no_decorative_shadow() {
 #[ignore = "opt-in synthetic PNG; memory GDI only, never captures the desktop"]
 fn synthetic_startup_preview() {
     let g = layout(1.);
-    let (icon, _, _) = crate::brand::whale_rgba(76);
+    let (icon, _, _) = crate::brand::app_rgba(76, false);
     let background = |x: u32, y: u32| {
         let wave = ((x as f32 / 180.).sin() * (y as f32 / 210.).cos() + 1.) * 0.5;
         mix([93, 132, 182], [229, 203, 186], wave)

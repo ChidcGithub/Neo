@@ -34,7 +34,7 @@ pub mod waketest;
 use neo_theme::Theme;
 use neo_ui::Design;
 
-use crate::brand::WhaleMark;
+use crate::brand::MascotMark;
 
 /// 输入卡的固定 id。
 ///
@@ -56,18 +56,18 @@ pub fn ime_active(ctx: &egui::Context) -> bool {
 /// 一次绘制共享的「皮肤」：设计上下文 + 品牌资源。
 ///
 /// `Design` 来自 [`neo_ui`]，持有色板 / 度量 / 字号 / 组件 token；
-/// `whale` 是应用级品牌资源，组件库不携带。
+/// `mascot` 是应用级品牌资源，组件库不携带。
 #[derive(Clone, Copy)]
 pub struct Skin<'a> {
     pub design: Design,
-    pub whale: &'a WhaleMark,
+    pub mascot: &'a MascotMark,
 }
 
 impl<'a> Skin<'a> {
-    pub fn new(theme: Theme, whale: &'a WhaleMark) -> Self {
+    pub fn new(theme: Theme, mascot: &'a MascotMark) -> Self {
         Self {
             design: Design::new(theme),
-            whale,
+            mascot,
         }
     }
 

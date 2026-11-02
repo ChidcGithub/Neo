@@ -23,7 +23,7 @@ pub struct Outcome {
     pub composer: composer::Outcome,
 }
 
-/// 绘制空态：鲸鱼 + 标题 / workspace chip / 输入卡，三段垂直居中。
+/// 绘制空态：吉祥物 + 标题 / workspace chip / 输入卡，三段垂直居中。
 pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> Outcome {
     let p = skin.p();
     let m = skin.m();
@@ -33,12 +33,12 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
     let card_w = m.card_max(area.width());
     let card_h = composer::block_height(ui, skin, state, card_w, true);
 
-    let fish_w = t.fish;
+    let mascot_w = t.fish;
     let title = ui.painter().layout(
         tr("今天想在课堂上做点什么？").to_owned(),
         skin.bold(t.headline),
         p.label_primary,
-        (card_w - fish_w - m.s(16.0)).max(1.0),
+        (card_w - mascot_w - m.s(16.0)).max(1.0),
     );
     let headline_h = title.size().y.max(t.headline_lh);
     let chip_h = m.hit_target(m.s(28.0));
@@ -61,17 +61,17 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
     );
 
     // 标题、工作区与输入卡共用左基线；窄窗口按实际列宽换行。
-    let fish_h = fish_w / skin.whale.aspect();
+    let mascot_h = mascot_w / skin.mascot.aspect();
     let gx = col.left();
     let gy = col.top();
-    let whale_rect = Rect::from_min_size(
-        egui::pos2(gx, gy + (t.headline_lh - fish_h) * 0.5),
-        Vec2::new(fish_w, fish_h),
+    let mascot_rect = Rect::from_min_size(
+        egui::pos2(gx, gy + (t.headline_lh - mascot_h) * 0.5),
+        Vec2::new(mascot_w, mascot_h),
     );
-    skin.whale
-        .paint(ui.painter(), whale_rect, p.label_secondary);
+    skin.mascot
+        .paint(ui.painter(), mascot_rect, p.label_secondary);
     ui.painter().galley(
-        egui::pos2(gx + fish_w + m.s(16.0), gy),
+        egui::pos2(gx + mascot_w + m.s(16.0), gy),
         title,
         p.label_primary,
     );

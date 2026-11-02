@@ -19,7 +19,7 @@ fn wake_test_narrow_page_wraps_and_blocks_unsafe_start() {
                 neo_theme::Metrics::from_scale(scale),
             );
             theme.apply(&ctx);
-            let whale = crate::brand::WhaleMark::cached(&ctx);
+            let whale = crate::brand::MascotMark::cached(&ctx);
             let skin = Skin::new(theme, &whale);
             let mut state = AppState::default();
             state.wake_test.error =

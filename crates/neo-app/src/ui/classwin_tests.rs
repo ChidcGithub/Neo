@@ -345,7 +345,7 @@ fn failed_close_keeps_card_and_renders_explicit_retention() {
         neo_theme::Distance::Standard,
     );
     theme.apply(&ctx);
-    let whale = WhaleMark::load(&ctx);
+    let whale = MascotMark::load(&ctx);
     let skin = Skin::new(theme, &whale);
     let mut monitor = ClassMonitor::default();
     monitor.seed_pending_summaries();
