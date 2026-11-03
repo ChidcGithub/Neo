@@ -5,14 +5,7 @@
 //! `dark_mode` flag selects the texture at paint time. System icons (tray,
 //! window, installer) use separately cropped square exports.
 
-pub mod whale_path;
-
 use egui::{Color32, Context, Painter, Pos2, Rect, TextureHandle, TextureOptions, Vec2};
-use neo_theme::svg;
-
-use whale_path::{FISH_LOGO_PATH, VIEWBOX_H, VIEWBOX_W};
-
-const SUPERSAMPLE: usize = 4;
 
 /// Main-window mascot textures, trimmed to their content and capped at 1024px.
 const MASCOT_BLACK_PNG: &[u8] = include_bytes!("../../../../resources/icons/mascot_black.png");
@@ -166,36 +159,6 @@ pub fn window_rgba(size: usize, white: bool) -> (Vec<u8>, u32, u32) {
 /// Square large application icon (full cat + wordmark).
 pub fn app_rgba(size: usize, white: bool) -> (Vec<u8>, u32, u32) {
     rgba_from_png(if white { APP_WHITE_PNG } else { APP_BLACK_PNG }, size)
-}
-
-/// Legacy brand-blue whale bitmap, still used by the floating control until a
-/// dedicated small mascot crop is available.
-pub fn whale_rgba(size: usize) -> (Vec<u8>, u32, u32) {
-    let subpaths = svg::parse_subpaths(FISH_LOGO_PATH);
-    let aspect = VIEWBOX_W / VIEWBOX_H;
-    let w = size;
-    let h = ((size as f32) / aspect).round() as usize;
-    let coverage = svg::rasterize(
-        &subpaths,
-        (VIEWBOX_W, VIEWBOX_H),
-        w,
-        h,
-        SUPERSAMPLE,
-        svg::FillRule::EvenOdd,
-    );
-    let mut rgba = vec![0u8; size * size * 4];
-    let y0 = (size - h.min(size)) / 2;
-    for y in 0..h.min(size) {
-        for x in 0..w.min(size) {
-            let a = (coverage[y * w + x].clamp(0.0, 1.0) * 255.0).round() as u8;
-            let px = ((y0 + y) * size + x) * 4;
-            rgba[px] = 0x4D;
-            rgba[px + 1] = 0x6B;
-            rgba[px + 2] = 0xFE;
-            rgba[px + 3] = a;
-        }
-    }
-    (rgba, size as u32, size as u32)
 }
 
 /// Fit `outer` into the artwork aspect ratio without stretching.

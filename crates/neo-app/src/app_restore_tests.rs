@@ -660,7 +660,7 @@ fn safety_sqlite_readonly_blocks_close_and_tray_then_retry_saves() {
         }
         let mut output = ctx.run_ui(input, |_| {
             if tray {
-                app.handle_tray_menu(&ctx, &app.tray_quit_id.clone());
+                app.request_exit(&ctx);
             } else {
                 app.tick(ctx.clone());
             }
@@ -1503,7 +1503,7 @@ fn desktop_barrier_visible_main_auto_avoids_without_tray_and_holds_round() {
     assert!(rx.try_recv().is_err(), "必须等下一帧验证");
     assert!(app.desktop_windows.main_avoided);
     assert!(!app.hidden_to_tray);
-    assert!(app.tray.is_none());
+    assert!(!app.tray.is_active());
     app.tick_desktop_barrier(&ctx);
     assert!(rx.try_recv().unwrap().is_ok());
     app.state

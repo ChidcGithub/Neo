@@ -45,7 +45,7 @@ fn shoot(name: &str, size: Vec2, setup: impl FnOnce(&mut NeoApp) + 'static) -> P
     shoot_steps(name, size, 2, setup)
 }
 
-/// 指定帧数的版本。持续重绘的界面（脉动点、鲸鱼游动）会让
+/// 指定帧数的版本。持续重绘的界面（脉动点、吉祥物动画）会让
 /// [`Harness::run`] 撞上 max_steps 上限 —— 它假设界面最终会静止。
 fn shoot_steps(
     name: &str,

@@ -9,7 +9,7 @@ use neo_theme::{fonts, Metrics, Palette, Theme, Typography};
 /// 组件只认 `Design` —— 这保证同一帧里所有控件用的是同一套色板与度量，
 /// 不会出现"侧栏是暗色、主区是亮色"这类脏状态。
 ///
-/// 不持有品牌资源：鲸鱼标志这类**应用级素材**留在 app 侧，
+/// 不持有品牌资源：猫吉祥物这类**应用级素材**留在 app 侧，
 /// 组件库只关心"造型系统"（色 / 度量 / 字号 / 形状），不关心"画的是哪个 logo"。
 #[derive(Clone, Copy)]
 pub struct Design {

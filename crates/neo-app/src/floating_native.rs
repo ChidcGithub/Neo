@@ -597,7 +597,7 @@ impl RenderCache {
         }
         if self.scale != Some(scale) {
             let icon_size = (34.0 * scale).round().max(1.0) as usize;
-            let (mut rgba, width, height) = crate::brand::whale_rgba(icon_size);
+            let (mut rgba, width, height) = crate::brand::window_rgba(icon_size, false);
             #[cfg(test)]
             {
                 self.work.rasterizations += 1;
@@ -607,7 +607,7 @@ impl RenderCache {
             }
             self.icon = Some(
                 image::RgbaImage::from_raw(width, height, rgba)
-                    .ok_or("floating invalid whale bitmap")?,
+                    .ok_or("floating invalid mascot bitmap")?,
             );
             self.fonts = Fonts::default();
             self.label_key = None;

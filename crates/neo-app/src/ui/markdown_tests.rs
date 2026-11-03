@@ -36,8 +36,8 @@
         };
         input.events = events;
         let mut output = ctx.run_ui(input, |ui| {
-            let whale = crate::brand::MascotMark::load(ui.ctx());
-            let skin = Skin::new(theme, &whale);
+            let mascot = crate::brand::MascotMark::load(ui.ctx());
+            let skin = Skin::new(theme, &mascot);
             render(ui, &skin, text, false);
         });
         output.textures_delta.clear();
@@ -363,12 +363,12 @@
                     ..Default::default()
                 },
                 |ui| {
-                    let whale = crate::brand::MascotMark::load(ui.ctx());
+                    let mascot = crate::brand::MascotMark::load(ui.ctx());
                     configure(
                         ui,
                         &Skin::new(
                             Theme::new(ThemeMode::Light, 1080.0, Distance::Standard),
-                            &whale,
+                            &mascot,
                         ),
                     );
                     let math = move |ui: &mut Ui, _: &str, _: bool| {
@@ -602,8 +602,8 @@
                     ui.painter()
                         .rect_filled(ui.ctx().content_rect(), 0.0, theme.palette.bg_base);
                     egui::Frame::NONE.inner_margin(24.0).show(ui, |ui| {
-                        let whale = crate::brand::MascotMark::load(ui.ctx());
-                        render(ui, &Skin::new(theme, &whale), SAMPLE, false);
+                        let mascot = crate::brand::MascotMark::load(ui.ctx());
+                        render(ui, &Skin::new(theme, &mascot), SAMPLE, false);
                         assert!(
                             ui.min_rect().right() <= width - 12.0,
                             "Markdown expanded beyond viewport: {:?}",

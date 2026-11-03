@@ -134,8 +134,8 @@ impl ResultWin {
                     ui.ctx().request_repaint_of(ViewportId::ROOT);
                 }
                 let Some(card) = &card else { return };
-                let whale = MascotMark::cached(ui.ctx());
-                let skin = Skin::new(theme, &whale);
+                let mascot = MascotMark::cached(ui.ctx());
+                let skin = Skin::new(theme, &mascot);
                 if paint(ui, &skin, card) {
                     close_wanted.store(true, Ordering::Release);
                     ui.ctx().request_repaint_of(ViewportId::ROOT);

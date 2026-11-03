@@ -50,23 +50,6 @@ fn smooth_curve_chains_keep_reflection_for_relative_and_implicit_segments() {
 }
 
 #[test]
-fn current_whale_geometry_and_cutouts_are_preserved() {
-    use super::whale_fixture::*;
-    let paths = parse_subpaths(FISH_LOGO_PATH);
-    assert_eq!(paths.len(), 4);
-    for point in paths.iter().flatten() {
-        assert!((-1.0..=VIEWBOX_W + 1.0).contains(&point[0]));
-        assert!((-1.0..=VIEWBOX_H + 1.0).contains(&point[1]));
-    }
-    let coverage = rasterize(&paths, (VIEWBOX_W, VIEWBOX_H), 256, 188, 4, FillRule::EvenOdd);
-    let at = |x: f32, y: f32| coverage[(y / VIEWBOX_H * 188.0) as usize * 256 + (x / VIEWBOX_W * 256.0) as usize];
-    assert!(at(2.0, 10.0) > 0.9);
-    assert!(at(10.0, 8.0) > 0.9);
-    assert!(at(12.44, 8.26) < 0.2);
-    assert!(at(14.0, 8.5) < 0.2);
-}
-
-#[test]
 fn parses_absolute_square() {
     let sp = parse_subpaths("M0 0L10 0L10 10L0 10Z");
     assert_eq!(sp.len(), 1);

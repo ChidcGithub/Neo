@@ -558,8 +558,8 @@ fn paint(ui: &mut egui::Ui, snap: &Snapshot, fade: f32, measure: &Arc<Mutex<f32>
                     .color(p.label_secondary),
             );
         } else {
-            let whale = crate::brand::MascotMark::cached(ui.ctx());
-            let skin = super::Skin::new(snap.theme, &whale);
+            let mascot = crate::brand::MascotMark::cached(ui.ctx());
+            let skin = super::Skin::new(snap.theme, &mascot);
             super::markdown::render(ui, &skin, &snap.body, snap.streaming);
         }
 

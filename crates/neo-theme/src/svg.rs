@@ -467,9 +467,5 @@ impl<'a> Lexer<'a> {
 const TAU: f32 = 2.0 * PI;
 
 #[cfg(test)]
-#[path = "../../neo-app/src/brand/whale_path.rs"]
-mod whale_fixture;
-
-#[cfg(test)]
 #[path = "svg_tests.rs"]
 mod tests;

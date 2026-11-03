@@ -26,8 +26,8 @@
                 let theme =
                     neo_theme::Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
                 theme.apply(&ctx);
-                let whale = crate::brand::MascotMark::cached(&ctx);
-                let skin = Skin::new(theme, &whale);
+                let mascot = crate::brand::MascotMark::cached(&ctx);
+                let skin = Skin::new(theme, &mascot);
                 let area = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, height));
                 let mut state = AppState::default();
                 state.workspace = Some("long-workspace-path/".repeat(30));

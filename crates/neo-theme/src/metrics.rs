@@ -95,8 +95,8 @@ pub const BASE_CHIP_CHEVRON: f32 = 12.0;
 /// hero 标题（`.headline { font-size: 26px; line-height: 32px }`）。
 pub const BASE_HEADLINE: f32 = 26.0;
 pub const BASE_HEADLINE_LH: f32 = 32.0;
-/// hero 鲸鱼标志宽度（figma 34×25）。
-pub const BASE_FISH: f32 = 34.0;
+/// hero 吉祥物宽度（figma 34×25 的品牌位，按内容等比放大）。
+pub const BASE_MASCOT: f32 = 34.0;
 
 /// 正文 / 草稿字号（`.card { font-size: 14px; line-height: 24px }`）。
 pub const BASE_BODY: f32 = 14.0;
@@ -300,7 +300,7 @@ pub struct Typography {
     pub label_lh: f32,
     pub caption: f32,
     pub caption_lh: f32,
-    pub fish: f32,
+    pub mascot: f32,
 }
 
 impl Typography {
@@ -314,7 +314,7 @@ impl Typography {
             label_lh: m.s(BASE_LABEL_LH),
             caption: m.s(BASE_CAPTION),
             caption_lh: m.s(18.0),
-            fish: m.s(BASE_FISH),
+            mascot: m.s(BASE_MASCOT),
         }
     }
 }

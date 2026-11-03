@@ -119,8 +119,8 @@ impl ConfirmWin {
         let draw = move |ui: &mut egui::Ui| {
             theme.apply(ui.ctx());
             let Some(meta) = &snapshot else { return };
-            let whale = MascotMark::cached(ui.ctx());
-            let skin = Skin::new(theme, &whale);
+            let mascot = MascotMark::cached(ui.ctx());
+            let skin = Skin::new(theme, &mascot);
             let clicked = ui
                 .add_enabled_ui(answer.load(Ordering::Acquire) == 0, |ui| {
                     if meta.name == "ask_user" {

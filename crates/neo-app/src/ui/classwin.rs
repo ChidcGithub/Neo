@@ -214,8 +214,8 @@ impl ClassWin {
                 }
                 drop(since);
 
-                let whale = MascotMark::cached(ui.ctx());
-                let skin = Skin::new(theme, &whale);
+                let mascot = MascotMark::cached(ui.ctx());
+                let skin = Skin::new(theme, &mascot);
                 if paint(
                     ui,
                     &skin,

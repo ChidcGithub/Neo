@@ -229,7 +229,7 @@ fn language_setting_roundtrip_and_invalid_default() {
             .unwrap();
         app.load_settings();
         assert_eq!(app.state.language, Language::ZhCn);
-        assert!(app.tray.is_none() && app.tray_labels.is_none());
+        assert!(!app.tray.is_active());
     });
 }
 
@@ -256,7 +256,7 @@ fn language_switch_updates_title_without_tray_and_failed_save_retries() {
         assert!(app.persist_preferences());
         assert_eq!(app.saved_language, Language::EnUs);
         assert!(!app.state.preferences_unsaved);
-        assert!(app.tray.is_none() && app.tray_labels.is_none());
+        assert!(!app.tray.is_active());
     });
 }
 

@@ -88,8 +88,8 @@ fn tool_states_are_exclusive_and_errors_remain_accessible() {
                     let theme =
                         neo_theme::Theme::from_metrics(mode, neo_theme::Metrics::from_scale(scale));
                     theme.apply(&ctx);
-                    let whale = crate::brand::MascotMark::cached(&ctx);
-                    let skin = Skin::new(theme, &whale);
+                    let mascot = crate::brand::MascotMark::cached(&ctx);
+                    let skin = Skin::new(theme, &mascot);
                     let mut outcome = neo_tools::Outcome::fail(
                         "bash",
                         neo_tools::ToolError::io(&message).with_hint(&hint),

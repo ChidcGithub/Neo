@@ -416,18 +416,7 @@ pub struct NeoApp {
     wake_sensitivity_applied: u8,
     saved_wake_sensitivity: u8,
     /// 系统托盘图标。只在真实客户端装配（`start_tray`），离屏测试没有托盘。
-    tray: Option<tray_icon::TrayIcon>,
-    tray_labels: Option<(tray_icon::menu::MenuItem, tray_icon::menu::MenuItem)>,
-    /// 托盘菜单「显示主界面」的 id。
-    tray_show_id: tray_icon::menu::MenuId,
-    /// 托盘菜单「退出」的 id。
-    tray_quit_id: tray_icon::menu::MenuId,
-    /// 托盘图标当前是否使用白色（深色背景）版本。
-    tray_icon_white: bool,
-    /// 托盘当前是否使用 `neo + spark` 样式。
-    tray_icon_spark: bool,
-    /// 上一次轮换托盘图标的时间。
-    tray_icon_at: std::time::Instant,
+    tray: crate::tray::Tray,
     /// 已应用的窗口图标颜色；`None` 表示等首次主题同步。
     window_icon_white: Option<bool>,
     /// 当前是否处于「关窗转后台」的隐藏态。
@@ -575,13 +564,7 @@ impl NeoApp {
             wake_broken: false,
             wake_sensitivity_applied: 255,
             saved_wake_sensitivity: 255,
-            tray: None,
-            tray_labels: None,
-            tray_show_id: tray_icon::menu::MenuId::new("neo-tray-show"),
-            tray_quit_id: tray_icon::menu::MenuId::new("neo-tray-quit"),
-            tray_icon_white: true,
-            tray_icon_spark: false,
-            tray_icon_at: std::time::Instant::now(),
+            tray: crate::tray::Tray::new(),
             window_icon_white: None,
             hidden_to_tray: false,
             quitting: false,
@@ -1008,91 +991,9 @@ impl NeoApp {
     /// 装配系统托盘：图标 + 「显示主界面 / 退出」菜单。
     ///
     /// **只应在真实客户端里调用**（`main`）。托盘创建失败不挡启动，
-    /// 只是关窗时退化为直接退出。事件没有回调——在 [`NeoApp::poll_tray`]
-    /// 里逐帧轮询。
+    /// 只是关窗时退化为直接退出。
     pub fn start_tray(&mut self) {
-        use tray_icon::menu::{Menu, MenuItem};
-        use tray_icon::TrayIconBuilder;
-
-        if self.tray.is_some() {
-            return;
-        }
-        let menu = Menu::new();
-        let show = MenuItem::with_id(self.tray_show_id.clone(), tr("显示主界面"), true, None);
-        let quit = MenuItem::with_id(self.tray_quit_id.clone(), tr("退出 Neo"), true, None);
-        if menu.append(&show).is_err() || menu.append(&quit).is_err() {
-            record(Level::Error, "tray", "托盘菜单创建失败");
-            return;
-        }
-        self.tray_icon_white = self.state.theme_mode == ThemeMode::Dark;
-        self.tray_icon_spark = false;
-        self.tray_icon_at = std::time::Instant::now();
-        let (rgba, w, h) =
-            crate::brand::tray_rgba(crate::brand::tray_size(), self.tray_icon_white);
-        let icon = match tray_icon::Icon::from_rgba(rgba, w, h) {
-            Ok(icon) => icon,
-            Err(_) => {
-                record(Level::Error, "tray", "托盘图标创建失败");
-                return;
-            }
-        };
-        match TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip(tr("Neo — 教室大屏 AI 助手"))
-            .with_icon(icon)
-            .build()
-        {
-            Ok(tray) => {
-                self.tray = Some(tray);
-                self.tray_labels = Some((show, quit));
-            }
-            Err(_) => record(Level::Error, "tray", "系统托盘创建失败"),
-        }
-    }
-
-    /// 按系统小图标尺寸重画托盘图标，避免 Windows 二次缩放把字标糊掉。
-    fn apply_tray_icon(&self) {
-        let Some(tray) = &self.tray else { return };
-        let size = crate::brand::tray_size();
-        let (rgba, w, h) = if self.tray_icon_spark {
-            crate::brand::tray_spark_rgba(size, self.tray_icon_white)
-        } else {
-            crate::brand::tray_rgba(size, self.tray_icon_white)
-        };
-        if let Ok(icon) = tray_icon::Icon::from_rgba(rgba, w, h) {
-            let _ = tray.set_icon(Some(icon));
-        }
-    }
-
-    /// 轮询托盘事件：图标点击 / 菜单点击。
-    ///
-    /// 托盘没有 winit 唤醒源，隐藏期间靠 `request_repaint_after` 保持低频轮询。
-    fn poll_tray(&mut self, ctx: &egui::Context) {
-        if self.tray.is_none() {
-            return;
-        }
-        // 同一种颜色下轮换字标样式：纯 `neo` ↔ `neo + spark`。
-        const ROTATE: std::time::Duration = std::time::Duration::from_secs(3);
-        if self.tray_icon_at.elapsed() >= ROTATE {
-            self.tray_icon_spark = !self.tray_icon_spark;
-            self.tray_icon_at = std::time::Instant::now();
-            self.apply_tray_icon();
-            ctx.request_repaint_after(ROTATE);
-        }
-        while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
-            // 左键按下即唤回（比双击省一步，教室里少一次操作）。
-            if let tray_icon::TrayIconEvent::Click {
-                button: tray_icon::MouseButton::Left,
-                button_state: tray_icon::MouseButtonState::Down,
-                ..
-            } = event
-            {
-                self.show_window(ctx);
-            }
-        }
-        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-            self.handle_tray_menu(ctx, &event.id);
-        }
+        self.tray.start(self.state.theme_mode == ThemeMode::Dark);
     }
 
     /// 所有应用内退出都经过同一屏障；系统强杀、断电不受此屏障保证。
@@ -1211,7 +1112,7 @@ impl NeoApp {
         self.drawing_exit_pending = false;
         self.quitting = true;
         crate::filelog::shutdown();
-        drop(self.tray.take());
+        self.tray.close();
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         ctx.request_repaint();
     }
@@ -1222,17 +1123,9 @@ impl NeoApp {
         if self.quitting {
             return;
         }
-        if self.state.minimize_to_tray && self.tray.is_some() && !self.exit_blocked {
+        if self.state.minimize_to_tray && self.tray.is_active() && !self.exit_blocked {
             self.hide_to_tray(ctx);
         } else {
-            self.request_exit(ctx);
-        }
-    }
-
-    fn handle_tray_menu(&mut self, ctx: &egui::Context, id: &tray_icon::menu::MenuId) {
-        if id == &self.tray_show_id {
-            self.show_window(ctx);
-        } else if id == &self.tray_quit_id {
             self.request_exit(ctx);
         }
     }
@@ -2289,13 +2182,7 @@ impl NeoApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(
             tr("Neo — 教室大屏 AI 助手").into(),
         ));
-        if let Some((show, quit)) = &self.tray_labels {
-            show.set_text(tr("显示主界面"));
-            quit.set_text(tr("退出 Neo"));
-        }
-        if let Some(tray) = &self.tray {
-            let _ = tray.set_tooltip(Some(tr("Neo — 教室大屏 AI 助手")));
-        }
+        self.tray.refresh_language();
         ctx.request_repaint();
     }
 
@@ -2476,10 +2363,7 @@ impl NeoApp {
         self.theme = Theme::new(self.state.theme_mode, viewport.y, self.state.distance);
         self.theme.apply(ctx);
         let white = self.state.theme_mode == ThemeMode::Dark;
-        if self.tray_icon_white != white {
-            self.tray_icon_white = white;
-            self.apply_tray_icon();
-        }
+        self.tray.apply_theme(white);
         if self.window_icon_white != Some(white) {
             let (rgba, width, height) = crate::brand::window_rgba(64, white);
             ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(
@@ -2866,7 +2750,11 @@ impl NeoApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             self.handle_close(&ctx);
         }
-        self.poll_tray(&ctx);
+        match self.tray.poll(&ctx) {
+            Some(crate::tray::TrayAction::ShowWindow) => self.show_window(&ctx),
+            Some(crate::tray::TrayAction::Quit) => self.request_exit(&ctx),
+            None => {}
+        }
         self.sync_floating(&ctx);
         // 保存失败等待用户选择时，不得再启动生成、工具或音频采集。
         if self.quitting
@@ -2891,7 +2779,7 @@ impl NeoApp {
         // 注释提到 wgpu 对隐藏窗仍会取交换链，最小化走「尺寸为零跳过」的既有路径。
         if !self.start_hidden_done {
             self.start_hidden_done = true;
-            if self.state.effective_start_in_tray() && self.tray.is_some() {
+            if self.state.effective_start_in_tray() && self.tray.is_active() {
                 self.hidden_to_tray = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -3075,7 +2963,7 @@ impl NeoApp {
             self.last_round_done = Some(std::time::Instant::now());
             if self.state.round_cancelled {
                 self.state.round_cancelled = false;
-            } else if self.tray.is_some() {
+            } else if self.tray.is_active() {
                 // tray 存在 = 真实客户端（离屏测试不装托盘），借它当门槛。
                 let last = self
                     .state

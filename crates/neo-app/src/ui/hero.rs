@@ -33,7 +33,7 @@ pub fn draw(ui: &mut Ui, skin: &Skin<'_>, area: Rect, state: &mut AppState) -> O
     let card_w = m.card_max(area.width());
     let card_h = composer::block_height(ui, skin, state, card_w, true);
 
-    let mascot_w = t.fish * 1.4;
+    let mascot_w = t.mascot * 1.4;
     let title = ui.painter().layout(
         tr("今天想在课堂上做点什么？").to_owned(),
         skin.bold(t.headline),

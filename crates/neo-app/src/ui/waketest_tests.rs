@@ -19,8 +19,8 @@ fn wake_test_narrow_page_wraps_and_blocks_unsafe_start() {
                 neo_theme::Metrics::from_scale(scale),
             );
             theme.apply(&ctx);
-            let whale = crate::brand::MascotMark::cached(&ctx);
-            let skin = Skin::new(theme, &whale);
+            let mascot = crate::brand::MascotMark::cached(&ctx);
+            let skin = Skin::new(theme, &mascot);
             let mut state = AppState::default();
             state.wake_test.error =
                 Some("学校模型资源缺失，请联系管理员核对部署资源与权限".repeat(3));
